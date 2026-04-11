@@ -16,7 +16,7 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 # Copy compiled output (build happens outside Docker)
-COPY --from=build /app/dist/ ./dist/
+COPY dist/ ./dist/
 COPY CLAUDE.md ./
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 
@@ -27,9 +27,10 @@ ENV DB_PATH=/data/receipts.db
 ENV UPLOAD_DIR=/data/uploads
 ENV HOME=/home/node
 
-USER node
 RUN mkdir -p /data/uploads /home/node/.claude && \
     chown -R node:node /data /home/node /app
+
+USER node
 
 EXPOSE 3000 3001
 VOLUME ["/data"]

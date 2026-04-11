@@ -8,7 +8,7 @@ import fs from "fs/promises";
 // @ts-ignore -- no type declarations available
 import heicConvert from "heic-convert";
 import { extractReceipt, askClaude } from "./claude.js";
-import { insertReceipt, getReceipt, listReceipts, getSpendingSummary } from "./db.js";
+import { insertReceipt, getReceipt, listReceipts, getSpendingSummary, initSchema } from "./db.js";
 import { submitJob, getJob, subscribeJob } from "./jobs.js";
 
 const PORT = parseInt(process.env.PORT || "3000");
@@ -36,7 +36,7 @@ mcp.addTool({
     const result = await extractReceipt(image_path);
     const id = uuidv4();
     const data = { id, ...result, image_path, notes: notes ?? result.notes };
-    insertReceipt(data);
+    await insertReceipt(data);
     return JSON.stringify({ success: true, ...data }, null, 2);
   },
 });
@@ -52,7 +52,7 @@ mcp.addTool({
     limit: z.number().optional().describe("Max results (default 50)"),
   }),
   execute: async (opts) => {
-    const results = listReceipts(opts);
+    const results = await listReceipts(opts);
     return JSON.stringify(results, null, 2);
   },
 });
@@ -66,7 +66,7 @@ mcp.addTool({
     to: z.string().optional().describe("End date YYYY-MM-DD"),
   }),
   execute: async ({ from, to }) => {
-    const summary = getSpendingSummary(from, to);
+    const summary = await getSpendingSummary(from, to);
     return JSON.stringify(summary, null, 2);
   },
 });
@@ -79,7 +79,7 @@ mcp.addTool({
     id: z.string().describe("Receipt ID"),
   }),
   execute: async ({ id }) => {
-    const receipt = getReceipt(id);
+    const receipt = await getReceipt(id);
     if (!receipt) return JSON.stringify({ error: "Receipt not found" });
     return JSON.stringify(receipt, null, 2);
   },
@@ -94,8 +94,8 @@ mcp.addTool({
   }),
   execute: async ({ question }) => {
     // Pull recent data for context
-    const recent = listReceipts({ limit: 30 });
-    const summary = getSpendingSummary();
+    const recent = await listReceipts({ limit: 30 });
+    const summary = await getSpendingSummary();
 
     const prompt = `You are a personal finance assistant. The user has the following recent receipts and spending summary.
 
@@ -195,7 +195,7 @@ app.post("/receipt", upload.single("image"), async (req: Request, res: Response)
 
 // GET /jobs/:id — poll job status (for clients that can't use SSE)
 app.get("/jobs/:id", (req: Request, res: Response) => {
-  const job = getJob(req.params.id);
+  const job = getJob(req.params.id as string);
   if (!job) {
     res.status(404).json({ error: "Job not found" });
     return;
@@ -212,7 +212,7 @@ app.get("/jobs/:id", (req: Request, res: Response) => {
 
 // GET /jobs/:id/stream — SSE endpoint for real-time job progress
 app.get("/jobs/:id/stream", (req: Request, res: Response) => {
-  const job = getJob(req.params.id);
+  const job = getJob(req.params.id as string);
   if (!job) {
     res.status(404).json({ error: "Job not found" });
     return;
@@ -253,9 +253,9 @@ app.get("/jobs/:id/stream", (req: Request, res: Response) => {
 });
 
 // GET /receipts — list receipts
-app.get("/receipts", (req: Request, res: Response) => {
+app.get("/receipts", async (req: Request, res: Response) => {
   const { from, to, category, limit } = req.query as Record<string, string>;
-  const results = listReceipts({
+  const results = await listReceipts({
     from, to, category,
     limit: limit ? parseInt(limit) : undefined,
   });
@@ -263,8 +263,8 @@ app.get("/receipts", (req: Request, res: Response) => {
 });
 
 // GET /receipt/:id — get single receipt
-app.get("/receipt/:id", (req: Request, res: Response) => {
-  const receipt = getReceipt(req.params.id);
+app.get("/receipt/:id", async (req: Request, res: Response) => {
+  const receipt = await getReceipt(req.params.id as string);
   if (!receipt) {
     res.status(404).json({ error: "Not found" });
     return;
@@ -272,10 +272,21 @@ app.get("/receipt/:id", (req: Request, res: Response) => {
   res.json(receipt);
 });
 
+// DELETE /receipt/:id — delete a receipt
+app.delete("/receipt/:id", async (req: Request, res: Response) => {
+  const { deleteReceipt } = await import("./db.js");
+  const deleted = await deleteReceipt(req.params.id as string);
+  if (!deleted) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+  res.json({ success: true, id: req.params.id });
+});
+
 // GET /summary — spending summary
-app.get("/summary", (req: Request, res: Response) => {
+app.get("/summary", async (req: Request, res: Response) => {
   const { from, to } = req.query as Record<string, string>;
-  const summary = getSpendingSummary(from, to);
+  const summary = await getSpendingSummary(from, to);
   res.json(summary);
 });
 
@@ -288,8 +299,8 @@ app.post("/ask", async (req: Request, res: Response) => {
       return;
     }
     // Reuse the MCP tool logic
-    const recent = listReceipts({ limit: 30 });
-    const summary = getSpendingSummary();
+    const recent = await listReceipts({ limit: 30 });
+    const summary = await getSpendingSummary();
     const prompt = `You are a personal finance assistant. Recent receipts:\n${JSON.stringify(recent)}\nSummary:\n${JSON.stringify(summary)}\nQuestion: ${question}`;
     const answer = await askClaude(prompt);
     res.json({ answer });
@@ -305,6 +316,10 @@ app.post("/ask", async (req: Request, res: Response) => {
 async function main() {
   // Ensure upload directory exists
   await fs.mkdir(UPLOAD_DIR, { recursive: true });
+
+  // Initialize PostgreSQL schema
+  await initSchema();
+  console.log("🗄️  PostgreSQL schema initialized");
 
   // Start MCP server (for Claude Code / MCP clients)
   mcp.start({

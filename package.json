@@ -10,11 +10,12 @@
     "db:init": "node dist/db.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.0",
+    "@types/pg": "^8.20.0",
     "express": "^5.1.0",
     "fastmcp": "^3.34.0",
     "heic-convert": "^2.1.0",
     "multer": "^2.0.0",
+    "pg": "^8.20.0",
     "uuid": "^11.1.0",
     "zod": "^3.24.0"
   },

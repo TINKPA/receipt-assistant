@@ -1,7 +1,8 @@
 import { EventEmitter } from "events";
 import { v4 as uuidv4 } from "uuid";
-import { extractReceiptQuick, extractReceipt, type ClaudeReceiptQuickResult } from "./claude.js";
+import { extractReceiptQuick, extractReceipt, getSessionJsonlPath, type ClaudeReceiptQuickResult } from "./claude.js";
 import { insertReceipt, type ReceiptData } from "./db.js";
+import { ingestSession } from "./langfuse.js";
 
 // ── Job Store + Event Bus ────────────────────────────────────────────
 
@@ -60,26 +61,37 @@ async function runJob(jobId: string) {
   try {
     // Phase 1: quick extraction
     const quick = await extractReceiptQuick(job.imagePath);
-    job.quickResult = quick;
+    const { sessionId: quickSessionId, ...quickData } = quick;
+    job.quickResult = quickData;
     emit(jobId, {
       type: "quick_done",
-      data: { merchant: quick.merchant, date: quick.date, total: quick.total, currency: quick.currency },
+      data: { merchant: quickData.merchant, date: quickData.date, total: quickData.total, currency: quickData.currency },
     });
+    // Langfuse: ingest Phase 1 session (fire-and-forget)
+    ingestSession(getSessionJsonlPath(quickSessionId), ["phase-1", "quick"]).catch(() => {});
 
     // Phase 2: full extraction
     emit(jobId, { type: "processing_full", data: null });
-    const full = await extractReceipt(job.imagePath);
+    const full = await extractReceipt(job.imagePath, quickData);
+    const { sessionId: fullSessionId, ...fullData } = full;
 
+    const { extraction_quality, business_flags, ...coreData } = fullData;
     const receiptData: ReceiptData = {
       id: job.receiptId,
-      ...full,
+      ...coreData,
       image_path: job.imagePath,
-      notes: job.notes ?? full.notes,
+      notes: job.notes ?? coreData.notes,
+      extraction_meta: (extraction_quality || business_flags) ? {
+        quality: extraction_quality ?? { confidence_score: 0, missing_fields: [], warnings: [] },
+        business: business_flags ?? { is_reimbursable: false, is_tax_deductible: false, is_recurring: false, is_split_bill: false },
+      } : undefined,
     };
 
-    insertReceipt(receiptData);
+    await insertReceipt(receiptData);
     job.fullResult = receiptData;
     emit(jobId, { type: "done", data: receiptData });
+    // Langfuse: ingest Phase 2 session (fire-and-forget)
+    ingestSession(getSessionJsonlPath(fullSessionId), ["phase-2", "full"]).catch(() => {});
   } catch (err: any) {
     job.error = err.message;
     emit(jobId, { type: "error", data: { error: err.message } });
