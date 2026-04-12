@@ -36,6 +36,8 @@ interface ContentBlock {
   text?: string;
   name?: string;
   thinking?: string;
+  content?: string | ContentBlock[];
+  tool_use_id?: string;
 }
 
 interface TokenUsage {
@@ -49,10 +51,24 @@ function getUserText(msg: JsonlMessage): string {
   const content = msg.message?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content
-      .filter((b) => b.type === "text" && b.text)
-      .map((b) => b.text!)
-      .join(" ");
+    const parts: string[] = [];
+    for (const b of content) {
+      if (b.type === "text" && b.text) {
+        parts.push(b.text);
+      } else if (b.type === "tool_result") {
+        // Tool results are the user-side responses to assistant tool_use calls
+        if (typeof b.content === "string") {
+          parts.push(`[tool_result] ${b.content}`);
+        } else if (Array.isArray(b.content)) {
+          const inner = b.content
+            .filter((c) => c.type === "text" && c.text)
+            .map((c) => c.text!)
+            .join(" ");
+          if (inner) parts.push(`[tool_result] ${inner}`);
+        }
+      }
+    }
+    return parts.join("\n");
   }
   return "";
 }
@@ -61,16 +77,17 @@ function getAssistantText(msg: JsonlMessage): string {
   const content = msg.message?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    // Prefer text blocks; fall back to JSON-stringified tool_use inputs
-    const texts = content
-      .filter((b) => b.type === "text" && b.text)
-      .map((b) => b.text!);
-    if (texts.length > 0) return texts.join("\n");
-    // For --json-schema mode: Claude may only emit tool_use blocks
-    const toolInputs = content
-      .filter((b) => b.type === "tool_use" && (b as any).input)
-      .map((b) => JSON.stringify((b as any).input));
-    if (toolInputs.length > 0) return toolInputs.join("\n");
+    const parts: string[] = [];
+    for (const b of content) {
+      if (b.type === "text" && b.text) {
+        parts.push(b.text);
+      } else if (b.type === "thinking" && b.thinking) {
+        parts.push(`[thinking] ${b.thinking}`);
+      } else if (b.type === "tool_use" && (b as any).input) {
+        parts.push(`[tool_use:${b.name}] ${JSON.stringify((b as any).input)}`);
+      }
+    }
+    return parts.join("\n");
   }
   return "";
 }
@@ -143,8 +160,6 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
     let firstTs: string | undefined;
     let model: string | undefined;
     let slug: string | undefined;
-    let totalInput = 0;
-    let totalOutput = 0;
 
     for (const msg of messages) {
       if (msg.type === "user" && !firstUser) {
@@ -155,11 +170,6 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
         const m = msg.message?.model;
         if (!model && m && m !== "<synthetic>") model = m;
         if (!slug) slug = (msg as any).slug;
-        const usage = msg.message?.usage;
-        if (usage) {
-          totalInput += (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
-          totalOutput += usage.output_tokens ?? 0;
-        }
       }
     }
 
@@ -177,7 +187,94 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
     // Build ingestion events
     const events: IngestionEvent[] = [];
 
-    // Trace
+    // Generations — one per real LLM API call.
+    //
+    // Claude Code's JSONL splits a single assistant response across multiple
+    // messages (one per content block: thinking, text, tool_use). All of them
+    // share the same `usage` object. We group them together by `usage` identity
+    // so one API call = one generation, not N.
+    //
+    // Agent loop pattern: user prompt → [assistant response] → tool_result →
+    // [assistant response] → tool_result → ... → final [assistant response].
+    // Each bracketed group is one API call.
+    type TurnGroup = {
+      timestamp: string;
+      model: string;
+      usage: TokenUsage;
+      texts: string[];
+      tools: string[];
+      stopReason: string | undefined;
+      input: string;
+      inputTs: string | undefined;
+    };
+
+    const groups: TurnGroup[] = [];
+    let currentGroup: TurnGroup | null = null;
+    let pendingInput = "";
+    let pendingInputTs: string | undefined;
+
+    for (const msg of messages) {
+      if (msg.type === "user" && msg.message?.role === "user") {
+        // Flush current assistant group — a user message always ends a group
+        if (currentGroup) {
+          groups.push(currentGroup);
+          currentGroup = null;
+        }
+        const text = getUserText(msg);
+        if (text) {
+          pendingInput = text;
+          pendingInputTs = msg.timestamp;
+        }
+        continue;
+      }
+
+      if (msg.type !== "assistant") continue;
+
+      const aUsage = msg.message?.usage;
+      const aModel = msg.message?.model ?? model ?? "unknown";
+      if (aModel === "<synthetic>") continue;
+
+      // Decide whether this message starts a new group or extends the current one.
+      // Same usage object → same API call → extend. Different usage → new call.
+      const sameUsageAsCurrent =
+        currentGroup &&
+        aUsage &&
+        currentGroup.usage.input_tokens === aUsage.input_tokens &&
+        currentGroup.usage.output_tokens === aUsage.output_tokens &&
+        currentGroup.usage.cache_read_input_tokens === aUsage.cache_read_input_tokens;
+
+      if (!sameUsageAsCurrent) {
+        if (currentGroup) groups.push(currentGroup);
+        currentGroup = {
+          timestamp: msg.timestamp ?? new Date().toISOString(),
+          model: aModel,
+          usage: aUsage ?? {},
+          texts: [],
+          tools: [],
+          stopReason: msg.message?.stop_reason,
+          input: pendingInput,
+          inputTs: pendingInputTs,
+        };
+      }
+
+      const text = getAssistantText(msg);
+      if (text) currentGroup!.texts.push(text);
+      currentGroup!.tools.push(...getToolNames(msg));
+      if (msg.message?.stop_reason) currentGroup!.stopReason = msg.message.stop_reason;
+      // Keep the latest timestamp as end time
+      if (msg.timestamp) currentGroup!.timestamp = msg.timestamp;
+    }
+    if (currentGroup) groups.push(currentGroup);
+
+    // Compute correct totals from grouped (deduped) usage
+    let totalInput = 0;
+    let totalOutput = 0;
+    for (const g of groups) {
+      totalInput += (g.usage.input_tokens ?? 0) + (g.usage.cache_read_input_tokens ?? 0);
+      totalOutput += g.usage.output_tokens ?? 0;
+    }
+
+    // Trace (created after grouping so totals are accurate)
     events.push({
       id: randomUUID(),
       type: "trace-create",
@@ -199,56 +296,45 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
       },
     });
 
-    // Generations — one per user→assistant turn
+    // Emit one generation per group. Skip groups with no real usage (synthetic).
     let turn = 0;
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      if (msg.type !== "user" || msg.message?.role !== "user") continue;
-      const userText = getUserText(msg);
-      if (!userText) continue;
-
-      const userTs = msg.timestamp;
-      turn++;
-
-      for (let j = i + 1; j < messages.length; j++) {
-        const aMsg = messages[j];
-        if (aMsg.type === "user" && aMsg.message?.role === "user") break;
-        if (aMsg.type !== "assistant") continue;
-
-        const aUsage = aMsg.message?.usage;
-        const aModel = aMsg.message?.model ?? model ?? "unknown";
-        const aText = getAssistantText(aMsg);
-        const tools = getToolNames(aMsg);
-
-        let genName = `turn-${turn}`;
-        if (tools.length > 0) genName += ` (${tools.slice(0, 3).join(", ")})`;
-
-        events.push({
-          id: randomUUID(),
-          type: "generation-create",
-          timestamp: aMsg.timestamp ?? new Date().toISOString(),
-          body: {
-            id: randomUUID(),
-            traceId: sessionId,
-            name: genName,
-            model: aModel !== "<synthetic>" ? aModel : "unknown",
-            input: userText.slice(0, 5000),
-            output: aText.slice(0, 5000) || undefined,
-            startTime: userTs,
-            endTime: aMsg.timestamp,
-            usageDetails: {
-              input: (aUsage?.input_tokens ?? 0) + (aUsage?.cache_read_input_tokens ?? 0),
-              output: aUsage?.output_tokens ?? 0,
-            },
-            metadata: {
-              tool_calls: tools,
-              stop_reason: aMsg.message?.stop_reason,
-              cache_read: aUsage?.cache_read_input_tokens ?? 0,
-              cache_create: aUsage?.cache_creation_input_tokens ?? 0,
-            },
-          },
-        });
+    for (const g of groups) {
+      if (
+        !g.usage ||
+        (g.usage.input_tokens == null && g.usage.output_tokens == null)
+      ) {
+        continue;
       }
+      turn++;
+      const uniqueTools = [...new Set(g.tools)];
+      let genName = `turn-${turn}`;
+      if (uniqueTools.length > 0) genName += ` (${uniqueTools.slice(0, 3).join(", ")})`;
+
+      events.push({
+        id: randomUUID(),
+        type: "generation-create",
+        timestamp: g.timestamp,
+        body: {
+          id: randomUUID(),
+          traceId: sessionId,
+          name: genName,
+          model: g.model,
+          input: g.input.slice(0, 5000),
+          output: g.texts.join("\n").slice(0, 5000) || undefined,
+          startTime: g.inputTs ?? g.timestamp,
+          endTime: g.timestamp,
+          usageDetails: {
+            input: (g.usage.input_tokens ?? 0) + (g.usage.cache_read_input_tokens ?? 0),
+            output: g.usage.output_tokens ?? 0,
+          },
+          metadata: {
+            tool_calls: uniqueTools,
+            stop_reason: g.stopReason,
+            cache_read: g.usage.cache_read_input_tokens ?? 0,
+            cache_create: g.usage.cache_creation_input_tokens ?? 0,
+          },
+        },
+      });
     }
 
     // Send in batches of 50
