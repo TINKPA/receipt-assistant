@@ -1,15 +1,15 @@
 import { EventEmitter } from "events";
 import { v4 as uuidv4 } from "uuid";
-import { extractReceiptQuick, extractReceipt, getSessionJsonlPath, type ClaudeReceiptQuickResult } from "./claude.js";
-import { insertReceipt, type ReceiptData } from "./db.js";
+import { processReceipt, getSessionJsonlPath } from "./claude.js";
+import { insertReceiptPlaceholder, updateReceiptStatus, getReceipt } from "./db.js";
 import { ingestSession } from "./langfuse.js";
 
 // ── Job Store + Event Bus ────────────────────────────────────────────
 
-export type JobStatus = "queued" | "quick_done" | "processing_full" | "done" | "error";
+export type JobStatus = "queued" | "done" | "error";
 
 export interface JobEvent {
-  type: "queued" | "quick_done" | "processing_full" | "done" | "error";
+  type: "queued" | "done" | "error";
   data: any;
 }
 
@@ -19,8 +19,6 @@ export interface Job {
   imagePath: string;
   notes?: string;
   status: JobStatus;
-  quickResult?: ClaudeReceiptQuickResult;
-  fullResult?: ReceiptData;
   error?: string;
   createdAt: string;
 }
@@ -59,42 +57,25 @@ async function runJob(jobId: string) {
   const job = jobs.get(jobId)!;
 
   try {
-    // Phase 1: quick extraction
-    const quick = await extractReceiptQuick(job.imagePath);
-    const { sessionId: quickSessionId, ...quickData } = quick;
-    job.quickResult = quickData;
-    emit(jobId, {
-      type: "quick_done",
-      data: { merchant: quickData.merchant, date: quickData.date, total: quickData.total, currency: quickData.currency },
-    });
-    // Langfuse: ingest Phase 1 session (fire-and-forget)
-    ingestSession(getSessionJsonlPath(quickSessionId), ["phase-1", "quick"]).catch(() => {});
+    // Single agent call: Claude reads image + writes to DB directly
+    const { sessionId } = await processReceipt(job.imagePath, job.receiptId);
 
-    // Phase 2: full extraction
-    emit(jobId, { type: "processing_full", data: null });
-    const full = await extractReceipt(job.imagePath, quickData);
-    const { sessionId: fullSessionId, ...fullData } = full;
+    emit(jobId, { type: "done", data: { receiptId: job.receiptId } });
 
-    const { extraction_quality, business_flags, ...coreData } = fullData;
-    const receiptData: ReceiptData = {
-      id: job.receiptId,
-      ...coreData,
-      image_path: job.imagePath,
-      notes: job.notes ?? coreData.notes,
-      extraction_meta: (extraction_quality || business_flags) ? {
-        quality: extraction_quality ?? { confidence_score: 0, missing_fields: [], warnings: [] },
-        business: business_flags ?? { is_reimbursable: false, is_tax_deductible: false, is_recurring: false, is_split_bill: false },
-      } : undefined,
-    };
-
-    await insertReceipt(receiptData);
-    job.fullResult = receiptData;
-    emit(jobId, { type: "done", data: receiptData });
-    // Langfuse: ingest Phase 2 session (fire-and-forget)
-    ingestSession(getSessionJsonlPath(fullSessionId), ["phase-2", "full"]).catch(() => {});
+    // Langfuse: ingest session trace (fire-and-forget)
+    ingestSession(getSessionJsonlPath(sessionId), ["single-call", "receipt"]).catch(() => {});
   } catch (err: any) {
-    job.error = err.message;
-    emit(jobId, { type: "error", data: { error: err.message } });
+    // Check if Claude already wrote the data before the error (e.g. "Reached max turns"
+    // but the DB write succeeded in an earlier turn)
+    const receipt = await getReceipt(job.receiptId).catch(() => null) as any;
+    if (receipt && receipt.status === "done") {
+      // Claude finished the DB write — treat as success
+      emit(jobId, { type: "done", data: { receiptId: job.receiptId } });
+    } else {
+      job.error = err.message;
+      await updateReceiptStatus(job.receiptId, "error", err.message).catch(() => {});
+      emit(jobId, { type: "error", data: { error: err.message } });
+    }
   } finally {
     running--;
     drainQueue();
@@ -112,12 +93,16 @@ function drainQueue() {
 // ── Public API ───────────────────────────────────────────────────────
 
 /**
- * Submit a receipt for two-phase extraction.
+ * Submit a receipt for extraction.
+ * Inserts a placeholder row immediately, then queues the agent call.
  * Returns immediately with jobId; results arrive via events.
  */
-export function submitJob(imagePath: string, notes?: string): Job {
+export async function submitJob(imagePath: string, notes?: string): Promise<Job> {
   const jobId = uuidv4();
   const receiptId = uuidv4();
+
+  // Insert placeholder so receipt appears in GET /receipts immediately
+  await insertReceiptPlaceholder(receiptId, imagePath, notes);
 
   const job: Job = {
     id: jobId,

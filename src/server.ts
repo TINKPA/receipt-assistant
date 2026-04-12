@@ -5,10 +5,8 @@ import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs/promises";
-// @ts-ignore -- no type declarations available
-import heicConvert from "heic-convert";
-import { extractReceipt, askClaude } from "./claude.js";
-import { insertReceipt, getReceipt, listReceipts, getSpendingSummary, initSchema } from "./db.js";
+import { askClaude } from "./claude.js";
+import { getReceipt, listReceipts, getSpendingSummary, initSchema } from "./db.js";
 import { submitJob, getJob, subscribeJob } from "./jobs.js";
 
 const PORT = parseInt(process.env.PORT || "3000");
@@ -33,11 +31,8 @@ mcp.addTool({
     notes: z.string().optional().describe("Optional notes to attach"),
   }),
   execute: async ({ image_path, notes }) => {
-    const result = await extractReceipt(image_path);
-    const id = uuidv4();
-    const data = { id, ...result, image_path, notes: notes ?? result.notes };
-    await insertReceipt(data);
-    return JSON.stringify({ success: true, ...data }, null, 2);
+    const job = await submitJob(image_path, notes);
+    return JSON.stringify({ success: true, jobId: job.id, receiptId: job.receiptId, status: "processing" }, null, 2);
   },
 });
 
@@ -135,49 +130,44 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
 }
 app.use(authMiddleware);
 
-// File upload config
+// File upload config — JPG only
 const storage = multer.diskStorage({
   destination: UPLOAD_DIR,
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname) || ".jpg";
-    cb(null, `${uuidv4()}${ext}`);
+  filename: (_req, _file, cb) => {
+    cb(null, `${uuidv4()}.jpg`);
   },
 });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
+const upload = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB max
+  fileFilter: (_req, file, cb) => {
+    const mime = file.mimetype.toLowerCase();
+    if (mime === "image/jpeg" || mime === "image/jpg") {
+      cb(null, true);
+    } else {
+      cb(new Error("Only JPEG images are accepted"));
+    }
+  },
+});
 
 // Health check
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "receipt-assistant", version: "1.0.0" });
 });
 
-// POST /receipt — upload receipt image, submit async two-phase job
+// POST /receipt — upload receipt image, submit async extraction job
 app.post("/receipt", upload.single("image"), async (req: Request, res: Response) => {
   try {
     if (!req.file) {
-      res.status(400).json({ error: "No image file uploaded. Use form field 'image'." });
+      res.status(400).json({ error: "No image file uploaded. Use form field 'image'. Only JPEG accepted." });
       return;
     }
 
-    let imagePath = req.file.path;
+    const imagePath = req.file.path;
     const notes = req.body?.notes;
 
-    // Convert HEIC/HEIF to JPEG (Claude's Read tool doesn't support HEIC)
-    const ext = path.extname(imagePath).toLowerCase();
-    if ([".heic", ".heif"].includes(ext)) {
-      const inputBuffer = await fs.readFile(imagePath);
-      const jpegBuffer = await heicConvert({
-        buffer: inputBuffer,
-        format: "JPEG",
-        quality: 0.9,
-      });
-      const jpegPath = imagePath.replace(/\.[^.]+$/, ".jpg");
-      await fs.writeFile(jpegPath, Buffer.from(jpegBuffer));
-      console.log(`🔄 Converted ${ext} → JPEG: ${jpegPath}`);
-      imagePath = jpegPath;
-    }
-
     console.log(`📸 Submitting receipt job: ${imagePath}`);
-    const job = submitJob(imagePath, notes);
+    const job = await submitJob(imagePath, notes);
     console.log(`📋 Job created: ${job.id} (receipt: ${job.receiptId})`);
 
     res.json({
@@ -193,7 +183,7 @@ app.post("/receipt", upload.single("image"), async (req: Request, res: Response)
   }
 });
 
-// GET /jobs/:id — poll job status (for clients that can't use SSE)
+// GET /jobs/:id — poll job status
 app.get("/jobs/:id", (req: Request, res: Response) => {
   const job = getJob(req.params.id as string);
   if (!job) {
@@ -204,8 +194,6 @@ app.get("/jobs/:id", (req: Request, res: Response) => {
     jobId: job.id,
     receiptId: job.receiptId,
     status: job.status,
-    quickResult: job.quickResult ?? null,
-    fullResult: job.fullResult ?? null,
     error: job.error ?? null,
   });
 });
@@ -224,12 +212,8 @@ app.get("/jobs/:id/stream", (req: Request, res: Response) => {
   res.flushHeaders();
 
   // Send current state immediately (client may have missed events)
-  if (job.status === "quick_done" || job.status === "processing_full") {
-    res.write(`event: quick_done\ndata: ${JSON.stringify(job.quickResult)}\n\n`);
-  }
   if (job.status === "done") {
-    res.write(`event: quick_done\ndata: ${JSON.stringify(job.quickResult)}\n\n`);
-    res.write(`event: done\ndata: ${JSON.stringify(job.fullResult)}\n\n`);
+    res.write(`event: done\ndata: ${JSON.stringify({ receiptId: job.receiptId })}\n\n`);
     res.end();
     return;
   }
@@ -283,6 +267,21 @@ app.delete("/receipt/:id", async (req: Request, res: Response) => {
   res.json({ success: true, id: req.params.id });
 });
 
+// GET /receipt/:id/image — serve the receipt image file
+app.get("/receipt/:id/image", async (req: Request, res: Response) => {
+  const receipt = await getReceipt(req.params.id as string);
+  if (!receipt || !receipt.image_path) {
+    res.status(404).json({ error: "Image not found" });
+    return;
+  }
+  try {
+    await fs.access(receipt.image_path);
+    res.sendFile(receipt.image_path);
+  } catch {
+    res.status(404).json({ error: "Image file not found on disk" });
+  }
+});
+
 // GET /summary — spending summary
 app.get("/summary", async (req: Request, res: Response) => {
   const { from, to } = req.query as Record<string, string>;
@@ -333,11 +332,12 @@ async function main() {
     console.log(`🌐 HTTP API listening on http://0.0.0.0:${PORT}`);
     console.log(`
 📋 Available endpoints:
-   POST /receipt          — upload receipt (returns jobId, async two-phase)
-   GET  /jobs/:id         — poll job status (quick_done → done)
+   POST /receipt          — upload receipt JPG (returns jobId, async)
+   GET  /jobs/:id         — poll job status (queued → done/error)
    GET  /jobs/:id/stream  — SSE stream for real-time progress
    GET  /receipts         — list receipts (?from=&to=&category=&limit=)
    GET  /receipt/:id      — get receipt details
+   GET  /receipt/:id/image — serve receipt image
    GET  /summary          — spending summary (?from=&to=)
    POST /ask              — ask a question about spending
    GET  /health           — health check
