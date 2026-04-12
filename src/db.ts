@@ -98,6 +98,9 @@ export async function initSchema(): Promise<void> {
     )
   `);
 
+  // Add status column for async processing (placeholder → done/error)
+  await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done'`);
+
   await p.query(`CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_receipts_merchant ON receipts(merchant)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_receipts_category ON receipts(category)`);
@@ -161,6 +164,41 @@ export async function insertReceipt(data: ReceiptData): Promise<ReceiptData> {
   }
 
   return data;
+}
+
+/**
+ * Insert a placeholder receipt row with status='processing'.
+ * Called immediately on upload so the receipt appears in GET /receipts
+ * before extraction completes.
+ */
+export async function insertReceiptPlaceholder(
+  id: string,
+  imagePath: string,
+  notes?: string
+): Promise<void> {
+  const p = getPool();
+  await initSchema();
+  await p.query(
+    `INSERT INTO receipts (id, merchant, date, total, image_path, notes, status)
+     VALUES ($1, 'Processing...', $2, 0, $3, $4, 'processing')`,
+    [id, new Date().toISOString().slice(0, 10), imagePath, notes ?? null]
+  );
+}
+
+/**
+ * Update the status of a receipt (e.g. to 'error' on failure).
+ */
+export async function updateReceiptStatus(
+  id: string,
+  status: string,
+  error?: string
+): Promise<void> {
+  const p = getPool();
+  await initSchema();
+  await p.query(
+    `UPDATE receipts SET status = $1, notes = COALESCE($2, notes), updated_at = NOW() WHERE id = $3`,
+    [status, error ?? null, id]
+  );
 }
 
 export async function deleteReceipt(id: string): Promise<boolean> {
