@@ -275,10 +275,12 @@ app.get("/receipt/:id/image", async (req: Request, res: Response) => {
     res.status(404).json({ error: "Image not found" });
     return;
   }
+  const absPath = path.resolve(receipt.image_path);
   try {
-    await fs.access(receipt.image_path);
-    res.sendFile(receipt.image_path);
-  } catch {
+    await fs.access(absPath);
+    res.sendFile(absPath);
+  } catch (err) {
+    console.error(`[/receipt/${req.params.id}/image] failed:`, err);
     res.status(404).json({ error: "Image file not found on disk" });
   }
 });
