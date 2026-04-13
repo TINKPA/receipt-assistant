@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@types/pg": "^8.20.0",
+    "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "fastmcp": "^3.34.0",
     "heic-convert": "^2.1.0",

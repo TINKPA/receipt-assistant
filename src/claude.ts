@@ -117,6 +117,7 @@ RULES:
 - payment_method: MUST be one of: credit_card|debit_card|cash|mobile_pay|other
 - tax: tax amount if visible
 - tip: tip amount if visible (watch for handwritten tips)
+- address: full printed street address of the merchant if visible on the receipt (e.g. "11727 Olympic Blvd, Los Angeles, CA 90064"). Combine street, city, state, zip into one string. Use NULL if not visible — do NOT guess.
 - raw_text: full transcription of the receipt text
 - For each line item: name, quantity (default 1), unit_price, total_price
 
@@ -124,7 +125,7 @@ DATABASE — run SQL via:
 ${psqlCmd} "<SQL>"
 
 UPDATE the existing receipt row:
-UPDATE receipts SET merchant='...', date='...', total=<num>, currency='...', category='...', payment_method='...', tax=<num_or_null>, tip=<num_or_null>, raw_text='...', status='done', updated_at=NOW() WHERE id='${receiptId}';
+UPDATE receipts SET merchant='...', date='...', total=<num>, currency='...', category='...', payment_method='...', tax=<num_or_null>, tip=<num_or_null>, address=<'...'_or_NULL>, raw_text='...', status='done', updated_at=NOW() WHERE id='${receiptId}';
 
 For each line item:
 INSERT INTO receipt_items (receipt_id, name, quantity, unit_price, total_price) VALUES ('${receiptId}', '...', <qty>, <price>, <total>);

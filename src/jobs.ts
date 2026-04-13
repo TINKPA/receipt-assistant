@@ -1,8 +1,9 @@
 import { EventEmitter } from "events";
 import { v4 as uuidv4 } from "uuid";
 import { processReceipt, getSessionJsonlPath } from "./claude.js";
-import { insertReceiptPlaceholder, updateReceiptStatus, getReceipt } from "./db.js";
+import { insertReceiptPlaceholder, updateReceiptStatus, getReceipt, updateReceiptGeocode } from "./db.js";
 import { ingestSession } from "./langfuse.js";
+import { geocodeReceipt } from "./geocode.js";
 
 // ── Job Store + Event Bus ────────────────────────────────────────────
 
@@ -51,6 +52,23 @@ function emit(jobId: string, event: JobEvent) {
   bus.emit(jobId, event);
 }
 
+/**
+ * Geocode the merchant location and persist it. Runs after the
+ * extraction pipeline has already marked the receipt as 'done'.
+ * Failures are swallowed — this must never flip status back to error.
+ */
+async function runGeocode(receiptId: string): Promise<void> {
+  try {
+    const row = await getReceipt(receiptId) as any;
+    if (!row) return;
+    const hit = await geocodeReceipt({ address: row.address, merchant: row.merchant });
+    if (!hit) return;
+    await updateReceiptGeocode(receiptId, { ...hit, address: row.address });
+  } catch {
+    // Geocoding failures never affect core pipeline
+  }
+}
+
 // ── Pipeline ─────────────────────────────────────────────────────────
 
 async function runJob(jobId: string) {
@@ -62,6 +80,9 @@ async function runJob(jobId: string) {
 
     emit(jobId, { type: "done", data: { receiptId: job.receiptId } });
 
+    // Fire-and-forget: geocode after extraction, persist lat/lng
+    runGeocode(job.receiptId);
+
     // Langfuse: ingest session trace (fire-and-forget)
     ingestSession(getSessionJsonlPath(sessionId), ["single-call", "receipt"]).catch(() => {});
   } catch (err: any) {
@@ -71,6 +92,7 @@ async function runJob(jobId: string) {
     if (receipt && receipt.status === "done") {
       // Claude finished the DB write — treat as success
       emit(jobId, { type: "done", data: { receiptId: job.receiptId } });
+      runGeocode(job.receiptId);
     } else {
       job.error = err.message;
       await updateReceiptStatus(job.receiptId, "error", err.message).catch(() => {});
