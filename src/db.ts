@@ -37,6 +37,10 @@ export interface ReceiptData {
   notes?: string;
   raw_text?: string;
   image_path?: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+  place_id?: string;
   extraction_meta?: ExtractionMeta;
   items?: {
     name: string;
@@ -100,6 +104,12 @@ export async function initSchema(): Promise<void> {
 
   // Add status column for async processing (placeholder → done/error)
   await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'done'`);
+
+  // Geocoding columns (populated by post-extraction geocode step)
+  await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS address TEXT`);
+  await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS latitude REAL`);
+  await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS longitude REAL`);
+  await p.query(`ALTER TABLE receipts ADD COLUMN IF NOT EXISTS place_id TEXT`);
 
   await p.query(`CREATE INDEX IF NOT EXISTS idx_receipts_date ON receipts(date)`);
   await p.query(`CREATE INDEX IF NOT EXISTS idx_receipts_merchant ON receipts(merchant)`);
@@ -198,6 +208,28 @@ export async function updateReceiptStatus(
   await p.query(
     `UPDATE receipts SET status = $1, notes = COALESCE($2, notes), updated_at = NOW() WHERE id = $3`,
     [status, error ?? null, id]
+  );
+}
+
+/**
+ * Update geocoding fields for a receipt. Called after the extraction
+ * pipeline finishes. Fails silently if the receipt is gone.
+ */
+export async function updateReceiptGeocode(
+  id: string,
+  geo: { address?: string | null; latitude: number; longitude: number; place_id: string }
+): Promise<void> {
+  const p = getPool();
+  await initSchema();
+  await p.query(
+    `UPDATE receipts
+     SET address = COALESCE($1, address),
+         latitude = $2,
+         longitude = $3,
+         place_id = $4,
+         updated_at = NOW()
+     WHERE id = $5`,
+    [geo.address ?? null, geo.latitude, geo.longitude, geo.place_id, id]
   );
 }
 
