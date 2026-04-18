@@ -54,9 +54,16 @@ Every extraction includes metadata stored as PostgreSQL JSONB:
 
 ## Quick Start
 
-The entire stack (Langfuse + receipt-assistant) is orchestrated by a single
-root `docker-compose.yml`. Everything runs in Docker — there is no `npm run
-dev` on the host.
+Two independent units live in the root `docker-compose.yml`:
+
+1. **receipt-assistant + its own postgres** — the app and its database,
+   deployable on their own.
+2. **Langfuse stack** (postgres, clickhouse, minio, redis, web, worker) —
+   optional developer observability, pulled in via `include:`. Comment out
+   the `include:` line in `docker-compose.yml` to run the app without it;
+   trace ingestion fails silently when Langfuse is unreachable.
+
+Everything runs in Docker — there is no `npm run dev` on the host.
 
 ### Prerequisites
 
@@ -79,10 +86,25 @@ failing with auth errors — tokens expire periodically.
 docker compose up -d --build
 ```
 
-This single command:
-- starts the full Langfuse stack (postgres, clickhouse, minio, redis, web, worker)
-- builds the receipt-assistant image (multi-stage: tsc in a builder stage, lean runtime)
-- runs receipt-assistant on ports 3000 (REST) and 3001 (MCP)
+What happens:
+- dedicated `receipts-postgres` starts and auto-creates the `receipts` database
+- the receipt-assistant image is built (multi-stage: tsc in a builder stage, lean runtime)
+- receipt-assistant starts on ports 3000 (REST) and 3001 (MCP)
+- the Langfuse stack starts in parallel
+
+First-time pull of the Langfuse images is 2–3 GB; expect 3–5 minutes on a
+fresh machine. Follow progress with:
+
+```bash
+docker compose logs -f
+```
+
+Once everything is up:
+
+```bash
+curl http://localhost:3000/health
+# { "status": "ok", "service": "receipt-assistant", "version": "1.0.0" }
+```
 
 Langfuse dashboard: http://localhost:3333 (admin@local.dev / admin123)
 
@@ -92,7 +114,7 @@ Langfuse dashboard: http://localhost:3333 (admin@local.dev / admin123)
 docker compose up -d --build receipt-assistant
 ```
 
-Only the app is rebuilt; the Langfuse stack keeps running. Layer caching in
+Only the app is rebuilt; the DB and Langfuse keep running. Layer caching in
 the Dockerfile means unchanged `package.json` skips the `npm ci` step, so
 rebuilds are typically 10–20 seconds.
 
@@ -114,7 +136,7 @@ curl http://localhost:3000/jobs/<jobId>
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/receipt` | Upload receipt image, returns jobId for async processing |
-| `GET` | `/jobs/:id` | Poll job status (queued → quick_done → processing_full → done) |
+| `GET` | `/jobs/:id` | Poll job status (`queued` → `done` or `error`) |
 | `GET` | `/jobs/:id/stream` | SSE stream for real-time progress |
 | `GET` | `/receipts` | List receipts (`?from=&to=&category=&limit=`) |
 | `GET` | `/receipt/:id` | Get single receipt with line items |

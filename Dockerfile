@@ -67,5 +67,9 @@ USER node
 EXPOSE 3000 3001
 VOLUME ["/data"]
 
+# depends_on: service_healthy in docker-compose.yml relies on this.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:3000/health || exit 1
+
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
 CMD ["node", "dist/server.js"]
