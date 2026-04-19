@@ -46,27 +46,40 @@ The SQLite database is at `/data/receipts.db`. Tables:
 
 ## Known Pitfalls
 
-1. **`--json-schema` degrades OCR accuracy vs plain text output**:
+1. **`--json-schema` degrades OCR accuracy vs plain-text output**:
    Tested 10 receipts with Sonnet, same prompt, same model:
    - `--json-schema` mode: 4/10 dates wrong (including year errors,
      fallbacks to today's date, merchant names unreadable)
    - Plain text mode: all 4 disagreements were more accurate
-   
+
    Notable case: AYCE Sushi receipt — JSON-schema couldn't read the
    merchant name at all ("Unknown"), text mode read "GYOTAKU".
    JSON-schema fell back to today's date, text mode got 2026-03-06.
-   
+
    Root cause: `--json-schema` forces direct JSON output with no
    reasoning space. Text mode allows chain-of-thought ("is this a 3
-   or a 9? Given the date context...") which improves ambiguous OCR.
-   
-   **Solution**: Two-step pipeline — Step 1: text OCR + reasoning,
-   Step 2: structure the text into JSON.
-   
-   Additional finding: Phase 1 errors can anchor-bias Phase 2 OCR.
-   Mitigation: prompt marks Phase 1 date as "UNVERIFIED" to reduce
-   anchoring effect. Costco gas receipt remains a hard case — the
-   date digits are genuinely ambiguous in this photo angle.
+   or a 9? Given the date context…") which improves ambiguous OCR.
+
+   **Current solution**: Single-call agent pipeline
+   (`src/claude.ts::processReceipt`). One `claude -p` invocation reads
+   the image, reasons in plain text, and writes the extracted fields
+   to Postgres via a `psql` tool call — **no JSON-schema coercion
+   anywhere in the flow**. A placeholder receipt row is seeded at
+   upload time and `UPDATE`d by the agent.
+
+   An earlier two-phase variant (Phase 1: image → plain-text OCR;
+   Phase 2: separate `claude -p` call structuring the text into JSON
+   without seeing the image, with Phase 1's date marked `UNVERIFIED`
+   to avoid anchor bias) was replaced by the single-call flow. Worth
+   knowing if you A/B a return to two-phase — don't forget the
+   `UNVERIFIED` anchor-bias mitigation.
+
+   Open regression: date accuracy remains the weakest dimension —
+   Wilson receipt returned `2023-01-07` and `2026-04-18` on two runs
+   against ground truth `2025-09-03`. Tracked in
+   [#27](https://github.com/TINKPA/receipt-assistant/issues/27).
+   Costco gas receipt digits are genuinely ambiguous in the sample
+   photo angle; treat it as a known-hard fixture, not a regression.
 
 2. **Handwritten amounts**: Tips and totals written by hand are
    frequently missed or misread. The `handwritten_tip` warning flag
