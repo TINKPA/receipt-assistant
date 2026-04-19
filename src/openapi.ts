@@ -59,6 +59,7 @@ export function buildRegistry(): OpenAPIRegistry {
     security: [{ [bearerAuth.name]: [] }],
     request: {
       body: {
+        required: true,
         content: {
           "multipart/form-data": { schema: UploadReceiptForm },
         },

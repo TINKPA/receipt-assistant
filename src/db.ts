@@ -309,12 +309,16 @@ export async function getSpendingSummary(from?: string, to?: string): Promise<an
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
+  // Cast aggregates to float8 so pg returns JS numbers, not strings.
+  // Without the cast, ROUND(...)::numeric is serialized as a string by
+  // node-postgres' default parser (numeric has no exact JS representation),
+  // which silently breaks any client that expects total_spent: number.
   const result = await p.query(
     `SELECT
       category,
       COUNT(*)::int as count,
-      ROUND(SUM(total)::numeric, 2) as total_spent,
-      ROUND(AVG(total)::numeric, 2) as avg_per_receipt
+      ROUND(SUM(total)::numeric, 2)::float8 as total_spent,
+      ROUND(AVG(total)::numeric, 2)::float8 as avg_per_receipt
     FROM receipts
     ${where}
     GROUP BY category
