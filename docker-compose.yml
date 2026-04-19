@@ -50,9 +50,6 @@ services:
       - "3000:3000"
       - "3001:3001"
     environment:
-      # Fail fast if the OAuth token isn't set in .env — better to error at
-      # `compose up` than to discover it after a failed claude -p call.
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN in .env (run scripts/refresh-token.sh)}
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
       # Langfuse is optional. If the Langfuse stack isn't running, the app
       # still works — trace ingestion is fire-and-forget and tolerates
@@ -62,6 +59,13 @@ services:
       LANGFUSE_SECRET_KEY: sk-receipt-local
     volumes:
       - receipt-data:/data
+      # Claude Code OAuth credentials — mounted RW so the `claude` CLI inside
+      # the container can self-refresh access+refresh tokens on expiry. On
+      # macOS hosts this file is seeded from Keychain by the `setup` skill
+      # (see ~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup).
+      # Do NOT swap to `:ro` — that disables self-refresh and brings back the
+      # 24h-expiry 401 bug.
+      - ${HOME}/.claude/.credentials.json:/home/node/.claude/.credentials.json:rw
     restart: unless-stopped
 
 volumes:

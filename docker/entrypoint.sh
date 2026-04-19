@@ -1,12 +1,9 @@
 #!/bin/sh
 set -e
 
-# Convert CLAUDE_CODE_OAUTH_TOKEN env var to credential file
-if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-  mkdir -p "$HOME/.claude"
-  cat > "$HOME/.claude/.credentials.json" << EOF
-{"claudeAiOauth":{"accessToken":"${CLAUDE_CODE_OAUTH_TOKEN}","refreshToken":"","expiresAt":"2027-01-01T00:00:00.000Z","scopes":["user:inference","user:profile"],"subscriptionType":"claude_pro"}}
-EOF
-fi
+# Claude Code OAuth credentials arrive via a volume-mounted .credentials.json
+# (see docker-compose.yml). The CLI inside the container self-refreshes on
+# expiry and writes the rotated tokens back to the mounted file. No env-var
+# handoff or credentials synthesis here — keep this entrypoint thin.
 
 exec "$@"

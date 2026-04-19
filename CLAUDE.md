@@ -181,6 +181,19 @@ that trap.)
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
+## Claude Code OAuth credentials — volume-mounted, self-refreshing
+
+Auth is **not** an env var. `docker-compose.yml` mounts `${HOME}/.claude/.credentials.json` into the container RW; the in-container `claude` CLI refreshes both `accessToken` and `refreshToken` on expiry and writes the rotation back to the same file. No `CLAUDE_CODE_OAUTH_TOKEN` env var, no entrypoint-side credentials synthesis — both were removed in the migration commit that introduced this section.
+
+**Operate this via the `setup` skill**, not via shell scripts. The skill lives at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md` and covers first-time seeding, the old-to-new architecture migration, and 401 diagnosis. A prior design had an `refresh-token.sh` that poked `.env` — it's been removed, and re-adding it would silently disable self-refresh (env var overrides the file; see the skill for the empirical evidence).
+
+**Hard rules, in one place so it's harder to lose:**
+
+- Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN` to `.env` or `docker-compose.yml`. Presence of the env var makes the CLI skip the file entirely → no refresh → 24h 401s.
+- Never switch the mount to `:ro`. RO kills self-refresh; the rotated tokens have nowhere to land.
+- Never mount `~/.claude/` as a directory — only the single `.credentials.json` file. The host dir contains `projects/`, `skills/`, `settings.json` etc. that the container has no business seeing.
+- If Keychain (macOS) and the file drift far enough that host `claude` stops working, run `claude /login` on the host, then re-invoke the `setup` skill — that's the whole recovery procedure, and it's fine for this to happen occasionally.
+
 ## GitHub Issues
 
 **Every issue filed here must follow the cross-repo label taxonomy.** The full spec lives in the project-level doc: `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/CLAUDE.md` → "GitHub issue conventions". Do not open issues with only the legacy `bug` label.

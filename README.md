@@ -61,17 +61,20 @@ Everything runs in Docker — there is no `npm run dev` on the host.
 ### Prerequisites
 
 - Docker Desktop (or Docker Engine) with Compose v2.20+ (for `include:` support)
-- Claude Code CLI signed in on macOS (the OAuth token is read from the Keychain)
+- Claude Code CLI signed in on the host (on macOS the credentials live in Keychain; on Linux they live at `~/.claude/.credentials.json` after `claude /login`)
 
-### 1. Set up the OAuth token
+### 1. First-time auth setup
+
+Invoke the **`setup` skill** in Claude Code inside this project — it seeds `~/.claude/.credentials.json` from the host (Keychain on macOS) and hands the file to the container via a volume mount. The in-container CLI then auto-refreshes the OAuth tokens; there's no recurring script to run.
+
+If you prefer to do it manually (macOS):
 
 ```bash
-./scripts/refresh-token.sh
+security find-generic-password -s 'Claude Code-credentials' -w > ~/.claude/.credentials.json
+chmod 600 ~/.claude/.credentials.json
 ```
 
-This copies `.env.example` to `.env` (if needed) and writes your current
-Claude Code OAuth token into it. Rerun it whenever `claude -p` calls start
-failing with auth errors — tokens expire periodically.
+No env var goes into `.env` — auth is fully file-based.
 
 ### 2. Bring everything up
 
@@ -188,8 +191,9 @@ curl -s http://localhost:3333/api/public/traces/<trace-id> \
 
 | Script | Usage |
 |--------|-------|
-| `scripts/refresh-token.sh` | Refresh `CLAUDE_CODE_OAUTH_TOKEN` in `.env` from macOS Keychain |
 | `scripts/benchmark.sh` | Upload 10 receipts sequentially, measure per-phase timing via SSE |
+
+OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md`) — there is no recurring shell script for token refresh. The in-container CLI self-refreshes via the RW volume mount configured in `docker-compose.yml`.
 
 ## Tech Stack
 
