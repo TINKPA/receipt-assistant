@@ -1274,6 +1274,299 @@
           "poll"
         ]
       },
+      "ReconcileScope": {
+        "type": "string",
+        "enum": [
+          "batch",
+          "batch_plus_recent_90d"
+        ],
+        "default": "batch"
+      },
+      "ReconcileKind": {
+        "type": "string",
+        "enum": [
+          "dedup",
+          "payment_link",
+          "trip_group",
+          "inventory"
+        ]
+      },
+      "ReconcileRequest": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "$ref": "#/components/schemas/ReconcileScope"
+          },
+          "enable": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReconcileKind"
+            }
+          },
+          "auto_apply_threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.95
+          }
+        }
+      },
+      "ReconcileBatchStatus": {
+        "type": "string",
+        "enum": [
+          "extracted",
+          "reconciling",
+          "reconciled",
+          "reconcile_error"
+        ]
+      },
+      "ReconcileApplied": {
+        "type": "object",
+        "properties": {
+          "duplicates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "receiptId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                },
+                "duplicateOf": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                }
+              },
+              "required": [
+                "receiptId",
+                "duplicateOf"
+              ]
+            },
+            "default": []
+          },
+          "payment_links": {
+            "type": "array",
+            "items": {},
+            "default": []
+          },
+          "inventory": {
+            "type": "array",
+            "items": {},
+            "default": []
+          },
+          "proposals_total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "proposals_total"
+        ]
+      },
+      "ReconcileProposalStatus": {
+        "type": "string",
+        "enum": [
+          "proposed",
+          "auto_applied",
+          "user_applied",
+          "rejected"
+        ]
+      },
+      "ReconcileProposal": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "batch_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReconcileKind"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          "score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReconcileProposalStatus"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "resolved_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "batch_id",
+          "kind",
+          "payload",
+          "score",
+          "status",
+          "created_at",
+          "resolved_at"
+        ]
+      },
+      "ReconcileResult": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReconcileBatchStatus"
+          },
+          "applied": {
+            "$ref": "#/components/schemas/ReconcileApplied"
+          },
+          "proposals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReconcileProposal"
+            }
+          },
+          "poll": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "batchId",
+          "status",
+          "applied",
+          "proposals"
+        ]
+      },
+      "ApplyRequest": {
+        "type": "object",
+        "properties": {
+          "proposal_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "proposal_ids"
+        ]
+      },
+      "ApplyResult": {
+        "type": "object",
+        "properties": {
+          "applied": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "reason"
+              ]
+            }
+          }
+        },
+        "required": [
+          "applied",
+          "skipped"
+        ]
+      },
+      "RejectRequest": {
+        "type": "object",
+        "properties": {
+          "proposal_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "minItems": 1
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_ids"
+        ]
+      },
+      "RejectResult": {
+        "type": "object",
+        "properties": {
+          "rejected": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "reason"
+              ]
+            }
+          }
+        },
+        "required": [
+          "rejected",
+          "skipped"
+        ]
+      },
       "SummaryItem": {
         "type": "object",
         "properties": {
@@ -3822,6 +4115,240 @@
           },
           "404": {
             "description": "Ingest not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/batches/{id}/reconcile": {
+      "post": {
+        "summary": "Run the reconcile pipeline over an extracted batch. Idempotent: a second call on a reconciled batch returns the stored result.",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconcileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reconcile completed (or replayed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResult"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Batch is already mid-reconcile on another caller; response carries a `poll` URL to fetch the final result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Batch is not in a reconcilable state (still extracting, or entered reconcile_error).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResult"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Fetch the latest reconcile result for a batch.",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Reconcile snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/batches/{id}/reconcile/apply": {
+      "post": {
+        "summary": "Apply one or more reconcile proposals. For dedup proposals this voids the duplicate via the ledger service.",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-id apply/skip outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/batches/{id}/reconcile/reject": {
+      "post": {
+        "summary": "Reject one or more reconcile proposals. Marks proposals as rejected with no ledger mutation.",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-id reject/skip outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RejectResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
             "content": {
               "application/problem+json": {
                 "schema": {

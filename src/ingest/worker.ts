@@ -493,8 +493,10 @@ async function onBatchChildTerminated(
   workspaceId: string,
 ): Promise<void> {
   // If all children of this batch are terminal (done/error/unsupported),
-  // flip the batch to `extracted` and stamp completed_at.
-  await db.execute(
+  // flip the batch to `extracted` and stamp completed_at. RETURNING
+  // tells us whether THIS call is the one that effected the transition
+  // — only then do we kick off auto-reconcile.
+  const res = await db.execute(
     sql`UPDATE batches
          SET status = 'extracted',
              completed_at = NOW()
@@ -505,8 +507,56 @@ async function onBatchChildTerminated(
            SELECT 1 FROM ingests
             WHERE batch_id = ${batchId}::uuid
               AND status NOT IN ('done','error','unsupported')
-         )`,
+         )
+      RETURNING auto_reconcile`,
   );
+  if (res.rows.length === 0) return;
+  const flipped = res.rows[0] as { auto_reconcile: boolean };
+  if (flipped.auto_reconcile) {
+    await triggerAutoReconcile(batchId, workspaceId);
+  }
+}
+
+// ── Auto-reconcile hook (#32 Phase 2a) ───────────────────────────────
+
+/**
+ * Fire-and-forget the reconcile pipeline for a batch that just reached
+ * `extracted`. The extractor path must not block on reconcile — a
+ * reconcile failure leaves the batch in `reconcile_error` but does NOT
+ * revert extraction, per the acceptance criteria in #32 Phase 2a.
+ *
+ * We wire the promise into the worker's `inflight` set so integration
+ * tests can `await drain()` and observe the post-reconcile state
+ * deterministically without sleeping.
+ */
+async function triggerAutoReconcile(
+  batchId: string,
+  workspaceId: string,
+): Promise<void> {
+  // Dynamic import avoids a circular import (engine → transactions.service
+  // → documents/service chains), plus delays work until genuinely needed.
+  const { runReconcile } = await import("../reconcile/engine.js");
+
+  const wsRows = await db
+    .select({ ownerId: workspaces.ownerId })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
+  const userId = wsRows[0]?.ownerId;
+  if (!userId) return;
+
+  const p = runReconcile({ workspaceId, userId, batchId })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[ingest worker] auto-reconcile failed for batch ${batchId}:`,
+        err,
+      );
+    })
+    .finally(() => {
+      inflight.delete(p);
+      resolveDrainWaiters();
+    });
+  inflight.add(p);
 }
 
 // ── Startup recovery ──────────────────────────────────────────────────

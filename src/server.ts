@@ -15,6 +15,7 @@ import { seed } from "./db/seed.js";
 import { registerAccountsMcpTools } from "./mcp/accounts.js";
 import { registerTransactionsMcpTools } from "./mcp/transactions.js";
 import { registerDocumentsMcpTools } from "./mcp/documents.js";
+import { registerReconcileMcpTools } from "./mcp/reconcile.js";
 import { registerReportsMcpTools } from "./mcp/reports.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
 
@@ -29,6 +30,7 @@ const mcp = new FastMCP({
 registerAccountsMcpTools(mcp);
 registerTransactionsMcpTools(mcp);
 registerDocumentsMcpTools(mcp);
+registerReconcileMcpTools(mcp);
 registerReportsMcpTools(mcp);
 
 async function main(): Promise<void> {
