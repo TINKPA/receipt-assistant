@@ -3360,6 +3360,49 @@
         }
       }
     },
+    "/v1/batches/{id}/stream": {
+      "get": {
+        "summary": "Server-Sent Events stream of per-ingest + per-batch + reconcile events. Connects, sends a `hello` catch-up frame with current counts + status, then relays `job.*`, `batch.*`, and `reconcile.*` events as they fire. Closes on terminal status (reconciled / failed) or client disconnect.",
+        "tags": [
+          "ingest"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event stream. `event:` names: `hello`, `batch.status`, `job.started`, `job.done`, `job.error`, `batch.extracted`, `batch.failed`, `batch.reconciled`, `reconcile.started`, `reconcile.proposal`, `reconcile.done`.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "SSE frames of the form `event: <name>\\ndata: <json>\\n\\n`."
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/ingests": {
       "get": {
         "summary": "List ingests across batches",

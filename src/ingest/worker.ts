@@ -40,6 +40,7 @@ import {
   type TransactionRow,
 } from "../routes/transactions.service.js";
 import { linkDocumentToTransaction } from "../routes/documents.service.js";
+import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -225,6 +226,37 @@ function pickExpenseAccount(
 
 // ── Per-file processing ───────────────────────────────────────────────
 
+/**
+ * Aggregate ingest counts for one batch, shaped to match the SSE event
+ * contract. Used when emitting `batch.extracted` / `batch.status` /
+ * `batch.failed` so subscribers get fresh totals without a separate
+ * round-trip.
+ */
+async function fetchCountsForEvent(batchId: string): Promise<BatchCountsPayload> {
+  const res = await db.execute(
+    sql`SELECT status, COUNT(*)::int AS n
+          FROM ingests
+         WHERE batch_id = ${batchId}::uuid
+         GROUP BY status`,
+  );
+  const counts: BatchCountsPayload = {
+    total: 0,
+    queued: 0,
+    processing: 0,
+    done: 0,
+    error: 0,
+    unsupported: 0,
+  };
+  for (const row of res.rows as Array<{ status: string; n: number }>) {
+    const n = Number(row.n);
+    counts.total += n;
+    if (row.status in counts) {
+      (counts as unknown as Record<string, number>)[row.status] = n;
+    }
+  }
+  return counts;
+}
+
 async function markProcessing(ingestId: string, workspaceId: string): Promise<void> {
   await db
     .update(ingests)
@@ -389,6 +421,11 @@ async function runOne(item: QueueItem): Promise<void> {
     // Workspace vanished between enqueue and dequeue — shouldn't happen
     // outside a test teardown, but fail the ingest cleanly.
     await markError(ingestId, workspaceId, new Error("workspace not found"));
+    busEmit("job.error", {
+      batchId,
+      ingestId,
+      error: "workspace not found",
+    });
     await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
@@ -396,6 +433,7 @@ async function runOne(item: QueueItem): Promise<void> {
 
   await markProcessing(ingestId, workspaceId);
   await onBatchChildStarted(batchId, workspaceId);
+  busEmit("job.started", { batchId, ingestId });
 
   let result: ExtractorResult;
   try {
@@ -406,6 +444,11 @@ async function runOne(item: QueueItem): Promise<void> {
     });
   } catch (err) {
     await markError(ingestId, workspaceId, err);
+    busEmit("job.error", {
+      batchId,
+      ingestId,
+      error: err instanceof Error ? err.message : String(err),
+    });
     await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
@@ -413,6 +456,15 @@ async function runOne(item: QueueItem): Promise<void> {
   try {
     if (result.classification === "unsupported") {
       await markUnsupported(ingestId, workspaceId, result.reason);
+      // Unsupported is a non-error terminal state; emit `job.done` with
+      // classification="unsupported" and empty produced{} so subscribers
+      // can render it as "skipped" without a second heuristic.
+      busEmit("job.done", {
+        batchId,
+        ingestId,
+        classification: "unsupported",
+        produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
+      });
       await onBatchChildTerminated(batchId, workspaceId);
       return;
     }
@@ -425,6 +477,12 @@ async function runOne(item: QueueItem): Promise<void> {
         workspaceId,
         "statement pipeline not yet implemented (Phase 2 of #32)",
       );
+      busEmit("job.done", {
+        batchId,
+        ingestId,
+        classification: "unsupported",
+        produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
+      });
       await onBatchChildTerminated(batchId, workspaceId);
       return;
     }
@@ -464,9 +522,24 @@ async function runOne(item: QueueItem): Promise<void> {
       document_ids: documentIds,
       receipt_ids: [],
     });
+    busEmit("job.done", {
+      batchId,
+      ingestId,
+      classification: result.classification,
+      produced: {
+        receipt_ids: [],
+        transaction_ids: [tx.id],
+        document_ids: documentIds,
+      },
+    });
     await onBatchChildTerminated(batchId, workspaceId);
   } catch (err) {
     await markError(ingestId, workspaceId, err);
+    busEmit("job.error", {
+      batchId,
+      ingestId,
+      error: err instanceof Error ? err.message : String(err),
+    });
     await onBatchChildTerminated(batchId, workspaceId);
   }
 }
@@ -493,8 +566,11 @@ async function onBatchChildTerminated(
   workspaceId: string,
 ): Promise<void> {
   // If all children of this batch are terminal (done/error/unsupported),
-  // flip the batch to `extracted` and stamp completed_at.
-  await db.execute(
+  // flip the batch to `extracted` and stamp completed_at. Use RETURNING
+  // so we only emit `batch.extracted` when *this* call was the one that
+  // made the transition — concurrent children finishing at the same
+  // moment will race into this code but only one row will update.
+  const updated = await db.execute(
     sql`UPDATE batches
          SET status = 'extracted',
              completed_at = NOW()
@@ -505,8 +581,13 @@ async function onBatchChildTerminated(
            SELECT 1 FROM ingests
             WHERE batch_id = ${batchId}::uuid
               AND status NOT IN ('done','error','unsupported')
-         )`,
+         )
+       RETURNING id`,
   );
+  if (updated.rows.length > 0) {
+    const counts = await fetchCountsForEvent(batchId);
+    busEmit("batch.extracted", { batchId, counts });
+  }
 }
 
 // ── Startup recovery ──────────────────────────────────────────────────
