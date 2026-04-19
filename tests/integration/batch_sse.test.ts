@@ -35,8 +35,21 @@ const ctx = withTestDb();
 
 // Same filename-stem stub as the ingest test suite. Having its own copy
 // keeps the two suites decoupled so you can run either in isolation.
+//
+// Deliberate 150ms delay: the SSE client connects *after* POST returns,
+// and on fast CI runners the worker can drain all 3 files before the
+// client's HTTP handshake completes, so events fire on an unsubscribed
+// bus and the stream only sees the terminal `hello` catch-up. The
+// delay keeps the worker window open long enough for the reader to
+// attach. In production, each claude -p invocation takes ~8s; this
+// stub compresses that without eliminating it.
+async function delay(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const FakeExtractor: Extractor = async ({ filename }) => {
   const head = filename.toLowerCase().split(/[-_]/)[0]!;
+  await delay(150);
   if (head === "throw") {
     throw new Error("stub extractor blew up on purpose");
   }
