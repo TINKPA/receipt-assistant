@@ -24,6 +24,7 @@ import { registerAccountsOpenApi } from "./routes/accounts.js";
 import { registerTransactionsOpenApi } from "./routes/transactions.js";
 import { registerPostingsOpenApi } from "./routes/postings.js";
 import { registerDocumentsOpenApi } from "./routes/documents.js";
+import { registerIngestOpenApi } from "./routes/ingest.js";
 
 export function buildRegistry(): OpenAPIRegistry {
   const registry = new OpenAPIRegistry();
@@ -57,6 +58,7 @@ export function buildRegistry(): OpenAPIRegistry {
   registerTransactionsOpenApi(registry);
   registerPostingsOpenApi(registry);
   registerDocumentsOpenApi(registry);
+  registerIngestOpenApi(registry);
 
   return registry;
 }

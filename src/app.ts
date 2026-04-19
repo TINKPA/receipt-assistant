@@ -21,6 +21,11 @@ import { accountsRouter } from "./routes/accounts.js";
 import { transactionsRouter } from "./routes/transactions.js";
 import { postingsRouter } from "./routes/postings.js";
 import { documentsRouter } from "./routes/documents.js";
+import {
+  ingestRouter,
+  batchesRouter,
+  ingestsRouter,
+} from "./routes/ingest.js";
 
 export function buildApp(): Express {
   const app = express();
@@ -53,6 +58,9 @@ export function buildApp(): Express {
   app.use("/v1/transactions", transactionsRouter);
   app.use("/v1/postings", postingsRouter);
   app.use("/v1/documents", documentsRouter);
+  app.use("/v1/ingest", ingestRouter);
+  app.use("/v1/batches", batchesRouter);
+  app.use("/v1/ingests", ingestsRouter);
 
   // ── Final error handler ─────────────────────────────────────────────
   app.use(problemHandler);

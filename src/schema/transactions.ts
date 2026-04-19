@@ -12,6 +12,7 @@ import { txnStatusEnum } from "./enums.js";
 import { createdAt, updatedAt, version } from "./common.js";
 import { workspaces } from "./workspaces.js";
 import { users } from "./users.js";
+import { ingests } from "./ingests.js";
 
 export const transactions = pgTable(
   "transactions",
@@ -29,10 +30,14 @@ export const transactions = pgTable(
       (): AnyPgColumn => transactions.id,
       { onDelete: "set null" },
     ),
-    // source_ingest_id is a forward-reference to the `ingests` table
-    // introduced by the batch-ingest epic (#32). We keep it as a bare
-    // uuid column for now — FK added in the ingests migration.
-    sourceIngestId: uuid("source_ingest_id"),
+    // FK to `ingests` added in `0002_batch_ingest.sql`. Originally
+    // introduced as a bare UUID in 0000_init.sql because `ingests`
+    // didn't exist yet; the Drizzle definition now uses `.references()`
+    // so future schema changes stay consistent.
+    sourceIngestId: uuid("source_ingest_id").references(
+      (): AnyPgColumn => ingests.id,
+      { onDelete: "set null" },
+    ),
     // trip_id is a forward-reference to the future trips table.
     tripId: uuid("trip_id"),
     metadata: jsonb("metadata").notNull().default({}),

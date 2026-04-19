@@ -15,6 +15,7 @@ import { seed } from "./db/seed.js";
 import { registerAccountsMcpTools } from "./mcp/accounts.js";
 import { registerTransactionsMcpTools } from "./mcp/transactions.js";
 import { registerDocumentsMcpTools } from "./mcp/documents.js";
+import { start as startIngestWorker } from "./ingest/worker.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3001", 10);
@@ -47,6 +48,12 @@ async function main(): Promise<void> {
     httpStream: { port: MCP_PORT },
   });
   console.log(`🔌 MCP server listening on http://0.0.0.0:${MCP_PORT}/mcp`);
+
+  // Ingest worker: recovers any stale batches from a prior crash and
+  // then sits idle until /v1/ingest/batch enqueues files. Same process
+  // as HTTP so the DB pool + v1 services are shared.
+  await startIngestWorker();
+  console.log(`⚙️  Ingest worker ready (concurrency ${process.env.MAX_CLAUDE_CONCURRENCY ?? 3})`);
 
   const app = buildApp();
   app.listen(PORT, "0.0.0.0", () => {

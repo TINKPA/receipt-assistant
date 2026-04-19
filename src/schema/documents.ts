@@ -6,11 +6,13 @@ import {
   uniqueIndex,
   index,
   primaryKey,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { createdAt, updatedAt } from "./common.js";
 import { documentKindEnum } from "./enums.js";
 import { workspaces } from "./workspaces.js";
 import { transactions } from "./transactions.js";
+import { ingests } from "./ingests.js";
 
 export const documents = pgTable(
   "documents",
@@ -25,7 +27,10 @@ export const documents = pgTable(
     sha256: text("sha256").notNull(),
     ocrText: text("ocr_text"),
     extractionMeta: jsonb("extraction_meta"),
-    sourceIngestId: uuid("source_ingest_id"),
+    sourceIngestId: uuid("source_ingest_id").references(
+      (): AnyPgColumn => ingests.id,
+      { onDelete: "set null" },
+    ),
     createdAt,
     updatedAt,
   },

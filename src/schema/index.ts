@@ -7,3 +7,6 @@ export * from "./postings.js";
 export * from "./documents.js";
 export * from "./audit.js";
 export * from "./idempotency.js";
+export * from "./batches.js";
+export * from "./ingests.js";
+export * from "./reconcile_proposals.js";

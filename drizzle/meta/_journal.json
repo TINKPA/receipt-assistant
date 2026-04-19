@@ -15,6 +15,13 @@
       "when": 1776588444835,
       "tag": "0001_ledger_invariants",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1776593049864,
+      "tag": "0002_batch_ingest",
+      "breakpoints": true
     }
   ]
 }
