@@ -33,23 +33,23 @@ process.env.UPLOAD_DIR = UPLOAD_DIR;
 
 const ctx = withTestDb();
 
-// Same filename-stem stub as the ingest test suite. Having its own copy
-// keeps the two suites decoupled so you can run either in isolation.
-//
-// Deliberate 150ms delay: the SSE client connects *after* POST returns,
-// and on fast CI runners the worker can drain all 3 files before the
-// client's HTTP handshake completes, so events fire on an unsubscribed
-// bus and the stream only sees the terminal `hello` catch-up. The
-// delay keeps the worker window open long enough for the reader to
-// attach. In production, each claude -p invocation takes ~8s; this
-// stub compresses that without eliminating it.
-async function delay(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+// The extractor is gated on a controllable promise. Each test opens
+// the gate only *after* subscribing to the SSE stream — this removes
+// the drain-before-subscribe race that fixed-duration delays couldn't
+// close on fast CI runners. `resetGate()` installs a fresh closed gate
+// at the start of each test; `openGate()` lets the extractor proceed.
+let gate: Promise<void> = Promise.resolve();
+let openGate: () => void = () => {};
+
+function resetGate(): void {
+  gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
 }
 
 const FakeExtractor: Extractor = async ({ filename }) => {
+  await gate;
   const head = filename.toLowerCase().split(/[-_]/)[0]!;
-  await delay(150);
   if (head === "throw") {
     throw new Error("stub extractor blew up on purpose");
   }
@@ -196,6 +196,7 @@ async function postBatch(files: Array<{ name: string; tag: string }>) {
 
 describe("GET /v1/batches/:id/stream", () => {
   it("relays job.started/done + batch.extracted while draining a 3-file batch", async () => {
+    resetGate();
     const res = await postBatch([
       { name: "image-a.jpg", tag: "a" },
       { name: "image-b.jpg", tag: "b" },
@@ -204,9 +205,9 @@ describe("GET /v1/batches/:id/stream", () => {
     expect(res.status).toBe(202);
     const batchId = res.body.batchId as string;
 
-    // Subscribe BEFORE the worker has had a chance to drain. The catch-up
-    // `hello` frame covers the window where events fired before we
-    // connected; bus events fire thereafter.
+    // Subscribe BEFORE releasing the extractor. The gate blocks the
+    // worker in `extractor()` until `openGate()` is called, so there's
+    // no drain-before-subscribe race regardless of runner speed.
     const controller = new AbortController();
     const streamRes = await fetch(`${baseUrl}/v1/batches/${batchId}/stream`, {
       signal: controller.signal,
@@ -216,6 +217,9 @@ describe("GET /v1/batches/:id/stream", () => {
     expect(streamRes.headers.get("cache-control")).toBe("no-cache");
     expect(streamRes.headers.get("connection")).toBe("keep-alive");
     expect(streamRes.headers.get("x-accel-buffering")).toBe("no");
+
+    // Reader is ready; let the worker proceed.
+    openGate();
 
     // Expect: 1× hello + 3× job.started + 3× job.done + 1× batch.extracted
     // = 8 events. Allow slack for interleaving order.
@@ -251,6 +255,7 @@ describe("GET /v1/batches/:id/stream", () => {
   });
 
   it("emits one job.error event when a single file fails", async () => {
+    resetGate();
     const res = await postBatch([
       { name: "image-ok.jpg", tag: "ok" },
       { name: "throw-me.jpg", tag: "bad" },
@@ -262,6 +267,7 @@ describe("GET /v1/batches/:id/stream", () => {
     const streamRes = await fetch(`${baseUrl}/v1/batches/${batchId}/stream`, {
       signal: controller.signal,
     });
+    openGate();
     // hello + 2× job.started + 1× job.done + 1× job.error + batch.extracted
     const frames = await readSse(streamRes, 6, 10_000);
     controller.abort();
@@ -278,6 +284,8 @@ describe("GET /v1/batches/:id/stream", () => {
     // DB so it's in a terminal state for SSE purposes. (`extracted`
     // intentionally is NOT terminal — it's waiting for reconcile — so
     // the stream would stay open there.)
+    resetGate();
+    openGate(); // this test doesn't care about event ordering; just let worker run
     const res = await postBatch([{ name: "image-x.jpg", tag: "x" }]);
     expect(res.status).toBe(202);
     const batchId = res.body.batchId as string;
@@ -322,6 +330,7 @@ describe("GET /v1/batches/:id/stream", () => {
   });
 
   it("client disconnect cleans up bus listeners", async () => {
+    resetGate();
     const res = await postBatch([{ name: "image-y.jpg", tag: "y" }]);
     expect(res.status).toBe(202);
     const batchId = res.body.batchId as string;
@@ -334,6 +343,7 @@ describe("GET /v1/batches/:id/stream", () => {
       signal: controller.signal,
     });
     expect(streamRes.status).toBe(200);
+    openGate();
 
     // Drain enough to confirm the subscription actually registered.
     await readSse(streamRes, 1, 2000); // `hello`
