@@ -121,14 +121,14 @@ rebuilds are typically 10–20 seconds.
 ### 4. Test with a receipt
 
 ```bash
-# Upload
+# 1. Upload — returns { jobId, receiptId }
 curl -X POST http://localhost:3000/receipt -F "image=@receipt.jpg"
 
-# Poll for result
+# 2. Poll job status (queued → done / error)
 curl http://localhost:3000/jobs/<jobId>
 
-# Or use the verify script for end-to-end testing
-./scripts/verify-receipt.sh ~/path/to/receipt.jpg
+# 3. Fetch the parsed receipt (merchant, date, total, items, ...)
+curl http://localhost:3000/receipt/<receiptId> | jq .
 ```
 
 ## API Reference
@@ -179,8 +179,8 @@ curl -s http://localhost:3333/api/public/traces/<trace-id> \
 
 | Script | Usage |
 |--------|-------|
-| `scripts/verify-receipt.sh <image>` | End-to-end: upload → parse → show App result + Langfuse trace |
-| `scripts/batch-test.sh <dir> [n]` | Batch test N receipts from a directory |
+| `scripts/refresh-token.sh` | Refresh `CLAUDE_CODE_OAUTH_TOKEN` in `.env` from macOS Keychain |
+| `scripts/benchmark.sh` | Upload 10 receipts sequentially, measure per-phase timing via SSE |
 
 ## Tech Stack
 

@@ -45,9 +45,11 @@ far only `docker compose config --quiet` syntax validation has been run
 
 ### End-to-end
 
-- [ ] `./scripts/verify-receipt.sh ~/Desktop/RECEIPT/<sample>.jpeg`
-      completes without errors
-- [ ] App API returns a structured result
+- [ ] `curl -X POST http://localhost:3000/receipt -F "image=@<sample>.jpeg"`
+      returns a `jobId`
+- [ ] `curl http://localhost:3000/jobs/<jobId>` reaches `status: done`
+- [ ] `curl http://localhost:3000/receipt/<receiptId>` returns a
+      structured result (merchant, date, total, items)
 - [ ] A matching trace appears in Langfuse with both `phase-1/quick`
       and `phase-2/full` generations
 

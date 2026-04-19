@@ -116,18 +116,33 @@ Local dev defaults:
 - Public key: `pk-receipt-local`
 - Secret key: `sk-receipt-local`
 
-### Verify Script
+### Manual Verification Flow
 
-`scripts/verify-receipt.sh` — one-command end-to-end verification:
+No verify script. Three curl calls are the contract:
 
 ```bash
-./scripts/verify-receipt.sh ~/Desktop/RECEIPT/IMG_0211.jpeg
+# 1. Upload
+JOB=$(curl -sS -X POST http://localhost:3000/receipt \
+  -F "image=@$HOME/Desktop/RECEIPT/IMG.jpeg" | jq -r .jobId)
+
+# 2. Poll until status=done
+while :; do
+  s=$(curl -sS http://localhost:3000/jobs/$JOB | jq -r .status)
+  [[ "$s" == "done" || "$s" == "error" ]] && break
+  sleep 2
+done
+RECEIPT=$(curl -sS http://localhost:3000/jobs/$JOB | jq -r .receiptId)
+
+# 3. Inspect the receipt record (the data of record — merchant/date/
+#    total/tip/items are all here)
+curl -sS http://localhost:3000/receipt/$RECEIPT | jq .
 ```
 
-Uploads receipt → waits for parsing → prints structured result →
-queries Langfuse API for the trace with Claude's reasoning.
-Use this after any prompt or extraction logic changes to verify
-quality and compare against the original receipt image.
+For the Langfuse trace, query the API directly (see
+"Query Langfuse" above). Never trust a wrapper script's display —
+go to `/receipt/:id` for ground truth. (Earlier `verify-receipt.sh`
+printed all-None while the DB had correct data; deleted to avoid
+that trap.)
 
 ### Why API over UI
 
