@@ -26,6 +26,7 @@ import {
   batchesRouter,
   ingestsRouter,
 } from "./routes/ingest.js";
+import { reconcileRouter } from "./routes/reconcile.js";
 
 export function buildApp(): Express {
   const app = express();
@@ -59,6 +60,10 @@ export function buildApp(): Express {
   app.use("/v1/postings", postingsRouter);
   app.use("/v1/documents", documentsRouter);
   app.use("/v1/ingest", ingestRouter);
+  // `reconcileRouter` owns `/v1/batches/:id/reconcile*`; mount it first
+  // so Express matches its more-specific paths before falling through to
+  // the generic `batchesRouter` (which handles `/` and `/:id`).
+  app.use("/v1/batches", reconcileRouter);
   app.use("/v1/batches", batchesRouter);
   app.use("/v1/ingests", ingestsRouter);
 

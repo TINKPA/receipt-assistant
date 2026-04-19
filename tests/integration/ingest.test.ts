@@ -135,8 +135,12 @@ async function waitForBatchExtracted(
 
 describe("POST /v1/ingest/batch", () => {
   it("returns 202 with batchId + per-file ingestIds; worker drains to extracted", async () => {
+    // auto_reconcile=false so the batch stops at `extracted` and the
+    // Phase 2a reconcile hook (introduced in #32 Phase 2a) doesn't
+    // advance the state machine to `reconciled` before our assertions.
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("a"), { filename: "image-a.jpg", contentType: "image/jpeg" })
       .attach("files", uniqueBytes("b"), { filename: "email-b.eml", contentType: "message/rfc822" })
       .attach("files", uniqueBytes("c"), { filename: "pdf-c.pdf", contentType: "application/pdf" });
@@ -178,6 +182,7 @@ describe("GET /v1/ingests/:id — produced reverse-lookup", () => {
   it("populates transaction_ids + document_ids for each successful extraction", async () => {
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("d"), { filename: "image-d.jpg", contentType: "image/jpeg" })
       .attach("files", uniqueBytes("e"), { filename: "email-e.eml", contentType: "message/rfc822" });
     expect(res.status).toBe(202);
@@ -199,6 +204,7 @@ describe("GET /v1/ingests/:id — produced reverse-lookup", () => {
   it("GET /v1/transactions?source_ingest_id=<x> returns the produced txn", async () => {
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("src-ingest"), {
         filename: "image-source-link.jpg",
         contentType: "image/jpeg",
@@ -227,6 +233,7 @@ describe("failure isolation", () => {
   it("one file failing does not fail the batch (ingest=error, others done, batch=extracted)", async () => {
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("ok1"), { filename: "image-ok1.jpg", contentType: "image/jpeg" })
       .attach("files", uniqueBytes("bad"), { filename: "throw-me.jpg", contentType: "image/jpeg" })
       .attach("files", uniqueBytes("ok2"), { filename: "image-ok2.jpg", contentType: "image/jpeg" });
@@ -250,6 +257,7 @@ describe("failure isolation", () => {
   it("unsupported classification produces no transaction/document and ingest.status='unsupported'", async () => {
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("unsup"), {
         filename: "unsupported-W2.pdf",
         contentType: "application/pdf",
@@ -275,6 +283,7 @@ describe("failure isolation", () => {
   it("statement_pdf is deferred → marked unsupported with a clear note", async () => {
     const res = await request(ctx.app)
       .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
       .attach("files", uniqueBytes("stmt"), {
         filename: "statement-april.pdf",
         contentType: "application/pdf",
