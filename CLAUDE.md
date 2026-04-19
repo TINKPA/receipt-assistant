@@ -151,3 +151,32 @@ that trap.)
   result in a single command pipeline
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
+
+## GitHub Issues
+
+**Every issue filed here must follow the cross-repo label taxonomy.** The full spec lives in the project-level doc: `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/CLAUDE.md` → "GitHub issue conventions". Do not open issues with only the legacy `bug` label.
+
+Minimum label set (every issue):
+
+- one `kind/*` — `bug` · `feature` · `enhancement` · `docs` · `refactor` · `chore`
+- one `priority/*` — `p0` · `p1` · `p2` · `p3`
+- one `area/*` — `api` · `extraction` · `db` · `docker` · `langfuse` · `mcp` · `ops`
+- one `status/*` — `needs-triage` · `confirmed` · `in-progress` · `blocked`
+- **bugs also require** one `severity/*` — `critical` · `major` · `minor` · `trivial`
+
+Body template (Summary → Steps to reproduce → Expected → Actual → Root cause → Proposed fix → Acceptance criteria → Impact). See the project-level CLAUDE.md for the full template and the list of reference issues (#25, #27, #28) to copy from.
+
+Filing command:
+
+```bash
+gh issue create \
+  --title "..." \
+  --label "kind/bug,priority/p1,severity/major,area/api,status/confirmed" \
+  --body "$(cat <<'EOF'
+## Summary
+...
+EOF
+)"
+```
+
+Run `gh label list` to see the exact label set; colors and descriptions are already configured.
