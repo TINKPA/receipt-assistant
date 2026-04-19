@@ -4,11 +4,9 @@
  * Usage:
  *   import { withTestDb } from "../setup/db.js";
  *   const ctx = withTestDb();
- *   // Inside tests: ctx.db, ctx.pool, ctx.workspaceId are populated
- *   // after `beforeAll` runs.
+ *   // Inside tests: ctx.db / ctx.pool / ctx.app / ctx.workspaceId / ctx.userId
  *
- * One container per suite, migrations + seed applied once.
- * `ctx.db` is the drizzle client against the testcontainer.
+ * One container per suite. Migrations + seed applied once in beforeAll.
  */
 import {
   PostgreSqlContainer,
@@ -17,12 +15,14 @@ import {
 import pg from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { beforeAll, afterAll } from "vitest";
+import type { Express } from "express";
 import * as schema from "../../src/schema/index.js";
 
 export interface TestDbContext {
   container: StartedPostgreSqlContainer;
   pool: pg.Pool;
   db: ReturnType<typeof drizzle<typeof schema>>;
+  app: Express;
   workspaceId: string;
   userId: string;
 }
@@ -37,8 +37,6 @@ export function withTestDb(): TestDbContext {
     const { runMigrations } = await import("../../src/db/migrate.js");
     await runMigrations();
 
-    // Seed module reads DATABASE_URL at import time via src/db/client.ts,
-    // so dynamic-import after setting the env var to point at the container.
     const { seed, SEED_WORKSPACE_ID, SEED_USER_ID } = await import(
       "../../src/db/seed.js"
     );
@@ -49,12 +47,13 @@ export function withTestDb(): TestDbContext {
     ctx.db = drizzle(ctx.pool, { schema });
     ctx.workspaceId = SEED_WORKSPACE_ID;
     ctx.userId = SEED_USER_ID;
+
+    const { buildApp } = await import("../../src/app.js");
+    ctx.app = buildApp();
   });
 
   afterAll(async () => {
     if (ctx.pool) await ctx.pool.end();
-    // The seed module's own pool (imported from src/db/client.ts) is still
-    // open at this point. Close it so the process can exit cleanly.
     const { pool: seedPool } = await import("../../src/db/client.js");
     await seedPool.end().catch(() => {});
     if (ctx.container) await ctx.container.stop();

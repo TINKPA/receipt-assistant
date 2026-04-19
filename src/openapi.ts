@@ -19,6 +19,11 @@ import {
   ValidationErrorResponse,
 } from "./schemas/common.js";
 import { HealthResponse } from "./schemas/health.js";
+import { ProblemDetails } from "./schemas/v1/common.js";
+import { registerAccountsOpenApi } from "./routes/accounts.js";
+import { registerTransactionsOpenApi } from "./routes/transactions.js";
+import { registerPostingsOpenApi } from "./routes/postings.js";
+import { registerDocumentsOpenApi } from "./routes/documents.js";
 
 export function buildRegistry(): OpenAPIRegistry {
   const registry = new OpenAPIRegistry();
@@ -26,6 +31,7 @@ export function buildRegistry(): OpenAPIRegistry {
   registry.register("ErrorResponse", ErrorResponse);
   registry.register("ValidationErrorResponse", ValidationErrorResponse);
   registry.register("HealthResponse", HealthResponse);
+  registry.register("ProblemDetails", ProblemDetails);
 
   // Bearer-token scheme reserved for the upcoming /v1 auth epic.
   registry.registerComponent("securitySchemes", "bearerAuth", {
@@ -45,6 +51,12 @@ export function buildRegistry(): OpenAPIRegistry {
       },
     },
   });
+
+  // v1 resource routers register their own paths + response schemas.
+  registerAccountsOpenApi(registry);
+  registerTransactionsOpenApi(registry);
+  registerPostingsOpenApi(registry);
+  registerDocumentsOpenApi(registry);
 
   return registry;
 }
