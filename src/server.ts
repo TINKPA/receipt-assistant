@@ -11,6 +11,10 @@ import { askClaude } from "./claude.js";
 import { getReceipt, listReceipts, getSpendingSummary, initSchema } from "./db.js";
 import { submitJob, getJob, subscribeJob } from "./jobs.js";
 import { buildOpenApiDocument } from "./openapi.js";
+import { parseOr400 } from "./validate.js";
+import { ListReceiptsQuery } from "./schemas/receipt.js";
+import { SummaryQuery } from "./schemas/summary.js";
+import { AskRequest } from "./schemas/ask.js";
 
 const PORT = parseInt(process.env.PORT || "3000");
 const MCP_PORT = parseInt(process.env.MCP_PORT || "3001");
@@ -252,11 +256,9 @@ app.get("/jobs/:id/stream", (req: Request, res: Response) => {
 
 // GET /receipts — list receipts
 app.get("/receipts", async (req: Request, res: Response) => {
-  const { from, to, category, limit } = req.query as Record<string, string>;
-  const results = await listReceipts({
-    from, to, category,
-    limit: limit ? parseInt(limit) : undefined,
-  });
+  const query = parseOr400(ListReceiptsQuery, req.query, res);
+  if (!query) return;
+  const results = await listReceipts(query);
   res.json(results);
 });
 
@@ -300,23 +302,20 @@ app.get("/receipt/:id/image", async (req: Request, res: Response) => {
 
 // GET /summary — spending summary
 app.get("/summary", async (req: Request, res: Response) => {
-  const { from, to } = req.query as Record<string, string>;
-  const summary = await getSpendingSummary(from, to);
+  const query = parseOr400(SummaryQuery, req.query, res);
+  if (!query) return;
+  const summary = await getSpendingSummary(query.from, query.to);
   res.json(summary);
 });
 
 // POST /ask — free-form question
 app.post("/ask", async (req: Request, res: Response) => {
+  const body = parseOr400(AskRequest, req.body, res);
+  if (!body) return;
   try {
-    const { question } = req.body;
-    if (!question) {
-      res.status(400).json({ error: "Missing 'question' field" });
-      return;
-    }
-    // Reuse the MCP tool logic
     const recent = await listReceipts({ limit: 30 });
     const summary = await getSpendingSummary();
-    const prompt = `You are a personal finance assistant. Recent receipts:\n${JSON.stringify(recent)}\nSummary:\n${JSON.stringify(summary)}\nQuestion: ${question}`;
+    const prompt = `You are a personal finance assistant. Recent receipts:\n${JSON.stringify(recent)}\nSummary:\n${JSON.stringify(summary)}\nQuestion: ${body.question}`;
     const answer = await askClaude(prompt);
     res.json({ answer });
   } catch (err: any) {

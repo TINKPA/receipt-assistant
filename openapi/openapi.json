@@ -31,6 +31,41 @@
           "error"
         ]
       },
+      "ValidationErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "Invalid request"
+            ]
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "example": "limit"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Expected number, received string"
+                }
+              },
+              "required": [
+                "path",
+                "message"
+              ]
+            }
+          }
+        },
+        "required": [
+          "error",
+          "issues"
+        ]
+      },
       "HealthResponse": {
         "type": "object",
         "properties": {
@@ -663,6 +698,16 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid query parameter (e.g. malformed date, non-numeric limit)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -829,6 +874,16 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid query parameter (e.g. malformed date)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -860,11 +915,11 @@
             }
           },
           "400": {
-            "description": "Missing question",
+            "description": "Missing or invalid `question` field",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "$ref": "#/components/schemas/ValidationErrorResponse"
                 }
               }
             }

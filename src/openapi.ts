@@ -4,7 +4,7 @@ import {
 } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 
-import { ErrorResponse, IdParam } from "./schemas/common.js";
+import { ErrorResponse, IdParam, ValidationErrorResponse } from "./schemas/common.js";
 import { HealthResponse } from "./schemas/health.js";
 import {
   Receipt,
@@ -22,6 +22,7 @@ export function buildRegistry(): OpenAPIRegistry {
 
   // Register named schemas so they appear under components/schemas
   registry.register("ErrorResponse", ErrorResponse);
+  registry.register("ValidationErrorResponse", ValidationErrorResponse);
   registry.register("HealthResponse", HealthResponse);
   registry.register("Receipt", Receipt);
   registry.register("ReceiptWithItems", ReceiptWithItems);
@@ -127,6 +128,10 @@ export function buildRegistry(): OpenAPIRegistry {
         description: "Receipts ordered by date desc",
         content: { "application/json": { schema: z.array(Receipt) } },
       },
+      400: {
+        description: "Invalid query parameter (e.g. malformed date, non-numeric limit)",
+        content: { "application/json": { schema: ValidationErrorResponse } },
+      },
     },
   });
 
@@ -195,6 +200,10 @@ export function buildRegistry(): OpenAPIRegistry {
         description: "One row per category, ordered by total_spent desc",
         content: { "application/json": { schema: SpendingSummary } },
       },
+      400: {
+        description: "Invalid query parameter (e.g. malformed date)",
+        content: { "application/json": { schema: ValidationErrorResponse } },
+      },
     },
   });
 
@@ -212,8 +221,8 @@ export function buildRegistry(): OpenAPIRegistry {
         content: { "application/json": { schema: AskResponse } },
       },
       400: {
-        description: "Missing question",
-        content: { "application/json": { schema: ErrorResponse } },
+        description: "Missing or invalid `question` field",
+        content: { "application/json": { schema: ValidationErrorResponse } },
       },
       500: {
         description: "Server error",
