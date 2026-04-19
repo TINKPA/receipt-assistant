@@ -143,7 +143,10 @@ describe("POST /v1/ingest/batch", () => {
 
     expect(res.status).toBe(202);
     expect(res.body.batchId).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(res.body.status).toBe("pending");
+    // Worker can flip 'pending' → 'processing' between POST commit and
+    // response flush (observed on fast CI runners). Both are valid
+    // non-terminal states at the moment of POST return.
+    expect(["pending", "processing"]).toContain(res.body.status);
     expect(res.body.items).toHaveLength(3);
     for (const it of res.body.items) {
       expect(it.ingestId).toMatch(/^[0-9a-f-]{36}$/i);
