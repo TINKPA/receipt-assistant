@@ -15,6 +15,19 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { buildExtractorPrompt } from "./prompt.js";
 
+export type ExtractorGeoInfo = {
+  /** Google Places `place_id`. */
+  place_id: string;
+  /** Google-formatted address (what Google returned, not what's on the receipt). */
+  formatted_address: string;
+  /** Latitude in decimal degrees. */
+  lat: number;
+  /** Longitude in decimal degrees. */
+  lng: number;
+  /** Which Google API was used. */
+  source: "google_geocode" | "google_places";
+};
+
 export type ExtractorReceiptFields = {
   payee: string;
   occurred_on: string;
@@ -30,6 +43,12 @@ export type ExtractorReceiptFields = {
     | (string & {});
   items?: Array<{ name: string; total_price_minor?: number }>;
   raw_text?: string;
+  /**
+   * Optional geocode result produced by the agent during Phase 3 of the
+   * extraction prompt. Null/absent when the agent couldn't confidently
+   * resolve the merchant to a Google Places entry.
+   */
+  geo?: ExtractorGeoInfo;
 };
 
 export type ExtractorStatementRow = {
@@ -179,6 +198,30 @@ function coerceResult(parsed: unknown, sessionId: string): ExtractorResult {
         sessionId,
       };
     }
+    // Optional geo block. Shape-check all five fields before letting
+    // it through — a partial / malformed geo gets silently dropped so
+    // it never lands in metadata with stringly-typed coordinates.
+    let geo: ExtractorGeoInfo | undefined;
+    const rawGeo = ex.geo;
+    if (rawGeo && typeof rawGeo === "object" && !Array.isArray(rawGeo)) {
+      const g = rawGeo as Record<string, unknown>;
+      if (
+        typeof g.place_id === "string" &&
+        typeof g.formatted_address === "string" &&
+        typeof g.lat === "number" &&
+        typeof g.lng === "number" &&
+        (g.source === "google_geocode" || g.source === "google_places")
+      ) {
+        geo = {
+          place_id: g.place_id,
+          formatted_address: g.formatted_address,
+          lat: g.lat,
+          lng: g.lng,
+          source: g.source,
+        };
+      }
+    }
+
     return {
       classification: k,
       extracted: {
@@ -191,6 +234,7 @@ function coerceResult(parsed: unknown, sessionId: string): ExtractorResult {
           ? (ex.items as ExtractorReceiptFields["items"])
           : undefined,
         raw_text: typeof ex.raw_text === "string" ? ex.raw_text : undefined,
+        geo,
       },
       sessionId,
     };

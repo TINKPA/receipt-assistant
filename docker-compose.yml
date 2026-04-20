@@ -61,6 +61,10 @@ services:
       # Matches the Anthropic-official devcontainer convention and pairs with
       # the `claude-code-config` named volume mounted below.
       CLAUDE_CONFIG_DIR: /home/node/.claude
+      # Google Maps API key reachable by the in-container `claude -p` agent
+      # via its Bash tool (for Phase 3 geocoding during extraction). Empty
+      # is fine — the prompt instructs the agent to skip geocoding.
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
     volumes:
       - receipt-data:/data
       # Claude Code OAuth credentials live in a **named Docker volume**,

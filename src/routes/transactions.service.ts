@@ -22,6 +22,7 @@ import {
   transactionEvents,
   workspaces,
 } from "../schema/index.js";
+import { loadPlacesByIds, type PlaceRow } from "./places.service.js";
 import { newId } from "../http/uuid.js";
 import {
   HttpProblem,
@@ -84,6 +85,13 @@ export interface TransactionRow {
   updated_at: string;
   postings: PostingRow[];
   documents: Array<{ id: string; kind: string }>;
+  /**
+   * Optional Google Places entry for this transaction's merchant
+   * location. Null when the extraction agent declined to geocode (no
+   * address / no locality hint), when the workspace/ingest predates
+   * the places feature, or when the row has been unlinked.
+   */
+  place: PlaceRow | null;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -177,6 +185,7 @@ function mapTransactionRow(
   row: any,
   posts: any[],
   docs: Array<{ id: string; kind: string }>,
+  place: PlaceRow | null = null,
 ): TransactionRow {
   return {
     id: row.id,
@@ -197,6 +206,7 @@ function mapTransactionRow(
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
     postings: posts.map(mapPostingRow),
     documents: docs,
+    place,
   };
 }
 
@@ -225,7 +235,9 @@ async function loadTransactionFull(
     .from(documentLinks)
     .innerJoin(documents, eq(documents.id, documentLinks.documentId))
     .where(eq(documentLinks.transactionId, id));
-  return mapTransactionRow(t, posts, docLinks);
+  const placeMap = t.placeId ? await loadPlacesByIds([t.placeId]) : null;
+  const place = placeMap?.get(t.placeId!) ?? null;
+  return mapTransactionRow(t, posts, docLinks, place);
 }
 
 async function loadWorkspaceBaseCurrency(
@@ -501,8 +513,18 @@ export async function listTransactions(
     docByTx.set(d.transaction_id, arr);
   }
 
+  const placeIds = page
+    .map((r) => r.place_id as string | null)
+    .filter((v): v is string => typeof v === "string" && v.length > 0);
+  const placeMap = placeIds.length > 0 ? await loadPlacesByIds(placeIds) : null;
+
   const items = page.map((r) =>
-    mapTransactionRow(r, postByTx.get(r.id) ?? [], docByTx.get(r.id) ?? []),
+    mapTransactionRow(
+      r,
+      postByTx.get(r.id) ?? [],
+      docByTx.get(r.id) ?? [],
+      r.place_id && placeMap ? (placeMap.get(r.place_id) ?? null) : null,
+    ),
   );
 
   const last = page[page.length - 1]!;
