@@ -9,11 +9,29 @@
  */
 import fs from "fs/promises";
 import path from "path";
+import os from "os";
 import { randomUUID } from "crypto";
 
 const LANGFUSE_HOST = process.env.LANGFUSE_HOST || "http://localhost:3333";
 const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "pk-receipt-local";
 const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "sk-receipt-local";
+
+/**
+ * Resolve where Claude Code dumps the JSONL transcript for a given
+ * `--session-id`. The CLI mangles CWD by replacing "/" and "_" with "-"
+ * and writes to `~/.claude/projects/<mangled-cwd>/<sessionId>.jsonl`.
+ * Stable across host mode (`$HOME=/Users/…`) and container (`/home/node`).
+ */
+export function getSessionJsonlPath(sessionId: string): string {
+  const mangledCwd = process.cwd().replace(/[/_]/g, "-");
+  return path.join(
+    os.homedir(),
+    ".claude",
+    "projects",
+    mangledCwd,
+    `${sessionId}.jsonl`,
+  );
+}
 
 // ── JSONL message helpers ──────────────────────────────────────────
 
