@@ -181,18 +181,25 @@ that trap.)
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
-## Claude Code OAuth credentials — volume-mounted, self-refreshing
+## Claude Code OAuth credentials — named volume, in-container login
 
-Auth is **not** an env var. `docker-compose.yml` mounts `${HOME}/.claude/.credentials.json` into the container RW; the in-container `claude` CLI refreshes both `accessToken` and `refreshToken` on expiry and writes the rotation back to the same file. No `CLAUDE_CODE_OAUTH_TOKEN` env var, no entrypoint-side credentials synthesis — both were removed in the migration commit that introduced this section.
+Auth is **not** an env var, and is **not** a bind mount of the host's `~/.claude/.credentials.json`. `docker-compose.yml` mounts the Docker-managed named volume `claude-code-config` at `/home/node/.claude`; the container holds its own independent OAuth session, seeded once by running `docker exec -it receipt-assistant claude /login`. The in-container `claude` CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into the volume. This matches the Anthropic-official devcontainer pattern (`anthropics/claude-code/.devcontainer/devcontainer.json`).
 
-**Operate this via the `setup` skill**, not via shell scripts. The skill lives at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md` and covers first-time seeding, the old-to-new architecture migration, and 401 diagnosis. A prior design had an `refresh-token.sh` that poked `.env` — it's been removed, and re-adding it would silently disable self-refresh (env var overrides the file; see the skill for the empirical evidence).
+**Operate this via the `setup` skill**, not via shell scripts. The skill lives at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md` and covers first-time bootstrap, migration from the earlier bind-mount / env-var architectures, and 401 diagnosis.
+
+**Three-era timeline of what has and has not worked:**
+
+- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized file had `refreshToken: ""` so couldn't refresh even if the env var were removed. Result: 24h 401 cycle.
+- **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW into the container.** Broke because host and container shared a single OAuth session: host's native `claude` CLI rotates the refresh token on every interactive use (Anthropic docs: "Refresh tokens rotate on each use"), which invalidates the container's next call. Result: 401 every few hours instead of every 24h.
+- **Era 3 (2026-04-20 onward) — named volume `claude-code-config` + in-container `claude /login`.** Container has its own OAuth session, isolated from host and other containers. No drift, no rotation collisions. Refresh token eventually expires server-side (~weeks to months); at that point rerun `claude /login` inside the container.
 
 **Hard rules, in one place so it's harder to lose:**
 
-- Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN` to `.env` or `docker-compose.yml`. Presence of the env var makes the CLI skip the file entirely → no refresh → 24h 401s.
-- Never switch the mount to `:ro`. RO kills self-refresh; the rotated tokens have nowhere to land.
-- Never mount `~/.claude/` as a directory — only the single `.credentials.json` file. The host dir contains `projects/`, `skills/`, `settings.json` etc. that the container has no business seeing.
-- If Keychain (macOS) and the file drift far enough that host `claude` stops working, run `claude /login` on the host, then re-invoke the `setup` skill — that's the whole recovery procedure, and it's fine for this to happen occasionally.
+- **Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN`** to `.env` or `docker-compose.yml`. Presence of the env var makes the CLI skip the file entirely (Anthropic auth precedence) → no refresh → Era 1's 24h 401s.
+- **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container session collision is Era 2's 401-every-few-hours bug. Always use the Docker-managed named volume `claude-code-config`.
+- **Never `docker compose down -v`** on this stack unless you want to re-run `claude /login`. The `-v` flag wipes named volumes, including `claude-code-config`. Use plain `docker compose down` or `docker compose stop`.
+- **Never periodically sync host Keychain → the volume.** It re-introduces rotation collisions; Anthropic's in-container auto-refresh is the intended mechanism.
+- **Recovery on 401:** `docker exec -it receipt-assistant claude /login`, follow the OAuth code flow, done. Do not touch host Keychain or host `~/.claude/` as part of recovery — they're unrelated to the container's OAuth session.
 
 ## GitHub Issues
 

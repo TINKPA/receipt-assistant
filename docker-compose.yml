@@ -57,17 +57,25 @@ services:
       LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: pk-receipt-local
       LANGFUSE_SECRET_KEY: sk-receipt-local
+      # Tell the `claude` CLI explicitly where its config + credentials live.
+      # Matches the Anthropic-official devcontainer convention and pairs with
+      # the `claude-code-config` named volume mounted below.
+      CLAUDE_CONFIG_DIR: /home/node/.claude
     volumes:
       - receipt-data:/data
-      # Claude Code OAuth credentials — mounted RW so the `claude` CLI inside
-      # the container can self-refresh access+refresh tokens on expiry. On
-      # macOS hosts this file is seeded from Keychain by the `setup` skill
-      # (see ~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup).
-      # Do NOT swap to `:ro` — that disables self-refresh and brings back the
-      # 24h-expiry 401 bug.
-      - ${HOME}/.claude/.credentials.json:/home/node/.claude/.credentials.json:rw
+      # Claude Code OAuth credentials live in a **named Docker volume**,
+      # NOT a bind mount of the host's `~/.claude/`. The container holds its
+      # own independent OAuth session (seeded once via
+      # `docker exec -it receipt-assistant claude /login`) and self-refreshes
+      # forever without colliding with host or other containers.
+      # See the `setup` skill for bootstrap and recovery procedures.
+      - claude-code-config:/home/node/.claude
     restart: unless-stopped
 
 volumes:
   receipt-data:
   receipts-postgres-data:
+  # Holds the container's Claude Code credentials + config. Persists across
+  # `docker compose down` / `up` / `restart`. `docker compose down -v` WIPES
+  # it — that loses the OAuth session and requires another `claude /login`.
+  claude-code-config:
