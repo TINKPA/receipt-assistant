@@ -56,6 +56,46 @@ Phase 2 — extract
   For unsupported, provide only:
     { "reason": "short explanation of why this isn't extractable" }
 
+Phase 3 — geocode (receipt_image / receipt_email / receipt_pdf only)
+  Resolve the merchant location to a Google Places entry IF you can do
+  so with high confidence. Call Google Maps APIs via the Bash tool; the
+  API key is in the GOOGLE_MAPS_API_KEY environment variable.
+
+  Decision tree (in order — stop at first match):
+    (a) $GOOGLE_MAPS_API_KEY is empty  → geo: null. Do not call the API.
+    (b) Receipt shows a full street address → call Geocoding API:
+
+          ADDR='1380 Stockton St, San Francisco, CA 94133'
+          QS=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "$ADDR")
+          curl -sS "https://maps.googleapis.com/maps/api/geocode/json?address=$QS&key=$GOOGLE_MAPS_API_KEY"
+
+        If status=="OK" and results is non-empty, use results[0].
+        Emit geo with source="google_geocode".
+    (c) No address, but receipt shows merchant + a locality hint (city
+        name on the header, state abbreviation, or ZIP code) → call
+        Places Find-Place-From-Text with the locality in the query:
+
+          Q='Wing On Market San Francisco'
+          QS=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "$Q")
+          curl -sS "https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=$QS&inputtype=textquery&fields=place_id,name,formatted_address,geometry&key=$GOOGLE_MAPS_API_KEY"
+
+        If status=="OK" and candidates is non-empty, use candidates[0].
+        Emit geo with source="google_places".
+    (d) Only merchant name, no locality anywhere on receipt → geo: null.
+        Do NOT geocode by bare merchant name — chains like "Costco" or
+        common names like "Wing On Market" resolve to random stores in
+        other cities (empirically confirmed: bare "Wing On Market"
+        returns the San Gabriel LA store, not the SF one).
+
+  Validation (MUST do before emitting a non-null geo):
+    - The top result's formatted_address MUST contain one of the
+      locality tokens visible on the receipt (the city name, the
+      two-letter state abbreviation, or the ZIP code). If none match,
+      emit geo: null — you got a wrong-city match.
+    - Any non-OK API status, HTTP error, timeout, or parse failure →
+      geo: null. The caller's pipeline tolerates null geo; never block
+      extraction on a Maps outage.
+
 Rules
   - .eml with a PDF attachment: prefer the source with richer data
     (usually the attachment). Mention which in raw_text.
@@ -70,13 +110,20 @@ Final answer format (REQUIRED) — end your response with a single fenced
     "extracted": { "payee": "...", "occurred_on": "YYYY-MM-DD",
                    "total_minor": 12345, "currency": "USD",
                    "category_hint": "groceries",
-                   "items": [ ... ], "raw_text": "..." } }
+                   "items": [ ... ], "raw_text": "...",
+                   "geo": null | {
+                     "place_id": "ChIJ...",
+                     "formatted_address": "1380 Stockton St, San Francisco, CA 94133, USA",
+                     "lat": 37.7985813,
+                     "lng": -122.4084993,
+                     "source": "google_geocode"
+                   } } }
 
   { "classification": "receipt_email",
-    "extracted": { ...same fields as receipt_image... } }
+    "extracted": { ...same fields as receipt_image, including geo... } }
 
   { "classification": "receipt_pdf",
-    "extracted": { ...same fields as receipt_image... } }
+    "extracted": { ...same fields as receipt_image, including geo... } }
 
   { "classification": "statement_pdf",
     "extracted": { "rows": [ { "date": "...", "payee": "...", "amount_minor": 1234 } ] } }

@@ -13,6 +13,7 @@ import { createdAt, updatedAt, version } from "./common.js";
 import { workspaces } from "./workspaces.js";
 import { users } from "./users.js";
 import { ingests } from "./ingests.js";
+import { places } from "./places.js";
 
 export const transactions = pgTable(
   "transactions",
@@ -40,6 +41,13 @@ export const transactions = pgTable(
     ),
     // trip_id is a forward-reference to the future trips table.
     tripId: uuid("trip_id"),
+    // FK to `places` for merchant geolocation; nullable because the
+    // extraction agent may legitimately decline to geocode (no address
+    // and no locality hint → geo:null). Written by the ingest worker
+    // from the agent's Phase 3 geo block.
+    placeId: uuid("place_id").references(() => places.id, {
+      onDelete: "set null",
+    }),
     metadata: jsonb("metadata").notNull().default({}),
     version,
     createdBy: uuid("created_by").references(() => users.id, {
@@ -58,5 +66,6 @@ export const transactions = pgTable(
     index("transactions_status_idx").on(t.workspaceId, t.status),
     index("transactions_source_ingest_idx").on(t.sourceIngestId),
     index("transactions_trip_idx").on(t.tripId),
+    index("transactions_place_idx").on(t.placeId),
   ],
 );

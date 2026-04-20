@@ -40,6 +40,7 @@ import {
   type TransactionRow,
 } from "../routes/transactions.service.js";
 import { linkDocumentToTransaction } from "../routes/documents.service.js";
+import { upsertPlace } from "../routes/places.service.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
 import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
@@ -424,6 +425,26 @@ async function writeReceiptTransaction(
        WHERE id = ${tx.id}::uuid
          AND workspace_id = ${workspaceId}::uuid`,
   );
+
+  // Phase 3 geocode: if the agent produced a valid geo block, upsert
+  // into the shared `places` table and point this transaction at it.
+  // Failure here is logged but does not fail the ingest — geo is
+  // best-effort and the ledger row is already balanced & durable.
+  if (ex.geo) {
+    try {
+      const placeId = await upsertPlace(ex.geo);
+      await db.execute(
+        sql`UPDATE transactions
+             SET place_id = ${placeId}::uuid
+           WHERE id = ${tx.id}::uuid
+             AND workspace_id = ${workspaceId}::uuid`,
+      );
+    } catch (err) {
+      console.warn(
+        `[places] upsert failed for ingest=${ingestId}: ${(err as Error).message}`,
+      );
+    }
+  }
 
   return tx;
 }

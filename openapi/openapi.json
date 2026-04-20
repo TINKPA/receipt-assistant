@@ -630,6 +630,46 @@
           "kind"
         ]
       },
+      "Place": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "google_place_id": {
+            "type": "string"
+          },
+          "formatted_address": {
+            "type": "string"
+          },
+          "lat": {
+            "type": "number"
+          },
+          "lng": {
+            "type": "number"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "google_geocode",
+              "google_places"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "google_place_id",
+          "formatted_address",
+          "lat",
+          "lng",
+          "source"
+        ]
+      },
       "Transaction": {
         "type": "object",
         "properties": {
@@ -730,6 +770,9 @@
             "items": {
               "$ref": "#/components/schemas/TransactionDocumentRef"
             }
+          },
+          "place": {
+            "$ref": "#/components/schemas/Place"
           }
         },
         "required": [
@@ -747,7 +790,8 @@
           "created_at",
           "updated_at",
           "postings",
-          "documents"
+          "documents",
+          "place"
         ]
       },
       "BulkResultItem": {
