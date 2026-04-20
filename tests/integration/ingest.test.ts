@@ -15,6 +15,7 @@ import * as path from "path";
 import { sql } from "drizzle-orm";
 import { withTestDb } from "../setup/db.js";
 import type { Extractor } from "../../src/ingest/extractor.js";
+import type { LangfuseIngestor } from "../../src/ingest/worker.js";
 
 // Worker module touches the drizzle pool at import-time. Defer the load
 // until beforeAll() has set DATABASE_URL via `withTestDb()` — otherwise
@@ -97,15 +98,25 @@ const FakeExtractor: Extractor = async ({ filename }) => {
   };
 };
 
+// Langfuse spy — captures (sessionId, tags) per extraction without
+// touching the real ingestion HTTP path. See worker.ts::trackLangfuse.
+const langfuseCalls: Array<{ sessionId: string; tags: string[] }> = [];
+const SpyLangfuseIngestor: LangfuseIngestor = async (sessionId, tags) => {
+  langfuseCalls.push({ sessionId, tags });
+};
+
 beforeAll(async () => {
   workerApi = await import("../../src/ingest/worker.js");
   workerApi.setExtractor(FakeExtractor);
+  workerApi.setLangfuseIngestor(SpyLangfuseIngestor);
 });
 
 afterEach(() => {
-  // Tests may override, but default back to the deterministic stub so
+  // Tests may override, but default back to the deterministic stubs so
   // the suite ordering doesn't matter.
   workerApi.setExtractor(FakeExtractor);
+  workerApi.setLangfuseIngestor(SpyLangfuseIngestor);
+  langfuseCalls.length = 0;
 });
 
 // Distinct bytes per file so sha256 dedup doesn't collapse them.
@@ -175,6 +186,27 @@ describe("POST /v1/ingest/batch", () => {
     const res = await request(ctx.app).post("/v1/ingest/batch");
     expect(res.status).toBe(422);
     expect(res.body.type).toMatch(/validation/);
+  });
+
+  it("invokes Langfuse ingestor with sessionId + tags after extraction (#43)", async () => {
+    const res = await request(ctx.app)
+      .post("/v1/ingest/batch")
+      .field("auto_reconcile", "false")
+      .attach("files", uniqueBytes("lf"), {
+        filename: "image-lf.jpg",
+        contentType: "image/jpeg",
+      });
+
+    expect(res.status).toBe(202);
+    const ingestId = res.body.items[0].ingestId;
+    await waitForBatchExtracted(res.body.batchId);
+
+    expect(langfuseCalls).toHaveLength(1);
+    const call = langfuseCalls[0]!;
+    expect(call.sessionId).toBe("stub-session-image");
+    expect(call.tags).toContain(res.body.batchId);
+    expect(call.tags).toContain(ingestId);
+    expect(call.tags).toContain("receipt_image");
   });
 });
 

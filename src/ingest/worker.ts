@@ -41,6 +41,7 @@ import {
 } from "../routes/transactions.service.js";
 import { linkDocumentToTransaction } from "../routes/documents.service.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
+import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -63,6 +64,28 @@ export function resetExtractor(): void {
 }
 export function getExtractor(): Extractor {
   return currentExtractor;
+}
+
+// ── Injectable Langfuse ingestor ──────────────────────────────────────
+
+export type LangfuseIngestor = (
+  sessionId: string,
+  tags: string[],
+) => Promise<void>;
+
+const defaultLangfuseIngestor: LangfuseIngestor = async (sessionId, tags) => {
+  await ingestSession(getSessionJsonlPath(sessionId), tags);
+};
+
+let currentLangfuseIngestor: LangfuseIngestor = defaultLangfuseIngestor;
+export function setLangfuseIngestor(fn: LangfuseIngestor): void {
+  currentLangfuseIngestor = fn;
+}
+export function resetLangfuseIngestor(): void {
+  currentLangfuseIngestor = defaultLangfuseIngestor;
+}
+export function getLangfuseIngestor(): LangfuseIngestor {
+  return currentLangfuseIngestor;
 }
 
 // ── In-process queue ──────────────────────────────────────────────────
@@ -453,6 +476,10 @@ async function runOne(item: QueueItem): Promise<void> {
     return;
   }
 
+  if (result.sessionId) {
+    trackLangfuse(result.sessionId, [batchId, ingestId, result.classification]);
+  }
+
   try {
     if (result.classification === "unsupported") {
       await markUnsupported(ingestId, workspaceId, result.reason);
@@ -591,6 +618,28 @@ async function onBatchChildTerminated(
   if (flipped.auto_reconcile) {
     await triggerAutoReconcile(batchId, workspaceId);
   }
+}
+
+// ── Langfuse trace ingestion (fire-and-forget) ───────────────────────
+
+/**
+ * Kick off Langfuse ingestion for a finished extraction without blocking
+ * the worker. The promise is wired into `inflight` so `drain()` still
+ * waits for it — integration tests can assert on the spy synchronously.
+ * `ingestSession` itself swallows errors, so Langfuse downtime never
+ * fails a batch.
+ */
+function trackLangfuse(sessionId: string, tags: string[]): void {
+  const p = currentLangfuseIngestor(sessionId, tags)
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[ingest worker] langfuse ingestion failed:", err);
+    })
+    .finally(() => {
+      inflight.delete(p);
+      resolveDrainWaiters();
+    });
+  inflight.add(p);
 }
 
 // ── Auto-reconcile hook (#32 Phase 2a) ───────────────────────────────
