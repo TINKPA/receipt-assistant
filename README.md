@@ -61,22 +61,9 @@ Everything runs in Docker — there is no `npm run dev` on the host.
 ### Prerequisites
 
 - Docker Desktop (or Docker Engine) with Compose v2.20+ (for `include:` support)
-- Claude Code CLI signed in on the host (on macOS the credentials live in Keychain; on Linux they live at `~/.claude/.credentials.json` after `claude /login`)
+- A Claude Code subscription (Pro / Max / Team / Enterprise) to log in with
 
-### 1. First-time auth setup
-
-Invoke the **`setup` skill** in Claude Code inside this project — it seeds `~/.claude/.credentials.json` from the host (Keychain on macOS) and hands the file to the container via a volume mount. The in-container CLI then auto-refreshes the OAuth tokens; there's no recurring script to run.
-
-If you prefer to do it manually (macOS):
-
-```bash
-security find-generic-password -s 'Claude Code-credentials' -w > ~/.claude/.credentials.json
-chmod 600 ~/.claude/.credentials.json
-```
-
-No env var goes into `.env` — auth is fully file-based.
-
-### 2. Bring everything up
+### 1. Bring everything up
 
 ```bash
 docker compose up -d --build
@@ -103,6 +90,20 @@ curl http://localhost:3000/health
 ```
 
 Langfuse dashboard: http://localhost:3333 (admin@local.dev / admin123)
+
+### 2. Log the container into Claude (one-time)
+
+The container holds its own OAuth session, independent of anything on the host. Bootstrap it **once**:
+
+```bash
+docker exec -it receipt-assistant claude /login
+# Follow the prompt: open the URL in a browser, authenticate,
+# paste the returned code back into the terminal.
+```
+
+Credentials persist in the `claude-code-config` named Docker volume and survive every `docker compose down` / `up` / `restart`. The in-container CLI self-refreshes access + refresh tokens on expiry and writes rotation back into the volume. No env var, no host Keychain sync, no recurring script.
+
+Eventually the refresh token expires server-side (weeks to months). When that happens the next call returns 401 — rerun the same `claude /login` inside the container. For full bootstrap, migration, and 401-recovery procedures, invoke the **`setup` skill** in Claude Code inside this project.
 
 ### 3. After changing source code
 

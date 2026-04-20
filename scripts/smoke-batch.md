@@ -5,7 +5,7 @@ Phase 1 of issue #32 ships the batch ingestion endpoint but no automated CLI har
 ## Prerequisites
 
 - `receipt-assistant` running on `localhost:3000` (the usual `docker compose up`).
-- `claude` CLI v2.x authenticated on host + in-container (see the `setup` skill if 401s appear).
+- `claude` CLI v2.x logged in **inside the container** via `docker exec -it receipt-assistant claude /login` (host auth is unrelated to the container's OAuth session). See the `setup` skill if 401s appear.
 - Two or three real receipt images on disk — e.g. `~/Desktop/RECEIPT/*.jpeg`.
 
 ## Step 1 — Submit a batch
