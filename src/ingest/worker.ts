@@ -384,13 +384,17 @@ async function runOne(item: QueueItem): Promise<void> {
     return;
   }
 
-  if (result.sessionId) {
-    trackLangfuse(result.sessionId, [batchId, ingestId]);
-  }
-
   // The agent is responsible for UPDATE ingests SET status=... at the
-  // end of its run (see Phase 5 of prompt.ts). Read the row it wrote.
+  // end of its run (see Phase 5 of prompt.ts). Read the row it wrote
+  // BEFORE kicking off Langfuse ingestion so the classification tag
+  // (which tests and trace filters rely on) is available.
   const terminal = await readIngestTerminal(ingestId, workspaceId);
+
+  if (result.sessionId) {
+    const tags: string[] = [batchId, ingestId];
+    if (terminal?.classification) tags.push(terminal.classification);
+    trackLangfuse(result.sessionId, tags);
+  }
   if (!terminal) {
     // Agent exited 0 but didn't close out — treat as error.
     const msg =
