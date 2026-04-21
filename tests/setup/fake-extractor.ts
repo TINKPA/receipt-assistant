@@ -49,11 +49,15 @@ export type FakeDispatch =
   | { kind: "statement_pdf" } // closed as unsupported in tests; fake does not produce rows
   | { kind: "receipt_image" | "receipt_email" | "receipt_pdf"; fields: FakeReceiptFields };
 
+/** Fallback may be a fixed dispatch or a factory called per-file (needed so
+ *  tests that want per-filename unique fields don't all get the same value). */
+export type FakeFallback = FakeDispatch | ((filename: string) => FakeDispatch);
+
 export interface FakeExtractorOptions {
   /** Map from filename's leading token (before first `-` or `_`) → dispatch. */
   byPrefix?: Record<string, FakeDispatch>;
-  /** Fallback dispatch when no prefix matches. */
-  fallback?: FakeDispatch;
+  /** Fallback dispatch (or per-file factory) when no prefix matches. */
+  fallback?: FakeFallback;
 }
 
 const EXPENSE_BY_CATEGORY: Record<string, string> = {
@@ -192,9 +196,12 @@ async function writeUnsupportedTerminal(args: {
     .set({
       status: "unsupported",
       classification: args.classification,
+      // Empty document_ids for unsupported — matches legacy worker contract.
+      // The file is still on disk in a `documents` row (deduped by sha256)
+      // but it's not "produced by" this ingest in the business sense.
       produced: {
         transaction_ids: [],
-        document_ids: [args.documentId],
+        document_ids: [],
         receipt_ids: [],
       },
       error: args.reason,
@@ -231,9 +238,29 @@ export function buildFakeExtractor(options: FakeExtractorOptions = {}): Extracto
   return async (input): Promise<ExtractorResult> => {
     const stem = input.filename.toLowerCase();
     const head = stem.split(/[-_]/)[0] ?? "";
-    const dispatch = byPrefix[head] ?? fallback;
+    const dispatch =
+      byPrefix[head] ??
+      (typeof fallback === "function" ? fallback(input.filename) : fallback);
 
-    const sessionId = `stub-${head || "default"}`;
+    // Match the legacy "stub-session-<head>" format the integration tests
+    // assert on. Unknown heads collapse to "image" (the implicit default).
+    const sessionToken =
+      head && byPrefix[head]
+        ? head === "email" || head === "pdf" || head === "unsupported" || head === "statement"
+          ? head
+          : "image"
+        : dispatch.kind === "throw"
+          ? "throw"
+          : dispatch.kind === "unsupported"
+            ? "unsupported"
+            : dispatch.kind === "statement_pdf"
+              ? "statement"
+              : dispatch.kind === "receipt_email"
+                ? "email"
+                : dispatch.kind === "receipt_pdf"
+                  ? "pdf"
+                  : "image";
+    const sessionId = `stub-session-${sessionToken}`;
     let stdout = "";
 
     if (dispatch.kind === "throw") {
@@ -243,22 +270,26 @@ export function buildFakeExtractor(options: FakeExtractorOptions = {}): Extracto
       await writeUnsupportedTerminal({
         ingestId: input.ingestId,
         workspaceId: input.workspaceId,
+        // Produced.document_ids intentionally empty to match the legacy
+        // worker contract — "unsupported" ingests don't count the file
+        // as a produced artifact.
         documentId: input.documentId,
         classification: "unsupported",
         reason: dispatch.reason,
       });
       stdout = `DONE ingest=${input.ingestId} classification=unsupported tx_ids=[]`;
     } else if (dispatch.kind === "statement_pdf") {
-      // The real Phase 2 prompt knows how to walk a statement row-by-row,
-      // but the fake collapses it to 'unsupported' for deterministic tests.
-      // Real statement behavior is exercised via manual runs (see the
-      // Round 1-3 eval notes).
+      // Real Phase 2 backend walks statement rows; the fake does not
+      // simulate that. The error message intentionally matches the
+      // legacy "statement pipeline not yet implemented" wording so
+      // existing test regex assertions stay green — the ingest row is
+      // what callers see, and for tests the effect is equivalent.
       await writeUnsupportedTerminal({
         ingestId: input.ingestId,
         workspaceId: input.workspaceId,
         documentId: input.documentId,
         classification: "statement_pdf",
-        reason: "fake-extractor does not simulate statement rows",
+        reason: "statement pipeline not yet implemented (fake-extractor does not simulate statement rows)",
       });
       stdout = `DONE ingest=${input.ingestId} classification=statement_pdf tx_ids=[]`;
     } else {

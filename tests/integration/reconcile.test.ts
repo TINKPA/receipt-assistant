@@ -57,23 +57,23 @@ function makeExtractor(keys: DuplicateKey[]): Extractor {
       },
     };
   }
-  // The fallback produces per-file unique fields so non-duplicate
-  // uploads stay distinct. buildFakeExtractor dispatches by the
-  // filename's leading token; when we need per-filename variance we
-  // rely on the fact that each test's filenames are unique strings
-  // (see uniqueBytes + filename composition).
+  // Fallback must produce per-file unique fields so non-duplicate
+  // uploads stay distinct. Use a function-form fallback so each call
+  // derives payee/total from the filename itself (matches the
+  // pre-Phase-2 extractor's `Unique ${filename}` / `100 + filename.length`
+  // pattern).
   return buildFakeExtractor({
-    byPrefix: byPrefix as Record<string, Parameters<typeof buildFakeExtractor>[0]["byPrefix"][string]>,
-    fallback: {
+    byPrefix,
+    fallback: (filename) => ({
       kind: "receipt_image",
       fields: {
-        payee: `Unique ${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        payee: `Unique ${filename}`,
         occurred_on: "2026-04-01",
-        total_minor: 100 + Math.floor(Math.random() * 10_000),
+        total_minor: 100 + filename.length,
         currency: "USD",
         category_hint: "groceries",
       },
-    },
+    }),
   });
 }
 
