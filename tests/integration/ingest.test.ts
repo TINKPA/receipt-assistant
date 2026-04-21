@@ -16,6 +16,7 @@ import { sql } from "drizzle-orm";
 import { withTestDb } from "../setup/db.js";
 import type { Extractor } from "../../src/ingest/extractor.js";
 import type { LangfuseIngestor } from "../../src/ingest/worker.js";
+import { buildFakeExtractor } from "../setup/fake-extractor.js";
 
 // Worker module touches the drizzle pool at import-time. Defer the load
 // until beforeAll() has set DATABASE_URL via `withTestDb()` — otherwise
@@ -30,73 +31,50 @@ process.env.UPLOAD_DIR = UPLOAD_DIR;
 
 const ctx = withTestDb();
 
-// Filename-stem → ExtractorResult mapping. The stub keys off the
-// filename's LEADING token (before the first dash/underscore) so
-// callers can compose names like "image-a.jpg", "unsupported-W2.pdf",
+// Filename-stem → dispatch mapping. The fake keys off the filename's
+// LEADING token (before the first dash/underscore) so callers can
+// compose names like "image-a.jpg", "unsupported-W2.pdf",
 // "statement-april.pdf" without collisions.
 //
 // Note: the worker passes the CLIENT filename (from multipart), not the
 // on-disk sha256-derived path, so the mapping survives dedup renaming.
-const FakeExtractor: Extractor = async ({ filename }) => {
-  const stem = filename.toLowerCase();
-  const head = stem.split(/[-_]/)[0]!;
-
-  if (head === "throw") {
-    throw new Error("stub extractor blew up on purpose");
-  }
-  if (head === "unsupported") {
-    return {
-      classification: "unsupported",
-      reason: "test fixture flagged unsupported",
-      sessionId: "stub-session-unsupported",
-    };
-  }
-  if (head === "statement") {
-    return {
-      classification: "statement_pdf",
-      extracted: { rows: [] },
-      sessionId: "stub-session-statement",
-    };
-  }
-  if (head === "email") {
-    return {
-      classification: "receipt_email",
-      extracted: {
+const FakeExtractor: Extractor = buildFakeExtractor({
+  byPrefix: {
+    throw: { kind: "throw", reason: "stub extractor blew up on purpose" },
+    unsupported: { kind: "unsupported", reason: "test fixture flagged unsupported" },
+    statement: { kind: "statement_pdf" },
+    email: {
+      kind: "receipt_email",
+      fields: {
         payee: "Amazon.com",
         occurred_on: "2026-04-18",
         total_minor: 4999,
         currency: "USD",
         category_hint: "retail",
       },
-      sessionId: "stub-session-email",
-    };
-  }
-  if (head === "pdf") {
-    return {
-      classification: "receipt_pdf",
-      extracted: {
+    },
+    pdf: {
+      kind: "receipt_pdf",
+      fields: {
         payee: "PDF Coffee Co",
         occurred_on: "2026-04-17",
         total_minor: 725,
         currency: "USD",
         category_hint: "cafe",
       },
-      sessionId: "stub-session-pdf",
-    };
-  }
-  // Default: treat as a receipt_image.
-  return {
-    classification: "receipt_image",
-    extracted: {
+    },
+  },
+  fallback: {
+    kind: "receipt_image",
+    fields: {
       payee: "FakeMart",
       occurred_on: "2026-04-19",
       total_minor: 1234,
       currency: "USD",
       category_hint: "groceries",
     },
-    sessionId: "stub-session-image",
-  };
-};
+  },
+});
 
 // Langfuse spy — captures (sessionId, tags) per extraction without
 // touching the real ingestion HTTP path. See worker.ts::trackLangfuse.

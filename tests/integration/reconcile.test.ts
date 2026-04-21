@@ -15,6 +15,7 @@ import * as path from "path";
 import { sql } from "drizzle-orm";
 import { withTestDb } from "../setup/db.js";
 import type { Extractor } from "../../src/ingest/extractor.js";
+import { buildFakeExtractor } from "../setup/fake-extractor.js";
 
 type WorkerModule = typeof import("../../src/ingest/worker.js");
 let workerApi: WorkerModule;
@@ -43,36 +44,37 @@ const DEFAULT_DUPLICATE: DuplicateKey = {
 };
 
 function makeExtractor(keys: DuplicateKey[]): Extractor {
-  return async ({ filename }) => {
-    const stem = filename.toLowerCase();
-    for (const k of keys) {
-      if (stem.startsWith(k.prefix)) {
-        return {
-          classification: "receipt_image",
-          extracted: {
-            payee: k.payee,
-            occurred_on: k.occurred_on,
-            total_minor: k.total_minor,
-            currency: "USD",
-            category_hint: "groceries",
-          },
-          sessionId: `stub-${k.prefix}`,
-        };
-      }
-    }
-    // Unique-per-file fallback so non-duplicate uploads stay distinct.
-    return {
-      classification: "receipt_image",
-      extracted: {
-        payee: `Unique ${filename}`,
-        occurred_on: "2026-04-01",
-        total_minor: 100 + filename.length,
+  const byPrefix: Record<string, Parameters<typeof buildFakeExtractor>[0]["byPrefix"][string]> = {};
+  for (const k of keys) {
+    byPrefix[k.prefix] = {
+      kind: "receipt_image",
+      fields: {
+        payee: k.payee,
+        occurred_on: k.occurred_on,
+        total_minor: k.total_minor,
         currency: "USD",
         category_hint: "groceries",
       },
-      sessionId: `stub-unique-${filename}`,
     };
-  };
+  }
+  // The fallback produces per-file unique fields so non-duplicate
+  // uploads stay distinct. buildFakeExtractor dispatches by the
+  // filename's leading token; when we need per-filename variance we
+  // rely on the fact that each test's filenames are unique strings
+  // (see uniqueBytes + filename composition).
+  return buildFakeExtractor({
+    byPrefix: byPrefix as Record<string, Parameters<typeof buildFakeExtractor>[0]["byPrefix"][string]>,
+    fallback: {
+      kind: "receipt_image",
+      fields: {
+        payee: `Unique ${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        occurred_on: "2026-04-01",
+        total_minor: 100 + Math.floor(Math.random() * 10_000),
+        currency: "USD",
+        category_hint: "groceries",
+      },
+    },
+  });
 }
 
 beforeAll(async () => {

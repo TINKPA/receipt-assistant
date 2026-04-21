@@ -23,6 +23,7 @@ import request from "supertest";
 import { withTestDb } from "../setup/db.js";
 import type { Extractor } from "../../src/ingest/extractor.js";
 import { listenerCount } from "../../src/events/bus.js";
+import { buildFakeExtractor } from "../setup/fake-extractor.js";
 
 type WorkerModule = typeof import("../../src/ingest/worker.js");
 let workerApi: WorkerModule;
@@ -47,30 +48,28 @@ function resetGate(): void {
   });
 }
 
-const FakeExtractor: Extractor = async ({ filename }) => {
-  await gate;
-  const head = filename.toLowerCase().split(/[-_]/)[0]!;
-  if (head === "throw") {
-    throw new Error("stub extractor blew up on purpose");
-  }
-  if (head === "unsupported") {
-    return {
-      classification: "unsupported",
-      reason: "test fixture flagged unsupported",
-      sessionId: "stub-session-unsupported",
-    };
-  }
-  return {
-    classification: "receipt_image",
-    extracted: {
+// Wraps the shared fake with a controllable gate so tests can
+// subscribe to the SSE stream BEFORE the extraction actually advances
+// (prevents the drain-before-subscribe race on fast CI).
+const baseFake = buildFakeExtractor({
+  byPrefix: {
+    throw: { kind: "throw", reason: "stub extractor blew up on purpose" },
+    unsupported: { kind: "unsupported", reason: "test fixture flagged unsupported" },
+  },
+  fallback: {
+    kind: "receipt_image",
+    fields: {
       payee: "FakeMart",
       occurred_on: "2026-04-19",
       total_minor: 1234,
       currency: "USD",
       category_hint: "groceries",
     },
-    sessionId: "stub-session-image",
-  };
+  },
+});
+const FakeExtractor: Extractor = async (input) => {
+  await gate;
+  return baseFake(input);
 };
 
 // Spin a real HTTP server in front of the Express app. We need a live
