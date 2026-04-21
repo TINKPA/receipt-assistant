@@ -1,20 +1,15 @@
 /**
- * Places service — manages the shared `places` table.
- *
- * Populated by the ingest worker when the extraction agent resolves a
- * merchant to a Google Places entry (see `src/ingest/prompt.ts` Phase
- * 3). Keyed by Google's stable `google_place_id`; the same merchant
- * seen by two ingests (same or different workspace) hits one row.
- *
- * The shape returned by `upsertPlace` is the row's internal UUID —
- * callers (the ingest worker) store this in `transactions.place_id`.
- * The row itself is read by `loadPlacesByIds` for the transaction
+ * Places service — reads the shared `places` table for the transaction
  * response JOIN.
+ *
+ * Writes to this table happen agent-side in Phase 2 of #32 (see
+ * `src/ingest/prompt.ts`). The Node worker no longer calls an upsert
+ * helper; the agent issues `INSERT ... ON CONFLICT (google_place_id)
+ * DO UPDATE` inline inside its main BEGIN/COMMIT block.
  */
-import { sql, inArray } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { places } from "../schema/places.js";
-import type { ExtractorGeoInfo } from "../ingest/extractor.js";
 
 export interface PlaceRow {
   id: string;
@@ -25,37 +20,6 @@ export interface PlaceRow {
   lat: number;
   lng: number;
   source: "google_geocode" | "google_places";
-}
-
-/**
- * Insert a new places row or bump hit_count + last_seen_at on an
- * existing row keyed by google_place_id. Returns the row's UUID.
- *
- * The `formatted_address` / `lat` / `lng` on an existing row are NOT
- * updated on conflict — Google's place_id is considered stable and we
- * trust the first sighting. Raw response is overwritten with the
- * latest body for debugging convenience.
- */
-export async function upsertPlace(geo: ExtractorGeoInfo): Promise<string> {
-  const rows = await db
-    .insert(places)
-    .values({
-      googlePlaceId: geo.place_id,
-      formattedAddress: geo.formatted_address,
-      lat: String(geo.lat),
-      lng: String(geo.lng),
-      source: geo.source,
-      rawResponse: geo as unknown as Record<string, unknown>,
-    })
-    .onConflictDoUpdate({
-      target: places.googlePlaceId,
-      set: {
-        lastSeenAt: sql`NOW()`,
-        hitCount: sql`${places.hitCount} + 1`,
-      },
-    })
-    .returning({ id: places.id });
-  return rows[0]!.id;
 }
 
 /**

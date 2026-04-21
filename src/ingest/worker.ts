@@ -1,31 +1,31 @@
 /**
  * In-process async worker for `/v1/ingest/batch`.
  *
- * Runs in the same Node process as the HTTP server so:
- *   - it shares the Drizzle connection pool (no double bookkeeping),
- *   - it calls `createTransaction()` / `linkDocumentToTransaction()`
- *     directly instead of self-HTTP, preserving all the v1 invariants
- *     (balanced postings, audit log, document dedup by sha256),
- *   - Phase 2 SSE can hook into the same event emitter without IPC.
+ * Phase 2 of #32 (landed 2026-04-20): the worker no longer calls
+ * `createTransaction()` / `linkDocumentToTransaction()` / `upsertPlace`.
+ * It spawns `claude -p` with a prompt that teaches the agent to write
+ * directly to the ledger via psql, then reads back the `ingests` row
+ * the agent updated to build the SSE event payload.
  *
  * Design notes
  *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (default 3).
- *     Claude CLI calls dominate latency (15-30s each) and three in
- *     parallel is empirically enough for a laptop host without
- *     starving OAuth refresh.
+ *     Claude CLI calls dominate latency (30-60s each with geocoding +
+ *     SQL writes) and three in parallel is empirically enough for a
+ *     laptop host without starving OAuth refresh.
  *   - No resume on restart. On boot we scan for `pending/processing`
  *     batches older than 5 minutes and mark them `failed`; in-flight
  *     ingests of those batches flip to `error`. Durable queuing is a
- *     Phase 2 concern.
+ *     future concern.
  *   - The extractor is injectable. Integration tests call
- *     `setExtractor(stub)` to avoid shelling out to `claude`.
+ *     `setExtractor(stub)` to avoid shelling out to `claude`. Stubs
+ *     must honor the Phase 2 contract: write terminal state into the
+ *     `ingests` row themselves (status/classification/produced).
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import {
   batches,
   ingests,
-  accounts,
   documents as documentsTable,
   workspaces,
 } from "../schema/index.js";
@@ -35,12 +35,6 @@ import {
   type Extractor,
   type ExtractorResult,
 } from "./extractor.js";
-import {
-  createTransaction,
-  type TransactionRow,
-} from "../routes/transactions.service.js";
-import { linkDocumentToTransaction } from "../routes/documents.service.js";
-import { upsertPlace } from "../routes/places.service.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
 import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
@@ -157,98 +151,12 @@ function maybeSpawnWorker(): void {
   resolveDrainWaiters();
 }
 
-// ── Account resolution (same heuristic as the smoke harness) ──────────
-
-type CategoryBucket =
-  | "groceries"
-  | "dining"
-  | "cafe"
-  | "retail"
-  | "transport"
-  | "other";
-
-interface WorkspaceAccountsMap {
-  groceries: string;
-  dining: string;
-  cafe: string; // folded into dining in the seed chart
-  retail: string;
-  transport: string;
-  other: string;
-  creditCard: string;
-}
-
-async function resolveWorkspaceAccounts(
-  workspaceId: string,
-): Promise<WorkspaceAccountsMap> {
-  const rows = await db
-    .select()
-    .from(accounts)
-    .where(eq(accounts.workspaceId, workspaceId));
-
-  const find = (
-    pred: (a: typeof rows[number]) => boolean,
-    label: string,
-  ): string => {
-    const a = rows.find(pred);
-    if (!a) throw new Error(`seeded account missing: ${label}`);
-    return a.id;
-  };
-
-  const groceries = find(
-    (a) => a.type === "expense" && a.name === "Groceries",
-    "Expenses:Groceries",
-  );
-  const dining = find(
-    (a) => a.type === "expense" && a.name === "Dining",
-    "Expenses:Dining",
-  );
-  const transport = find(
-    (a) => a.type === "expense" && a.name === "Transport",
-    "Expenses:Transport",
-  );
-  // Two "Other" rows exist (income + expense); pick expense.
-  const other = find(
-    (a) => a.type === "expense" && a.name === "Other",
-    "Expenses:Other",
-  );
-  const creditCard = find(
-    (a) => a.type === "liability" && a.subtype === "credit_card",
-    "Liabilities:Credit Card",
-  );
-
-  return {
-    groceries,
-    dining,
-    cafe: dining,
-    retail: other,
-    transport,
-    other,
-    creditCard,
-  };
-}
-
-function pickExpenseAccount(
-  map: WorkspaceAccountsMap,
-  categoryHint: string | undefined,
-): string {
-  const h = (categoryHint ?? "").toLowerCase().trim() as CategoryBucket;
-  switch (h) {
-    case "groceries":
-      return map.groceries;
-    case "dining":
-      return map.dining;
-    case "cafe":
-      return map.cafe;
-    case "retail":
-      return map.retail;
-    case "transport":
-      return map.transport;
-    default:
-      return map.other;
-  }
-}
-
 // ── Per-file processing ───────────────────────────────────────────────
+//
+// Phase 2 of #32: Claude writes the ledger itself via psql. The worker
+// only spawns the agent, passes in the ingest/document/workspace ids
+// the agent needs for its INSERTs, then reads the `ingests` row the
+// agent updated. See `src/ingest/prompt.ts` for the agent-side SQL.
 
 /**
  * Aggregate ingest counts for one batch, shaped to match the SSE event
@@ -348,122 +256,69 @@ async function markError(
 }
 
 /**
- * Attach the `source_ingest_id` to a document the worker just linked
- * to a transaction. The v1 service doesn't take this field on upload
- * because the document may be linked to zero-or-more ingests; for the
- * batch-ingest path we know exactly which ingest owns each doc so we
- * backfill after insert.
+ * Read the terminal state the agent wrote into the `ingests` row.
+ * Returns null if the agent didn't close out (row is still in a
+ * non-terminal state) — the caller treats that as an error.
  */
-async function stampDocumentSource(
-  workspaceId: string,
-  documentId: string,
+async function readIngestTerminal(
   ingestId: string,
-): Promise<void> {
-  await db
-    .update(documentsTable)
-    .set({ sourceIngestId: ingestId })
-    .where(
-      and(
-        eq(documentsTable.id, documentId),
-        eq(documentsTable.workspaceId, workspaceId),
-      ),
-    );
-}
-
-/**
- * Materialize one receipt-kind extraction as a transaction with two
- * postings (expense debit + credit-card credit) using the same sign
- * convention as the smoke harness.
- */
-async function writeReceiptTransaction(
-  args: {
-    workspaceId: string;
-    userId: string | null;
-    ingestId: string;
-    result: Extract<ExtractorResult, { classification: "receipt_image" | "receipt_email" | "receipt_pdf" }>;
-  },
-  accountMap: WorkspaceAccountsMap,
-): Promise<TransactionRow> {
-  const { workspaceId, userId, ingestId, result } = args;
-  const ex = result.extracted;
-  const expenseId = pickExpenseAccount(accountMap, ex.category_hint);
-  const amount = ex.total_minor;
-  // SEED_USER_ID is a real FK; in tests it equals SEED_USER_ID. If caller
-  // passes null we let the service default to null (createdBy is nullable).
-  const tx = await createTransaction(workspaceId, userId ?? "", {
-    occurred_on: ex.occurred_on,
-    payee: ex.payee,
-    postings: [
-      {
-        account_id: expenseId,
-        amount_minor: amount,
-        currency: "USD",
-        amount_base_minor: amount,
-      },
-      {
-        account_id: accountMap.creditCard,
-        amount_minor: -amount,
-        currency: "USD",
-        amount_base_minor: -amount,
-      },
-    ],
-    metadata: {
-      source: "ingest",
-      source_ingest_id: ingestId,
-      classification: result.classification,
-      category_hint: ex.category_hint,
-    },
-  });
-
-  // source_ingest_id is a first-class column but the service does not yet
-  // expose it as an input — set it directly. We do this AFTER the create
-  // because the balance trigger on postings is deferred, and the service
-  // has already committed the row.
-  await db.execute(
-    sql`UPDATE transactions
-         SET source_ingest_id = ${ingestId}::uuid
-       WHERE id = ${tx.id}::uuid
-         AND workspace_id = ${workspaceId}::uuid`,
-  );
-
-  // Phase 3 geocode: if the agent produced a valid geo block, upsert
-  // into the shared `places` table and point this transaction at it.
-  // Failure here is logged but does not fail the ingest — geo is
-  // best-effort and the ledger row is already balanced & durable.
-  if (ex.geo) {
-    try {
-      const placeId = await upsertPlace(ex.geo);
-      await db.execute(
-        sql`UPDATE transactions
-             SET place_id = ${placeId}::uuid
-           WHERE id = ${tx.id}::uuid
-             AND workspace_id = ${workspaceId}::uuid`,
-      );
-    } catch (err) {
-      console.warn(
-        `[places] upsert failed for ingest=${ingestId}: ${(err as Error).message}`,
-      );
-    }
+  workspaceId: string,
+): Promise<{
+  status: "done" | "unsupported" | "error";
+  classification: string | null;
+  produced: {
+    transaction_ids: string[];
+    document_ids: string[];
+    receipt_ids: string[];
+  };
+  error: string | null;
+} | null> {
+  const rows = await db
+    .select({
+      status: ingests.status,
+      classification: ingests.classification,
+      produced: ingests.produced,
+      error: ingests.error,
+    })
+    .from(ingests)
+    .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
+  const row = rows[0];
+  if (!row) return null;
+  if (
+    row.status !== "done" &&
+    row.status !== "unsupported" &&
+    row.status !== "error"
+  ) {
+    return null;
   }
-
-  return tx;
+  const p = (row.produced ?? {}) as Record<string, unknown>;
+  const coerceArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  return {
+    status: row.status,
+    classification:
+      typeof row.classification === "string" ? row.classification : null,
+    produced: {
+      transaction_ids: coerceArr(p.transaction_ids),
+      document_ids: coerceArr(p.document_ids),
+      receipt_ids: coerceArr(p.receipt_ids),
+    },
+    error: typeof row.error === "string" ? row.error : null,
+  };
 }
 
 async function runOne(item: QueueItem): Promise<void> {
   const { ingestId, workspaceId, batchId, filePath, mimeType } = item;
 
-  // Workspace owner acts as the "actor" for the synthesized transaction.
-  // The v1 service requires a string userId; we defer FK constraints to
-  // the DB (`created_by` is nullable with ON DELETE SET NULL, but at
-  // insert time drizzle receives whatever we pass through).
+  // Resolve workspace owner + the pre-existing document row id. The
+  // agent needs both inside its SQL (transactions.created_by and
+  // document_links.document_id). Both were set during upload.
   const wsRows = await db
     .select({ ownerId: workspaces.ownerId })
     .from(workspaces)
     .where(eq(workspaces.id, workspaceId));
   const ownerId = wsRows[0]?.ownerId;
   if (!ownerId) {
-    // Workspace vanished between enqueue and dequeue — shouldn't happen
-    // outside a test teardown, but fail the ingest cleanly.
     await markError(ingestId, workspaceId, new Error("workspace not found"));
     busEmit("job.error", {
       batchId,
@@ -475,6 +330,31 @@ async function runOne(item: QueueItem): Promise<void> {
   }
   const userId = ownerId;
 
+  const docRows = await db
+    .select({ id: documentsTable.id })
+    .from(documentsTable)
+    .where(
+      and(
+        eq(documentsTable.workspaceId, workspaceId),
+        eq(documentsTable.filePath, filePath),
+      ),
+    );
+  const documentId = docRows[0]?.id;
+  if (!documentId) {
+    await markError(
+      ingestId,
+      workspaceId,
+      new Error(`document row not found for filePath=${filePath}`),
+    );
+    busEmit("job.error", {
+      batchId,
+      ingestId,
+      error: "document row not found",
+    });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+
   await markProcessing(ingestId, workspaceId);
   await onBatchChildStarted(batchId, workspaceId);
   busEmit("job.started", { batchId, ingestId });
@@ -485,8 +365,15 @@ async function runOne(item: QueueItem): Promise<void> {
       filePath,
       mimeType,
       filename: item.filename,
+      ingestId,
+      workspaceId,
+      documentId,
+      userId,
     });
   } catch (err) {
+    // Agent died / timed out before closing out the ingest row. Stamp
+    // it with the error; leave place_id etc. untouched (the agent may
+    // have gotten partway through — operators can inspect `ingests`).
     await markError(ingestId, workspaceId, err);
     busEmit("job.error", {
       batchId,
@@ -498,98 +385,51 @@ async function runOne(item: QueueItem): Promise<void> {
   }
 
   if (result.sessionId) {
-    trackLangfuse(result.sessionId, [batchId, ingestId, result.classification]);
+    trackLangfuse(result.sessionId, [batchId, ingestId]);
   }
 
-  try {
-    if (result.classification === "unsupported") {
-      await markUnsupported(ingestId, workspaceId, result.reason);
-      // Unsupported is a non-error terminal state; emit `job.done` with
-      // classification="unsupported" and empty produced{} so subscribers
-      // can render it as "skipped" without a second heuristic.
-      busEmit("job.done", {
-        batchId,
-        ingestId,
-        classification: "unsupported",
-        produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
-      });
-      await onBatchChildTerminated(batchId, workspaceId);
-      return;
-    }
-
-    if (result.classification === "statement_pdf") {
-      // Phase 1 explicitly defers the statement pipeline. Mark unsupported
-      // with a pointer so operators know why no transactions appeared.
-      await markUnsupported(
-        ingestId,
-        workspaceId,
-        "statement pipeline not yet implemented (Phase 2 of #32)",
-      );
-      busEmit("job.done", {
-        batchId,
-        ingestId,
-        classification: "unsupported",
-        produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
-      });
-      await onBatchChildTerminated(batchId, workspaceId);
-      return;
-    }
-
-    // receipt_image | receipt_email | receipt_pdf
-    const accountMap = await resolveWorkspaceAccounts(workspaceId);
-    const tx = await writeReceiptTransaction(
-      { workspaceId, userId, ingestId, result },
-      accountMap,
-    );
-
-    // Link the uploaded document to the new transaction. The ingest row
-    // owns exactly one sha256-identified document — find it by path.
-    const docRows = await db
-      .select()
-      .from(documentsTable)
-      .where(
-        and(
-          eq(documentsTable.workspaceId, workspaceId),
-          eq(documentsTable.filePath, filePath),
-        ),
-      );
-    const documentIds: string[] = [];
-    if (docRows.length > 0) {
-      const doc = docRows[0]!;
-      await linkDocumentToTransaction({
-        workspaceId,
-        documentId: doc.id,
-        transactionId: tx.id,
-      });
-      await stampDocumentSource(workspaceId, doc.id, ingestId);
-      documentIds.push(doc.id);
-    }
-
-    await markDone(ingestId, workspaceId, result.classification, {
-      transaction_ids: [tx.id],
-      document_ids: documentIds,
-      receipt_ids: [],
-    });
-    busEmit("job.done", {
-      batchId,
-      ingestId,
-      classification: result.classification,
-      produced: {
-        receipt_ids: [],
-        transaction_ids: [tx.id],
-        document_ids: documentIds,
-      },
-    });
-    await onBatchChildTerminated(batchId, workspaceId);
-  } catch (err) {
-    await markError(ingestId, workspaceId, err);
+  // The agent is responsible for UPDATE ingests SET status=... at the
+  // end of its run (see Phase 5 of prompt.ts). Read the row it wrote.
+  const terminal = await readIngestTerminal(ingestId, workspaceId);
+  if (!terminal) {
+    // Agent exited 0 but didn't close out — treat as error.
+    const msg =
+      "agent did not close out ingest row (status still processing). stdout: " +
+      result.stdout.slice(0, 500);
+    await markError(ingestId, workspaceId, new Error(msg));
     busEmit("job.error", {
       batchId,
       ingestId,
-      error: err instanceof Error ? err.message : String(err),
+      error: msg,
     });
     await onBatchChildTerminated(batchId, workspaceId);
+    return;
   }
+
+  if (terminal.status === "error") {
+    busEmit("job.error", {
+      batchId,
+      ingestId,
+      error: terminal.error ?? "agent-reported error",
+    });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+
+  busEmit("job.done", {
+    batchId,
+    ingestId,
+    classification: terminal.classification ?? "unsupported",
+    produced: {
+      receipt_ids: terminal.produced.receipt_ids,
+      transaction_ids: terminal.produced.transaction_ids,
+      document_ids:
+        terminal.produced.document_ids.length > 0
+          ? terminal.produced.document_ids
+          : [documentId],
+    },
+  });
+  await onBatchChildTerminated(batchId, workspaceId);
 }
 
 // ── Batch state machine ───────────────────────────────────────────────
