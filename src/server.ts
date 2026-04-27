@@ -30,6 +30,13 @@ async function main(): Promise<void> {
     );
   }
 
+  if (!process.env.GOOGLE_MAPS_API_KEY) {
+    console.warn(
+      "⚠️  GOOGLE_MAPS_API_KEY not set — receipt geocoding will be skipped. " +
+        "Set the env var in .env to enable Google Maps Geocoding + Places API calls during Phase 3 of extraction.",
+    );
+  }
+
   // Ingest worker: recovers any stale batches from a prior crash and
   // then sits idle until /v1/ingest/batch enqueues files. Same process
   // as HTTP so the DB pool + v1 services are shared.
