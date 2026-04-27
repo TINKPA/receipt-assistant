@@ -16,12 +16,16 @@ FROM node:22-bookworm AS builder
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
 # Install full deps first (cached layer as long as package*.json is unchanged)
 COPY package.json package-lock.json* ./
 RUN npm ci
 
 # Copy sources and build
+COPY .git ./.git
 COPY tsconfig.json ./
+COPY scripts/ ./scripts/
 COPY src/ ./src/
 COPY drizzle/ ./drizzle/
 RUN npm run build
