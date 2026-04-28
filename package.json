@@ -4,6 +4,7 @@
   "description": "Personal receipt processing assistant powered by Claude Code CLI + FastMCP",
   "type": "module",
   "scripts": {
+    "prebuild": "node scripts/generate-build-info.mjs",
     "build": "tsc",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",

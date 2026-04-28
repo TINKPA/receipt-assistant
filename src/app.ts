@@ -28,6 +28,7 @@ import {
 } from "./routes/ingest.js";
 import { reconcileRouter } from "./routes/reconcile.js";
 import { reportsRouter } from "./routes/reports.js";
+import { buildInfo } from "./generated/build-info.js";
 
 export function buildApp(): Express {
   const app = express();
@@ -49,7 +50,16 @@ export function buildApp(): Express {
   );
 
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ status: "ok", service: "receipt-assistant", version: "2.0.0-alpha" });
+    res.json({
+      status: "ok",
+      service: "receipt-assistant",
+      version: buildInfo.version,
+      build: buildInfo,
+    });
+  });
+
+  app.get("/version", (_req: Request, res: Response) => {
+    res.json(buildInfo);
   });
 
   // ── Per-request context ─────────────────────────────────────────────

@@ -18,6 +18,7 @@ import { registerDocumentsMcpTools } from "./mcp/documents.js";
 import { registerReconcileMcpTools } from "./mcp/reconcile.js";
 import { registerReportsMcpTools } from "./mcp/reports.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
+import { buildInfo } from "./generated/build-info.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3001", 10);
@@ -62,9 +63,10 @@ async function main(): Promise<void> {
   const app = buildApp();
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌐 HTTP API listening on http://0.0.0.0:${PORT}`);
+    console.log(`🏷️  Build ${buildInfo.version} (${buildInfo.gitShortSha}) built ${buildInfo.builtAt}`);
     console.log(`
 📋 Endpoints:
-   GET  /health · /openapi.json · /docs
+   GET  /health · /version · /openapi.json · /docs
    /v1/accounts        — chart of accounts + balance + register
    /v1/transactions    — double-entry ledger CRUD + postings + void
    /v1/postings        — read-only posting search

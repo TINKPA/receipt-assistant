@@ -18,7 +18,7 @@ import {
   ErrorResponse,
   ValidationErrorResponse,
 } from "./schemas/common.js";
-import { HealthResponse } from "./schemas/health.js";
+import { BuildInfoResponse, HealthResponse } from "./schemas/health.js";
 import { ProblemDetails } from "./schemas/v1/common.js";
 import { registerAccountsOpenApi } from "./routes/accounts.js";
 import { registerTransactionsOpenApi } from "./routes/transactions.js";
@@ -33,6 +33,7 @@ export function buildRegistry(): OpenAPIRegistry {
 
   registry.register("ErrorResponse", ErrorResponse);
   registry.register("ValidationErrorResponse", ValidationErrorResponse);
+  registry.register("BuildInfoResponse", BuildInfoResponse);
   registry.register("HealthResponse", HealthResponse);
   registry.register("ProblemDetails", ProblemDetails);
 
@@ -51,6 +52,19 @@ export function buildRegistry(): OpenAPIRegistry {
       200: {
         description: "Service is up",
         content: { "application/json": { schema: HealthResponse } },
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/version",
+    summary: "Build metadata",
+    tags: ["meta"],
+    responses: {
+      200: {
+        description: "Deployed build metadata",
+        content: { "application/json": { schema: BuildInfoResponse } },
       },
     },
   });
