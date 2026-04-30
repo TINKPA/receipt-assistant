@@ -6,9 +6,6 @@
  * serialize as `application/problem+json` via the central
  * `problemHandler`.
  *
- * The service functions (`listAccountsService`, `createAccountService`,
- * etc.) are exported so the MCP tool layer in `src/mcp/accounts.ts` can
- * invoke them directly without doing HTTP self-calls.
  */
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";

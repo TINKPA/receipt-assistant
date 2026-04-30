@@ -64,7 +64,6 @@ COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 
 ENV NODE_ENV=production
 ENV PORT=3000
-ENV MCP_PORT=3001
 ENV DB_PATH=/data/receipts.db
 ENV UPLOAD_DIR=/data/uploads
 ENV HOME=/home/node
@@ -74,7 +73,7 @@ RUN mkdir -p /data/uploads /home/node/.claude && \
 
 USER node
 
-EXPOSE 3000 3001
+EXPOSE 3000
 VOLUME ["/data"]
 
 # depends_on: service_healthy in docker-compose.yml relies on this.

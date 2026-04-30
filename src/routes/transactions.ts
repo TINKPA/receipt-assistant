@@ -3,9 +3,7 @@
  * nested postings).
  *
  * The heavy lifting — DB transaction wrapping, balance-trigger error
- * translation, audit-log writes — lives in `transactions.service.ts`
- * so the MCP tools can reuse the same code path without spinning a
- * fake HTTP request.
+ * translation, audit-log writes — lives in `transactions.service.ts`.
  *
  * Error handling: every handler is an `async (req, res, next)` that
  * forwards thrown `HttpProblem`s to `next(err)` — the final

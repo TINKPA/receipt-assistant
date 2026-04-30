@@ -1,7 +1,7 @@
 {
   "name": "receipt-assistant",
   "version": "1.0.0",
-  "description": "Personal receipt processing assistant powered by Claude Code CLI + FastMCP",
+  "description": "Personal receipt processing assistant powered by Claude Code CLI",
   "type": "module",
   "scripts": {
     "prebuild": "node scripts/generate-build-info.mjs",
@@ -9,10 +9,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx scripts/seed.ts",
-    "openapi:generate": "tsx scripts/generate-openapi.ts",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:ui": "vitest --ui"
+    "openapi:generate": "tsx scripts/generate-openapi.ts"
   },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "^7.3.4",
@@ -20,7 +17,6 @@
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "express": "^5.1.0",
-    "fastmcp": "^3.34.0",
     "heic-convert": "^2.1.0",
     "multer": "^2.0.0",
     "pg": "^8.20.0",
@@ -29,20 +25,13 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@testcontainers/postgresql": "^11.14.0",
-    "@types/better-sqlite3": "^7.6.0",
     "@types/express": "^5.0.0",
     "@types/multer": "^1.4.0",
     "@types/node": "^22.0.0",
-    "@types/supertest": "^7.2.0",
     "@types/swagger-ui-express": "^4.1.8",
     "@types/uuid": "^10.0.0",
-    "@vitest/ui": "^4.1.4",
     "drizzle-kit": "^0.31.10",
-    "supertest": "^7.2.2",
-    "testcontainers": "^11.14.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
-    "vitest": "^4.1.4"
+    "typescript": "^5.7.0"
   }
 }

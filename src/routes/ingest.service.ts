@@ -2,8 +2,8 @@
  * Service layer for the `/v1/ingest`, `/v1/batches`, `/v1/ingests`
  * routes.
  *
- * Split from `ingest.ts` so the HTTP + future MCP callers share the
- * same DB access paths (mirrors the accounts / transactions services).
+ * Split from `ingest.ts` to mirror the accounts / transactions
+ * service layout — handlers stay thin, DB access lives here.
  *
  * Phase 1 scope:
  *   - `createBatchFromFiles` — persist batch + N ingest rows and enqueue

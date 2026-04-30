@@ -9,8 +9,6 @@
  * user-supplied date range and the number of accounts), so these
  * endpoints return full arrays without keyset pagination.
  *
- * Service functions are exported so the MCP tools in `src/mcp/reports.ts`
- * can invoke them directly without doing HTTP self-calls.
  */
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { sql } from "drizzle-orm";

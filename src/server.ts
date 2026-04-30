@@ -1,38 +1,20 @@
 /**
- * HTTP + MCP entrypoint.
+ * HTTP entrypoint.
  *
  * Boot sequence:
  *   1. Run pending Drizzle migrations. Fail fast on any migration error.
  *   2. Idempotent seed (default workspace + chart of accounts).
- *   3. Start MCP server with registered v1 tools.
+ *   3. Start the in-process ingest worker.
  *   4. Start Express HTTP server built from `buildApp()`.
  */
 import "dotenv/config";
-import { FastMCP } from "fastmcp";
 import { buildApp } from "./app.js";
 import { runMigrations } from "./db/migrate.js";
 import { seed } from "./db/seed.js";
-import { registerAccountsMcpTools } from "./mcp/accounts.js";
-import { registerTransactionsMcpTools } from "./mcp/transactions.js";
-import { registerDocumentsMcpTools } from "./mcp/documents.js";
-import { registerReconcileMcpTools } from "./mcp/reconcile.js";
-import { registerReportsMcpTools } from "./mcp/reports.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
 import { buildInfo } from "./generated/build-info.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3001", 10);
-
-const mcp = new FastMCP({
-  name: "receipt-assistant",
-  version: "2.0.0",
-});
-
-registerAccountsMcpTools(mcp);
-registerTransactionsMcpTools(mcp);
-registerDocumentsMcpTools(mcp);
-registerReconcileMcpTools(mcp);
-registerReportsMcpTools(mcp);
 
 async function main(): Promise<void> {
   console.log("🗄️  Running Drizzle migrations…");
@@ -47,12 +29,6 @@ async function main(): Promise<void> {
         : `🌱 Workspace ${r.workspaceId} already present`,
     );
   }
-
-  mcp.start({
-    transportType: "httpStream",
-    httpStream: { port: MCP_PORT },
-  });
-  console.log(`🔌 MCP server listening on http://0.0.0.0:${MCP_PORT}/mcp`);
 
   // Ingest worker: recovers any stale batches from a prior crash and
   // then sits idle until /v1/ingest/batch enqueues files. Same process

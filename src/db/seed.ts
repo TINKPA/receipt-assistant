@@ -9,7 +9,6 @@
  * Callers:
  *   - `src/server.ts` at startup (unless SEED_ON_BOOT=false).
  *   - `scripts/seed.ts` as a standalone CLI.
- *   - Vitest integration tests (reset + reseed per suite).
  */
 import { v7 as uuidv7 } from "uuid";
 import { sql } from "drizzle-orm";

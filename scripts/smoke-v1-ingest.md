@@ -69,6 +69,6 @@ Plus a `Failures` section with raw Claude output tail for any extraction errors,
 
 ## Non-goals
 
-- Not a DB-level integrity test — for that, see `src/routes/transactions.service.ts` + the vitest suite.
+- Not a DB-level integrity test — see `src/routes/transactions.service.ts` for the constraint-trigger logic.
 - Not a Langfuse trace check — extraction happens on the host, not in the container, so the Langfuse trace volume is not written.
 - Not a load test. 15 receipts, concurrency 3, ~15–60s per extraction.

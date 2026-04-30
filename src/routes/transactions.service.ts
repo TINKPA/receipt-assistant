@@ -1,6 +1,6 @@
 /**
- * Transactions service — the business logic shared between the HTTP
- * router (`/v1/transactions*`) and the FastMCP tools.
+ * Transactions service — the business logic behind the HTTP router
+ * (`/v1/transactions*`).
  *
  * Everything that mutates the ledger runs inside a single
  * `db.transaction(...)` block so that the deferred `postings_balance_ck`

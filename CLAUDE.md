@@ -214,7 +214,7 @@ Minimum label set (every issue):
 
 - one `kind/*` — `bug` · `feature` · `enhancement` · `docs` · `refactor` · `chore`
 - one `priority/*` — `p0` · `p1` · `p2` · `p3`
-- one `area/*` — `api` · `extraction` · `db` · `docker` · `langfuse` · `mcp` · `ops`
+- one `area/*` — `api` · `extraction` · `db` · `docker` · `langfuse` · `ops`
 - one `status/*` — `needs-triage` · `confirmed` · `in-progress` · `blocked`
 - **bugs also require** one `severity/*` — `critical` · `major` · `minor` · `trivial`
 

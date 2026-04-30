@@ -1,13 +1,8 @@
 /**
- * Document service — internal helpers shared by the HTTP handlers and
- * the FastMCP tools.
+ * Document service — internal helpers behind the HTTP handlers.
  *
- * The two clients (Express + MCP) speak different I/O idioms but share
- * the same business rules: sha256-based content dedup per workspace,
- * disk write under `UPLOAD_DIR`, insert into `documents`, etc.
- *
- * Keeping this logic in one module makes the MCP `upload_document` tool
- * and the HTTP `POST /v1/documents` provably equivalent.
+ * Business rules: sha256-based content dedup per workspace, disk write
+ * under `UPLOAD_DIR`, insert into `documents`, etc.
  */
 import { createHash } from "crypto";
 import { mkdir, writeFile, unlink } from "fs/promises";

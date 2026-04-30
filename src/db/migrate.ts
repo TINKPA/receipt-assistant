@@ -4,7 +4,6 @@
  * Imported by:
  *   - `src/server.ts` at container boot (production path).
  *   - `scripts/migrate.ts` as a standalone CLI (dev path, via tsx).
- *   - Vitest integration setup (per-test database).
  *
  * `migrationsFolder` resolves relative to the compiled file location.
  * In dev   : <repo>/src/db/migrate.ts → <repo>/drizzle

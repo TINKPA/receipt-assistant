@@ -1,6 +1,6 @@
 /**
- * Express app factory — separated from `server.ts` so integration tests
- * can `supertest(buildApp())` without opening a listening socket.
+ * Express app factory — separated from `server.ts` so the listening
+ * socket is owned by `server.ts` and the wiring lives here.
  *
  * Middleware stack (order matters):
  *   1. JSON body parsing + trust-proxy (for correct `req.protocol`)

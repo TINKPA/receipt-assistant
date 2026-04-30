@@ -72,7 +72,7 @@ docker compose up -d --build
 What happens:
 - dedicated `receipts-postgres` starts and auto-creates the `receipts` database
 - the receipt-assistant image is built (multi-stage: tsc in a builder stage, lean runtime)
-- receipt-assistant starts on ports 3000 (REST) and 3001 (MCP)
+- receipt-assistant starts on port 3000 (REST)
 - the Langfuse stack starts in parallel
 
 First-time pull of the Langfuse images is 2–3 GB; expect 3–5 minutes on a
@@ -158,16 +158,6 @@ Frontend, macOS, and any future client generate typed bindings from `openapi/ope
 
 See [`CLAUDE.md` → Schema editing workflow](CLAUDE.md#schema-editing-workflow-openapi-contract) for the edit-and-regen rules.
 
-### MCP Tools (port 3001)
-
-| Tool | Description |
-|------|-------------|
-| `process_receipt` | Parse a receipt image and save to database |
-| `list_receipts` | List receipts with date/category filters |
-| `spending_summary` | Spending aggregated by category |
-| `get_receipt` | Get receipt details with line items |
-| `ask_about_spending` | Natural language query about spending habits |
-
 ## Langfuse Monitoring
 
 Every `claude -p` call is automatically traced in Langfuse with:
@@ -199,7 +189,7 @@ OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_
 ## Tech Stack
 
 - **Runtime**: Node.js 22 + TypeScript (ES2022)
-- **Framework**: Express 5 + FastMCP
+- **Framework**: Express 5
 - **Database**: PostgreSQL (shared with Langfuse)
 - **AI**: Claude Code CLI (`claude -p`) with subscription auth
 - **Monitoring**: Langfuse (self-hosted)

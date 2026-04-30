@@ -48,7 +48,6 @@ services:
         condition: service_healthy
     ports:
       - "3000:3000"
-      - "3001:3001"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
       # Langfuse is optional. If the Langfuse stack isn't running, the app
