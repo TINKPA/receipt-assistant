@@ -5,10 +5,6 @@
  * only `sessionId` from this module; everything else (classification,
  * produced tx_ids) is read by polling the `ingests` row the agent
  * itself updates.
- *
- * Kept injectable so integration tests can swap in a fake extractor
- * that writes to the DB via the Node-side services for reproducibility
- * (Phase 2's real path depends on a live Claude CLI + seeded accounts).
  */
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";

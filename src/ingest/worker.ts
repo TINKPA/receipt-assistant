@@ -16,10 +16,6 @@
  *     batches older than 5 minutes and mark them `failed`; in-flight
  *     ingests of those batches flip to `error`. Durable queuing is a
  *     future concern.
- *   - The extractor is injectable. Integration tests call
- *     `setExtractor(stub)` to avoid shelling out to `claude`. Stubs
- *     must honor the Phase 2 contract: write terminal state into the
- *     `ingests` row themselves (status/classification/produced).
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -32,7 +28,6 @@ import {
 import { newId } from "../http/uuid.js";
 import {
   defaultClaudeExtractor,
-  type Extractor,
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
@@ -48,41 +43,6 @@ function getConcurrency(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONCURRENCY;
 }
 
-// ── Injectable extractor ──────────────────────────────────────────────
-
-let currentExtractor: Extractor = defaultClaudeExtractor;
-export function setExtractor(fn: Extractor): void {
-  currentExtractor = fn;
-}
-export function resetExtractor(): void {
-  currentExtractor = defaultClaudeExtractor;
-}
-export function getExtractor(): Extractor {
-  return currentExtractor;
-}
-
-// ── Injectable Langfuse ingestor ──────────────────────────────────────
-
-export type LangfuseIngestor = (
-  sessionId: string,
-  tags: string[],
-) => Promise<void>;
-
-const defaultLangfuseIngestor: LangfuseIngestor = async (sessionId, tags) => {
-  await ingestSession(getSessionJsonlPath(sessionId), tags);
-};
-
-let currentLangfuseIngestor: LangfuseIngestor = defaultLangfuseIngestor;
-export function setLangfuseIngestor(fn: LangfuseIngestor): void {
-  currentLangfuseIngestor = fn;
-}
-export function resetLangfuseIngestor(): void {
-  currentLangfuseIngestor = defaultLangfuseIngestor;
-}
-export function getLangfuseIngestor(): LangfuseIngestor {
-  return currentLangfuseIngestor;
-}
-
 // ── In-process queue ──────────────────────────────────────────────────
 
 interface QueueItem {
@@ -96,31 +56,6 @@ interface QueueItem {
 
 const queue: QueueItem[] = [];
 let activeWorkers = 0;
-// Tracks all work promises so tests can await quiescence deterministically.
-const inflight = new Set<Promise<unknown>>();
-// Resolved when the queue becomes empty AND no workers are active.
-let drainResolvers: Array<() => void> = [];
-
-function resolveDrainWaiters(): void {
-  if (queue.length === 0 && activeWorkers === 0 && inflight.size === 0) {
-    const pending = drainResolvers;
-    drainResolvers = [];
-    for (const r of pending) r();
-  }
-}
-
-/**
- * Await the point where all currently-enqueued work has terminated.
- * Useful for integration tests; not otherwise exported to HTTP callers.
- */
-export function drain(): Promise<void> {
-  if (queue.length === 0 && activeWorkers === 0 && inflight.size === 0) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    drainResolvers.push(resolve);
-  });
-}
 
 export function enqueue(item: QueueItem): void {
   queue.push(item);
@@ -132,7 +67,7 @@ function maybeSpawnWorker(): void {
   while (activeWorkers < maxC && queue.length > 0) {
     const item = queue.shift()!;
     activeWorkers += 1;
-    const p = runOne(item)
+    runOne(item)
       .catch((err) => {
         // runOne already stamps the DB row; this is a belt-and-braces
         // safety net so a thrown error never crashes the whole process.
@@ -141,14 +76,10 @@ function maybeSpawnWorker(): void {
       })
       .finally(() => {
         activeWorkers -= 1;
-        inflight.delete(p);
         // Spawn more as long as queue has work.
         maybeSpawnWorker();
-        resolveDrainWaiters();
       });
-    inflight.add(p);
   }
-  resolveDrainWaiters();
 }
 
 // ── Per-file processing ───────────────────────────────────────────────
@@ -361,7 +292,7 @@ async function runOne(item: QueueItem): Promise<void> {
 
   let result: ExtractorResult;
   try {
-    result = await currentExtractor({
+    result = await defaultClaudeExtractor({
       filePath,
       mimeType,
       filename: item.filename,
@@ -489,22 +420,14 @@ async function onBatchChildTerminated(
 
 /**
  * Kick off Langfuse ingestion for a finished extraction without blocking
- * the worker. The promise is wired into `inflight` so `drain()` still
- * waits for it — integration tests can assert on the spy synchronously.
- * `ingestSession` itself swallows errors, so Langfuse downtime never
- * fails a batch.
+ * the worker. `ingestSession` itself swallows errors, so Langfuse
+ * downtime never fails a batch.
  */
 function trackLangfuse(sessionId: string, tags: string[]): void {
-  const p = currentLangfuseIngestor(sessionId, tags)
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error("[ingest worker] langfuse ingestion failed:", err);
-    })
-    .finally(() => {
-      inflight.delete(p);
-      resolveDrainWaiters();
-    });
-  inflight.add(p);
+  ingestSession(getSessionJsonlPath(sessionId), tags).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error("[ingest worker] langfuse ingestion failed:", err);
+  });
 }
 
 // ── Auto-reconcile hook (#32 Phase 2a) ───────────────────────────────
@@ -514,10 +437,6 @@ function trackLangfuse(sessionId: string, tags: string[]): void {
  * `extracted`. The extractor path must not block on reconcile — a
  * reconcile failure leaves the batch in `reconcile_error` but does NOT
  * revert extraction, per the acceptance criteria in #32 Phase 2a.
- *
- * We wire the promise into the worker's `inflight` set so integration
- * tests can `await drain()` and observe the post-reconcile state
- * deterministically without sleeping.
  */
 async function triggerAutoReconcile(
   batchId: string,
@@ -534,19 +453,13 @@ async function triggerAutoReconcile(
   const userId = wsRows[0]?.ownerId;
   if (!userId) return;
 
-  const p = runReconcile({ workspaceId, userId, batchId })
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[ingest worker] auto-reconcile failed for batch ${batchId}:`,
-        err,
-      );
-    })
-    .finally(() => {
-      inflight.delete(p);
-      resolveDrainWaiters();
-    });
-  inflight.add(p);
+  runReconcile({ workspaceId, userId, batchId }).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[ingest worker] auto-reconcile failed for batch ${batchId}:`,
+      err,
+    );
+  });
 }
 
 // ── Startup recovery ──────────────────────────────────────────────────
@@ -600,10 +513,8 @@ export async function recoverStaleBatches(): Promise<{
 }
 
 /**
- * Start the worker. Idempotent — safe to call from both `main()` in
- * production and per-suite setup in tests. For Phase 1 there's nothing
- * async to spin up; the queue drains on its own once `enqueue` is
- * called.
+ * Start the worker. Idempotent. For Phase 1 there's nothing async to
+ * spin up; the queue drains on its own once `enqueue` is called.
  */
 export async function start(): Promise<void> {
   await recoverStaleBatches().catch((err) => {

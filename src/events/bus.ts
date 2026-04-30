@@ -148,20 +148,3 @@ export function on(
     emitter.off(event, handler);
   };
 }
-
-/**
- * Introspection for tests: count of listeners on an event. Useful for
- * asserting that a client disconnect actually cleaned up its handlers.
- */
-export function listenerCount(event: string): number {
-  return emitter.listenerCount(event);
-}
-
-/**
- * Test helper — drop every listener on every event. Call this in
- * `afterEach` if a suite leaks subscribers across tests. Production
- * code must not invoke this.
- */
-export function removeAllListenersForTesting(): void {
-  emitter.removeAllListeners();
-}

@@ -21,7 +21,7 @@ import {
 } from "../schema/index.js";
 
 /**
- * Stable IDs so re-runs and integration tests can pin the same rows.
+ * Stable IDs so re-runs of the seeder land on the same rows.
  * UUIDv7-shaped (version nibble = 7, variant bits = 10).
  */
 export const SEED_USER_ID = "00000000-0000-7000-8000-000000000001";

@@ -1,6 +1,6 @@
 # smoke-batch — manual end-to-end verification of `/v1/ingest/batch`
 
-Phase 1 of issue #32 ships the batch ingestion endpoint but no automated CLI harness — integration tests cover the happy path with a stubbed extractor. This doc shows how to exercise the **real** `claude -p` pipeline end-to-end against the running Docker stack.
+Phase 1 of issue #32 ships the batch ingestion endpoint. This doc shows how to exercise the **real** `claude -p` pipeline end-to-end against the running Docker stack.
 
 ## Prerequisites
 
