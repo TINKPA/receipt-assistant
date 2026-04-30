@@ -120,6 +120,12 @@ export const VoidTransactionRequest = z
   })
   .openapi("VoidTransactionRequest");
 
+export const UnreconcileTransactionRequest = z
+  .object({
+    reason: z.string().optional(),
+  })
+  .openapi("UnreconcileTransactionRequest");
+
 export const UpdatePostingRequest = z
   .object({
     account_id: Uuid.optional(),

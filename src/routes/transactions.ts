@@ -21,6 +21,7 @@ import {
   CreateTransactionRequest,
   UpdateTransactionRequest,
   VoidTransactionRequest,
+  UnreconcileTransactionRequest,
   UpdatePostingRequest,
   NewPosting,
   ListTransactionsQuery,
@@ -52,6 +53,7 @@ import {
   deleteTransaction,
   voidTransaction,
   reconcileTransaction,
+  unreconcileTransaction,
   addPosting,
   updatePosting,
   deletePosting,
@@ -349,6 +351,31 @@ transactionsRouter.post(
   },
 );
 
+// ── POST /v1/transactions/:id/unreconcile ──────────────────────────────
+
+transactionsRouter.post(
+  "/:id/unreconcile",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = parseOrThrow(IdParam, req.params);
+      const body = parseOrThrow(UnreconcileTransactionRequest, req.body ?? {});
+      const currentVersion = await loadVersion(req.ctx.workspaceId, id);
+      requireIfMatch(req, currentVersion);
+      const result = await unreconcileTransaction(
+        req.ctx.workspaceId,
+        req.ctx.userId,
+        id,
+        currentVersion,
+        body.reason,
+      );
+      setEtag(res, result.version);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // ── POST /v1/transactions/:id/postings ─────────────────────────────────
 
 transactionsRouter.post(
@@ -579,6 +606,34 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         description: "OK",
         content: { "application/json": { schema: TransactionSchema } },
       },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/transactions/{id}/unreconcile",
+    summary: "Unreconcile a transaction (reconciled → posted)",
+    description:
+      "Pure state flip: `reconciled` → `posted`, with an audit event. Match-side state (e.g. bank-line associations) is intentionally NOT cleaned up here — callers compose this with their own match cleanup. Used as the escape hatch before `DELETE /v1/transactions/:id?hard=true` or `DELETE /v1/documents/:id?cascade=true&hard=true` on a reconciled row.",
+    tags: ["transactions"],
+    request: {
+      params: z.object({ id: Uuid }),
+      headers: z.object({ "If-Match": z.string() }),
+      body: {
+        content: { "application/json": { schema: UnreconcileTransactionRequest } },
+      },
+    },
+    responses: {
+      200: {
+        description: "OK",
+        content: { "application/json": { schema: TransactionSchema } },
+      },
+      409: {
+        description: "Transaction is not in reconciled state",
+        content: problemContent,
+      },
+      412: { description: "Version mismatch", content: problemContent },
+      428: { description: "If-Match required", content: problemContent },
     },
   });
 

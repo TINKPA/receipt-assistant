@@ -830,6 +830,68 @@ export async function reconcileTransaction(
   });
 }
 
+// ── Unreconcile ────────────────────────────────────────────────────────
+//
+// Pure state flip `reconciled → posted` with an audit event. Match-side
+// state (e.g. reconcile_proposals or a future bank-line match table) is
+// intentionally untouched — callers compose the unreconcile + their own
+// match cleanup as needed.
+
+export async function unreconcileTransaction(
+  workspaceId: string,
+  userId: string,
+  id: string,
+  expectedVersion: number,
+  reason?: string,
+): Promise<TransactionRow> {
+  return await mapBalanceErrors(async () => {
+    return await db.transaction(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(transactions)
+        .where(
+          and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
+        );
+      if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
+      const current = rows[0]!;
+      if (Number(current.version) !== expectedVersion) {
+        const { VersionMismatchProblem } = await import("../http/problem.js");
+        throw new VersionMismatchProblem(Number(current.version), expectedVersion);
+      }
+      if (current.status !== "reconciled") {
+        throw new HttpProblem(
+          409,
+          "invalid-state",
+          "Cannot unreconcile",
+          `Transaction ${id} is in status=${current.status}; only 'reconciled' may be unreconciled.`,
+          { transaction_id: id, status: current.status },
+        );
+      }
+
+      await tx
+        .update(transactions)
+        .set({ status: "posted" })
+        .where(eq(transactions.id, id));
+
+      await tx.insert(transactionEvents).values({
+        id: newId(),
+        workspaceId,
+        transactionId: id,
+        eventType: "unreconciled",
+        actorId: userId,
+        payload: reason ? { reason } : {},
+      });
+
+      const full = await loadTransactionFull(
+        tx as unknown as typeof db,
+        workspaceId,
+        id,
+      );
+      return full!;
+    });
+  });
+}
+
 // ── Posting-level mutations ────────────────────────────────────────────
 
 export async function addPosting(

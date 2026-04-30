@@ -300,6 +300,49 @@ describe("POST /v1/transactions/:id/reconcile", () => {
   });
 });
 
+describe("POST /v1/transactions/:id/unreconcile", () => {
+  it("flips reconciled → posted and writes an audit event", async () => {
+    const created = await request(ctx.app)
+      .post("/v1/transactions")
+      .set("Idempotency-Key", uuidv7())
+      .send(balancedBody({ payee: "Unreconcile-target" }));
+    const id = created.body.id;
+
+    const reconciled = await request(ctx.app)
+      .post(`/v1/transactions/${id}/reconcile`)
+      .set("If-Match", created.headers["etag"]!);
+    expect(reconciled.status).toBe(200);
+    expect(reconciled.body.status).toBe("reconciled");
+
+    const res = await request(ctx.app)
+      .post(`/v1/transactions/${id}/unreconcile`)
+      .set("If-Match", reconciled.headers["etag"]!)
+      .send({ reason: "user clicked unreconcile before deleting" });
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("posted");
+
+    // After unreconcile, hard-delete is now allowed on the same row.
+    const ver = res.headers["etag"]!;
+    const del = await request(ctx.app)
+      .delete(`/v1/transactions/${id}?hard=true`)
+      .set("If-Match", ver);
+    expect(del.status).toBe(204);
+  });
+
+  it("rejects with 409 invalid-state when the transaction isn't reconciled", async () => {
+    const created = await request(ctx.app)
+      .post("/v1/transactions")
+      .set("Idempotency-Key", uuidv7())
+      .send(balancedBody({ payee: "Posted-only" }));
+    const res = await request(ctx.app)
+      .post(`/v1/transactions/${created.body.id}/unreconcile`)
+      .set("If-Match", created.headers["etag"]!);
+    expect(res.status).toBe(409);
+    expect(res.body.type).toContain("errors/invalid-state");
+    expect(res.body.transaction_id).toBe(created.body.id);
+  });
+});
+
 describe("POST /v1/transactions:bulk", () => {
   it("runs each op independently; failures don't block successes", async () => {
     const t1 = await request(ctx.app)
