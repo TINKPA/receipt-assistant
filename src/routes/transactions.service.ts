@@ -422,9 +422,28 @@ export async function getTransaction(
 
 // ── List ───────────────────────────────────────────────────────────────
 
+type SortColumn = "occurred_on" | "created_at";
+
+/** Keyset cursor on (<sort column value>, id). The `sort` field is
+ *  stored on the cursor so paginating a result set keeps using the
+ *  same ORDER BY column that was used to compute it. Legacy cursors
+ *  written before sort=created_at was honored use the un-tagged
+ *  `{ occurred_on, id }` shape and are coerced at decode time. */
 interface ListCursor {
+  sort: SortColumn;
+  value: string;
+  id: string;
+}
+
+interface LegacyListCursor {
   occurred_on: string;
   id: string;
+}
+
+function normalizeCursor(raw: ListCursor | LegacyListCursor | null): ListCursor | null {
+  if (!raw) return null;
+  if ("sort" in raw) return raw;
+  return { sort: "occurred_on", value: raw.occurred_on, id: raw.id };
 }
 
 export interface ListTransactionsResult {
@@ -439,6 +458,26 @@ export async function listTransactions(
   const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
   const order = query.order ?? "desc";
   const wantDesc = order === "desc";
+
+  // Default to created_at so freshly-uploaded receipts surface at the
+  // top regardless of their occurred_on date — the user mental model
+  // after upload is "I just added this; it should be at the top."
+  // sort=amount is in the OpenAPI enum but not yet wired here; it
+  // needs a correlated subquery over postings and an amount-keyed
+  // index to be efficient. Reject explicitly until a real consumer
+  // shows up.
+  if (query.sort === "amount") {
+    throw new HttpProblem(
+      501,
+      "not-implemented",
+      "Sort by amount not implemented",
+      "GET /v1/transactions supports sort=occurred_on and sort=created_at. " +
+        "Sort by amount requires a subquery over postings and is not yet wired.",
+    );
+  }
+  const sortCol: SortColumn = query.sort === "occurred_on" ? "occurred_on" : "created_at";
+  const sortColSql = sortCol === "occurred_on" ? sql`t.occurred_on` : sql`t.created_at`;
+  const cursorCast = sortCol === "occurred_on" ? sql`::date` : sql`::timestamptz`;
 
   const conditions: ReturnType<typeof sql>[] = [];
   conditions.push(sql`t.workspace_id = ${workspaceId}::uuid`);
@@ -464,20 +503,32 @@ export async function listTransactions(
     conditions.push(sql`NOT EXISTS (SELECT 1 FROM document_links dl WHERE dl.transaction_id = t.id)`);
   }
 
-  // Keyset cursor on (occurred_on, id)
-  const cursor = decodeCursor<ListCursor>(query.cursor ?? undefined);
+  // Keyset cursor on (<sort column>, id). If the cursor was issued
+  // under a different sort, results would be wrong — callers must
+  // not mix sorts within a pagination session. The cursor carries
+  // its sort so we can at least detect and refuse the mix.
+  const cursor = normalizeCursor(decodeCursor<ListCursor | LegacyListCursor>(query.cursor ?? undefined));
   if (cursor) {
+    if (cursor.sort !== sortCol) {
+      throw new HttpProblem(
+        400,
+        "cursor-sort-mismatch",
+        "Cursor was issued under a different sort",
+        `Cursor was issued for sort=${cursor.sort} but request asked for sort=${sortCol}. ` +
+          "Either keep the original sort or omit the cursor to start fresh.",
+      );
+    }
     if (wantDesc) {
-      conditions.push(sql`(t.occurred_on, t.id) < (${cursor.occurred_on}::date, ${cursor.id}::uuid)`);
+      conditions.push(sql`(${sortColSql}, t.id) < (${cursor.value}${cursorCast}, ${cursor.id}::uuid)`);
     } else {
-      conditions.push(sql`(t.occurred_on, t.id) > (${cursor.occurred_on}::date, ${cursor.id}::uuid)`);
+      conditions.push(sql`(${sortColSql}, t.id) > (${cursor.value}${cursorCast}, ${cursor.id}::uuid)`);
     }
   }
 
   const where = sql.join(conditions, sql` AND `);
   const orderSql = wantDesc
-    ? sql`t.occurred_on DESC, t.id DESC`
-    : sql`t.occurred_on ASC, t.id ASC`;
+    ? sql`${sortColSql} DESC, t.id DESC`
+    : sql`${sortColSql} ASC, t.id ASC`;
 
   const rowsRes = await db.execute(
     sql`SELECT t.* FROM transactions t WHERE ${where} ORDER BY ${orderSql} LIMIT ${limit + 1}`,
@@ -528,8 +579,12 @@ export async function listTransactions(
   );
 
   const last = page[page.length - 1]!;
+  const cursorValue =
+    sortCol === "occurred_on"
+      ? toIsoDate(last.occurred_on)
+      : toIsoString(last.created_at);
   const nextCursor = hasMore
-    ? encodeCursor({ occurred_on: toIsoDate(last.occurred_on), id: last.id })
+    ? encodeCursor({ sort: sortCol, value: cursorValue, id: last.id })
     : null;
 
   return { items, next_cursor: nextCursor };

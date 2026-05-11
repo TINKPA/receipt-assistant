@@ -1,0 +1,1 @@
+CREATE INDEX "transactions_created_at_keyset_idx" ON "transactions" USING btree ("workspace_id","created_at" DESC NULLS LAST,"id" DESC NULLS LAST);

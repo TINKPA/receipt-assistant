@@ -63,6 +63,14 @@ export const transactions = pgTable(
       t.occurredOn.desc(),
       t.id.desc(),
     ),
+    // Keyset pagination for sort=created_at (the new default ordering).
+    // Mirrors transactions_keyset_idx but keyed on created_at so the
+    // "newest uploads first" path is index-scannable.
+    index("transactions_created_at_keyset_idx").on(
+      t.workspaceId,
+      t.createdAt.desc(),
+      t.id.desc(),
+    ),
     index("transactions_status_idx").on(t.workspaceId, t.status),
     index("transactions_source_ingest_idx").on(t.sourceIngestId),
     index("transactions_trip_idx").on(t.tripId),
