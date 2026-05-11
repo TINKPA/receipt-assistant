@@ -29,15 +29,12 @@ services:
       TZ: UTC
       PGTZ: UTC
     volumes:
-      # Bind-mount to a host path OUTSIDE this repo so that:
-      #   1. OrbStack/Docker resets can never wipe the ledger
-      #   2. The data is physically separate from a public git repo —
-      #      no .gitignore failure mode can leak it
-      #   3. The path stays the same across multiple repos (frontend
-      #      and macOS clients can share the same uploads dir if needed)
-      # Lives inside the project notebook ~/Developer/2026_Dev_ReceiptAssistant/
-      # which is itself off iCloud-synced ~/Documents/.
-      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/postgres:/var/lib/postgresql/data
+      # App DB binary state. Bind-mount lives inside this repo at ./data/postgres
+      # (gitignored via /data/ in .gitignore) — it's pure runtime state, not
+      # user content. Keeping it next to the compose file means relative path,
+      # cross-machine portability, and no cross-repo path coupling.
+      # Survives OrbStack/Docker resets because it's host-side.
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d receipts"]
       interval: 3s
@@ -66,24 +63,27 @@ services:
       LANGFUSE_SECRET_KEY: sk-receipt-local
       # Tell the `claude` CLI explicitly where its config + credentials live.
       # Matches the Anthropic-official devcontainer convention and pairs with
-      # the `claude-code-config` named volume mounted below.
+      # the ./data/claude bind-mount below.
       CLAUDE_CONFIG_DIR: /home/node/.claude
       # Google Maps API key reachable by the in-container `claude -p` agent
       # via its Bash tool (for Phase 3 geocoding during extraction). Empty
       # is fine — the prompt instructs the agent to skip geocoding.
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
     volumes:
-      # Uploaded receipt images. Bind-mounted to host so they survive
-      # OrbStack / Docker resets (originals also kept in ~/Desktop/RECEIPT/
-      # but ingest pipeline writes its own copy here). Path lives outside
-      # this public git repo to keep PII receipt content out of the
-      # version-control blast radius.
-      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/uploads:/data
-      # Claude Code OAuth credentials. Bind-mounted onto the host (NOT a
-      # bind of host's ~/.claude/ — that caused rotation collisions in
-      # Era 2). Container has its own OAuth session, seeded once via
-      # `docker exec -it receipt-assistant claude /login`. The CLI
-      # self-refreshes and writes back into the host bind path on disk.
-      # Survives compose down/up and OrbStack resets. See `setup` skill.
-      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/claude:/home/node/.claude
+      # Uploaded receipt images = user content (PII). Lives in the outer
+      # project's iCloud-synced docs root, so the user's own receipt corpus
+      # syncs across their Macs naturally. NOT in any git repo — outer
+      # project's .gitignore covers /data/, and these are never in this repo
+      # anyway. If iCloud "Optimize Mac Storage" evicts files, the bind-mount
+      # will return errors at read time; pin the dir via Finder → "Keep
+      # Downloaded" to prevent that.
+      - ${HOME}/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads:/data
+      # Claude Code OAuth credentials + session state. Bind-mount inside
+      # this repo at ./data/claude (gitignored). NOT a bind of host's
+      # ~/.claude/ — that caused rotation collisions in Era 2. Container
+      # holds its own independent OAuth session, seeded once via
+      # `docker exec -it receipt-assistant claude /login`; the CLI
+      # self-refreshes and writes back here. Survives compose down/up and
+      # OrbStack resets. See `setup` skill.
+      - ./data/claude:/home/node/.claude
     restart: unless-stopped

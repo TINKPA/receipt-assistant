@@ -2,6 +2,7 @@ node_modules/
 dist/
 /data/
 *.db
+.DS_Store
 
 # Local secrets — use .env.example as the template
 .env
