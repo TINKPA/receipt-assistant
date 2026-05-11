@@ -101,7 +101,7 @@ docker exec -it receipt-assistant claude /login
 # paste the returned code back into the terminal.
 ```
 
-Credentials persist in the `claude-code-config` named Docker volume and survive every `docker compose down` / `up` / `restart`. The in-container CLI self-refreshes access + refresh tokens on expiry and writes rotation back into the volume. No env var, no host Keychain sync, no recurring script.
+Credentials persist on the host at `~/Developer/receipt-assistant-data/claude/` (bind-mounted into the container at `/home/node/.claude`) and survive every `docker compose down` / `up` / `restart` — and OrbStack resets, unlike Docker named volumes. The in-container CLI self-refreshes access + refresh tokens on expiry and writes rotation back into the bind path. No env var, no host Keychain sync, no recurring script.
 
 Eventually the refresh token expires server-side (weeks to months). When that happens the next call returns 401 — rerun the same `claude /login` inside the container. For full bootstrap, migration, and 401-recovery procedures, invoke the **`setup` skill** in Claude Code inside this project.
 

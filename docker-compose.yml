@@ -29,12 +29,16 @@ services:
       TZ: UTC
       PGTZ: UTC
     volumes:
-      # App DB binary state. Bind-mount lives inside this repo at ./data/postgres
-      # (gitignored via /data/ in .gitignore) — it's pure runtime state, not
-      # user content. Keeping it next to the compose file means relative path,
-      # cross-machine portability, and no cross-repo path coupling.
-      # Survives OrbStack/Docker resets because it's host-side.
-      - ./data/postgres:/var/lib/postgresql/data
+      # App DB binary state. Bind-mount to a SIBLING dir outside any git repo
+      # and outside iCloud — `~/Developer/receipt-assistant-data/postgres/`.
+      # Why not inside this repo's data/? Because this repo is public on
+      # GitHub and the DB binary contains extracted receipt PII (merchants,
+      # amounts, line items). A `.gitignore` mishap or `git add -f` could
+      # leak it. Why not in the outer iCloud-synced project? Because
+      # iCloud's continuous block-level reupload is hostile to Postgres
+      # fsync semantics. Sibling dir is the right side of both lines.
+      # Survives OrbStack/Docker resets (host-side).
+      - ${HOME}/Developer/receipt-assistant-data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d receipts"]
       interval: 3s
@@ -78,12 +82,14 @@ services:
       # will return errors at read time; pin the dir via Finder → "Keep
       # Downloaded" to prevent that.
       - ${HOME}/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads:/data
-      # Claude Code OAuth credentials + session state. Bind-mount inside
-      # this repo at ./data/claude (gitignored). NOT a bind of host's
-      # ~/.claude/ — that caused rotation collisions in Era 2. Container
-      # holds its own independent OAuth session, seeded once via
-      # `docker exec -it receipt-assistant claude /login`; the CLI
-      # self-refreshes and writes back here. Survives compose down/up and
-      # OrbStack resets. See `setup` skill.
-      - ./data/claude:/home/node/.claude
+      # Claude Code OAuth credentials + session state. Bind-mount to a
+      # SIBLING dir outside any git repo and outside iCloud —
+      # `~/Developer/receipt-assistant-data/claude/`. NOT inside this
+      # public repo (`.credentials.json` is sensitive — keep it far from
+      # `git add -f`). NOT a bind of host's `~/.claude/` — that caused
+      # rotation collisions in Era 2. Container holds its own independent
+      # OAuth session, seeded once via `docker exec -it receipt-assistant
+      # claude /login`; the CLI self-refreshes and writes back here.
+      # Survives compose down/up and OrbStack resets. See `setup` skill.
+      - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
     restart: unless-stopped

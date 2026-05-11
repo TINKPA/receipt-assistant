@@ -186,52 +186,51 @@ that trap.)
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
-## Persistent data — host bind mounts at `~/Developer/2026_Dev_ReceiptAssistant/data/`
+## Persistent data — three locations by category
 
-All app-critical state lives on the **host filesystem**, *outside this git repo*, bind-mounted into containers. Docker named volumes are no longer used for anything that matters; the host path is also outside both this public repo and iCloud-synced `~/Documents/`.
+App state is split across three host locations by data type. Each location is chosen to defeat a specific failure mode; do not collapse them back into one.
 
-| Container path | Host bind | Purpose |
-|---|---|---|
-| `/var/lib/postgresql/data` | `~/Developer/2026_Dev_ReceiptAssistant/data/postgres/` | The ledger (postgres 17) |
-| `/data` | `~/Developer/2026_Dev_ReceiptAssistant/data/uploads/` | Uploaded receipt images |
-| `/home/node/.claude` | `~/Developer/2026_Dev_ReceiptAssistant/data/claude/` | Container's Claude Code OAuth + config |
+| Container path | Host bind | Category | Why this location |
+|---|---|---|---|
+| `/data` | `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/` | User content (receipt images, PII) | Outer project lives in iCloud, so the user's own receipt corpus syncs across their Macs. Pin via Finder → "Keep Downloaded" if Optimize Mac Storage is on. |
+| `/var/lib/postgresql/data` | `~/Developer/receipt-assistant-data/postgres/` | Runtime state (DB binary) | Sibling dir outside any git repo and outside iCloud. Postgres binary contains extracted PII; this repo is public on GitHub. iCloud + Postgres fsync is hostile. Sibling is the right side of both lines. |
+| `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials) | Same reason: `.credentials.json` is sensitive; keep it far from `git add -f` and never on iCloud. |
 
-The bind paths are written into `docker-compose.yml` as `${HOME}/Developer/2026_Dev_ReceiptAssistant/data/...` so they work for any local user. The notebook directory `~/Developer/2026_Dev_ReceiptAssistant/` is also reachable via a symlink at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/` for the Digital Life System layout. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
+`docker-compose.yml` uses absolute `${HOME}/...` paths so they resolve identically for any local user. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
 
-### Why this layout
+### Why three locations (the four failure modes)
 
-Three layered failure modes drove the design:
+1. **OrbStack / Docker named volumes are not durable.** Lost the entire ledger on 2026-05-09 to a stack-wide volume wipe (every named volume in this project recreated at the same instant — signature of `docker compose down -v` or OrbStack reset). Recovery from Time Machine was impossible: OrbStack sets `com.apple.metadata:com_apple_backup_excludeItem` on its 8 TB sparse `data.img.raw`, so TM has never backed it up. Only the raw images in `~/Desktop/RECEIPT/` survived. → Move durable data out of Docker-managed storage entirely.
 
-1. **OrbStack / Docker named volumes are not durable.** Lost the entire ledger on 2026-05-09 to a stack-wide volume wipe (every named volume in this project recreated at the same instant — signature of `docker compose down -v` or OrbStack reset). Recovery from Time Machine was impossible: OrbStack sets `com.apple.metadata:com_apple_backup_excludeItem` on its 8 TB sparse `data.img.raw`, so TM has never backed it up. Only the raw images in `~/Desktop/RECEIPT/` survived. → Move data out of Docker-managed storage entirely.
+2. **This repo is public on GitHub.** A `data/` directory inside the repo with real receipt content or OAuth credentials would be one `.gitignore` mishap or `git add -f` away from leaking PII / secrets. → Postgres data and OAuth credentials live in a **sibling** dir (`~/Developer/receipt-assistant-data/`), not in any git tree at all. The `data/` directory in this repo is reserved for code-asset datasets (test fixtures, golden eval sets) — gitignored via `/data/` but conceptually it's where intentional dataset additions go.
 
-2. **This repo is public on GitHub.** A `data/` directory inside the repo would be one `.gitignore` mishap or `git add -f` away from publishing PII receipts to the world. → Move data out of the repo tree entirely. The bind path is *outside* this repo, so no git operation here can ever touch it.
+3. **`~/Documents/` is iCloud-synced.** Postgres data files plus iCloud's continuous block-level reupload + revisioning is a hostile combination (constant churn, fsync semantics, possible truncation races). → Postgres lives outside iCloud. **User receipt images, however, intentionally live in iCloud** because the user wants their personal receipt corpus to sync across Macs; this is fine for static image files but requires "Keep Downloaded" pinning if Optimize Storage might evict them under the bind-mount.
 
-3. **`~/Documents/` is iCloud-synced** on this user's Mac. Postgres data files plus iCloud's continuous block-level reupload + revisioning is a hostile combination (constant churn, fsync semantics, possible truncation races). → Pick a non-iCloud path. `~/Developer/` is the right side of that line.
-
-The project notebook itself lives at `~/Developer/2026_Dev_ReceiptAssistant/` (moved off iCloud 2026-05-10) with a back-symlink at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant`. The `data/` subdirectory inside the notebook holds the runtime data.
+4. **The outer project notebook lives in iCloud** (`~/Documents/10_Projects/2026_Dev_ReceiptAssistant/`, with `~/Developer/2026_Dev_ReceiptAssistant/` as a symlink back) because top-level docs (PLAN, CLAUDE.md, lab notes) are the kind of writing that should sync. The three code repos under `code/` are symlinks to `~/Developer/<repo>/` so the codebase itself stays off iCloud.
 
 Bind mounts move the failure boundary: a container or volume reset no longer touches the host filesystem. The data only goes away if *you* `rm -rf` the bind path explicitly.
 
-### Claude Code OAuth — same volume rules as before, on disk now
+### Claude Code OAuth — bind mount at sibling dir
 
-Auth is still **not** an env var, and still **not** a bind mount of the host's `~/.claude/.credentials.json`. The container holds its own independent OAuth session at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`, seeded once via `docker exec -it receipt-assistant claude /login`. The in-container CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into that path on the host. No collision with the host's native `claude` CLI because nothing is shared.
+Auth is still **not** an env var, and still **not** a bind mount of the host's `~/.claude/.credentials.json`. The container holds its own independent OAuth session at `~/Developer/receipt-assistant-data/claude/`, seeded once via `docker exec -it receipt-assistant claude /login`. The in-container CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into that path on the host. No collision with the host's native `claude` CLI because nothing is shared.
 
 **Operate this via the `setup` skill** — first-time bootstrap, 401 diagnosis, recovery procedures all live there.
 
-### Four-era timeline of OAuth approaches
+### Five-era timeline of OAuth approaches
 
 - **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized file had `refreshToken: ""`. Result: 24h 401 cycle.
 - **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW.** Broke because host and container shared a single OAuth session: host's `claude` CLI rotates the refresh token on every interactive use, invalidating the container's next call. Result: 401 every few hours.
 - **Era 3 (2026-04-20 → 2026-05-09) — Docker-managed named volume `claude-code-config`.** Worked operationally but vulnerable to volume wipes (and was wiped along with everything else on 2026-05-09).
-- **Era 4 (2026-05-09 onward) — host bind mount at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`.** Same OAuth isolation as Era 3, but now resilient to volume resets and physically located outside the public git repo. The directory only goes away if you delete it explicitly.
+- **Era 4 (2026-05-09 → 2026-05-11) — host bind mount at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`.** Volume-reset-resilient but mixed runtime state into the outer project notebook, which complicated the 2026-05-11 outer-project iCloud migration.
+- **Era 5 (2026-05-11 onward) — host bind mount at `~/Developer/receipt-assistant-data/claude/`.** Sibling dir, deliberately outside this repo and outside iCloud. Same OAuth isolation, with the runtime-state-leaks-into-docs-notebook problem solved by physical separation.
 
 ### Hard rules
 
 - **Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN`** to `.env` or `docker-compose.yml`. Env var overrides the on-disk credentials file and disables self-refresh → Era 1's 24h 401 cycle.
-- **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container collision is Era 2's bug. Always use the project's `data/claude/`, which the host's native CLI never touches.
-- **Never `rm -rf` the bind-mount path** (`~/Developer/2026_Dev_ReceiptAssistant/data/`) without realizing you're nuking the ledger, the uploads, and the OAuth session in one command. `docker compose down -v` is now harmless — bind mounts are not Docker-managed — but the host directory is unforgiving.
-- **Never periodically sync host Keychain → the bind-mounted `data/claude/`.** Re-introduces rotation collisions; in-container auto-refresh is the intended mechanism.
-- **Never move `data/` back into this repo or under `~/Documents/`.** Repo placement risks a public-repo PII leak; `~/Documents/` is iCloud-synced and incompatible with Postgres write semantics.
+- **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container collision is Era 2's bug. Use the dedicated `~/Developer/receipt-assistant-data/claude/`, which the host's native CLI never touches.
+- **Never `rm -rf ~/Developer/receipt-assistant-data/`** — that's the postgres ledger + the OAuth session in one stroke. `docker compose down -v` is harmless (bind mounts are not Docker-managed) but the host directory is unforgiving.
+- **Never periodically sync host Keychain → `receipt-assistant-data/claude/`.** Re-introduces rotation collisions; in-container auto-refresh is the intended mechanism.
+- **Never move runtime data (postgres, claude) into this repo or into the outer iCloud notebook.** Repo placement risks a public-repo PII / credential leak; iCloud placement is incompatible with Postgres write semantics and risks credential exfil via sync. Only `data/uploads/` (user images) belongs in iCloud — postgres + claude stay in the sibling dir.
 - **Recovery on 401:** `docker exec -it receipt-assistant claude /login`, follow the OAuth code flow.
 
 ## GitHub Issues
