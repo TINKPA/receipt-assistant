@@ -186,25 +186,53 @@ that trap.)
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
-## Claude Code OAuth credentials — named volume, in-container login
+## Persistent data — host bind mounts at `~/Developer/2026_Dev_ReceiptAssistant/data/`
 
-Auth is **not** an env var, and is **not** a bind mount of the host's `~/.claude/.credentials.json`. `docker-compose.yml` mounts the Docker-managed named volume `claude-code-config` at `/home/node/.claude`; the container holds its own independent OAuth session, seeded once by running `docker exec -it receipt-assistant claude /login`. The in-container `claude` CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into the volume. This matches the Anthropic-official devcontainer pattern (`anthropics/claude-code/.devcontainer/devcontainer.json`).
+All app-critical state lives on the **host filesystem**, *outside this git repo*, bind-mounted into containers. Docker named volumes are no longer used for anything that matters; the host path is also outside both this public repo and iCloud-synced `~/Documents/`.
 
-**Operate this via the `setup` skill**, not via shell scripts. The skill lives at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md` and covers first-time bootstrap, migration from the earlier bind-mount / env-var architectures, and 401 diagnosis.
+| Container path | Host bind | Purpose |
+|---|---|---|
+| `/var/lib/postgresql/data` | `~/Developer/2026_Dev_ReceiptAssistant/data/postgres/` | The ledger (postgres 17) |
+| `/data` | `~/Developer/2026_Dev_ReceiptAssistant/data/uploads/` | Uploaded receipt images |
+| `/home/node/.claude` | `~/Developer/2026_Dev_ReceiptAssistant/data/claude/` | Container's Claude Code OAuth + config |
 
-**Three-era timeline of what has and has not worked:**
+The bind paths are written into `docker-compose.yml` as `${HOME}/Developer/2026_Dev_ReceiptAssistant/data/...` so they work for any local user. The notebook directory `~/Developer/2026_Dev_ReceiptAssistant/` is also reachable via a symlink at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/` for the Digital Life System layout. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
 
-- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized file had `refreshToken: ""` so couldn't refresh even if the env var were removed. Result: 24h 401 cycle.
-- **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW into the container.** Broke because host and container shared a single OAuth session: host's native `claude` CLI rotates the refresh token on every interactive use (Anthropic docs: "Refresh tokens rotate on each use"), which invalidates the container's next call. Result: 401 every few hours instead of every 24h.
-- **Era 3 (2026-04-20 onward) — named volume `claude-code-config` + in-container `claude /login`.** Container has its own OAuth session, isolated from host and other containers. No drift, no rotation collisions. Refresh token eventually expires server-side (~weeks to months); at that point rerun `claude /login` inside the container.
+### Why this layout
 
-**Hard rules, in one place so it's harder to lose:**
+Three layered failure modes drove the design:
 
-- **Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN`** to `.env` or `docker-compose.yml`. Presence of the env var makes the CLI skip the file entirely (Anthropic auth precedence) → no refresh → Era 1's 24h 401s.
-- **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container session collision is Era 2's 401-every-few-hours bug. Always use the Docker-managed named volume `claude-code-config`.
-- **Never `docker compose down -v`** on this stack unless you want to re-run `claude /login`. The `-v` flag wipes named volumes, including `claude-code-config`. Use plain `docker compose down` or `docker compose stop`.
-- **Never periodically sync host Keychain → the volume.** It re-introduces rotation collisions; Anthropic's in-container auto-refresh is the intended mechanism.
-- **Recovery on 401:** `docker exec -it receipt-assistant claude /login`, follow the OAuth code flow, done. Do not touch host Keychain or host `~/.claude/` as part of recovery — they're unrelated to the container's OAuth session.
+1. **OrbStack / Docker named volumes are not durable.** Lost the entire ledger on 2026-05-09 to a stack-wide volume wipe (every named volume in this project recreated at the same instant — signature of `docker compose down -v` or OrbStack reset). Recovery from Time Machine was impossible: OrbStack sets `com.apple.metadata:com_apple_backup_excludeItem` on its 8 TB sparse `data.img.raw`, so TM has never backed it up. Only the raw images in `~/Desktop/RECEIPT/` survived. → Move data out of Docker-managed storage entirely.
+
+2. **This repo is public on GitHub.** A `data/` directory inside the repo would be one `.gitignore` mishap or `git add -f` away from publishing PII receipts to the world. → Move data out of the repo tree entirely. The bind path is *outside* this repo, so no git operation here can ever touch it.
+
+3. **`~/Documents/` is iCloud-synced** on this user's Mac. Postgres data files plus iCloud's continuous block-level reupload + revisioning is a hostile combination (constant churn, fsync semantics, possible truncation races). → Pick a non-iCloud path. `~/Developer/` is the right side of that line.
+
+The project notebook itself lives at `~/Developer/2026_Dev_ReceiptAssistant/` (moved off iCloud 2026-05-10) with a back-symlink at `~/Documents/10_Projects/2026_Dev_ReceiptAssistant`. The `data/` subdirectory inside the notebook holds the runtime data.
+
+Bind mounts move the failure boundary: a container or volume reset no longer touches the host filesystem. The data only goes away if *you* `rm -rf` the bind path explicitly.
+
+### Claude Code OAuth — same volume rules as before, on disk now
+
+Auth is still **not** an env var, and still **not** a bind mount of the host's `~/.claude/.credentials.json`. The container holds its own independent OAuth session at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`, seeded once via `docker exec -it receipt-assistant claude /login`. The in-container CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into that path on the host. No collision with the host's native `claude` CLI because nothing is shared.
+
+**Operate this via the `setup` skill** — first-time bootstrap, 401 diagnosis, recovery procedures all live there.
+
+### Four-era timeline of OAuth approaches
+
+- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized file had `refreshToken: ""`. Result: 24h 401 cycle.
+- **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW.** Broke because host and container shared a single OAuth session: host's `claude` CLI rotates the refresh token on every interactive use, invalidating the container's next call. Result: 401 every few hours.
+- **Era 3 (2026-04-20 → 2026-05-09) — Docker-managed named volume `claude-code-config`.** Worked operationally but vulnerable to volume wipes (and was wiped along with everything else on 2026-05-09).
+- **Era 4 (2026-05-09 onward) — host bind mount at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`.** Same OAuth isolation as Era 3, but now resilient to volume resets and physically located outside the public git repo. The directory only goes away if you delete it explicitly.
+
+### Hard rules
+
+- **Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN`** to `.env` or `docker-compose.yml`. Env var overrides the on-disk credentials file and disables self-refresh → Era 1's 24h 401 cycle.
+- **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container collision is Era 2's bug. Always use the project's `data/claude/`, which the host's native CLI never touches.
+- **Never `rm -rf` the bind-mount path** (`~/Developer/2026_Dev_ReceiptAssistant/data/`) without realizing you're nuking the ledger, the uploads, and the OAuth session in one command. `docker compose down -v` is now harmless — bind mounts are not Docker-managed — but the host directory is unforgiving.
+- **Never periodically sync host Keychain → the bind-mounted `data/claude/`.** Re-introduces rotation collisions; in-container auto-refresh is the intended mechanism.
+- **Never move `data/` back into this repo or under `~/Documents/`.** Repo placement risks a public-repo PII leak; `~/Documents/` is iCloud-synced and incompatible with Postgres write semantics.
+- **Recovery on 401:** `docker exec -it receipt-assistant claude /login`, follow the OAuth code flow.
 
 ## GitHub Issues
 

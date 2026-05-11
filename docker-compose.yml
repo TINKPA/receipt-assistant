@@ -29,7 +29,15 @@ services:
       TZ: UTC
       PGTZ: UTC
     volumes:
-      - receipts-postgres-data:/var/lib/postgresql/data
+      # Bind-mount to a host path OUTSIDE this repo so that:
+      #   1. OrbStack/Docker resets can never wipe the ledger
+      #   2. The data is physically separate from a public git repo —
+      #      no .gitignore failure mode can leak it
+      #   3. The path stays the same across multiple repos (frontend
+      #      and macOS clients can share the same uploads dir if needed)
+      # Lives inside the project notebook ~/Developer/2026_Dev_ReceiptAssistant/
+      # which is itself off iCloud-synced ~/Documents/.
+      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d receipts"]
       interval: 3s
@@ -65,20 +73,17 @@ services:
       # is fine — the prompt instructs the agent to skip geocoding.
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
     volumes:
-      - receipt-data:/data
-      # Claude Code OAuth credentials live in a **named Docker volume**,
-      # NOT a bind mount of the host's `~/.claude/`. The container holds its
-      # own independent OAuth session (seeded once via
-      # `docker exec -it receipt-assistant claude /login`) and self-refreshes
-      # forever without colliding with host or other containers.
-      # See the `setup` skill for bootstrap and recovery procedures.
-      - claude-code-config:/home/node/.claude
+      # Uploaded receipt images. Bind-mounted to host so they survive
+      # OrbStack / Docker resets (originals also kept in ~/Desktop/RECEIPT/
+      # but ingest pipeline writes its own copy here). Path lives outside
+      # this public git repo to keep PII receipt content out of the
+      # version-control blast radius.
+      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/uploads:/data
+      # Claude Code OAuth credentials. Bind-mounted onto the host (NOT a
+      # bind of host's ~/.claude/ — that caused rotation collisions in
+      # Era 2). Container has its own OAuth session, seeded once via
+      # `docker exec -it receipt-assistant claude /login`. The CLI
+      # self-refreshes and writes back into the host bind path on disk.
+      # Survives compose down/up and OrbStack resets. See `setup` skill.
+      - ${HOME}/Developer/2026_Dev_ReceiptAssistant/data/claude:/home/node/.claude
     restart: unless-stopped
-
-volumes:
-  receipt-data:
-  receipts-postgres-data:
-  # Holds the container's Claude Code credentials + config. Persists across
-  # `docker compose down` / `up` / `restart`. `docker compose down -v` WIPES
-  # it — that loses the OAuth session and requires another `claude /login`.
-  claude-code-config:
