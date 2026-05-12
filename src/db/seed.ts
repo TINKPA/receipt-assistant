@@ -69,13 +69,19 @@ const DEFAULT_CHART: AccountSeed[] = [
   {
     name: "Expenses",
     type: "expense",
+    // Seven canonical spending categories — must stay aligned with the
+    // frontend's `CATEGORIES` tuple (`receipt-assistant-frontend/src/types.ts`)
+    // and the extractor prompt's account-picker (`src/ingest/prompt.ts`
+    // Phase 4a). Adding/removing a child here without updating those two
+    // breaks the Dashboard summary buckets — see migration 0007 + #68.
     children: [
-      { name: "Groceries", type: "expense" },
-      { name: "Dining", type: "expense" },
-      { name: "Transport", type: "expense" },
-      { name: "Utilities", type: "expense" },
+      { name: "Food & Drinks", type: "expense" },
+      { name: "Transportation", type: "expense" },
+      { name: "Shopping", type: "expense" },
+      { name: "Travel", type: "expense" },
       { name: "Entertainment", type: "expense" },
-      { name: "Other", type: "expense" },
+      { name: "Health", type: "expense" },
+      { name: "Services", type: "expense" },
     ],
   },
 ];

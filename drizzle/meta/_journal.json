@@ -50,6 +50,13 @@
       "when": 1778571038628,
       "tag": "0006_chilly_smasher",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1778623810414,
+      "tag": "0007_align_expense_accounts_to_seven",
+      "breakpoints": true
     }
   ]
 }
