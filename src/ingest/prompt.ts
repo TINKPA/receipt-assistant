@@ -313,13 +313,21 @@ them first):
   WITH
     expense AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'expense' AND name = '<EXPENSE_NAME>' LIMIT 1),
     credit  AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'liability' AND name = 'Credit Card' LIMIT 1),
+    m AS (
+      INSERT INTO merchants (workspace_id, brand_id, canonical_name, category)
+      VALUES ('${ctx.workspaceId}', '<brand-id>', '<CANONICAL_NAME>', '<7-class CATEGORY>')
+      ON CONFLICT (workspace_id, brand_id) DO UPDATE
+        SET updated_at = NOW()
+      RETURNING id
+    ),
     tx AS (
       INSERT INTO transactions (
         id, workspace_id, occurred_on, payee, status,
-        source_ingest_id, metadata, created_by
+        source_ingest_id, merchant_id, metadata, created_by
       ) VALUES (
         gen_random_uuid(), '${ctx.workspaceId}', '<YYYY-MM-DD>', '<PAYEE>', 'posted',
         '${ctx.ingestId}',
+        (SELECT id FROM m),
         jsonb_build_object(
           'source', 'ingest',
           'classification', '<receipt_image|receipt_email|receipt_pdf>',
