@@ -299,10 +299,25 @@ Invariants you MUST honor:
 
 ### 4a. receipt_image / receipt_email / receipt_pdf
 
-Write one balanced transaction. Expense account is picked by
-category_hint: groceries→Groceries, dining→Dining, cafe→Dining,
-transport→Transport, retail→Other, other→Other. Fall back to Other if
-unsure. Mirror side is Credit Card (default).
+Write one balanced transaction. The expense account name is **exactly
+the \`merchant.category\` value you emitted in Phase 2.5** — one of the
+seven canonical accounts:
+
+  Food & Drinks · Transportation · Shopping · Travel ·
+  Entertainment · Health · Services
+
+If for some reason you didn't fill \`merchant.category\` in Phase 2.5,
+derive it from \`category_hint\` using this mapping:
+
+  groceries / dining / cafe   → Food & Drinks
+  transport                   → Transportation
+  retail                      → Shopping
+  other / unsure              → Services   (catch-all — Services is the
+                                            new home for anything that
+                                            doesn't fit the other six;
+                                            never invent a new account)
+
+Mirror side is Credit Card (default).
 
 Template (substitute your extracted values for the placeholders; the
 subqueries resolve account ids inline so you do NOT need to SELECT
