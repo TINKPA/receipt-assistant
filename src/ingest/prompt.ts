@@ -86,6 +86,54 @@ For statement_pdf, pull rows: { date, payee, amount_minor }.
 
 For unsupported, record a short reason.
 
+── Phase 2.5 — Merchant canonicalization (#64) ────────────────────────
+
+For receipt_image / receipt_email / receipt_pdf only. After extracting
+the payee, emit a \`merchant\` block — the aggregation key for the
+frontend merchant page (see \`receipt-assistant-frontend#33\`). This is
+the most attention-sensitive new ask in the prompt; keep it terse.
+
+  canonical_name : the brand's display name with store ID / location /
+                   punctuation suffixes stripped. Single independent
+                   merchants keep their full name.
+                     "Costco #479"             → "Costco"
+                     "STARBUCKS STORE 12345"   → "Starbucks"
+                     "Apple Store, Pasadena"   → "Apple Store"
+                     "secure8.store.apple.com" → "Apple Store"
+                     "Wing Hop Fung Sawtelle"  → "Wing Hop Fung"
+                     "Wang Fu 王府饭店"        → "Wang Fu" (drop CJK
+                       parenthetical if a Latin name is present; if
+                       only CJK, use Hanyu Pinyin without tones)
+  brand_id       : kebab-case stable identifier. ASCII lowercase, digits,
+                   hyphens. Regex: ^[a-z0-9-]+$
+                   The SAME brand MUST always collapse to the SAME id —
+                   "Costco", "Costco #479", "COSTCO WHOLESALE" → all
+                   "costco". Strip CJK/accents (Pinyin for Chinese,
+                   Romaji for Japanese).
+                     "Apple Store"     → "apple-store"
+                     "The UPS Store"   → "the-ups-store"
+                     "Urth Caffé"      → "urth-caffe"
+                     "王府饭店"        → "wang-fu"
+  category       : one of "Food & Drinks" | "Transportation" | "Shopping"
+                   | "Travel" | "Entertainment" | "Health" | "Services".
+                   This is the per-transaction 7-class taxonomy used by
+                   the frontend Dashboard — NOT the same axis as
+                   \`category_hint\` above (groceries/dining/retail/…).
+                   It is OK for the same brand to land in different
+                   categories on different receipts (Costco warehouse
+                   → Shopping; Costco gas → Transportation).
+                   Mapping crib:
+                     dining/cafe/groceries/bakery   → "Food & Drinks"
+                     retail/department/apparel     → "Shopping"
+                     gas/transit/parking/rideshare → "Transportation"
+                     pharmacy/medical/dental       → "Health"
+                     shipping/subscriptions/utilities/rent/laundry → "Services"
+                     concerts/movies/streaming     → "Entertainment"
+                     hotel/flight/cruise           → "Travel"
+
+The merchant block goes into the transaction's \`metadata.merchant\` JSON
+key (see the Phase 4 template).
+
 ── Phase 3 — Geocode (receipt_image / receipt_email / receipt_pdf only) ──
 
 Resolve the merchant location to a Google Places entry IF you can do
@@ -276,7 +324,12 @@ them first):
           'source', 'ingest',
           'classification', '<receipt_image|receipt_email|receipt_pdf>',
           'category_hint', '<CATEGORY_HINT>',
-          'source_ingest_id', '${ctx.ingestId}'
+          'source_ingest_id', '${ctx.ingestId}',
+          'merchant', jsonb_build_object(
+            'canonical_name', '<CANONICAL_NAME>',
+            'brand_id',       '<brand-id>',
+            'category',       '<7-class CATEGORY>'
+          )
           -- add tax/tip/items/raw_text here if useful, as extra JSONB keys
         ),
         '${ctx.userId}'
