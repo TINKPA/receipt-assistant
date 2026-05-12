@@ -12,6 +12,7 @@ import { buildApp } from "./app.js";
 import { runMigrations } from "./db/migrate.js";
 import { seed } from "./db/seed.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
+import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
@@ -35,6 +36,11 @@ async function main(): Promise<void> {
   // as HTTP so the DB pool + v1 services are shared.
   await startIngestWorker();
   console.log(`⚙️  Ingest worker ready (concurrency ${process.env.MAX_CLAUDE_CONCURRENCY ?? 3})`);
+
+  // Background poller that fills place_id / address / lat / lng on
+  // newly-canonicalized merchant rows. No-ops when GOOGLE_MAPS_API_KEY
+  // is unset, so dev environments without a key boot cleanly.
+  startMerchantEnrichmentLoop();
 
   const app = buildApp();
   app.listen(PORT, "0.0.0.0", () => {
