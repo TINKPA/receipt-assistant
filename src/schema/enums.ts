@@ -65,3 +65,13 @@ export const ingestStatusEnum = pgEnum("ingest_status", [
   "error",
   "unsupported",
 ]);
+
+// Background-enrichment state for merchant rows (#64). New merchants land
+// as `pending`; the Places worker advances to `success`/`not_found`/`failed`
+// after one round-trip to Google Places. `failed` retries on backoff.
+export const merchantEnrichmentStatusEnum = pgEnum("merchant_enrichment_status", [
+  "pending",
+  "success",
+  "not_found",
+  "failed",
+]);

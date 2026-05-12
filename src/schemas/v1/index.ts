@@ -5,3 +5,4 @@ export * from "./document.js";
 export * from "./ingest.js";
 export * from "./reconcile.js";
 export * from "./report.js";
+export * from "./merchant.js";

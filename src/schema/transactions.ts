@@ -14,6 +14,7 @@ import { workspaces } from "./workspaces.js";
 import { users } from "./users.js";
 import { ingests } from "./ingests.js";
 import { places } from "./places.js";
+import { merchants } from "./merchants.js";
 
 export const transactions = pgTable(
   "transactions",
@@ -48,6 +49,13 @@ export const transactions = pgTable(
     placeId: uuid("place_id").references(() => places.id, {
       onDelete: "set null",
     }),
+    // FK to `merchants` for canonical brand aggregation (#64). Nullable
+    // during the migration window: rows written before extractor emits a
+    // `merchant` block won't have a merchant_id until the backfill script
+    // runs over them.
+    merchantId: uuid("merchant_id").references(() => merchants.id, {
+      onDelete: "set null",
+    }),
     metadata: jsonb("metadata").notNull().default({}),
     version,
     createdBy: uuid("created_by").references(() => users.id, {
@@ -75,5 +83,6 @@ export const transactions = pgTable(
     index("transactions_source_ingest_idx").on(t.sourceIngestId),
     index("transactions_trip_idx").on(t.tripId),
     index("transactions_place_idx").on(t.placeId),
+    index("transactions_merchant_idx").on(t.workspaceId, t.merchantId),
   ],
 );

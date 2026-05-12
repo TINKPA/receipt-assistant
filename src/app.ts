@@ -28,6 +28,7 @@ import {
 } from "./routes/ingest.js";
 import { reconcileRouter } from "./routes/reconcile.js";
 import { reportsRouter } from "./routes/reports.js";
+import { merchantsRouter } from "./routes/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 
 export function buildApp(): Express {
@@ -78,6 +79,7 @@ export function buildApp(): Express {
   app.use("/v1/batches", batchesRouter);
   app.use("/v1/ingests", ingestsRouter);
   app.use("/v1/reports", reportsRouter);
+  app.use("/v1/merchants", merchantsRouter);
 
   // ── Final error handler ─────────────────────────────────────────────
   app.use(problemHandler);

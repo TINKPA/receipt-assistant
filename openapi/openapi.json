@@ -2016,6 +2016,232 @@
           "buckets"
         ]
       },
+      "Merchant": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "brand_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "canonical_name": {
+            "type": "string"
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "place_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "photo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "photo_attribution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lat": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lng": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "enrichment_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "success",
+              "not_found",
+              "failed"
+            ]
+          },
+          "enrichment_attempted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "brand_id",
+          "canonical_name",
+          "category",
+          "place_id",
+          "photo_url",
+          "photo_attribution",
+          "address",
+          "lat",
+          "lng",
+          "enrichment_status",
+          "enrichment_attempted_at",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "MerchantStats": {
+        "type": "object",
+        "properties": {
+          "transaction_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lifetime_spend_minor": {
+            "type": "integer"
+          },
+          "current_month_spend_minor": {
+            "type": "integer"
+          },
+          "last_transaction_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "transaction_count",
+          "lifetime_spend_minor",
+          "current_month_spend_minor",
+          "last_transaction_date",
+          "currency"
+        ]
+      },
+      "MerchantDetail": {
+        "type": "object",
+        "properties": {
+          "merchant": {
+            "$ref": "#/components/schemas/Merchant"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/MerchantStats"
+          }
+        },
+        "required": [
+          "merchant",
+          "stats"
+        ]
+      },
+      "MerchantTransactionRow": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "occurred_on": {
+            "type": "string"
+          },
+          "payee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "posted",
+              "voided",
+              "reconciled",
+              "error"
+            ]
+          },
+          "total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "document_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          }
+        },
+        "required": [
+          "id",
+          "occurred_on",
+          "payee",
+          "status",
+          "total_minor",
+          "currency",
+          "document_id"
+        ]
+      },
+      "MerchantTransactionsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MerchantTransactionRow"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ]
+      },
       "NewPosting": {
         "type": "object",
         "properties": {
@@ -4980,6 +5206,107 @@
           },
           "404": {
             "description": "Workspace not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/merchants/{id}": {
+      "get": {
+        "summary": "Merchant detail + KPIs",
+        "description": "`id` accepts either the merchant row's UUID or its kebab-case `brand_id`.",
+        "tags": [
+          "merchants"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Merchant with aggregated stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MerchantDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Merchant not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/merchants/{id}/transactions": {
+      "get": {
+        "summary": "Transactions for a merchant, newest first, keyset-paginated",
+        "tags": [
+          "merchants"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "cursor",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated transactions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MerchantTransactionsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Merchant not found",
             "content": {
               "application/problem+json": {
                 "schema": {
