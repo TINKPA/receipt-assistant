@@ -57,6 +57,13 @@
       "when": 1778623810414,
       "tag": "0007_align_expense_accounts_to_seven",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1778636612525,
+      "tag": "0008_backfill_canonical_merchant_category",
+      "breakpoints": true
     }
   ]
 }
