@@ -306,16 +306,10 @@ seven canonical accounts:
   Food & Drinks · Transportation · Shopping · Travel ·
   Entertainment · Health · Services
 
-If for some reason you didn't fill \`merchant.category\` in Phase 2.5,
-derive it from \`category_hint\` using this mapping:
-
-  groceries / dining / cafe   → Food & Drinks
-  transport                   → Transportation
-  retail                      → Shopping
-  other / unsure              → Services   (catch-all — Services is the
-                                            new home for anything that
-                                            doesn't fit the other six;
-                                            never invent a new account)
+\`merchant.category\` is REQUIRED — Phase 2.5 is not optional and you
+must not skip it. If a merchant genuinely doesn't fit the other six
+buckets, use Services as the catch-all. Never invent a new account
+and never leave the category blank.
 
 Mirror side is Credit Card (default).
 
