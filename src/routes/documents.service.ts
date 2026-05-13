@@ -5,7 +5,7 @@
  * under `UPLOAD_DIR`, insert into `documents`, etc.
  */
 import { createHash } from "crypto";
-import { mkdir, writeFile, unlink } from "fs/promises";
+import { mkdir, writeFile, rename } from "fs/promises";
 import * as path from "path";
 import { and, eq, sql, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -309,12 +309,42 @@ export async function restoreDocument(params: {
 }
 
 /**
+ * Move a hard-deleted receipt's bytes into a `.trash/` subfolder of the
+ * uploads directory instead of unlinking them. Same filesystem, so
+ * `rename` is atomic; same bind mount, so the file stays inside the
+ * existing iCloud + Time Machine coverage.
+ *
+ * Why: receipt images are user PII the user wants permanently. The
+ * historical `unlink` path made hard delete irreversible, and recovery
+ * required Time-Machine APFS-snapshot forensics — see #72 for the
+ * incident report. A trash subfolder keeps the bytes one `mv` away.
+ *
+ * Best-effort: a missing source file (e.g. already moved by a prior
+ * cascade, or never written) returns silently. The DB row is the
+ * source-of-truth state; quarantining is a recoverability bonus.
+ */
+async function quarantineFile(filePath: string): Promise<string | null> {
+  try {
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    const trashDir = path.join(dir, ".trash");
+    await mkdir(trashDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const dest = path.join(trashDir, `${stamp}__${base}`);
+    await rename(filePath, dest);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Hard delete: row + on-disk bytes. By default refuses if links exist
  * (caller is expected to call cascade or unlink first). The image
- * file is removed AFTER the DB commit so a rollback doesn't leave a
- * deleted-on-disk-but-present-in-db state. The reverse risk (file
- * gone, row missed) is acceptable because the bytes are reproducible
- * from the user's source.
+ * file is moved to `.trash/` AFTER the DB commit so a rollback doesn't
+ * leave a quarantined-on-disk-but-present-in-db state. The reverse
+ * risk (file quarantined, row missed) is acceptable because the bytes
+ * are recoverable from the trash subfolder.
  */
 export async function hardDeleteDocument(params: {
   workspaceId: string;
@@ -337,14 +367,7 @@ export async function hardDeleteDocument(params: {
 
   await db.delete(documents).where(eq(documents.id, documentId));
 
-  if (filePath) {
-    try {
-      await unlink(filePath);
-    } catch {
-      // File missing or permission issue — log nothing and move on;
-      // the row is gone, which is the source-of-truth state.
-    }
-  }
+  if (filePath) await quarantineFile(filePath);
   return true;
 }
 
@@ -512,11 +535,7 @@ export async function cascadeDeleteDocument(params: {
   });
 
   if (pendingFileUnlink) {
-    try {
-      await unlink(pendingFileUnlink);
-    } catch {
-      // best-effort
-    }
+    await quarantineFile(pendingFileUnlink);
   }
 
   return { ...report, hardDeletedFilePath: pendingFileUnlink };

@@ -8,10 +8,12 @@
  *   POST   /v1/documents/:id/links       — link to a transaction
  *   DELETE /v1/documents/:id/links/:txn  — unlink
  *   DELETE /v1/documents/:id             — soft delete (default), or
- *                                          ?hard=true (row + file) /
- *                                          ?cascade=true (also handle
- *                                          linked txns; combine with
- *                                          ?hard=true for full purge)
+ *                                          ?hard=true (row + file moved
+ *                                          to .trash/) / ?cascade=true
+ *                                          (also handle linked txns;
+ *                                          combine with ?hard=true for
+ *                                          full purge — file still goes
+ *                                          to .trash/, never unlinked)
  *   POST   /v1/documents/:id/restore     — clear deleted_at
  *
  * Idempotency here is intentionally *not* driven by the
@@ -414,19 +416,21 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
     method: "delete",
     path: "/v1/documents/{id}",
     summary:
-      "Delete a document. Soft-deletes by default; ?hard=true removes the row + file; ?cascade=true also handles linked transactions.",
+      "Delete a document. Soft-deletes by default; ?hard=true removes the row and quarantines the file under .trash/; ?cascade=true also handles linked transactions.",
     description:
       "Default: soft delete (sets deleted_at). " +
-      "?hard=true: hard delete (row + file); requires no remaining links unless ?cascade=true is also set. " +
+      "?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. " +
       "?cascade=true: linked posted transactions are voided, draft/error transactions are hard-deleted, voided transactions are left intact, reconciled transactions abort the operation with 409. " +
-      "?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document is hard-deleted, and the image file is removed. " +
+      "?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). " +
       "Reconciled transactions always block hard cascades — unreconcile first.",
     tags: ["documents"],
     request: {
       params: z.object({ id: Uuid }),
       query: z.object({
         hard: z.enum(["true", "false", "1", "0"]).optional().openapi({
-          description: "Hard-delete the row and the on-disk image. Default false.",
+          description:
+            "Hard-delete the row and quarantine the on-disk image into <uploads_dir>/.trash/. " +
+            "The image is moved, not unlinked — recoverable by hand. Default false.",
         }),
         cascade: z.enum(["true", "false", "1", "0"]).optional().openapi({
           description:

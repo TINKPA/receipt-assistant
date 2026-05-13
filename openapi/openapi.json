@@ -4126,8 +4126,8 @@
         }
       },
       "delete": {
-        "summary": "Delete a document. Soft-deletes by default; ?hard=true removes the row + file; ?cascade=true also handles linked transactions.",
-        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row + file); requires no remaining links unless ?cascade=true is also set. ?cascade=true: linked posted transactions are voided, draft/error transactions are hard-deleted, voided transactions are left intact, reconciled transactions abort the operation with 409. ?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document is hard-deleted, and the image file is removed. Reconciled transactions always block hard cascades — unreconcile first.",
+        "summary": "Delete a document. Soft-deletes by default; ?hard=true removes the row and quarantines the file under .trash/; ?cascade=true also handles linked transactions.",
+        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: linked posted transactions are voided, draft/error transactions are hard-deleted, voided transactions are left intact, reconciled transactions abort the operation with 409. ?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). Reconciled transactions always block hard cascades — unreconcile first.",
         "tags": [
           "documents"
         ],
@@ -4151,7 +4151,7 @@
                 "1",
                 "0"
               ],
-              "description": "Hard-delete the row and the on-disk image. Default false."
+              "description": "Hard-delete the row and quarantine the on-disk image into <uploads_dir>/.trash/. The image is moved, not unlinked — recoverable by hand. Default false."
             },
             "required": false,
             "name": "hard",
