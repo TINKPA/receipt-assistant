@@ -121,10 +121,24 @@ export async function loadPlacesByIds(
 
 /**
  * Single-place fetch including photo refs. Used by GET /v1/places/:id.
+ *
+ * Identifier accepts EITHER the row's UUID `id` OR Google's stable
+ * `google_place_id` (`ChIJ…`-shaped). The latter is what
+ * `merchants.place_id` stores (the field name is misleading — it
+ * holds Google's id, not our FK; schema comment in
+ * `src/schema/merchants.ts:52`). Recognizing both keeps callers from
+ * having to maintain a separate lookup path for that distinction.
  */
 export async function loadPlaceById(id: string): Promise<PlaceRow | null> {
-  const rows = await db.select().from(places).where(eq(places.id, id));
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  const rows = await db
+    .select()
+    .from(places)
+    .where(isUuid ? eq(places.id, id) : eq(places.googlePlaceId, id));
   if (rows.length === 0) return null;
+  // Photos are keyed by the row's UUID — even if the caller passed a
+  // Google place_id we must resolve to UUID for the photos join.
+  const placeUuid = rows[0]!.id;
   const photoRows = await db
     .select({
       rank: placePhotos.rank,
@@ -134,7 +148,7 @@ export async function loadPlaceById(id: string): Promise<PlaceRow | null> {
       ocr_extracted: placePhotos.ocrExtracted,
     })
     .from(placePhotos)
-    .where(eq(placePhotos.placeId, id))
+    .where(eq(placePhotos.placeId, placeUuid))
     .orderBy(placePhotos.rank);
   return {
     ...rowToApi(rows[0]!),
