@@ -134,45 +134,163 @@ the most attention-sensitive new ask in the prompt; keep it terse.
 The merchant block goes into the transaction's \`metadata.merchant\` JSON
 key (see the Phase 4 template).
 
-── Phase 3 — Geocode (receipt_image / receipt_email / receipt_pdf only) ──
+── Phase 3 — Resolve place + fetch multilingual record (#74) ──────────
 
-Resolve the merchant location to a Google Places entry IF you can do
-so with high confidence. Call Google Maps APIs via the Bash tool; the
-API key is in the GOOGLE_MAPS_API_KEY environment variable.
+Goal: get a stable \`google_place_id\` for the merchant, fetch its full
+multilingual record from Google v1, cache locally. If the place is
+Chinese-named and Google text doesn't carry the Chinese, OCR the
+storefront photo for the CJK characters. Local-first — every step
+checks the DB before paying Google.
 
-Decision tree (in order — stop at first match):
+For receipt_image / receipt_email / receipt_pdf only. The API key is
+in the GOOGLE_MAPS_API_KEY environment variable.
 
-  (a) \$GOOGLE_MAPS_API_KEY is empty → skip geocoding.
-  (b) Receipt shows a full street address → call Geocoding API:
+### Phase 3a — Resolve google_place_id
+
+Decision tree (stop at first match):
+
+  (a) \$GOOGLE_MAPS_API_KEY is empty → skip the rest of Phase 3.
+  (b) Receipt shows a full street address → Geocoding API:
 
         ADDR='1380 Stockton St, San Francisco, CA 94133'
         QS=\$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "\$ADDR")
-        curl -sS "https://maps.googleapis.com/maps/api/geocode/json?address=\$QS&key=\$GOOGLE_MAPS_API_KEY"
+        curl -sS "https://maps.googleapis.com/maps/api/geocode/json?address=\$QS&language=zh-CN&key=\$GOOGLE_MAPS_API_KEY"
 
-      If status=="OK" and results is non-empty, use results[0].
-      Record source="google_geocode".
+      Use the top result's \`place_id\`. Source = "google_geocode".
+      Note \`language=zh-CN\` — Google returns localized name when it has
+      one (e.g. Wing Hop Fung at 725 W Garvey returns
+      "Wing Hop Fung(永合丰)Monterey Park Store" instead of plain
+      "Wing Hop Fung").
 
-  (c) No address, but receipt shows merchant + a locality hint (city
-      name on the header, state abbreviation, or ZIP code) → call
-      Places Find-Place-From-Text with the locality in the query:
+  (c) Address missing but receipt shows merchant + locality → Find-Place-From-Text:
 
-        Q='Wing On Market San Francisco'
+        Q='Wing Hop Fung Monterey Park'
         QS=\$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "\$Q")
-        curl -sS "https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=\$QS&inputtype=textquery&fields=place_id,name,formatted_address,geometry&key=\$GOOGLE_MAPS_API_KEY"
+        curl -sS "https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=\$QS&inputtype=textquery&fields=place_id,name,formatted_address&language=zh-CN&key=\$GOOGLE_MAPS_API_KEY"
 
-      If status=="OK" and candidates is non-empty, use candidates[0].
-      Record source="google_places".
+      Use candidates[0].place_id. Source = "google_places".
 
-  (d) Only merchant name, no locality anywhere on receipt → skip.
-      Bare names like "Costco" resolve to random branches.
+  (d) Only merchant name, no locality anywhere on receipt → skip the
+      rest of Phase 3. Bare names like "Costco" resolve to random
+      branches.
 
-Validation (MUST do before using a geocode result):
-  - The top result's formatted_address MUST contain one of the
-    locality tokens visible on the receipt (city name, two-letter
-    state abbreviation, or ZIP code). If none match, skip — you got a
-    wrong-city match.
-  - Any non-OK API status, HTTP error, timeout, or parse failure →
-    skip. Geocoding is best-effort and never blocks extraction.
+Validation: top result's formatted_address MUST contain a locality
+token from the receipt (city, state abbr, or ZIP). No match → skip.
+Any non-OK status / HTTP error → skip. Phase 3 is best-effort.
+
+### Phase 3b — Local-first cache check
+
+Before hitting any v1 endpoint, check whether we already have this
+place cached:
+
+  PID='<google_place_id from 3a>'
+  EXISTING=\$(psql "\$DATABASE_URL" -tA -c "SELECT id FROM places WHERE google_place_id = '\$PID'")
+
+If EXISTING is non-empty (the place is cached):
+  - Use the cached row id as your tx.place_id in Phase 4.
+  - Bump \`last_seen_at\`/\`hit_count\` via the upsert in Phase 4 — that
+    statement handles both insert-new and increment-existing.
+  - SKIP Phase 3c entirely. No outbound Google calls.
+
+Only when EXISTING is empty do you proceed to 3c.
+
+### Phase 3c — Dual-language v1 fetch + photos
+
+For uncached places, run TWO v1 \`places/{id}\` calls in sequence — once
+in en, once in zh-CN — using the wildcard FieldMask so we capture every
+field for the local cache:
+
+  PID='<google_place_id>'
+  for L in en zh-CN; do
+    curl -sS "https://places.googleapis.com/v1/places/\$PID?languageCode=\$L" \\
+      -H "X-Goog-Api-Key: \$GOOGLE_MAPS_API_KEY" \\
+      -H "X-Goog-FieldMask: *" \\
+      > /tmp/place_\${L}.json
+  done
+
+Extract these fields for the SQL upsert (read both files):
+
+  From the en response:
+    display_name_en          ← .displayName.text
+    formatted_address_en     ← .formattedAddress
+    primary_type             ← .primaryType
+    types[]                  ← .types
+    business_status          ← .businessStatus
+    business_hours           ← .regularOpeningHours (jsonb verbatim)
+    time_zone                ← .timeZone.id
+    rating                   ← .rating
+    user_rating_count        ← .userRatingCount
+    national_phone_number    ← .nationalPhoneNumber
+    website_uri              ← .websiteUri
+    google_maps_uri          ← .googleMapsUri
+    postal_code              ← .postalAddress.postalCode
+    country_code             ← .postalAddress.regionCode
+    lat, lng                 ← .location.{latitude,longitude}
+    photos[]                 ← .photos (array of {name, widthPx, heightPx, authorAttributions})
+
+  From the zh-CN response (only if its displayName.languageCode starts
+  with \`zh\` — otherwise Google fell back to en and there is no Chinese
+  name to store):
+    display_name_zh          ← .displayName.text
+    display_name_zh_locale   ← .displayName.languageCode   (e.g. "zh")
+    display_name_zh_source   ← "google_text"
+    primary_type_display_zh  ← .primaryTypeDisplayName.text
+    maps_type_label_zh       ← .googleMapsTypeLabel.text
+    formatted_address_zh     ← .formattedAddress
+
+  Build raw_response as:
+    { "v1": { "en": <full en body>, "zh-CN": <full zh body> },
+      "fetched_at": "<ISO timestamp>" }
+
+### Phase 3d — Storefront-photo OCR fallback (only when needed)
+
+Trigger this ONLY when BOTH:
+  - Phase 3c left \`display_name_zh\` NULL (Google text has no Chinese), AND
+  - You judge the merchant is likely Chinese-named (receipt OCR text
+    contains CJK characters, OR the brand name reads as Cantonese/
+    Mandarin transliteration). When unsure, run it — false positives
+    just return null.
+
+Procedure: download the top up to 3 photos at \`maxHeightPx=1600\`,
+read them, return any CJK characters on storefront signage:
+
+  PID='<google_place_id>'
+  python3 - <<'PY' > /tmp/place_photos.txt
+import json
+photos = json.load(open('/tmp/place_en.json')).get('photos', [])[:3]
+for i, p in enumerate(photos):
+    print(f"{i}\\t{p['name']}\\t{p.get('widthPx',0)}x{p.get('heightPx',0)}")
+PY
+
+  while IFS=\$'\\t' read -r RANK NAME DIM; do
+    curl -sSL "https://places.googleapis.com/v1/\$NAME/media?maxHeightPx=1600&key=\$GOOGLE_MAPS_API_KEY" \\
+      -o "/tmp/place_photo_\$RANK.jpg"
+  done < /tmp/place_photos.txt
+
+Then read each downloaded photo and inspect storefront signage for
+CJK. Be conservative:
+  - Return the Chinese characters EXACTLY as they appear on the sign.
+  - If multiple candidate strings appear (店招 + 商品标签 + 装饰),
+    prefer the one that reads as a brand/shop name and is visually
+    largest. Goods tags are not the store name.
+  - If NO CJK is unambiguously visible on signage, return null. Do
+    not transliterate from the English name. Do not guess.
+
+When OCR yields a string:
+  display_name_zh          ← that string (e.g. "永安")
+  display_name_zh_locale   ← "zh"
+  display_name_zh_source   ← "photo_ocr"
+
+Always record per-photo OCR provenance in metadata regardless:
+  metadata.photo_ocr = [
+    {"rank":0,"chinese_chars":"永安","confidence":"high"},
+    {"rank":1,"chinese_chars":null,"confidence":"n/a"},
+    ...
+  ]
+
+Photos are downloaded for the cache regardless — Phase 4 inserts a
+\`place_photos\` row per photo with the local file_path; the OCR
+fallback just adds the \`ocr_extracted\` jsonb to the photos it read.
 
 ── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
 
@@ -376,26 +494,115 @@ them first):
   SQL
 
 If you have a geocode result, run this AFTER the main transaction
-(use the tx_id printed above):
+(use the tx_id printed above).
+
+The INSERT is a full multilingual upsert (#74). For uncached places
+include every column you extracted in Phase 3c/3d. For cached places
+the ON CONFLICT clause keeps existing per-language data and the
+\`custom_name_zh\` user override; only \`last_seen_at\` and \`hit_count\`
+bump. \`COALESCE(EXCLUDED.x, places.x)\` ensures a NEW fetch that
+returned NULL for a field never overwrites a previously-good value.
 
   psql "\$DATABASE_URL" <<'SQL'
   WITH
     place AS (
       INSERT INTO places (
         id, google_place_id, formatted_address, lat, lng, source, raw_response,
-        first_seen_at, last_seen_at, hit_count
+        first_seen_at, last_seen_at, hit_count,
+        display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source,
+        primary_type, primary_type_display_zh, maps_type_label_zh, types,
+        formatted_address_en, formatted_address_zh, postal_code, country_code,
+        business_status, business_hours, time_zone,
+        rating, user_rating_count,
+        national_phone_number, website_uri, google_maps_uri
       ) VALUES (
-        gen_random_uuid(), '<PLACE_ID>', '<FORMATTED_ADDRESS>', <LAT>, <LNG>,
-        '<google_geocode|google_places>', '<RAW_JSON_STRING>'::jsonb,
-        NOW(), NOW(), 1
+        gen_random_uuid(),
+        '<PLACE_ID>', '<FORMATTED_ADDRESS>', <LAT>, <LNG>,
+        '<google_geocode|google_places>',
+        '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb,
+        NOW(), NOW(), 1,
+        <NULLABLE_TEXT 'display_name_en'>,
+        <NULLABLE_TEXT 'display_name_zh'>,
+        <NULLABLE_TEXT 'display_name_zh_locale'>,
+        <NULLABLE_TEXT 'display_name_zh_source'>,           -- 'google_text' | 'photo_ocr' | NULL
+        <NULLABLE_TEXT 'primary_type'>,
+        <NULLABLE_TEXT 'primary_type_display_zh'>,
+        <NULLABLE_TEXT 'maps_type_label_zh'>,
+        <NULLABLE_TEXT_ARRAY 'types[]'>,                     -- e.g. ARRAY['store','food']::text[] or NULL
+        <NULLABLE_TEXT 'formatted_address_en'>,
+        <NULLABLE_TEXT 'formatted_address_zh'>,
+        <NULLABLE_TEXT 'postal_code'>,
+        <NULLABLE_TEXT 'country_code'>,
+        <NULLABLE_TEXT 'business_status'>,
+        <NULLABLE_JSONB 'business_hours'>,
+        <NULLABLE_TEXT 'time_zone'>,
+        <NULLABLE_NUMERIC 'rating'>,
+        <NULLABLE_INT 'user_rating_count'>,
+        <NULLABLE_TEXT 'national_phone_number'>,
+        <NULLABLE_TEXT 'website_uri'>,
+        <NULLABLE_TEXT 'google_maps_uri'>
       )
       ON CONFLICT (google_place_id) DO UPDATE
-        SET last_seen_at = NOW(), hit_count = places.hit_count + 1
+        SET last_seen_at = NOW(),
+            hit_count = places.hit_count + 1,
+            raw_response = EXCLUDED.raw_response,
+            display_name_en          = COALESCE(EXCLUDED.display_name_en,          places.display_name_en),
+            display_name_zh          = COALESCE(EXCLUDED.display_name_zh,          places.display_name_zh),
+            display_name_zh_locale   = COALESCE(EXCLUDED.display_name_zh_locale,   places.display_name_zh_locale),
+            display_name_zh_source   = COALESCE(EXCLUDED.display_name_zh_source,   places.display_name_zh_source),
+            primary_type             = COALESCE(EXCLUDED.primary_type,             places.primary_type),
+            primary_type_display_zh  = COALESCE(EXCLUDED.primary_type_display_zh,  places.primary_type_display_zh),
+            maps_type_label_zh       = COALESCE(EXCLUDED.maps_type_label_zh,       places.maps_type_label_zh),
+            types                    = COALESCE(EXCLUDED.types,                    places.types),
+            formatted_address_en     = COALESCE(EXCLUDED.formatted_address_en,     places.formatted_address_en),
+            formatted_address_zh     = COALESCE(EXCLUDED.formatted_address_zh,     places.formatted_address_zh),
+            postal_code              = COALESCE(EXCLUDED.postal_code,              places.postal_code),
+            country_code             = COALESCE(EXCLUDED.country_code,             places.country_code),
+            business_status          = COALESCE(EXCLUDED.business_status,          places.business_status),
+            business_hours           = COALESCE(EXCLUDED.business_hours,           places.business_hours),
+            time_zone                = COALESCE(EXCLUDED.time_zone,                places.time_zone),
+            rating                   = COALESCE(EXCLUDED.rating,                   places.rating),
+            user_rating_count        = COALESCE(EXCLUDED.user_rating_count,        places.user_rating_count),
+            national_phone_number    = COALESCE(EXCLUDED.national_phone_number,    places.national_phone_number),
+            website_uri              = COALESCE(EXCLUDED.website_uri,              places.website_uri),
+            google_maps_uri          = COALESCE(EXCLUDED.google_maps_uri,          places.google_maps_uri)
+            -- Note: custom_name_zh is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches.
       RETURNING id
     )
   UPDATE transactions SET place_id = (SELECT id FROM place), updated_at = NOW()
    WHERE id = '<TX_ID>' AND workspace_id = '${ctx.workspaceId}';
   SQL
+
+If you downloaded photos in Phase 3c, insert one \`place_photos\` row
+per photo. Move the temp files into the shared uploads dir under
+\`/data/uploads/places/<google_place_id>/<rank>__<sha256>.<ext>\` and
+record \`file_path\` accordingly:
+
+  PID='<google_place_id>'
+  PLACE_DIR="/data/uploads/places/\$PID"
+  mkdir -p "\$PLACE_DIR"
+  for f in /tmp/place_photo_*.jpg; do
+    [ -f "\$f" ] || continue
+    RANK=\$(basename "\$f" | sed -E 's/place_photo_([0-9]+)\\.jpg/\\1/')
+    SHA=\$(sha256sum "\$f" | awk '{print \$1}')
+    DEST="\$PLACE_DIR/\${RANK}__\${SHA}.jpg"
+    mv "\$f" "\$DEST"
+    SIZE=\$(stat -c%s "\$DEST" 2>/dev/null || stat -f%z "\$DEST")
+    PHOTO_NAME=\$(awk -v r="\$RANK" '\$1==r {print \$2}' /tmp/place_photos.txt)
+    WH=\$(awk -v r="\$RANK" '\$1==r {print \$3}' /tmp/place_photos.txt)
+    W=\${WH%x*}; H=\${WH#*x}
+    psql "\$DATABASE_URL" -c "
+      INSERT INTO place_photos (place_id, google_photo_name, rank, width_px, height_px, file_path, mime_type, sha256, ocr_extracted)
+      VALUES (
+        (SELECT id FROM places WHERE google_place_id = '\$PID'),
+        '\$PHOTO_NAME',
+        \$RANK, \$W, \$H,
+        '\$DEST', 'image/jpeg', '\$SHA',
+        <jsonb_build_object('chinese_chars', '...', 'model', 'claude-...', 'confidence', '...', 'ran_at', NOW()) or NULL>
+      )
+      ON CONFLICT (place_id, google_photo_name) DO NOTHING;
+    "
+  done
 
 Also stamp the document row (ties it back to this ingest):
 

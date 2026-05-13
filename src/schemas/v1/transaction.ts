@@ -10,6 +10,7 @@ import {
   Metadata,
   Uuid,
 } from "./common.js";
+import { Place } from "./place.js";
 
 export const TxnStatus = z.enum([
   "draft",
@@ -51,21 +52,8 @@ export const TransactionDocumentRef = z
   })
   .openapi("TransactionDocumentRef");
 
-/**
- * Google Places entry associated with a transaction's merchant location.
- * Shared across workspaces via the `places` table; joined into the
- * transaction response for display convenience.
- */
-export const Place = z
-  .object({
-    id: Uuid,
-    google_place_id: z.string(),
-    formatted_address: z.string(),
-    lat: z.number(),
-    lng: z.number(),
-    source: z.enum(["google_geocode", "google_places"]),
-  })
-  .openapi("Place");
+// Place schema moved to ./place.ts (#74). The Place is now a richer
+// multilingual record — see src/schemas/v1/place.ts.
 
 export const Transaction = z
   .object({

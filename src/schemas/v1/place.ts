@@ -1,0 +1,85 @@
+import { z } from "zod";
+import { Uuid } from "./common.js";
+
+/**
+ * Google Places entry. Shared resource keyed by `google_place_id` —
+ * the same merchant visited across workspaces is one row.
+ *
+ * Multilingual columns added by #74. Most fields are nullable because
+ * (a) older rows pre-#74 only have `formatted_address` / `lat` / `lng` /
+ * `source`, and (b) Google itself doesn't have a Chinese name for every
+ * place (Wing On Market in LA is the canonical counter-example — only
+ * the storefront photo carries 永安).
+ */
+export const Place = z
+  .object({
+    id: Uuid,
+    google_place_id: z.string(),
+    formatted_address: z.string(),
+    lat: z.number(),
+    lng: z.number(),
+    source: z.string(),
+
+    // multilingual identity
+    display_name_en: z.string().nullable(),
+    display_name_zh: z.string().nullable(),
+    display_name_zh_locale: z.string().nullable(),
+    display_name_zh_source: z
+      .enum(["google_text", "photo_ocr", "user_override"])
+      .nullable(),
+    custom_name_zh: z.string().nullable(),
+
+    // typing
+    primary_type: z.string().nullable(),
+    primary_type_display_zh: z.string().nullable(),
+    maps_type_label_zh: z.string().nullable(),
+    types: z.array(z.string()).nullable(),
+
+    // address pair
+    formatted_address_en: z.string().nullable(),
+    formatted_address_zh: z.string().nullable(),
+    postal_code: z.string().nullable(),
+    country_code: z.string().nullable(),
+
+    // operational
+    business_status: z.string().nullable(),
+    business_hours: z.unknown().nullable(),
+    time_zone: z.string().nullable(),
+
+    // ratings snapshot
+    rating: z.number().nullable(),
+    user_rating_count: z.number().int().nullable(),
+
+    // contact
+    national_phone_number: z.string().nullable(),
+    website_uri: z.string().nullable(),
+    google_maps_uri: z.string().nullable(),
+
+    // photos (just refs in the Place response; binary fetched separately)
+    photos: z
+      .array(
+        z.object({
+          rank: z.number().int(),
+          width_px: z.number().int().nullable(),
+          height_px: z.number().int().nullable(),
+          /** True when bytes are cached locally and binary fetch will work. */
+          has_local_copy: z.boolean(),
+          /** Vision-LLM result if available. */
+          ocr_extracted: z.unknown().nullable(),
+        }),
+      )
+      .nullable(),
+  })
+  .openapi("Place");
+
+export type PlaceShape = z.infer<typeof Place>;
+
+/**
+ * Patch body for `PATCH /v1/places/:id`. Only the user-overridable
+ * field — everything else is Google-canonical and never user-edited.
+ */
+export const UpdatePlaceRequest = z
+  .object({
+    custom_name_zh: z.string().nullable().optional(),
+  })
+  .openapi("UpdatePlaceRequest");

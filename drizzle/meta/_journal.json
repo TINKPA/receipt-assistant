@@ -64,6 +64,13 @@
       "when": 1778636612525,
       "tag": "0008_backfill_canonical_merchant_category",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1778657498049,
+      "tag": "0009_multilingual_place_cache",
+      "breakpoints": true
     }
   ]
 }

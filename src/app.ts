@@ -29,6 +29,7 @@ import {
 import { reconcileRouter } from "./routes/reconcile.js";
 import { reportsRouter } from "./routes/reports.js";
 import { merchantsRouter } from "./routes/merchants.js";
+import { placesRouter } from "./routes/places.js";
 import { buildInfo } from "./generated/build-info.js";
 
 export function buildApp(): Express {
@@ -80,6 +81,7 @@ export function buildApp(): Express {
   app.use("/v1/ingests", ingestsRouter);
   app.use("/v1/reports", reportsRouter);
   app.use("/v1/merchants", merchantsRouter);
+  app.use("/v1/places", placesRouter);
 
   // ── Final error handler ─────────────────────────────────────────────
   app.use(problemHandler);

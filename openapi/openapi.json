@@ -696,11 +696,172 @@
             "type": "number"
           },
           "source": {
-            "type": "string",
-            "enum": [
-              "google_geocode",
-              "google_places"
+            "type": "string"
+          },
+          "display_name_en": {
+            "type": [
+              "string",
+              "null"
             ]
+          },
+          "display_name_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name_zh_locale": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name_zh_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "google_text",
+              "photo_ocr",
+              "user_override"
+            ]
+          },
+          "custom_name_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_type_display_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maps_type_label_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "formatted_address_en": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formatted_address_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "postal_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "business_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "business_hours": {},
+          "time_zone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rating": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "user_rating_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "national_phone_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "website_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "google_maps_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "photos": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object",
+              "properties": {
+                "rank": {
+                  "type": "integer"
+                },
+                "width_px": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "height_px": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "has_local_copy": {
+                  "type": "boolean"
+                },
+                "ocr_extracted": {}
+              },
+              "required": [
+                "rank",
+                "width_px",
+                "height_px",
+                "has_local_copy"
+              ]
+            }
           }
         },
         "required": [
@@ -709,7 +870,28 @@
           "formatted_address",
           "lat",
           "lng",
-          "source"
+          "source",
+          "display_name_en",
+          "display_name_zh",
+          "display_name_zh_locale",
+          "display_name_zh_source",
+          "custom_name_zh",
+          "primary_type",
+          "primary_type_display_zh",
+          "maps_type_label_zh",
+          "types",
+          "formatted_address_en",
+          "formatted_address_zh",
+          "postal_code",
+          "country_code",
+          "business_status",
+          "time_zone",
+          "rating",
+          "user_rating_count",
+          "national_phone_number",
+          "website_uri",
+          "google_maps_uri",
+          "photos"
         ]
       },
       "Transaction": {
@@ -2521,6 +2703,17 @@
             "example": 14723
           },
           "memo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdatePlaceRequest": {
+        "type": "object",
+        "properties": {
+          "custom_name_zh": {
             "type": [
               "string",
               "null"
@@ -5307,6 +5500,166 @@
           },
           "404": {
             "description": "Merchant not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/places/{id}": {
+      "get": {
+        "summary": "Get a place by id (full multilingual record).",
+        "description": "Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Place",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Place"
+                    },
+                    {
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update user-overridable place fields.",
+        "description": "Currently exposes only `custom_name_zh` — the user override that wins over `display_name_zh` in the UI fallback chain. Pass null to clear.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePlaceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Place"
+                    },
+                    {
+                      "type": "object"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/places/{id}/photos/{rank}/content": {
+      "get": {
+        "summary": "Stream the binary of a cached Google Places photo.",
+        "description": "0-based rank within the place's photos[] (as returned by the v1 Places API at first fetch). 404 if the rank is out of range or the local file copy is missing.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "required": true,
+            "name": "rank",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Image bytes",
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
             "content": {
               "application/problem+json": {
                 "schema": {
