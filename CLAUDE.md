@@ -49,6 +49,38 @@ These apply to the agent that reads a receipt image and writes a `transaction` +
 7. **Language**: Receipts may be in English, Chinese, or other languages. Handle all.
 8. **OCR text**: Persist the full receipt transcription on the `documents.ocr_text` column for future reference.
 
+## Extraction provenance — `metadata.extraction` (Phase 1 of #80)
+
+Every transaction the ingest agent writes stamps a `metadata.extraction` block recording the prompt/model under which it ran. Schema:
+
+```jsonc
+{
+  "extraction": {
+    "prompt_version": "2.5",                    // see src/ingest/prompt.ts → PROMPT_VERSION
+    "prompt_git_sha": "<build-info gitSha>",
+    "model":          "<CLAUDE_MODEL env or 'sonnet'>",
+    "ran_at":         "<wall-clock at COMMIT>"
+  }
+}
+```
+
+This is the gate for [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (`POST /v1/documents/:id/re-extract`) and Phase 2 [#89](https://github.com/TINKPA/receipt-assistant/issues/89) — rows whose `prompt_version` ≠ the current source-tree `PROMPT_VERSION` are eligible to be re-derived.
+
+### When to bump `PROMPT_VERSION`
+
+Bump in the **same PR** as the prompt change. Guideline:
+
+| Change | Bump? |
+|---|---|
+| New self-check block, new required field, fundamentally different reasoning flow | **Yes** (minor or major) |
+| Wording polish, typo fix, whitespace, log-only edit | **No** |
+| New tool exposure (e.g. agent gains a new Bash command pattern) | **Yes** |
+| Reordering existing instructions without semantic change | **No** |
+
+The version is a flat string (`"2.5"` today; `"2.5.1"` for a small additive iteration, `"3.0"` for a clean break). Auto-bumping on every commit defeats the purpose — it floods the version field with noise and makes the re-extract eligibility filter useless.
+
+Legacy rows ingested before Phase 1 shipped have `metadata.extraction = NULL`. Phase 2/Phase 4 treats NULL as "unknown version, eligible to be re-extracted."
+
 ## Known Pitfalls
 
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:
