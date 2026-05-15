@@ -12,3 +12,4 @@ export * from "./ingests.js";
 export * from "./reconcile_proposals.js";
 export * from "./places.js";
 export * from "./merchants.js";
+export * from "./derivation_events.js";

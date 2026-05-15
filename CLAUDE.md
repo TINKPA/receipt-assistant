@@ -64,7 +64,7 @@ Every transaction the ingest agent writes stamps a `metadata.extraction` block r
 }
 ```
 
-This is the gate for [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (`POST /v1/documents/:id/re-extract`) and Phase 2 [#89](https://github.com/TINKPA/receipt-assistant/issues/89) — rows whose `prompt_version` ≠ the current source-tree `PROMPT_VERSION` are eligible to be re-derived.
+This is the gate for [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (`POST /v1/documents/:id/re-extract`) — rows whose `prompt_version` ≠ the current source-tree `PROMPT_VERSION` are eligible to be re-extracted. Phase 2 of the same epic ([#89](https://github.com/TINKPA/receipt-assistant/issues/89)) shipped re-derive for `places`; see the next section.
 
 ### When to bump `PROMPT_VERSION`
 
@@ -80,6 +80,51 @@ Bump in the **same PR** as the prompt change. Guideline:
 The version is a flat string (`"2.5"` today; `"2.5.1"` for a small additive iteration, `"3.0"` for a clean break). Auto-bumping on every commit defeats the purpose — it floods the version field with noise and makes the re-extract eligibility filter useless.
 
 Legacy rows ingested before Phase 1 shipped have `metadata.extraction = NULL`. Phase 2/Phase 4 treats NULL as "unknown version, eligible to be re-extracted."
+
+## Backfill / re-derivation — `places` (Phase 2 of #80)
+
+Phase 2 of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#89](https://github.com/TINKPA/receipt-assistant/issues/89)) ships two endpoints that re-run Layer 2 projection over the existing `places.raw_response` — no Google calls, no Anthropic calls in the hot path.
+
+```
+POST /v1/places/{id}/re-derive          # single
+POST /v1/admin/re-derive?scope=places   # batch over every place
+```
+
+### How the projection runs
+
+Pure TypeScript, deterministic. `src/projection/derive.ts ::projectPlace(rawResponse)` is the single source of truth — it ports the rules in `src/ingest/prompt.ts` Phase 3c (CJK extraction, branch-suffix stripping, `is_native` heuristic with a `GLOBAL_ENGLISH_BRANDS` allowlist) into a rule-encoded function. No `claude -p` invocation, no Anthropic SDK call. Rationale: the heuristics are stable enough to encode once; running them through an LLM per place would add 5–15 s of latency × N for the batch path with no judgment-call payoff the rules can't deliver. The "AI-native" principle still holds — initial extraction (OCR, payee + items, merchant aggregation) stays LLM-driven; only the cheap re-projection step is deterministic.
+
+When you change the projection logic (e.g. add a brand to `GLOBAL_ENGLISH_BRANDS`, refine the CJK strip rules), bump `PROJECTION_VERSION` in `src/projection/derive.ts` in the same PR and run `POST /v1/admin/re-derive?scope=places` after deploy to roll the new logic across the corpus.
+
+### Field-write policy
+
+Re-derive **overwrites** projection-domain fields with the new projection result (NOT COALESCE — re-derive is authoritative, NULL is a valid new value). Two narrow exceptions:
+
+- **Layer 3 user-truth** (`places.custom_name_zh`) is never in the UPDATE column list. Mirrors the existing pattern at `src/ingest/prompt.ts:712-713`. New Layer 3 fields must be added to the service-side allowlist in `src/routes/places.service.ts ::reDerivePlace`.
+- **OCR-sourced zh fields** (`display_name_zh_source IN ('photo_ocr', 'receipt_ocr')`) are preserved verbatim. The projection only consumes Google's response; a row whose Chinese name came from a storefront photo or the receipt's own letterhead is outside this projection's input domain and must not be reclassified to `NULL` just because Google has no Chinese.
+
+Physical facts (`lat`, `lng`, the legacy `formatted_address`) are also untouched — those were set at fetch time and don't change with projection logic.
+
+### Audit log — `derivation_events`
+
+Every re-derive INSERTs one row into `derivation_events` **before** the UPDATE lands, inside the same transaction. Schema is shared across entity types (Phase 2 only writes `entity_type='place'`; #91 will add `'document'` / `'merchant'`):
+
+```sql
+SELECT entity_id, prompt_version, prompt_git_sha, model, ran_at, changed_keys
+  FROM derivation_events
+ WHERE entity_type = 'place' AND entity_id = $1
+ ORDER BY ran_at DESC;
+```
+
+- **Diff a version bump after the fact**: `WHERE prompt_version = '2.6'` gives every row touched by that release.
+- **Roll back a bad re-derive**: write the `before` jsonb back to the entity, then INSERT a new event documenting the rollback.
+- **Audit no-op runs**: rows where `changed_keys = []` still get an event — so a version bump that happened to produce the same output is visible (and gives you a known-good checkpoint to compare future runs against).
+
+The `places.metadata.derivation` jsonb on the row itself answers "what produced *this* current row" without a join — equivalent to `transactions.metadata.extraction` from Phase 1.
+
+### Why no merchants cascade
+
+The user-facing question raised during planning was: when re-derive changes `places.display_name_en`, should `merchants.canonical_name` auto-update for the linked brand? The code says no — `merchants.canonical_name` / `brand_id` / `category` come from the LLM looking at the **receipt** at ingest time, not from `places` projection output. `merchants.address` / `lat` / `lng` come from `src/enrichment/merchants.ts` calling Google's `findPlaceFromText` endpoint, which is separate from `places.raw_response`. So a `places` projection change doesn't introduce any new inconsistency in `merchants`, and a cascade UPDATE would be dead code. The cascade architecture slot belongs to [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (re-extract), where re-reading the receipt with new place data can plausibly change `canonical_name`.
 
 ## Known Pitfalls
 

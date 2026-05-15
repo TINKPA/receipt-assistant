@@ -29,6 +29,7 @@ import { registerReconcileOpenApi } from "./routes/reconcile.js";
 import { registerReportsOpenApi } from "./routes/reports.js";
 import { registerMerchantsOpenApi } from "./routes/merchants.js";
 import { registerPlacesOpenApi } from "./routes/places.js";
+import { registerAdminOpenApi } from "./routes/admin.js";
 
 export function buildRegistry(): OpenAPIRegistry {
   const registry = new OpenAPIRegistry();
@@ -81,6 +82,7 @@ export function buildRegistry(): OpenAPIRegistry {
   registerReportsOpenApi(registry);
   registerMerchantsOpenApi(registry);
   registerPlacesOpenApi(registry);
+  registerAdminOpenApi(registry);
 
   return registry;
 }

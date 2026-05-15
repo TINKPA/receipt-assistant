@@ -88,3 +88,51 @@ export const UpdatePlaceRequest = z
     custom_name_zh: z.string().nullable().optional(),
   })
   .openapi("UpdatePlaceRequest");
+
+/**
+ * Response from `POST /v1/places/:id/re-derive` (#89). Reports
+ * what the projection rerun changed; the operator can correlate
+ * `derivation_event_id` against the `derivation_events` audit log
+ * for the full `before` / `after` jsonb.
+ */
+export const ReDerivePlaceResponse = z
+  .object({
+    place_id: Uuid,
+    changed_keys: z.array(z.string()),
+    derivation_event_id: Uuid,
+  })
+  .openapi("ReDerivePlaceResponse");
+
+/**
+ * Query params for `POST /v1/admin/re-derive`. Only `scope=places`
+ * is implemented in Phase 2 (#89); Phase 3+ will add `merchants`,
+ * `documents`, and the LLM-backed paths.
+ */
+export const ReDeriveQuery = z
+  .object({
+    scope: z.enum(["places"]).default("places"),
+  })
+  .openapi("ReDeriveQuery");
+
+/**
+ * Response from `POST /v1/admin/re-derive`. `updated` counts rows
+ * whose UPDATE landed (including no-op runs that still get a
+ * `derivation_events` row); `skipped` counts rows with no
+ * `raw_response` to project from; `errors` carries per-row
+ * exceptions so a partial batch is debuggable.
+ */
+export const ReDeriveBatchResponse = z
+  .object({
+    scope: z.enum(["places"]),
+    total: z.number().int(),
+    updated: z.number().int(),
+    skipped: z.number().int(),
+    errors: z.array(
+      z.object({
+        id: z.string(),
+        message: z.string(),
+      }),
+    ),
+    ran_at: z.string(),
+  })
+  .openapi("ReDeriveBatchResponse");
