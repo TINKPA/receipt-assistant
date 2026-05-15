@@ -153,6 +153,18 @@ export class PostingsImbalanceProblem extends HttpProblem {
   }
 }
 
+export class NoRawResponseProblem extends HttpProblem {
+  constructor(placeId: string) {
+    super(
+      422,
+      "place-no-raw-response",
+      "Cannot re-derive",
+      `Place ${placeId} has no raw_response; re-derive needs cached Google data to project from. Refresh the place via the (Phase 4) re-fetch path before re-deriving.`,
+      { place_id: placeId },
+    );
+  }
+}
+
 export class DocumentHasLinksProblem extends HttpProblem {
   constructor(documentId: string, linkCount: number) {
     super(

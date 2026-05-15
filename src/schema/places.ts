@@ -136,6 +136,17 @@ export const places = pgTable(
     yelpPriceLevel: text("yelp_price_level"),
     yelpCategories: jsonb("yelp_categories"),
     yelpRawResponse: jsonb("yelp_raw_response"),
+
+    /**
+     * Provenance + ad-hoc metadata bag. Phase 2 (#89) writes
+     * `metadata.derivation = { projection_version, prompt_git_sha,
+     * model, ran_at }` on every re-derive; mirrors the
+     * `transactions.metadata.extraction` pattern shipped in #88.
+     * Field-level audit lives in `derivation_events`; this column
+     * just answers "what projection produced the current row?"
+     * without a join.
+     */
+    metadata: jsonb("metadata"),
   },
   (t) => [
     // Geo-bbox filtering for future trip clustering. Btree on (lat, lng)

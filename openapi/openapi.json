@@ -2728,6 +2728,81 @@
             ]
           }
         }
+      },
+      "ReDerivePlaceResponse": {
+        "type": "object",
+        "properties": {
+          "place_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "changed_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "derivation_event_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          }
+        },
+        "required": [
+          "place_id",
+          "changed_keys",
+          "derivation_event_id"
+        ]
+      },
+      "ReDeriveBatchResponse": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "places"
+            ]
+          },
+          "total": {
+            "type": "integer"
+          },
+          "updated": {
+            "type": "integer"
+          },
+          "skipped": {
+            "type": "integer"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "message"
+              ]
+            }
+          },
+          "ran_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "total",
+          "updated",
+          "skipped",
+          "errors",
+          "ran_at"
+        ]
       }
     },
     "parameters": {}
@@ -5626,6 +5701,59 @@
         }
       }
     },
+    "/v1/places/{id}/re-derive": {
+      "post": {
+        "summary": "Re-run Layer 2 projection over cached raw_response.",
+        "description": "Re-applies the current projection logic to the cached Google Places response, overwriting derived columns. Layer 3 user-truth (`custom_name_zh`) is never touched. OCR-sourced zh fields (`display_name_zh_source IN ('photo_ocr','receipt_ocr')`) are preserved verbatim. Every run inserts a `derivation_events` row with a `before`/`after` jsonb diff; the returned `derivation_event_id` lets you correlate. Returns 422 when `raw_response` is NULL.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Re-derive committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReDerivePlaceResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Place not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Place has no raw_response — nothing to project from",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/places/{id}/photos/{rank}/content": {
       "get": {
         "summary": "Stream the binary of a cached Google Places photo.",
@@ -5668,6 +5796,51 @@
           },
           "404": {
             "description": "Not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/re-derive": {
+      "post": {
+        "summary": "Re-run Layer 2 projection across every row in scope.",
+        "description": "Phase 2 (#89): scope=places walks every `places` row and re-runs the projection over its cached `raw_response`. Rows with `raw_response IS NULL` are counted as `skipped` (not errored). Each updated row produces a `derivation_events` entry — including no-op runs that match the current state, so a version bump is auditable even when nothing visibly changes. Sync execution at current corpus scale (<1 s for tens to low hundreds of places).",
+        "tags": [
+          "admin"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "places"
+              ],
+              "default": "places"
+            },
+            "required": false,
+            "name": "scope",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Batch summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReDeriveBatchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid scope",
             "content": {
               "application/problem+json": {
                 "schema": {

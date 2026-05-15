@@ -23,10 +23,12 @@ import {
   loadPlaceById,
   updatePlace,
   loadPlacePhotoForStream,
+  reDerivePlace,
 } from "./places.service.js";
 import {
   Place,
   UpdatePlaceRequest,
+  ReDerivePlaceResponse,
 } from "../schemas/v1/place.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
 import { z } from "zod";
@@ -63,6 +65,16 @@ placesRouter.patch(
     const place = await updatePlace(id, patch);
     if (!place) throw new NotFoundProblem("Place", id);
     res.json(place);
+  }),
+);
+
+placesRouter.post(
+  "/:id/re-derive",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const result = await reDerivePlace(req.ctx.workspaceId, id);
+    if (!result) throw new NotFoundProblem("Place", id);
+    res.json(result);
   }),
 );
 
@@ -133,6 +145,34 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
     responses: {
       200: { description: "Updated", content: { "application/json": { schema: Place } } },
       404: { description: "Not found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/places/{id}/re-derive",
+    summary: "Re-run Layer 2 projection over cached raw_response.",
+    description:
+      "Re-applies the current projection logic to the cached Google " +
+      "Places response, overwriting derived columns. Layer 3 user-truth " +
+      "(`custom_name_zh`) is never touched. OCR-sourced zh fields " +
+      "(`display_name_zh_source IN ('photo_ocr','receipt_ocr')`) are " +
+      "preserved verbatim. Every run inserts a `derivation_events` row " +
+      "with a `before`/`after` jsonb diff; the returned " +
+      "`derivation_event_id` lets you correlate. Returns 422 when " +
+      "`raw_response` is NULL.",
+    tags: ["places"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      200: {
+        description: "Re-derive committed",
+        content: { "application/json": { schema: ReDerivePlaceResponse } },
+      },
+      404: { description: "Place not found", content: problemContent },
+      422: {
+        description: "Place has no raw_response — nothing to project from",
+        content: problemContent,
+      },
     },
   });
 
