@@ -1,0 +1,186 @@
+[
+  {
+    "sha256": "8e4239477e236ffa798d742f51c45b7c3e46fc590810de647f735d4e0c288a04",
+    "original_filename": "2025-09-30_Receipt_Wilson_wristband_classic_navy_x2_26.28.jpeg",
+    "bucket": "hard_date",
+    "ground_truth": { "date": "2025-09-30", "merchant_tokens": ["wilson"], "total_minor": 2628 },
+    "expected_status": "done",
+    "notes": "The original #27 case. 09/30 read as 09/03. Deterministic across 3 Phase 2.5 rounds (2026-04-21 comment) — digit-order read error, prompt layer cannot reach."
+  },
+  {
+    "sha256": "e4756c65fb691e32c4b3235ed46b6b5571bffcf719eafd8adf4811cf89dfe475",
+    "original_filename": "2025-09-20_Receipt_WingHopFung_black_pearl_wine_40.99.jpeg",
+    "bucket": "hard_all",
+    "ground_truth": { "date": "2025-09-20", "merchant_tokens": ["wing", "hop", "fung"], "total_minor": 4099 },
+    "expected_status": "done",
+    "notes": "Pathological fixture — faded thermal paper. Across 3 rounds (2026-04-21) stressed date, total, AND merchant simultaneously. Non-deterministic. Gold-standard regression marker."
+  },
+  {
+    "sha256": "56267be6676c0af681b958b29346d8302f312170819ddd6da964e9427befe2b1",
+    "original_filename": "2025-12-01_Receipt_Marukai_groceries_97.72.jpeg",
+    "bucket": "hard_date",
+    "ground_truth": { "date": "2025-12-01", "merchant_tokens": ["marukai"], "total_minor": 9772 },
+    "expected_status": "done",
+    "notes": "Day digit misread (01 → 11)."
+  },
+  {
+    "sha256": "2bf4026fa87080003a5d212a1e2bf096cb2fb3acc1e8a87d91a01ededec71469",
+    "original_filename": "2025-12-07_Receipt_CircleK_fuel_unleaded_70.79.jpeg",
+    "bucket": "hard_date",
+    "ground_truth": { "date": "2025-12-07", "merchant_tokens": ["circle", "k"], "total_minor": 7079 },
+    "expected_status": "done",
+    "notes": "Day digit misread (07 → 27). Common pump-receipt thermal-print artifact."
+  },
+  {
+    "sha256": "9e02b5d0b97606a1b344d3b65f75bfd5ba05bf531001c7ff4dc146cd2925e9ae",
+    "original_filename": "2025-11-29_Receipt_Haidilao_hotpot_dinner_306.49.jpeg",
+    "bucket": "hard_date",
+    "ground_truth": { "date": "2025-11-29", "merchant_tokens": ["haidilao"], "total_minor": 30649 },
+    "expected_status": "done",
+    "notes": "Month digit misread (11 → 10). Rare — month misreads are usually a sign of bad print or printer drift."
+  },
+  {
+    "sha256": "6f152d024a9be528796f5cec8b0a890d7cc711e31fa202f7fd7fd0eba87a8dab",
+    "original_filename": "2025-09-29_Receipt_UrthCaffe_brunch_93.03.jpeg",
+    "bucket": "hard_total",
+    "ground_truth": { "date": "2025-09-29", "merchant_tokens": ["urth", "caffe"], "total_minor": 9303 },
+    "expected_status": "done",
+    "notes": "Subtotal-vs-final confusion. Reads $98.03 (pre-tip + suggested-tip column) instead of final $93.03."
+  },
+  {
+    "sha256": "43cd36eb799a7a969b11ffd8593e4d4f549ed6533038ac985cbeda0b205b3731",
+    "original_filename": "2026-02-22_Receipt_TraderJoes_groceries_29.36.jpeg",
+    "bucket": "hard_total",
+    "ground_truth": { "date": "2026-02-22", "merchant_tokens": ["trader", "joe"], "total_minor": 2936 },
+    "expected_status": "done",
+    "notes": "Single-digit total misread (29.36 → 39.36)."
+  },
+  {
+    "sha256": "23494391be93197175867bd7d35e6e2578cac42f0d32729978b208612c0194f8",
+    "original_filename": "2026-02-27_Receipt_Eataly_black_label_ham_13.00.jpeg",
+    "bucket": "hard_total",
+    "ground_truth": { "date": "2026-02-27", "merchant_tokens": ["eataly"], "total_minor": 1300 },
+    "expected_status": "done",
+    "notes": "Total read as half of correct value (13.00 → 6.50). Likely a unit-price vs line-total confusion."
+  },
+  {
+    "sha256": "8975c08945295d059a74e37ecea21c32b6641e208a62b9d28c7b16b6302588fb",
+    "original_filename": "2025-09-10_Receipt_WingOnMarket_charge_slip_64.85.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-09-10", "merchant_tokens": ["wing", "on", "market"], "total_minor": 6485 },
+    "expected_status": "done",
+    "notes": "Asian-grocery thermal, lots of Chinese characters — historically extracts cleanly."
+  },
+  {
+    "sha256": "127a4e07980756252e7a4ee64abf80c9ed1ec926bb54c2fe56b09b2a53c18ff3",
+    "original_filename": "2025-09-28_Receipt_DongTingXian_dine_in_135.22.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-09-28", "merchant_tokens": ["dong", "ting", "xian"], "total_minor": 13522 },
+    "expected_status": "done",
+    "notes": "Dine-in receipt with tip line — historically clean."
+  },
+  {
+    "sha256": "db9ed4575a388b2c1928d97d69f091ebb262f3611129bd243fbc57ac616262a8",
+    "original_filename": "2025-10-18_Receipt_99Ranch_san_gabriel_groceries_131.12.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-10-18", "merchant_tokens": ["99", "ranch"], "total_minor": 13112 },
+    "expected_status": "done",
+    "notes": "99 Ranch — payee extraction historically resolves to store number; substring match is enough."
+  },
+  {
+    "sha256": "1c017723268d25781cc4775db86ff66cbb452929f656cbe14a90590a9698bc9a",
+    "original_filename": "2025-10-18_Receipt_LeYuenBBQ_bbq_63.91.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-10-18", "merchant_tokens": ["le", "yuen", "bbq"], "total_minor": 6391 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "b6a5fdd1615f0427f4577ad2f495a51df0dd23a2bec711f52cd9777df8919df2",
+    "original_filename": "2025-10-22_Receipt_Yoshinoya_beef_combo_bowls_21.03.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-10-22", "merchant_tokens": ["yoshinoya"], "total_minor": 2103 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "2879a616fd25054e87e7e779d4efe2d6a158e55cb309399cb518f5dd5dbfdc82",
+    "original_filename": "2025-10-27_Receipt_TraderJoes_milk_cinnamon_pumpkin_10.58.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-10-27", "merchant_tokens": ["trader", "joe"], "total_minor": 1058 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "38278bbaf8f85d97cc9d7b74824ebaab869aae73ce1041b1a54782d69cb96514",
+    "original_filename": "2025-11-02_Receipt_KellysCoffeeAndFudge_cafe_latte_5.75.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-11-02", "merchant_tokens": ["kelly", "coffee"], "total_minor": 575 },
+    "expected_status": "done",
+    "notes": "Small total — guards against truncation/zero-pad errors."
+  },
+  {
+    "sha256": "725c65febd2c3d1ccdcb6dff2f74917252dc5b81c4b2d4e125dc67ebbc059d51",
+    "original_filename": "2025-11-04_Receipt_Costco_groceries_47.17.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-11-04", "merchant_tokens": ["costco"], "total_minor": 4717 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "1eb3e55795d0dd606fe61ff8131b1a75789e3c2aeb93c00513aacd830c157a67",
+    "original_filename": "2025-11-14_Receipt_SunriseNoodleHouse_cantonese_clay_pot_69.94.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-11-14", "merchant_tokens": ["sunrise", "noodle"], "total_minor": 6994 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "361014b68e7b42d0a4bbebc9d939b0d3dd26299743545794d7937b8defc375a9",
+    "original_filename": "2025-11-22_Receipt_WingHopFung_groceries_15.39.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-11-22", "merchant_tokens": ["wing", "hop", "fung"], "total_minor": 1539 },
+    "expected_status": "done",
+    "notes": "Same merchant as the hard_all WingHopFung wine fixture, but a clean print — guards against false-positive prompt fixes that throw the baby out with the bathwater."
+  },
+  {
+    "sha256": "041098f3b03c9bb19ea4e1de5342e1922cc9f0bfc4a439e99b28e2500e71ba8c",
+    "original_filename": "2025-12-01_Receipt_Petco_grooming_bath_97.57.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-12-01", "merchant_tokens": ["petco"], "total_minor": 9757 },
+    "expected_status": "done",
+    "notes": "Same date as the hard_date Marukai 97.72 fixture — guards against date-fix regressions on receipts with similar timestamps."
+  },
+  {
+    "sha256": "e5f75d412c4cc3b4b669e5b29c3363395163838d45abaea571703890d4f9a14b",
+    "original_filename": "2025-12-08_Receipt_HMart_groceries_107.45.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2025-12-08", "merchant_tokens": ["h", "mart"], "total_minor": 10745 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "6a0f8737fc3c97746600e56baa078d18b1a386d740591a16f493e6aa12abbe86",
+    "original_filename": "2026-02-12_Receipt_KFC_zinger_sandwich_15.34.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2026-02-12", "merchant_tokens": ["kfc"], "total_minor": 1534 },
+    "expected_status": "done",
+    "notes": ""
+  },
+  {
+    "sha256": "86c4005c35cbe4a1b779eddc2753aa12be4853091831cc0263d61ca9ff472061",
+    "original_filename": "2026-03-06_Receipt_Costco_gas_marina_del_rey_73.78.jpeg",
+    "bucket": "good",
+    "ground_truth": { "date": "2026-03-06", "merchant_tokens": ["costco", "gas"], "total_minor": 7378 },
+    "expected_status": "done",
+    "notes": "CLAUDE.md-flagged historically-hard fixture (gas pump receipts), but extracts cleanly under current pipeline — guards against regressions if prompt evolves."
+  },
+  {
+    "sha256": "3a81863b580828192134c22afed6989bac5b9bec0ae010fb6e892ac446a94450",
+    "original_filename": "2026-03-25_Receipt_EuclidCoffee_iced_latte_8.00.jpeg",
+    "bucket": "hard_total",
+    "ground_truth": { "date": "2026-03-25", "merchant_tokens": ["euclid", "coffee"], "total_minor": 800 },
+    "expected_status": "done",
+    "notes": "Handwritten tip on small cafe receipt; pipeline reads pre-tip $5.59 / $6.59 lines as total instead of the final $8.00. Non-deterministic across runs (2026-04-19 issue comment)."
+  }
+]
