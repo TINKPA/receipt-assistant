@@ -73,6 +73,12 @@ services:
       # via its Bash tool (for Phase 3 geocoding during extraction). Empty
       # is fine — the prompt instructs the agent to skip geocoding.
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      # Worker concurrency for `claude -p` extraction. Default 3 is fine
+      # for steady-state single-receipt uploads but starves batch evals
+      # (e.g. scripts/eval-dates.ts on a 23-fixture manifest). CPU floor is
+      # ~10% even at concurrency 3 — host has headroom. Bumped to 6 to
+      # halve eval wall-clock without straining Anthropic API rate limits.
+      MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
     volumes:
       # Uploaded receipt images = user content (PII). Lives in the outer
       # project's iCloud-synced docs root, so the user's own receipt corpus

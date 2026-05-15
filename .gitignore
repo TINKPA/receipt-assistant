@@ -9,3 +9,5 @@ dist/
 .env.*
 !.env.example
 /scripts/smoke-v1-ingest.report.json
+/scripts/eval-dates.report.json
+/scripts/eval-dates.report.md
