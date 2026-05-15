@@ -1,0 +1,23 @@
+-- Distinguish merchant-native CJK names from Google translations.
+--
+-- `display_name_zh` carries two qualitatively different things:
+--
+--   (a) The merchant's own Chinese name, present on signage or
+--       receipts — 永合豐 for Wing Hop Fung, 九记八方甜品 for Jiu Ji
+--       Dessert, 小玲锅巴土豆 for Xiao Ling. These ARE the brand
+--       identity in the local Chinese-speaking community.
+--
+--   (b) A gloss Google adds to globally-English brands when asked
+--       for zh-CN — 好市多 for Costco, 星巴克 for Starbucks. The
+--       merchant never writes these on their own surfaces; they
+--       exist only inside Google's localization layer.
+--
+-- The display-name selector needs to promote (a) to primary while
+-- keeping (b) as a quiet alternate at most. A boolean flag is
+-- enough; we don't need to model degrees of nativeness.
+--
+-- NULL = unknown (treated conservatively as non-native by the
+-- selector). Existing rows are backfilled in a separate step using
+-- source heuristics; this migration only adds the column.
+
+ALTER TABLE "places" ADD COLUMN "display_name_zh_is_native" boolean;

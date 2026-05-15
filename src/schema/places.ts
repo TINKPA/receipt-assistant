@@ -2,6 +2,7 @@ import {
   pgTable,
   uuid,
   text,
+  boolean,
   integer,
   numeric,
   jsonb,
@@ -64,11 +65,40 @@ export const places = pgTable(
      *  the English fallback in the zh column. */
     displayNameZhLocale: text("display_name_zh_locale"),
     /** Provenance of `display_name_zh`:
-     *    `google_text`  — direct from Google v1 zh-CN call
-     *    `photo_ocr`    — extracted from storefront photo signage
+     *    `google_text`   — direct from Google v1 zh-CN call
+     *    `photo_ocr`     — extracted from storefront photo signage
+     *    `receipt_ocr`   — extracted from CJK on the receipt itself
+     *                       (used when Google has no Chinese for the
+     *                       place — typical for small vendors inside a
+     *                       plaza that only geocode to the plaza address)
      *    `user_override` — should never be — that's `custom_name_zh`
      *  NULL when no zh name is known. */
     displayNameZhSource: text("display_name_zh_source"),
+    /** Whether `display_name_zh` is the merchant's NATIVE-script name
+     *  (true) vs a translation/gloss Google added (false).
+     *
+     *  Examples:
+     *    永合豐 for Wing Hop Fung           → true  (on signage + receipts)
+     *    九记八方甜品 for Jiu Ji Dessert    → true  (Chinese-owned brand)
+     *    小玲锅巴土豆 (receipt_ocr)         → true  (printed on receipt)
+     *    好市多 for Costco                  → false (Google translation;
+     *                                                Costco's signage is
+     *                                                always English)
+     *    星巴克 for Starbucks               → false (gloss; brand identity
+     *                                                is global English)
+     *
+     *  Used by the display-name selector to decide whether to promote
+     *  the Chinese name to primary. Glosses (false) stay as alternates
+     *  only — never replace the merchant's actual brand name.
+     *
+     *  Source-derived defaults at ingest time:
+     *    receipt_ocr / photo_ocr → true (it's on the merchant's own surface)
+     *    google_text             → derived from heuristic (mixed Latin+CJK
+     *                              in the response → true; pure CJK while
+     *                              en is pure Latin → false)
+     *    user_override           → N/A (custom_name_zh has its own column)
+     *  NULL means unknown — selector treats as false (conservative). */
+    displayNameZhIsNative: boolean("display_name_zh_is_native"),
     /** User-supplied Chinese name. Wins over `display_name_zh` in the
      *  UI fallback chain. The user can correct OCR errors or supply a
      *  name Google never had. */

@@ -25,8 +25,13 @@ export const Place = z
     display_name_zh: z.string().nullable(),
     display_name_zh_locale: z.string().nullable(),
     display_name_zh_source: z
-      .enum(["google_text", "photo_ocr", "user_override"])
+      .enum(["google_text", "photo_ocr", "receipt_ocr", "user_override"])
       .nullable(),
+    /** True when `display_name_zh` is the merchant's native-script
+     *  name (永合豐 for Wing Hop Fung); false when it's a Google
+     *  gloss for a globally-English brand. Drives whether the
+     *  display selector promotes it to primary. NULL = unknown. */
+    display_name_zh_is_native: z.boolean().nullable(),
     custom_name_zh: z.string().nullable(),
 
     // typing

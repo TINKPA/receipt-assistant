@@ -239,12 +239,69 @@ Extract these fields for the SQL upsert (read both files):
     lat, lng                 ← .location.{latitude,longitude}
     photos[]                 ← .photos (array of {name, widthPx, heightPx, authorAttributions})
 
-  From the zh-CN response (only if its displayName.languageCode starts
-  with \`zh\` — otherwise Google fell back to en and there is no Chinese
-  name to store):
-    display_name_zh          ← .displayName.text
-    display_name_zh_locale   ← .displayName.languageCode   (e.g. "zh")
-    display_name_zh_source   ← "google_text"
+  From the zh-CN response — store ONLY when the response carries
+  actual Han characters. The check has two parts:
+    (i)  \`.displayName.languageCode\` starts with \`zh\` AND is NOT
+         \`zh-Latn\` / \`zh-Latn-pinyin\` (those are romanizations);
+    (ii) \`.displayName.text\` contains at least one CJK Unified
+         Ideograph (U+4E00–U+9FFF). Without this Google sometimes
+         returns the Latin name under a \`zh\` locale tag for places
+         that have no native Chinese name (e.g. "Costco" tagged
+         \`zh\`). Treat those as no-zh.
+
+  If both checks pass, run these TWO STEPS — do not skip Step A:
+
+    Step A — STRIP \`.displayName.text\` down to the brand-identity
+             CJK substring. Google's zh-CN field often returns a
+             verbose mixed string; you MUST NOT store it verbatim.
+             Discard surrounding Latin, parentheses, brackets, and
+             branch / store-locator suffixes; keep only the longest
+             contiguous CJK run that reads as the brand name:
+
+      "Wing Hop Fung(永合豐)Monterey Park Store"  →  "永合豐"
+      "Jiu Ji Dessert (九记八方甜品）"            →  "九记八方甜品"
+      "Starbucks 星巴克"                          →  "星巴克"
+      "永合豐"                                    →  "永合豐"   (already clean)
+
+      If no CJK substring remains after stripping (whole input was
+      Latin), set display_name_zh = NULL and skip Step B.
+
+    Step B — assign (using the STRIPPED value from Step A, never
+             the raw .displayName.text):
+
+      display_name_zh           ← <stripped CJK substring>
+      display_name_zh_locale    ← .displayName.languageCode   (e.g. "zh")
+      display_name_zh_source    ← "google_text"
+      display_name_zh_is_native ← see "is_native heuristic" below
+
+  ── is_native heuristic ──
+
+  display_name_zh_is_native distinguishes the merchant's REAL
+  Chinese-market identity from a Google-only translation gloss.
+  It governs whether the frontend promotes the Chinese name to
+  primary in the list view.
+
+  Default: true. Set false ONLY in the narrow case where ALL of:
+    - .displayName.text from the zh-CN response is pure CJK
+      (no Latin chars mixed in), AND
+    - .displayName.text from the en response is pure Latin
+      (no CJK mixed in), AND
+    - the en name is a globally-recognized English brand whose
+      identity is unambiguously English-first — Costco, Walmart,
+      Target, McDonald's, Whole Foods, Trader Joe's, CVS, the
+      USPS, Apple, Amazon, etc. The signage at every US store
+      shows the English name; the Chinese name only appears on
+      Google or in mainland-China stores.
+
+  When unsure (a brand you don't recognize as globally English-
+  first), default true. The cost of a false positive (showing a
+  Chinese name the user can override) is much lower than a false
+  negative (hiding the actual brand identity behind a pinyin name
+  like "Dong Ting Xian").
+
+  receipt_ocr and photo_ocr sources are ALWAYS is_native=true —
+  if it's printed on the merchant's own surface, it's their own
+  name by definition.
     primary_type_display_zh  ← .primaryTypeDisplayName.text
     maps_type_label_zh       ← .googleMapsTypeLabel.text
     formatted_address_zh     ← .formattedAddress
@@ -291,6 +348,7 @@ When OCR yields a string:
   display_name_zh          ← that string (e.g. "永安")
   display_name_zh_locale   ← "zh"
   display_name_zh_source   ← "photo_ocr"
+  display_name_zh_is_native← true   (signage is the merchant's own surface)
 
 Always record per-photo OCR provenance in metadata regardless:
   metadata.photo_ocr = [
@@ -302,6 +360,55 @@ Always record per-photo OCR provenance in metadata regardless:
 Photos are downloaded for the cache regardless — Phase 4 inserts a
 \`place_photos\` row per photo with the local file_path; the OCR
 fallback just adds the \`ocr_extracted\` jsonb to the photos it read.
+
+### Phase 3e — Receipt-OCR CJK fallback (last-resort, free)
+
+When Phase 3c and 3d both leave \`display_name_zh\` NULL, but the
+receipt itself prints the merchant name in CJK, use that. This is
+the common case for small vendors inside a plaza: the Google place
+resolves to the plaza's geocoded street address (no displayName.zh,
+no storefront photos), yet the receipt's letterhead shows e.g.
+"小玲锅巴土豆 / XIAO LING CRISPY POTATO BITES".
+
+Trigger when ALL of:
+  - \`display_name_zh\` is still NULL after 3c/3d, AND
+  - The receipt OCR text contains CJK Unified Ideographs
+    (U+4E00–U+9FFF, also U+3400–U+4DBF, U+20000+), AND
+  - You can identify a contiguous CJK substring that reads as the
+    merchant's name (i.e. appears in the letterhead / payee /
+    branding area, not in item descriptions or addresses).
+
+Procedure:
+  1. Look at the payee region of the receipt — top-of-receipt
+     letterhead, store-name banner, or whatever you used to extract
+     the Latin \`payee\`. Find the CJK substring that names the
+     merchant.
+  2. Strip surrounding punctuation, slashes, parens, the Latin
+     half, and the romanized form. Keep only the CJK characters
+     that name the store. Examples:
+       "小玲锅巴土豆 / XIAO LING CRISPY POTATO BITES" → "小玲锅巴土豆"
+       "九记八方甜品（Jiu Ji Dessert）"               → "九记八方甜品"
+       "王府饭店 WANG FU"                              → "王府饭店"
+  3. If the receipt is partly Chinese but the merchant-name region
+     is purely Latin (e.g. only item descriptions are in CJK),
+     leave \`display_name_zh\` NULL. Don't invent a name from item
+     text.
+
+When the receipt yields a CJK merchant string:
+  display_name_zh          ← that string (e.g. "小玲锅巴土豆")
+  display_name_zh_locale   ← "zh"
+  display_name_zh_source   ← "receipt_ocr"
+  display_name_zh_is_native← true   (the receipt is the merchant's own surface)
+
+Also record provenance in metadata:
+  metadata.receipt_ocr_zh = {
+    "chinese_chars": "小玲锅巴土豆",
+    "extracted_from": "letterhead",
+    "confidence": "high"
+  }
+
+This phase is FREE — it uses OCR you've already done. Always run
+it before giving up on the Chinese name.
 
 ── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
 
@@ -544,7 +651,7 @@ returned NULL for a field never overwrites a previously-good value.
       INSERT INTO places (
         id, google_place_id, formatted_address, lat, lng, source, raw_response,
         first_seen_at, last_seen_at, hit_count,
-        display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source,
+        display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source, display_name_zh_is_native,
         primary_type, primary_type_display_zh, maps_type_label_zh, types,
         formatted_address_en, formatted_address_zh, postal_code, country_code,
         business_status, business_hours, time_zone,
@@ -559,7 +666,8 @@ returned NULL for a field never overwrites a previously-good value.
         <NULLABLE_TEXT 'display_name_en'>,
         <NULLABLE_TEXT 'display_name_zh'>,
         <NULLABLE_TEXT 'display_name_zh_locale'>,
-        <NULLABLE_TEXT 'display_name_zh_source'>,           -- 'google_text' | 'photo_ocr' | NULL
+        <NULLABLE_TEXT 'display_name_zh_source'>,           -- 'google_text' | 'photo_ocr' | 'receipt_ocr' | NULL
+        <NULLABLE_BOOL 'display_name_zh_is_native'>,        -- true unless brand is a global English-first name w/ Google gloss
         <NULLABLE_TEXT 'primary_type'>,
         <NULLABLE_TEXT 'primary_type_display_zh'>,
         <NULLABLE_TEXT 'maps_type_label_zh'>,
@@ -585,6 +693,7 @@ returned NULL for a field never overwrites a previously-good value.
             display_name_zh          = COALESCE(EXCLUDED.display_name_zh,          places.display_name_zh),
             display_name_zh_locale   = COALESCE(EXCLUDED.display_name_zh_locale,   places.display_name_zh_locale),
             display_name_zh_source   = COALESCE(EXCLUDED.display_name_zh_source,   places.display_name_zh_source),
+            display_name_zh_is_native = COALESCE(EXCLUDED.display_name_zh_is_native, places.display_name_zh_is_native),
             primary_type             = COALESCE(EXCLUDED.primary_type,             places.primary_type),
             primary_type_display_zh  = COALESCE(EXCLUDED.primary_type_display_zh,  places.primary_type_display_zh),
             maps_type_label_zh       = COALESCE(EXCLUDED.maps_type_label_zh,       places.maps_type_label_zh),

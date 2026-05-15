@@ -29,7 +29,16 @@ export interface PlaceRow {
   display_name_en: string | null;
   display_name_zh: string | null;
   display_name_zh_locale: string | null;
-  display_name_zh_source: "google_text" | "photo_ocr" | "user_override" | null;
+  display_name_zh_source:
+    | "google_text"
+    | "photo_ocr"
+    | "receipt_ocr"
+    | "user_override"
+    | null;
+  /** Whether `display_name_zh` is the merchant's native-script name
+   *  (true) or a Google-translated gloss (false). See `places.ts`
+   *  schema for the full definition. */
+  display_name_zh_is_native: boolean | null;
   custom_name_zh: string | null;
 
   primary_type: string | null;
@@ -81,6 +90,7 @@ function rowToApi(r: typeof places.$inferSelect): Omit<PlaceRow, "photos"> {
     display_name_zh_locale: r.displayNameZhLocale,
     display_name_zh_source:
       (r.displayNameZhSource as PlaceRow["display_name_zh_source"]) ?? null,
+    display_name_zh_is_native: r.displayNameZhIsNative,
     custom_name_zh: r.customNameZh,
     primary_type: r.primaryType,
     primary_type_display_zh: r.primaryTypeDisplayZh,

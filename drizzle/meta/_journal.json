@@ -71,6 +71,13 @@
       "when": 1778657498049,
       "tag": "0009_multilingual_place_cache",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1778715060674,
+      "tag": "0010_display_name_zh_is_native",
+      "breakpoints": true
     }
   ]
 }

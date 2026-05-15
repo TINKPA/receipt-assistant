@@ -724,7 +724,14 @@
             "enum": [
               "google_text",
               "photo_ocr",
+              "receipt_ocr",
               "user_override"
+            ]
+          },
+          "display_name_zh_is_native": {
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "custom_name_zh": {
@@ -875,6 +882,7 @@
           "display_name_zh",
           "display_name_zh_locale",
           "display_name_zh_source",
+          "display_name_zh_is_native",
           "custom_name_zh",
           "primary_type",
           "primary_type_display_zh",
