@@ -7,6 +7,17 @@
  * See `receipt-assistant#49` for the architectural move from Phase 1
  * (Node-side coerce + service-layer writes) to Phase 2.
  */
+import { buildInfo } from "../generated/build-info.js";
+
+/**
+ * Manual prompt-version stamp written into `transactions.metadata.extraction`
+ * for every ingest. Bump on meaningful prompt changes only — typo fixes
+ * and whitespace edits do not warrant a new version. The string becomes
+ * the gate for `POST /v1/documents/:id/re-extract` (#91): rows whose
+ * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
+ * re-derived. See #80 / #88 for the 3-layer data model rationale.
+ */
+export const PROMPT_VERSION = "2.5";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -384,6 +395,24 @@ An ingest without this key is considered incomplete. Emit it even
 when no corrections were needed (correction_applied=false,
 note="clean extraction").
 
+### REQUIRED metadata.extraction shape (provenance stamp — #88 / #80)
+
+The transaction SQL template below already includes the
+\`extraction\` key under metadata. **Do not change its values** — they
+are templated from Node-side build artifacts so they describe the
+prompt/model under which extraction actually ran:
+
+  "extraction": {
+    "prompt_version": "${PROMPT_VERSION}",     // bumped manually on meaningful prompt edits
+    "prompt_git_sha": "${buildInfo.gitSha}",    // build-time git rev
+    "model":          "${process.env.CLAUDE_MODEL ?? "sonnet"}",
+    "ran_at":         NOW()                                                    // wall-clock at COMMIT
+  }
+
+Future re-extract endpoints (#91) gate eligibility on
+\`prompt_version != latest\`. Leaving these wrong would mark this
+transaction as already-up-to-date and skip it.
+
 ── Phase 4 — Write to the ledger ──────────────────────────────────────
 
 v1 schema primer (workspace_id is required on every row):
@@ -464,6 +493,12 @@ them first):
             'canonical_name', '<CANONICAL_NAME>',
             'brand_id',       '<brand-id>',
             'category',       '<7-class CATEGORY>'
+          ),
+          'extraction', jsonb_build_object(
+            'prompt_version', '${PROMPT_VERSION}',
+            'prompt_git_sha', '${buildInfo.gitSha}',
+            'model',          '${process.env.CLAUDE_MODEL ?? "sonnet"}',
+            'ran_at',         NOW()
           )
           -- add tax/tip/items/raw_text here if useful, as extra JSONB keys
         ),
