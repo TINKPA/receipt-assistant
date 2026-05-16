@@ -15,6 +15,7 @@ export const BrandAssetTier = z.enum([
   "svgl",
   "logo_dev",
   "simple_icons",
+  "google_play",
   "user_upload",
   "manual_url",
 ]);

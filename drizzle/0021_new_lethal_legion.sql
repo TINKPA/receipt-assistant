@@ -1,0 +1,2 @@
+ALTER TABLE "brand_assets" DROP CONSTRAINT "brand_assets_tier_ck";--> statement-breakpoint
+ALTER TABLE "brand_assets" ADD CONSTRAINT "brand_assets_tier_ck" CHECK ("brand_assets"."tier" IN ('itunes','svgl','logo_dev','simple_icons','google_play','user_upload','manual_url'));

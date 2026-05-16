@@ -267,6 +267,7 @@ brandsRouter.get(
         .select({
           localPath: brandAssets.localPath,
           contentType: brandAssets.contentType,
+          contentHash: brandAssets.contentHash,
           retiredAt: brandAssets.retiredAt,
         })
         .from(brandAssets)
@@ -297,8 +298,20 @@ brandsRouter.get(
           `File missing on disk: ${absPath}`,
         );
       }
+      // Strong ETag is the asset's content_hash. The URL stays stable
+      // (`/brands/<id>/icon`) while the underlying bytes flip whenever
+      // a user re-picks `preferred_asset_id` — so `immutable` would be
+      // wrong here. `max-age=0, must-revalidate` makes every request a
+      // conditional GET; the 304 path is cheap (no read) and the user's
+      // Pick takes effect the next time anything renders the icon.
+      const etag = `"${asset.contentHash}"`;
+      res.setHeader("ETag", etag);
+      res.setHeader("Cache-Control", "public, max-age=0, must-revalidate");
+      if (req.headers["if-none-match"] === etag) {
+        res.status(304).end();
+        return;
+      }
       res.setHeader("Content-Type", asset.contentType);
-      res.setHeader("Cache-Control", "public, max-age=86400, immutable");
       createReadStream(absPath).pipe(res);
     } catch (err) {
       next(err);
