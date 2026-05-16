@@ -10,9 +10,12 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { and, eq, sql } from "drizzle-orm";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
 
 import { db } from "../db/client.js";
 import { merchants } from "../schema/merchants.js";
+import { places, placePhotos } from "../schema/places.js";
 import { parseOrThrow } from "../http/validate.js";
 import { NotFoundProblem } from "../http/problem.js";
 import {
@@ -55,6 +58,14 @@ async function resolveMerchant(workspaceId: string, identifier: string) {
 }
 
 function rowToMerchantDto(m: typeof merchants.$inferSelect) {
+  // `photo_url` post-#67 is a relative proxy URL to the merchant
+  // photo endpoint when a Google place_id is linked. The endpoint
+  // resolves to a cached `place_photos.rank=0` byte stream when
+  // available, or 404s otherwise — CSS-background heroes degrade
+  // naturally to the category-color fallback in either case.
+  // The original `m.photoUrl` column (Google short-lived attribution
+  // URL) is no longer surfaced; it would expire after ~24h anyway.
+  const photoUrl = m.placeId ? `/v1/merchants/${m.id}/photo` : null;
   return {
     id: m.id,
     workspace_id: m.workspaceId,
@@ -62,7 +73,7 @@ function rowToMerchantDto(m: typeof merchants.$inferSelect) {
     canonical_name: m.canonicalName,
     category: m.category,
     place_id: m.placeId,
-    photo_url: m.photoUrl,
+    photo_url: photoUrl,
     photo_attribution: m.photoAttribution,
     address: m.address,
     lat: m.lat !== null ? Number(m.lat) : null,
@@ -222,6 +233,60 @@ merchantsRouter.get(
   }),
 );
 
+// ── GET /v1/merchants/:id/photo (#67) ──────────────────────────────────
+
+merchantsRouter.get(
+  "/:id/photo",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const merchant = await resolveMerchant(req.ctx.workspaceId, id);
+    if (!merchant) throw new NotFoundProblem("Merchant", id);
+
+    // Option A from #67 explore: reuse the existing place_photos
+    // cache from #74. The merchant's Google place_id maps to a
+    // places row, which has place_photos rows with bytes already on
+    // disk under /data/uploads/places/<google_place_id>/<rank>.jpg.
+    // No new schema, no duplicated bytes, no new enrichment hop.
+    if (!merchant.placeId) {
+      throw new NotFoundProblem("MerchantPhoto", id);
+    }
+
+    const photoRows = await db
+      .select({ filePath: placePhotos.filePath, mimeType: placePhotos.mimeType })
+      .from(placePhotos)
+      .innerJoin(places, eq(places.id, placePhotos.placeId))
+      .where(
+        and(
+          eq(places.googlePlaceId, merchant.placeId),
+          sql`${placePhotos.filePath} IS NOT NULL`,
+        ),
+      )
+      .orderBy(placePhotos.rank)
+      .limit(1);
+
+    if (photoRows.length === 0) {
+      throw new NotFoundProblem("MerchantPhoto", id);
+    }
+    const photo = photoRows[0]!;
+    if (!photo.filePath) {
+      throw new NotFoundProblem("MerchantPhoto", id);
+    }
+
+    // Sanity-check the file is still on disk — hard delete moves
+    // files into .trash/ rather than unlinking (#73).
+    try {
+      const st = await stat(photo.filePath);
+      if (!st.isFile()) throw new Error("not a file");
+    } catch {
+      throw new NotFoundProblem("MerchantPhoto", id);
+    }
+
+    res.setHeader("Content-Type", photo.mimeType ?? "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    createReadStream(photo.filePath).pipe(res);
+  }),
+);
+
 // ── OpenAPI registration ───────────────────────────────────────────────
 
 const problemResponse = {
@@ -248,6 +313,27 @@ export function registerMerchantsOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: MerchantDetail } },
       },
       404: { description: "Merchant not found", ...problemResponse },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/v1/merchants/{id}/photo",
+    summary: "Stream the cached hero photo for a merchant (#67).",
+    description:
+      "Resolves to the merchant's linked `places.id` and serves the " +
+      "first `place_photos` row with cached bytes. Returns 404 when " +
+      "the merchant has no linked place or no cached photos for that " +
+      "place. Reuses the `place_photos` cache from #74 — no separate " +
+      "merchant_photos table.",
+    tags: ["merchants"],
+    request: { params: MerchantPathParams },
+    responses: {
+      200: {
+        description: "Image bytes",
+        content: { "image/jpeg": { schema: { type: "string", format: "binary" } } },
+      },
+      404: { description: "Merchant or photo not found", ...problemResponse },
     },
   });
 

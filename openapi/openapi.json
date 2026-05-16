@@ -5687,6 +5687,49 @@
         }
       }
     },
+    "/v1/merchants/{id}/photo": {
+      "get": {
+        "summary": "Stream the cached hero photo for a merchant (#67).",
+        "description": "Resolves to the merchant's linked `places.id` and serves the first `place_photos` row with cached bytes. Returns 404 when the merchant has no linked place or no cached photos for that place. Reuses the `place_photos` cache from #74 — no separate merchant_photos table.",
+        "tags": [
+          "merchants"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Image bytes",
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Merchant or photo not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/merchants/{id}/transactions": {
       "get": {
         "summary": "Transactions for a merchant, newest first, keyset-paginated",
