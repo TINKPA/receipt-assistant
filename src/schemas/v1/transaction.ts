@@ -11,6 +11,23 @@ import {
   Uuid,
 } from "./common.js";
 import { Place } from "./place.js";
+import { MerchantBrandId } from "./merchant.js";
+
+/**
+ * Compact merchant reference embedded in transaction responses so the
+ * frontend can resolve brand-level Layer-3 overrides (#79 Phase C —
+ * `merchants.custom_name`) without an N+1 fetch per row. Exposes only
+ * the four fields the Ledger displayName cascade needs; full merchant
+ * detail is still at `GET /v1/merchants/:id`.
+ */
+export const TransactionMerchantRef = z
+  .object({
+    id: Uuid,
+    brand_id: MerchantBrandId,
+    canonical_name: z.string(),
+    custom_name: z.string().nullable(),
+  })
+  .openapi("TransactionMerchantRef");
 
 export const TxnStatus = z.enum([
   "draft",
@@ -132,6 +149,14 @@ export const Transaction = z
     postings: z.array(Posting),
     documents: z.array(TransactionDocumentRef),
     place: Place.nullable(),
+    /**
+     * Merchant aggregation root (#64) joined from `transactions.merchant_id`.
+     * Null when the row predates merchant emission or the agent declined
+     * to write a merchant block. Carries `custom_name` so the frontend
+     * `displayName()` cascade can pick up brand-level Layer-3 renames
+     * (#79 Phase C) without an extra fetch per Ledger row.
+     */
+    merchant: TransactionMerchantRef.nullable(),
     /**
      * Receipt line items (#81 Phase 2). Reads from the
      * `transaction_items` table when present; falls back to

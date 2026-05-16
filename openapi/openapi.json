@@ -909,6 +909,40 @@
           "photos"
         ]
       },
+      "TransactionMerchantRef": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "brand_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "canonical_name": {
+            "type": "string"
+          },
+          "custom_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "brand_id",
+          "canonical_name",
+          "custom_name"
+        ]
+      },
       "TransactionItem": {
         "type": "object",
         "properties": {
@@ -1153,6 +1187,9 @@
           "place": {
             "$ref": "#/components/schemas/Place"
           },
+          "merchant": {
+            "$ref": "#/components/schemas/TransactionMerchantRef"
+          },
           "items": {
             "type": "array",
             "items": {
@@ -1177,6 +1214,7 @@
           "postings",
           "documents",
           "place",
+          "merchant",
           "items"
         ]
       },

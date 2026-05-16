@@ -22,8 +22,45 @@ import {
   documentLinks,
   transactionEvents,
   workspaces,
+  merchants,
 } from "../schema/index.js";
 import { loadPlacesByIds, type PlaceRow } from "./places.service.js";
+
+/** Compact merchant ref joined into transaction responses; carries
+ *  `custom_name` so the frontend can apply brand-level Layer-3 renames
+ *  (#79 Phase C) to Ledger rows without an N+1 fetch. */
+export interface MerchantRefRow {
+  id: string;
+  brand_id: string;
+  canonical_name: string;
+  custom_name: string | null;
+}
+
+async function loadMerchantRefsByIds(
+  runner: typeof db,
+  ids: string[],
+): Promise<Map<string, MerchantRefRow>> {
+  const map = new Map<string, MerchantRefRow>();
+  if (ids.length === 0) return map;
+  const rows = await runner
+    .select({
+      id: merchants.id,
+      brandId: merchants.brandId,
+      canonicalName: merchants.canonicalName,
+      customName: merchants.customName,
+    })
+    .from(merchants)
+    .where(inArray(merchants.id, ids));
+  for (const r of rows) {
+    map.set(r.id, {
+      id: r.id,
+      brand_id: r.brandId,
+      canonical_name: r.canonicalName,
+      custom_name: r.customName ?? null,
+    });
+  }
+  return map;
+}
 import { newId } from "../http/uuid.js";
 import {
   HttpProblem,
@@ -125,6 +162,13 @@ export interface TransactionRow {
    * the places feature, or when the row has been unlinked.
    */
   place: PlaceRow | null;
+  /**
+   * Merchant aggregation root (#64) joined from `transactions.merchant_id`.
+   * Carries `custom_name` so the frontend `displayName()` cascade can
+   * pick up brand-level Layer-3 renames (#79 Phase C) without an N+1
+   * fetch per row.
+   */
+  merchant: MerchantRefRow | null;
   /**
    * Receipt line items (#81). Phase 2 reads `transaction_items`;
    * empty array means the receipt has no items section (e.g. the
@@ -290,6 +334,7 @@ function mapTransactionRow(
   docs: Array<{ id: string; kind: string }>,
   place: PlaceRow | null = null,
   itemRows: any[] = [],
+  merchant: MerchantRefRow | null = null,
 ): TransactionRow {
   const metadata = row.metadata ?? {};
   const items =
@@ -316,6 +361,7 @@ function mapTransactionRow(
     postings: posts.map(mapPostingRow),
     documents: docs,
     place,
+    merchant,
     items,
   };
 }
@@ -347,6 +393,10 @@ async function loadTransactionFull(
     .where(eq(documentLinks.transactionId, id));
   const placeMap = t.placeId ? await loadPlacesByIds([t.placeId]) : null;
   const place = placeMap?.get(t.placeId!) ?? null;
+  const merchantMap = t.merchantId
+    ? await loadMerchantRefsByIds(runner, [t.merchantId])
+    : null;
+  const merchant = merchantMap?.get(t.merchantId!) ?? null;
   // #84: only show LIVE items (retired_at IS NULL). Re-extract soft-
   // deletes the prior run; old rows are kept for history but must not
   // surface in the response.
@@ -360,7 +410,7 @@ async function loadTransactionFull(
       ),
     )
     .orderBy(transactionItems.lineNo);
-  return mapTransactionRow(t, posts, docLinks, place, itemRows);
+  return mapTransactionRow(t, posts, docLinks, place, itemRows, merchant);
 }
 
 async function loadWorkspaceBaseCurrency(
@@ -692,6 +742,13 @@ export async function listTransactions(
     .filter((v): v is string => typeof v === "string" && v.length > 0);
   const placeMap = placeIds.length > 0 ? await loadPlacesByIds(placeIds) : null;
 
+  const merchantIds = page
+    .map((r) => r.merchant_id as string | null)
+    .filter((v): v is string => typeof v === "string" && v.length > 0);
+  const merchantMap = merchantIds.length > 0
+    ? await loadMerchantRefsByIds(db, merchantIds)
+    : null;
+
   // Bulk-load relational line-items for this page. Empty → fallback
   // path in mapTransactionRow reads metadata.items for pre-#81 rows.
   // #84: filter retired_at IS NULL — re-extract soft-deletes the
@@ -713,6 +770,9 @@ export async function listTransactions(
       docByTx.get(r.id) ?? [],
       r.place_id && placeMap ? (placeMap.get(r.place_id) ?? null) : null,
       itemsByTx.get(r.id) ?? [],
+      r.merchant_id && merchantMap
+        ? (merchantMap.get(r.merchant_id) ?? null)
+        : null,
     ),
   );
 
