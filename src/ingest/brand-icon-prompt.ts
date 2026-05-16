@@ -181,6 +181,39 @@ via separate Bash tool calls if you want.
     Save to /data/brand-assets/<bid>/simple-icons/<slug>.svg.
     INSERT with tier='simple_icons'.
 
+  Tier google_play — Android app artwork, scrape og:image (NO auth):
+
+    Cover for the well-documented Apple iTunes Search API indexing lag
+    on freshly-launched bundleIds — CHAGEE USA (id=6737460668, launched
+    2025-01) returned 0 results from /lookup and /search across 7
+    countries for months after launch. Google Play indexes new apps
+    almost immediately and exposes a clean artwork URL in the page's
+    structured data, with no auth and no Cloudflare wall.
+
+    Guess the Android bundleId from the iOS one or the brand context.
+    Common patterns: com.<slug>.application / com.<slug>.us.application
+    / com.<slug>.app / com.<seller>.<slug>. If you have the iOS
+    bundleId, the Android one usually shares the same reverse-domain
+    structure (CHAGEE was com.chagee.application.zh on iOS, but
+    com.chagee.us.application on Android — the US-region variant). You
+    can also reach the page from a WebSearch "<brand> google play".
+
+    curl -sSL "https://play.google.com/store/apps/details?id=<bundleId>&hl=en_US" \
+      -A "Mozilla/5.0" -o /tmp/gp.html
+
+    The icon URL is exposed two ways — pick either:
+      (a) <meta property="og:image" content="https://play-lh.googleusercontent.com/...">
+      (b) JSON-LD <script type="application/ld+json"> { "@type": "SoftwareApplication",
+            "image": "https://play-lh.googleusercontent.com/..." }
+
+    Append =s512 to get a 512x512 PNG (Google Play resizes via URL param):
+      curl -sS "<url>=s512" -o /data/brand-assets/<bid>/google-play/<bundleId>_512.png
+
+    INSERT with tier='google_play', content_type='image/png'.
+    source_url should be the play.google.com/store/apps/details URL
+    (not the play-lh CDN URL — that lets future re-extracts trace
+    the asset back to its discoverable page).
+
 After mechanical fetch, brand_assets now has 0..N rows for this brand
 with agent_relevance and agent_notes still NULL. Proceed to Phase 4c.
 

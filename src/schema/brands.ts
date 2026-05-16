@@ -110,7 +110,7 @@ export const brandAssets = pgTable(
     index("brand_assets_brand_tier_idx").on(t.brandId, t.tier),
     check(
       "brand_assets_tier_ck",
-      sql`${t.tier} IN ('itunes','svgl','logo_dev','simple_icons','user_upload','manual_url')`,
+      sql`${t.tier} IN ('itunes','svgl','logo_dev','simple_icons','google_play','user_upload','manual_url')`,
     ),
   ],
 );
