@@ -23,6 +23,7 @@ import { ProblemDetails } from "./schemas/v1/common.js";
 import { registerAccountsOpenApi } from "./routes/accounts.js";
 import { registerTransactionsOpenApi } from "./routes/transactions.js";
 import { registerItemsOpenApi } from "./routes/items.js";
+import { registerProductsOpenApi } from "./routes/products.js";
 import { registerPostingsOpenApi } from "./routes/postings.js";
 import { registerDocumentsOpenApi } from "./routes/documents.js";
 import { registerIngestOpenApi } from "./routes/ingest.js";
@@ -77,6 +78,7 @@ export function buildRegistry(): OpenAPIRegistry {
   registerAccountsOpenApi(registry);
   registerTransactionsOpenApi(registry);
   registerItemsOpenApi(registry);
+  registerProductsOpenApi(registry);
   registerPostingsOpenApi(registry);
   registerDocumentsOpenApi(registry);
   registerIngestOpenApi(registry);

@@ -11,7 +11,7 @@
  * translated to `PostingsImbalanceProblem` (422) so clients see a
  * structured 7807 error rather than an opaque 500.
  */
-import { sql, eq, and, inArray } from "drizzle-orm";
+import { sql, eq, and, inArray, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import {
   transactions,
@@ -89,6 +89,16 @@ export interface TransactionItemRow {
   food_kind: "restaurant_dish" | "grocery_food" | "beverage" | null;
   tags: string[] | null;
   confidence: "high" | "medium" | "low";
+  /** #84 — recommended labels: product / tax / tip / discount / shipping. */
+  line_type: string;
+  /** #84 — catalog linkage; NULL on non-product rows. */
+  product_id: string | null;
+  /** #84 — per-line tax allocated from the printed aggregate. */
+  tax_minor: number | null;
+  tip_share_minor: number | null;
+  discount_share_minor: number | null;
+  /** #84 — generated column: line_total + tax + tip - discount. */
+  effective_total_minor: number;
 }
 
 export interface TransactionRow {
@@ -217,6 +227,13 @@ function mapPostingRow(row: any): PostingRow {
  * field-for-field so this can swallow either shape.
  */
 function mapTransactionItem(row: any): TransactionItemRow {
+  const unitPrice = row.unitPriceMinor ?? row.unit_price_minor;
+  const taxMinor = row.taxMinor ?? row.tax_minor;
+  const tipShare = row.tipShareMinor ?? row.tip_share_minor;
+  const discShare = row.discountShareMinor ?? row.discount_share_minor;
+  const lineTotal = Number(row.lineTotalMinor ?? row.line_total_minor);
+  const effective =
+    row.effectiveTotalMinor ?? row.effective_total_minor ?? null;
   return {
     line_no: Number(row.lineNo ?? row.line_no),
     raw_name: row.rawName ?? row.raw_name,
@@ -227,17 +244,30 @@ function mapTransactionItem(row: any): TransactionItemRow {
         : Number(row.quantity),
     unit: row.unit ?? null,
     unit_price_minor:
-      (row.unitPriceMinor ?? row.unit_price_minor) === null ||
-      (row.unitPriceMinor ?? row.unit_price_minor) === undefined
-        ? null
-        : Number(row.unitPriceMinor ?? row.unit_price_minor),
-    line_total_minor: Number(row.lineTotalMinor ?? row.line_total_minor),
+      unitPrice === null || unitPrice === undefined ? null : Number(unitPrice),
+    line_total_minor: lineTotal,
     currency: row.currency,
     item_class: row.itemClass ?? row.item_class,
     durability_tier: row.durabilityTier ?? row.durability_tier ?? null,
     food_kind: row.foodKind ?? row.food_kind ?? null,
     tags: Array.isArray(row.tags) ? row.tags : null,
     confidence: row.confidence,
+    line_type: row.lineType ?? row.line_type ?? "product",
+    product_id: row.productId ?? row.product_id ?? null,
+    tax_minor: taxMinor === null || taxMinor === undefined ? null : Number(taxMinor),
+    tip_share_minor:
+      tipShare === null || tipShare === undefined ? null : Number(tipShare),
+    discount_share_minor:
+      discShare === null || discShare === undefined ? null : Number(discShare),
+    // For fallback rows (pre-#84) the generated column doesn't exist;
+    // synthesize it from the components so clients always get a number.
+    effective_total_minor:
+      effective === null
+        ? lineTotal +
+          (Number(taxMinor) || 0) +
+          (Number(tipShare) || 0) -
+          (Number(discShare) || 0)
+        : Number(effective),
   };
 }
 
@@ -317,10 +347,18 @@ async function loadTransactionFull(
     .where(eq(documentLinks.transactionId, id));
   const placeMap = t.placeId ? await loadPlacesByIds([t.placeId]) : null;
   const place = placeMap?.get(t.placeId!) ?? null;
+  // #84: only show LIVE items (retired_at IS NULL). Re-extract soft-
+  // deletes the prior run; old rows are kept for history but must not
+  // surface in the response.
   const itemRows = await runner
     .select()
     .from(transactionItems)
-    .where(eq(transactionItems.transactionId, id))
+    .where(
+      and(
+        eq(transactionItems.transactionId, id),
+        isNull(transactionItems.retiredAt),
+      ),
+    )
     .orderBy(transactionItems.lineNo);
   return mapTransactionRow(t, posts, docLinks, place, itemRows);
 }
@@ -656,8 +694,10 @@ export async function listTransactions(
 
   // Bulk-load relational line-items for this page. Empty → fallback
   // path in mapTransactionRow reads metadata.items for pre-#81 rows.
+  // #84: filter retired_at IS NULL — re-extract soft-deletes the
+  // prior run; only the current run is live.
   const itemRes = await db.execute(
-    sql`SELECT * FROM transaction_items WHERE transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)}) ORDER BY transaction_id, line_no ASC`,
+    sql`SELECT * FROM transaction_items WHERE transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)}) AND retired_at IS NULL ORDER BY transaction_id, line_no ASC`,
   );
   const itemsByTx = new Map<string, any[]>();
   for (const it of itemRes.rows as any[]) {

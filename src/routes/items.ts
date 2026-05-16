@@ -71,6 +71,8 @@ itemsRouter.get(
 
       const conditions: ReturnType<typeof sql>[] = [];
       conditions.push(sql`ti.workspace_id = ${req.ctx.workspaceId}::uuid`);
+      // #84: only live items. Re-extract soft-deletes the prior run.
+      conditions.push(sql`ti.retired_at IS NULL`);
       if (query.class) conditions.push(sql`ti.item_class = ${query.class}`);
       if (query.transaction_id) {
         conditions.push(sql`ti.transaction_id = ${query.transaction_id}::uuid`);

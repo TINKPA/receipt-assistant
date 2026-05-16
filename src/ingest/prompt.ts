@@ -17,7 +17,7 @@ import { buildInfo } from "../generated/build-info.js";
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.6";
+export const PROMPT_VERSION = "2.7";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -163,6 +163,72 @@ Each \`item\` object has these fields:
                                  low    — thermal-paper smudge,
                                           ink fade, partial occlusion
 
+  ── Phase 1 of #84: products SSOT + allocation fields ──
+
+  line_type          text       prompt-recommended values:
+                                 product  — the default, an actual line
+                                 tax      — printed tax aggregate row
+                                 tip      — printed tip aggregate row
+                                 discount — store discount aggregate row
+                                 shipping | surcharge | service_fee |
+                                 gift_card | …
+                                Invent a snake_case label when none fit.
+                                tax/tip/discount rows MUST appear if
+                                printed — they're the audit baseline
+                                against the per-line allocations below.
+
+  product_key        text|null  kebab-case canonical key. REQUIRED for
+                                line_type='product'; NULL for tax/tip/
+                                discount rows. Format: ^[a-z0-9-]+\$.
+                                Same product → same key forever.
+                                Variants get distinct keys:
+                                  iphone-15-pro-natural-titanium-256
+                                  iphone-15-pro-blue-titanium-256
+                                  kirkland-paper-towels-12ct
+                                  starbucks-grande-latte
+                                  costco-gas-regular   (NOT just "gas")
+                                Don't include the merchant id in the key
+                                — merchant scoping lives on a separate
+                                column.
+
+  product_brand_id   text|null  the manufacturer brand, NOT the seller.
+                                "apple" for iPhone, "kirkland" for KS
+                                products, "starbucks" for in-store
+                                espresso. Mirror the merchant block's
+                                brand_id rules.
+
+  product_merchant_exclusive bool|null
+                                true  → this product only exists at
+                                        this merchant (Crunchwrap @
+                                        Taco Bell, AYCE @ Sichuan Spicy
+                                        Bay, in-store private label).
+                                        Phase 4 binds product.merchant_id
+                                        to this receipt's merchant.
+                                false → portable / cross-merchant
+                                        (iPhone, Coke, brand-name goods).
+                                        product.merchant_id stays NULL
+                                        and the row shares across stores.
+
+  product_model      text|null   "M3 13\\" 256GB", "iPad Pro 11\\""
+  product_color      text|null   "Natural Titanium", "Black", "Red"
+  product_size       text|null   "L", "12 ct", "750 ml"
+  product_variant    text|null   free-text catch-all (flavor, fit, finish)
+  product_sku        text|null   when printed on the receipt
+  product_manufacturer text|null when the brand and the manufacturer
+                                differ ("kirkland" brand made by
+                                "georgia-pacific" manufacturer); leave
+                                NULL when they match.
+
+  tax_minor          int|null    per-line tax share allocated from the
+                                printed tax aggregate. See Phase 2.7
+                                allocation logic. NULL on tax/tip/
+                                discount rows themselves and on lines
+                                you decide are non-taxable.
+  tip_share_minor    int|null    per-line tip share from printed tip.
+  discount_share_minor int|null  per-line discount share. Signed
+                                positive (always reduces). NULL when
+                                no discount applies.
+
 Arithmetic invariant — Σ line_total_minor across all items SHOULD
 approximate the receipt's printed subtotal (within \$0.01 rounding;
 tax/tip/discount lines are themselves items or excluded — see
@@ -209,6 +275,47 @@ Best Buy laptop ($1,599):
 For statement_pdf, pull rows: { date, payee, amount_minor }.
 
 For unsupported, record a short reason.
+
+── Phase 2.7 — Per-line tax / tip / discount allocation (#84) ─────────
+
+Receipts print aggregate tax / tip / discount; users want "what did
+this specific line cost me, all-in." Allocate per-line at ingest.
+Recommended logic (apply real arithmetic; do NOT hard-code rates):
+
+Tax allocation:
+  1. Look for per-line taxability markers ("T", "T1/T2", asterisks
+     next to specific lines, "Taxable" labels).
+  2. If markers present: \`tax_minor\` for each taxable line =
+     ROUND(printed-tax-total × line_total_minor / Σ taxable lines).
+     Non-taxable lines → tax_minor = NULL.
+  3. If no markers: treat all line_type='product' rows as equally
+     taxable and allocate proportionally.
+  4. Make Σ tax_minor exactly match the printed tax (absorb the
+     rounding remainder on the largest line).
+
+Tip allocation (dining receipts):
+  Split the printed tip total proportionally across product lines
+  by \`line_total_minor\`. Tips are for the whole meal.
+
+Discount allocation:
+  Receipt names the target ("20% off Item X") → put it all on that
+  line. Whole-order ("\$5 off subtotal") → split proportionally.
+  BOGO / "buy 2 get 1 free" / promo edge cases → use judgment;
+  record the reasoning in transactions.metadata.allocation_audit.
+
+Always emit the printed tax / tip / discount rows themselves as
+items with line_type ∈ ('tax','tip','discount') and product_key=NULL.
+Their tax_minor / tip_share_minor / discount_share_minor stay NULL
+— a tax line is not itself taxed.
+
+Final self-check before COMMIT:
+  Σ effective_total_minor (line_type='product') ≈ transactions.total
+  Σ tax_minor      ≈ items where line_type='tax'
+  Σ tip_share_minor ≈ items where line_type='tip'
+  Σ discount_share_minor ≈ items where line_type='discount'
+Discrepancies > 1¢ → record in transactions.metadata.allocation_audit
+(structured object: \`{kind, expected, got, delta}\`). Don't block
+ingest — just log.
 
 ── Phase 2.5 — Merchant canonicalization (#64) ────────────────────────
 
@@ -748,41 +855,125 @@ them first):
       ON CONFLICT DO NOTHING
       RETURNING transaction_id
     ),
-    -- #81 Phase 2: relational line-items. One INSERT per item from
-    -- your Phase 2 items[] array. The shape is identical to the
-    -- jsonb_build_object's 'items' key — both stay in sync this
-    -- release; clients read items off the table, the metadata copy
-    -- is the on-the-wire archive of the agent's exact emission.
-    -- Use ARRAY[]::text[] when tags is empty / NULL.
-    -- Re-extract on the same tx clears + reinserts via the (tx_id,
-    -- line_no) unique constraint; ingest only ever inserts (the
-    -- transaction is brand new here, so no conflicts possible).
+    -- #84 Phase 1: products SSOT upsert. The agent emits a
+    -- product_key per item; this CTE upserts the catalog row keyed by
+    -- (workspace_id, merchant_id, product_key) and returns its id.
+    -- merchant_id is NULL when product_merchant_exclusive=false (the
+    -- product is portable across stores) and the receipt's
+    -- merchant_id when true (in-store private label / dish).
+    -- Non-product lines (line_type ∈ tax/tip/discount/shipping/…) get
+    -- product_key=NULL and skip this step entirely (filtered by the
+    -- WHERE clause). NULLS NOT DISTINCT in the unique index makes
+    -- merchant_id=NULL participate.
+    p_upsert AS (
+      INSERT INTO products (
+        workspace_id, merchant_id, product_key, canonical_name,
+        item_class, brand_id, model, color, size, variant, sku,
+        manufacturer
+      )
+      SELECT '${ctx.workspaceId}',
+             CASE WHEN item.product_merchant_exclusive THEN (SELECT id FROM m) ELSE NULL END,
+             item.product_key,
+             COALESCE(item.normalized_name, item.raw_name),
+             item.item_class, item.product_brand_id,
+             item.product_model, item.product_color, item.product_size,
+             item.product_variant, item.product_sku, item.product_manufacturer
+      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+        line_no int, raw_name text, normalized_name text,
+        quantity numeric, unit text,
+        unit_price_minor bigint, line_total_minor bigint, currency text,
+        item_class text, durability_tier text, food_kind text,
+        tags text[], confidence text,
+        line_type text, product_key text, product_brand_id text,
+        product_merchant_exclusive boolean, product_model text,
+        product_color text, product_size text, product_variant text,
+        product_sku text, product_manufacturer text,
+        tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
+      )
+      WHERE COALESCE(item.line_type, 'product') = 'product' AND item.product_key IS NOT NULL
+      ON CONFLICT (workspace_id, merchant_id, product_key) DO UPDATE
+        SET updated_at = NOW(),
+            canonical_name = COALESCE(EXCLUDED.canonical_name, products.canonical_name),
+            brand_id       = COALESCE(EXCLUDED.brand_id,       products.brand_id),
+            item_class     = COALESCE(EXCLUDED.item_class,     products.item_class)
+      RETURNING id, product_key, merchant_id
+    ),
+    -- #81 Phase 2 + #84: relational line-items with product_id link
+    -- and per-line allocation columns. Re-extract on the same tx
+    -- bumps extraction_run and soft-deletes the prior run; this
+    -- ingest path always writes the first run (run=1, retired_at=NULL).
     ti AS (
       INSERT INTO transaction_items (
         id, workspace_id, transaction_id, line_no,
         raw_name, normalized_name, quantity, unit,
         unit_price_minor, line_total_minor, currency,
         item_class, durability_tier, food_kind, tags, confidence,
-        extraction_version
+        line_type, product_id, tax_minor, tip_share_minor,
+        discount_share_minor, extraction_run, extraction_version
       )
       SELECT gen_random_uuid(), '${ctx.workspaceId}', tx.id, item.line_no,
              item.raw_name, item.normalized_name, item.quantity, item.unit,
              item.unit_price_minor, item.line_total_minor, item.currency,
              item.item_class, item.durability_tier, item.food_kind,
              item.tags, item.confidence,
-             '${PROMPT_VERSION}'
+             COALESCE(item.line_type, 'product'),
+             (SELECT pu.id FROM p_upsert pu
+                WHERE pu.product_key = item.product_key
+                  AND pu.merchant_id IS NOT DISTINCT FROM
+                      (CASE WHEN item.product_merchant_exclusive THEN (SELECT id FROM m) ELSE NULL END)
+                LIMIT 1),
+             item.tax_minor, item.tip_share_minor, item.discount_share_minor,
+             1, '${PROMPT_VERSION}'
       FROM tx,
         jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
           line_no int, raw_name text, normalized_name text,
           quantity numeric, unit text,
           unit_price_minor bigint, line_total_minor bigint, currency text,
           item_class text, durability_tier text, food_kind text,
-          tags text[], confidence text
+          tags text[], confidence text,
+          line_type text, product_key text, product_brand_id text,
+          product_merchant_exclusive boolean, product_model text,
+          product_color text, product_size text, product_variant text,
+          product_sku text, product_manufacturer text,
+          tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
         )
-      RETURNING id
+      RETURNING id, product_id
     )
   SELECT tx.id AS tx_id FROM tx;
   COMMIT;
+  SQL
+
+After the main block commits, run the products aggregate recomputation
+for every product touched by this ingest. The agent runs this so
+the stats reflect THE LIVE set of transaction_items immediately —
+this is the recompute-not-increment rule from #84. \`from_dt\` is
+optional; use the workspace base currency snapshot already on
+\`postings.amount_base_minor\` for total_spent_minor:
+
+  psql "\$DATABASE_URL" <<'SQL'
+  WITH stats AS (
+    SELECT ti.product_id,
+           MIN(t.occurred_on)          AS first_on,
+           MAX(t.occurred_on)          AS last_on,
+           COUNT(DISTINCT ti.transaction_id) AS purchases,
+           SUM(ti.effective_total_minor)    AS total_minor
+    FROM transaction_items ti
+    JOIN transactions t ON t.id = ti.transaction_id
+    WHERE ti.workspace_id = '${ctx.workspaceId}'
+      AND ti.product_id IS NOT NULL
+      AND ti.retired_at IS NULL
+      AND ti.line_type = 'product'
+    GROUP BY ti.product_id
+  )
+  UPDATE products p SET
+    first_purchased_on = stats.first_on,
+    last_purchased_on  = stats.last_on,
+    purchase_count     = stats.purchases,
+    total_spent_minor  = stats.total_minor,
+    updated_at         = NOW()
+  FROM stats
+  WHERE p.id = stats.product_id
+    AND p.workspace_id = '${ctx.workspaceId}';
   SQL
 
 If you have a geocode result, run this AFTER the main transaction
