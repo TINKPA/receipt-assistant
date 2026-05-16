@@ -6000,7 +6000,8 @@
     },
     "/v1/brands/{brandId}/icon": {
       "get": {
-        "summary": "Resolve the preferred icon and stream it (501 until #101 Phase 2)",
+        "summary": "Stream the brand's preferred icon bytes",
+        "description": "Resolves preferred_asset_id and streams the file. 404 when the brand is missing, no asset is preferred, the asset is retired, or the file is missing on disk. Frontend falls back to CategoryIcon on 404 — never to a different candidate.",
         "tags": [
           "brands"
         ],
@@ -6019,17 +6020,7 @@
             "description": "Icon bytes"
           },
           "404": {
-            "description": "Brand or preferred asset missing",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "501": {
-            "description": "Streaming not implemented yet",
+            "description": "Brand or icon unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {

@@ -48,6 +48,15 @@ export const brands = pgTable("brands", {
   /** Layer-3 lock — when NOT NULL, re-extract leaves
    *  `preferred_asset_id` alone (user has chosen). */
   userChoseAt: timestamp("user_chose_at", { withTimezone: true }),
+  /**
+   * Free-form per-brand state. Currently used by Phase 2.6 / 4c to
+   * record icon-resolution outcomes:
+   *   - {"icon_resolution": "discovery_failed"} — Phase 2.6 couldn't
+   *     find a canonical domain, so Phase 4b is skipped.
+   *   - {"icon_resolution": "all_candidates_rejected"} — Phase 4c
+   *     scored every candidate below the acceptance threshold.
+   */
+  metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .default(sql`NOW()`),

@@ -8,6 +8,10 @@
  * (Node-side coerce + service-layer writes) to Phase 2.
  */
 import { buildInfo } from "../generated/build-info.js";
+import {
+  PHASE_2_6_BRAND_DISCOVERY,
+  PHASE_4B_4C_ICON_PIPELINE,
+} from "./brand-icon-prompt.js";
 
 /**
  * Manual prompt-version stamp written into `transactions.metadata.extraction`
@@ -17,7 +21,7 @@ import { buildInfo } from "../generated/build-info.js";
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.8";
+export const PROMPT_VERSION = "2.9";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -364,6 +368,11 @@ the most attention-sensitive new ask in the prompt; keep it terse.
 
 The merchant block goes into the transaction's \`metadata.merchant\` JSON
 key (see the Phase 4 template).
+
+${PHASE_2_6_BRAND_DISCOVERY}
+
+For receipt_image / receipt_email / receipt_pdf only. Skip for
+\`statement_pdf\` (handled per-row in Phase 4b) and \`unsupported\`.
 
 ── Phase 3 — Resolve place + fetch multilingual record (#74) ──────────
 
@@ -773,6 +782,28 @@ Invariants you MUST honor:
 
 ### 4a. receipt_image / receipt_email / receipt_pdf
 
+**Pre-step — brand FK guard.** Phase 2.6 ensured the merchant's
+brand_id is in \`brands\`. Items may also carry \`product_brand_id\`
+(e.g. Apple-branded products at Best Buy → product brand = "apple",
+merchant brand = "best-buy"). \`products.brand_id\` is FK into
+\`brands\`, so before the BEGIN below, run one defensive UPSERT for
+every distinct product_brand_id present in items[]:
+
+  psql "\$DATABASE_URL" <<'SQL'
+    INSERT INTO brands (brand_id, name)
+    SELECT DISTINCT product_brand_id, product_brand_id
+      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb)
+        AS item(product_brand_id text)
+     WHERE product_brand_id IS NOT NULL
+    ON CONFLICT (brand_id) DO NOTHING;
+  SQL
+
+This is a stub row (domain NULL); we don't run Phase 2.6 discovery
+for product brand_ids in v1. Phase 4b will skip them at the
+discovery_failed check, so they cost nothing extra at ingest. They
+become eligible for discovery + icon acquisition if a future ingest
+sees the same brand as a merchant.
+
 Write one balanced transaction. The expense account name is **exactly
 the \`merchant.category\` value you emitted in Phase 2.5** — one of the
 seven canonical accounts:
@@ -1154,6 +1185,9 @@ in the final ingest close-out (Phase 5).
 ### 4c. unsupported
 
 Skip every insert above. Go directly to Phase 5.
+
+${PHASE_4B_4C_ICON_PIPELINE}
+
 
 ── Phase 5 — Close the ingest row ─────────────────────────────────────
 

@@ -134,6 +134,13 @@
       "when": 1778920670679,
       "tag": "0018_zippy_gateway",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1778927292094,
+      "tag": "0019_tricky_korvac",
+      "breakpoints": true
     }
   ]
 }

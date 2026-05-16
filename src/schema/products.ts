@@ -33,6 +33,7 @@ import {
 import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces.js";
 import { merchants } from "./merchants.js";
+import { brands } from "./brands.js";
 
 export const products = pgTable(
   "products",
@@ -48,10 +49,12 @@ export const products = pgTable(
     merchantId: uuid("merchant_id").references(() => merchants.id, {
       onDelete: "set null",
     }),
-    /** Text, not FK — the manufacturer (`apple`) can differ from the
-     *  seller (`best-buy`). A soft join against `merchants.brand_id`
-     *  covers cases where the brand is itself a known merchant. */
-    brandId: text("brand_id"),
+    /** FK into the global `brands` registry (#101). Manufacturer brand,
+     *  may differ from the seller (Crunchwrap branded `taco-bell` sold
+     *  at a Best Buy → `brand_id='taco-bell'` here, merchant separately
+     *  identifies Best Buy). Nullable: line items without a recognizable
+     *  brand (raw groceries, services) leave it NULL. */
+    brandId: text("brand_id").references(() => brands.brandId),
     itemClass: text("item_class").notNull(),
 
     // Product-level attribute facets — each variant gets its own row.

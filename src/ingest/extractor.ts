@@ -14,7 +14,12 @@ import {
   type ReExtractPromptContext,
 } from "./reextract-prompt.js";
 
-const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 300_000);
+// Bumped 300s → 900s in #101 Phase 2 to accommodate the new Phase 2.6
+// (WebSearch for CJK domains), Phase 4b (4-tier mechanical fetch with
+// curl downloads), and Phase 4c (Read tool per candidate + visual
+// scoring). First-time brand resolution legitimately needs the budget;
+// cached brands return in seconds via the Case A early-out.
+const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
 
 export interface ExtractorInput {
   /** Absolute path on disk — sha256-named, written by the documents service. */

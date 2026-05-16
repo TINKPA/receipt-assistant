@@ -12,6 +12,7 @@ import { sql } from "drizzle-orm";
 import { merchantEnrichmentStatusEnum } from "./enums.js";
 import { createdAt, updatedAt } from "./common.js";
 import { workspaces } from "./workspaces.js";
+import { brands } from "./brands.js";
 
 /**
  * Canonicalized merchants, the aggregation root behind the merchant page
@@ -39,8 +40,14 @@ export const merchants = pgTable(
      * Kebab-case stable identifier emitted by the extractor — same brand
      * should always collapse to the same id (e.g. `starbucks`, `apple-store`).
      * Used in frontend URLs as the path segment for the merchant page.
+     * FK into the global `brands` registry (#101) — every merchant row's
+     * `brand_id` must correspond to a `brands.brand_id` PK. Phase 2.6
+     * of the ingest prompt upserts the brand row before the merchant
+     * UPSERT in Phase 4.
      */
-    brandId: text("brand_id").notNull(),
+    brandId: text("brand_id")
+      .notNull()
+      .references(() => brands.brandId),
     /** Display name (e.g. "Starbucks", "Apple Store"). */
     canonicalName: text("canonical_name").notNull(),
     /**

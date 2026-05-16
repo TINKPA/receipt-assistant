@@ -12,6 +12,9 @@ import express, { Router, type Request, type Response, type NextFunction } from 
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull } from "drizzle-orm";
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
+import { join, isAbsolute } from "path";
 import { db } from "../db/client.js";
 import { brands, brandAssets } from "../schema/index.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -20,11 +23,17 @@ import {
   BrandAsset,
   UpdateBrandRequest,
 } from "../schemas/v1/brand.js";
-import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
+import { ProblemDetails } from "../schemas/v1/common.js";
 import {
   HttpProblem,
   NotFoundProblem,
 } from "../http/problem.js";
+
+// Where the bind-mount lands inside the container. Phase 4b writes each
+// candidate to `<BRAND_ASSETS_ROOT>/<brand_id>/<tier>/<token>.<ext>` and
+// stores the relative path (everything after the root) in
+// `brand_assets.local_path`. Streaming joins root + local_path.
+const BRAND_ASSETS_ROOT = process.env.BRAND_ASSETS_ROOT || "/data/brand-assets";
 
 export const brandsRouter: Router = Router();
 
@@ -169,8 +178,12 @@ brandsRouter.get(
 
 // ── GET /v1/brands/:brandId/icon ───────────────────────────────────────
 //
-// Resolves the preferred asset and streams its bytes. Stub for now —
-// returns 404 until #101 Phase 2 starts populating brand_assets.
+// Resolves the brand's preferred_asset_id and streams the bytes from
+// `${BRAND_ASSETS_ROOT}/<local_path>`. Returns 404 if the brand is
+// missing, no asset is preferred, the asset row is retired, or the
+// file is missing on disk. The frontend falls back to CategoryIcon on
+// any 404; never to a different candidate (per #101 spec: no inter-
+// candidate cascade — the agent already picked the winner at ingest).
 
 brandsRouter.get(
   "/:brandId/icon",
@@ -191,17 +204,43 @@ brandsRouter.get(
           `No preferred_asset_id for brand=${brandId}`,
         );
       }
-      // Placeholder until Phase 2 wires the streaming path:
-      // - Look up `brand_assets.local_path` (relative)
-      // - Stream from `/data/brand-assets/<local_path>` with the right
-      //   Content-Type header and an immutable Cache-Control.
-      // For now we 501 so callers know it's not wired yet.
-      throw new HttpProblem(
-        501,
-        "icon-streaming-not-implemented",
-        "Brand icon streaming lands in #101 Phase 2",
-        `Phase 1 establishes brands + brand_assets schema. Streaming of the resolved asset (id=${preferredId}) is wired by the follow-up PR that adds Phase 5a/5b agent acquisition.`,
-      );
+      const assetRows = await db
+        .select({
+          localPath: brandAssets.localPath,
+          contentType: brandAssets.contentType,
+          retiredAt: brandAssets.retiredAt,
+        })
+        .from(brandAssets)
+        .where(eq(brandAssets.id, preferredId));
+      if (assetRows.length === 0) {
+        throw new NotFoundProblem(
+          "Brand icon",
+          `preferred_asset_id=${preferredId} not found for brand=${brandId}`,
+        );
+      }
+      const asset = assetRows[0]!;
+      if (asset.retiredAt !== null) {
+        // Stale pointer — UI fallback. Re-extract should clear this.
+        throw new NotFoundProblem(
+          "Brand icon",
+          `preferred_asset_id=${preferredId} is retired for brand=${brandId}`,
+        );
+      }
+      const absPath = isAbsolute(asset.localPath)
+        ? asset.localPath
+        : join(BRAND_ASSETS_ROOT, asset.localPath);
+      try {
+        const st = await stat(absPath);
+        if (!st.isFile()) throw new Error("not a file");
+      } catch {
+        throw new NotFoundProblem(
+          "Brand icon",
+          `File missing on disk: ${absPath}`,
+        );
+      }
+      res.setHeader("Content-Type", asset.contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+      createReadStream(absPath).pipe(res);
     } catch (err) {
       next(err);
     }
@@ -323,13 +362,14 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
   registry.registerPath({
     method: "get",
     path: "/v1/brands/{brandId}/icon",
-    summary: "Resolve the preferred icon and stream it (501 until #101 Phase 2)",
+    summary: "Stream the brand's preferred icon bytes",
+    description:
+      "Resolves preferred_asset_id and streams the file. 404 when the brand is missing, no asset is preferred, the asset is retired, or the file is missing on disk. Frontend falls back to CategoryIcon on 404 — never to a different candidate.",
     tags: ["brands"],
     request: { params: z.object({ brandId: z.string() }) },
     responses: {
       200: { description: "Icon bytes" },
-      404: { description: "Brand or preferred asset missing", content: problemContent },
-      501: { description: "Streaming not implemented yet", content: problemContent },
+      404: { description: "Brand or icon unavailable", content: problemContent },
     },
   });
 

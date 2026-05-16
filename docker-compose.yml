@@ -79,6 +79,15 @@ services:
       # ~10% even at concurrency 3 — host has headroom. Bumped to 6 to
       # halve eval wall-clock without straining Anthropic API rate limits.
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
+      # logo.dev API keys for #101 Phase 2 brand-icon acquisition. The
+      # publishable key (pk_…) is embedded in img.logo.dev URLs the agent
+      # follows; the secret key (sk_…) authorizes api.logo.dev/search,
+      # which Phase 4b uses search-first to avoid the letter-fallback bug
+      # (blind GET against img.logo.dev/<anydomain> returns a generated
+      # first-letter PNG for unknown domains — silent wrong-icon). Empty
+      # is fine — the agent skips the logo.dev tier when unset.
+      LOGODEV_PUBLISHABLE_KEY: ${LOGODEV_PUBLISHABLE_KEY:-}
+      LOGODEV_SECRET_KEY: ${LOGODEV_SECRET_KEY:-}
     volumes:
       # Uploaded receipt images = user content (PII). Lives in the outer
       # project's iCloud-synced docs root, so the user's own receipt corpus
@@ -98,4 +107,13 @@ services:
       # claude /login`; the CLI self-refreshes and writes back here.
       # Survives compose down/up and OrbStack resets. See `setup` skill.
       - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
+      # Brand icon assets cache (#101 Phase 2). Each brand_assets row's
+      # `local_path` is relative to /data/brand-assets/, structure:
+      #   <brand_id>/<tier>/<origin-token>.<ext>
+      # SIBLING dir same as postgres / claude — outside git (PII-adjacent
+      # via the brands they identify) and outside iCloud (continuous
+      # block reupload undermines `UNIQUE (brand_id, content_hash)`
+      # dedup semantics on byte-equal re-fetch). On a fresh machine:
+      #   mkdir -p ~/Developer/receipt-assistant-data/brand-assets
+      - ${HOME}/Developer/receipt-assistant-data/brand-assets:/data/brand-assets
     restart: unless-stopped

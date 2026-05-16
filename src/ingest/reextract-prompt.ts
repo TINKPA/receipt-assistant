@@ -29,6 +29,10 @@
  * `src/ingest/prompt.ts`'s ~800.
  */
 import { buildInfo } from "../generated/build-info.js";
+import {
+  PHASE_2_6_BRAND_DISCOVERY,
+  PHASE_4B_4C_ICON_PIPELINE,
+} from "./brand-icon-prompt.js";
 
 /**
  * Bumped on meaningful re-extract prompt edits. Separate from
@@ -37,7 +41,7 @@ import { buildInfo } from "../generated/build-info.js";
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.3";
+export const REEXTRACT_PROMPT_VERSION = "1.5";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -144,6 +148,19 @@ also OUT OF SCOPE — re-extract does not rewrite them. Do NOT touch
 \`postings\` or \`document_links\`.
 
 ── Phase 2 — Write ────────────────────────────────────────────────────
+
+**Brand FK guard (#101).** Items may carry product_brand_id, which is
+FK into \`brands\`. Re-extract products UPSERT below would fail if the
+brand row doesn't exist. Run this defensively BEFORE the main block:
+
+  psql "\$DATABASE_URL" <<'SQL'
+    INSERT INTO brands (brand_id, name)
+    SELECT DISTINCT product_brand_id, product_brand_id
+      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb)
+        AS item(product_brand_id text)
+     WHERE product_brand_id IS NOT NULL
+    ON CONFLICT (brand_id) DO NOTHING;
+  SQL
 
 Run exactly ONE psql block. Substitute your extracted values for the
 placeholders; the CASE statements consult \`metadata.user_edited\` so a
@@ -328,6 +345,38 @@ user override survives this re-extract.
 IMPORTANT escaping rule: SQL single quotes inside values must be
 doubled (\`O''Brien\`). Newlines inside \`raw_text\` are fine inside a
 single-quoted SQL literal as long as no single quote is unescaped.
+
+── Phase 3 — Refresh brand identity & icons (#101) ────────────────────
+
+Re-extract refreshes the merchant's brand registry entry AND its
+icons. Apply both sub-phases below to the merchant.brand_id of the
+transaction (NOT to product brand_ids — those are stub-only in v1).
+
+Layer-3 protection is mandatory: never overwrite a user's choice.
+The Phase 4c winner-pick UPDATE is gated on
+\`user_chose_at IS NULL\`; user ratings
+(\`brand_assets.user_rating\`) and uploads
+(\`brand_assets.user_uploaded\`) are not touched by re-extract at all.
+
+Step 1: identify the merchant's brand_id and canonical_name from the
+transaction's merchant row:
+
+  psql "\$DATABASE_URL" -c "SELECT m.brand_id, m.canonical_name FROM transactions t JOIN merchants m ON m.id = t.merchant_id WHERE t.id = '${ctx.transactionId}';"
+
+If the SELECT returns NULL (voided / orphaned tx), skip Phase 3.
+
+Step 2: substitute the returned brand_id for <bid> and the
+canonical_name for <canonical_name> in the inlined phases that
+follow, then execute them verbatim:
+
+${PHASE_2_6_BRAND_DISCOVERY}
+
+${PHASE_4B_4C_ICON_PIPELINE}
+
+Most re-extracts hit Case A (already-resolved) on the cache pre-check
+and complete in one SELECT. Case B (re-judge existing candidates with
+no new fetch) is the next most common; full Case D (mechanical fetch
++ judgment) only runs when the brand has never been resolved.
 
 ── Done ────────────────────────────────────────────────────────────────
 
