@@ -595,13 +595,15 @@ export async function getTransaction(
 
 // ── List ───────────────────────────────────────────────────────────────
 
-type SortColumn = "occurred_on" | "created_at";
+type SortColumn = "occurred_on" | "created_at" | "amount";
 
 /** Keyset cursor on (<sort column value>, id). The `sort` field is
  *  stored on the cursor so paginating a result set keeps using the
  *  same ORDER BY column that was used to compute it. Legacy cursors
  *  written before sort=created_at was honored use the un-tagged
- *  `{ occurred_on, id }` shape and are coerced at decode time. */
+ *  `{ occurred_on, id }` shape and are coerced at decode time.
+ *  For sort=amount the `value` is a stringified bigint of
+ *  MAX(ABS(p.amount_base_minor)) — the largest leg in minor units. */
 interface ListCursor {
   sort: SortColumn;
   value: string;
@@ -635,22 +637,30 @@ export async function listTransactions(
   // Default to created_at so freshly-uploaded receipts surface at the
   // top regardless of their occurred_on date — the user mental model
   // after upload is "I just added this; it should be at the top."
-  // sort=amount is in the OpenAPI enum but not yet wired here; it
-  // needs a correlated subquery over postings and an amount-keyed
-  // index to be efficient. Reject explicitly until a real consumer
-  // shows up.
-  if (query.sort === "amount") {
-    throw new HttpProblem(
-      501,
-      "not-implemented",
-      "Sort by amount not implemented",
-      "GET /v1/transactions supports sort=occurred_on and sort=created_at. " +
-        "Sort by amount requires a subquery over postings and is not yet wired.",
-    );
-  }
-  const sortCol: SortColumn = query.sort === "occurred_on" ? "occurred_on" : "created_at";
-  const sortColSql = sortCol === "occurred_on" ? sql`t.occurred_on` : sql`t.created_at`;
-  const cursorCast = sortCol === "occurred_on" ? sql`::date` : sql`::timestamptz`;
+  //
+  // sort=amount sorts by MAX(ABS(p.amount_base_minor)) per transaction
+  // — the largest leg, in base-currency minor units. Mirrors the
+  // axis already used by amount_min_minor / amount_max_minor filters
+  // below so a transaction's "amount" means the same thing for both.
+  const sortCol: SortColumn =
+    query.sort === "occurred_on"
+      ? "occurred_on"
+      : query.sort === "amount"
+        ? "amount"
+        : "created_at";
+  const amountSubquery = sql`(SELECT COALESCE(MAX(ABS(p.amount_base_minor)), 0) FROM postings p WHERE p.transaction_id = t.id)`;
+  const sortColSql =
+    sortCol === "occurred_on"
+      ? sql`t.occurred_on`
+      : sortCol === "amount"
+        ? amountSubquery
+        : sql`t.created_at`;
+  const cursorCast =
+    sortCol === "occurred_on"
+      ? sql`::date`
+      : sortCol === "amount"
+        ? sql`::bigint`
+        : sql`::timestamptz`;
 
   const conditions: ReturnType<typeof sql>[] = [];
   conditions.push(sql`t.workspace_id = ${workspaceId}::uuid`);
@@ -703,8 +713,14 @@ export async function listTransactions(
     ? sql`${sortColSql} DESC, t.id DESC`
     : sql`${sortColSql} ASC, t.id ASC`;
 
+  // When sorting by amount, expose the computed value as `sort_amount`
+  // so we can recover it for the next_cursor below without re-querying.
+  const selectClause =
+    sortCol === "amount"
+      ? sql`SELECT t.*, ${amountSubquery} AS sort_amount`
+      : sql`SELECT t.*`;
   const rowsRes = await db.execute(
-    sql`SELECT t.* FROM transactions t WHERE ${where} ORDER BY ${orderSql} LIMIT ${limit + 1}`,
+    sql`${selectClause} FROM transactions t WHERE ${where} ORDER BY ${orderSql} LIMIT ${limit + 1}`,
   );
   const rows = rowsRes.rows as any[];
   const hasMore = rows.length > limit;
@@ -780,7 +796,11 @@ export async function listTransactions(
   const cursorValue =
     sortCol === "occurred_on"
       ? toIsoDate(last.occurred_on)
-      : toIsoString(last.created_at);
+      : sortCol === "amount"
+        // sort_amount comes back as a string from node-postgres for bigint;
+        // coerce defensively in case the driver decides otherwise.
+        ? String(last.sort_amount ?? 0)
+        : toIsoString(last.created_at);
   const nextCursor = hasMore
     ? encodeCursor({ sort: sortCol, value: cursorValue, id: last.id })
     : null;
