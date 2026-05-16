@@ -37,7 +37,7 @@ import { buildInfo } from "../generated/build-info.js";
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.1";
+export const REEXTRACT_PROMPT_VERSION = "1.2";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -192,6 +192,35 @@ user override survives this re-extract.
     ocr_model_version = '${REEXTRACT_MODEL}',
     updated_at        = NOW()
   WHERE id = '${ctx.documentId}' AND workspace_id = '${ctx.workspaceId}';
+
+  -- #81 Phase 2: refresh relational items in lockstep with metadata.
+  -- DELETE-then-INSERT inside the same txn is idempotent because the
+  -- UNIQUE (transaction_id, line_no) constraint would otherwise reject
+  -- a second pass. Always reset, even on a no-item receipt (the agent
+  -- emits the 'TOTAL ONLY' fallback row in that case).
+  DELETE FROM transaction_items
+  WHERE transaction_id = '${ctx.transactionId}';
+
+  INSERT INTO transaction_items (
+    id, workspace_id, transaction_id, line_no,
+    raw_name, normalized_name, quantity, unit,
+    unit_price_minor, line_total_minor, currency,
+    item_class, durability_tier, food_kind, tags, confidence,
+    extraction_version
+  )
+  SELECT gen_random_uuid(), '${ctx.workspaceId}', '${ctx.transactionId}', item.line_no,
+         item.raw_name, item.normalized_name, item.quantity, item.unit,
+         item.unit_price_minor, item.line_total_minor, item.currency,
+         item.item_class, item.durability_tier, item.food_kind,
+         item.tags, item.confidence,
+         '${REEXTRACT_PROMPT_VERSION}'
+  FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+    line_no int, raw_name text, normalized_name text,
+    quantity numeric, unit text,
+    unit_price_minor bigint, line_total_minor bigint, currency text,
+    item_class text, durability_tier text, food_kind text,
+    tags text[], confidence text
+  );
 
   INSERT INTO transaction_events (
     id, workspace_id, transaction_id, event_type, actor_id, payload

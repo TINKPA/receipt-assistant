@@ -3,6 +3,7 @@ export * from "./users.js";
 export * from "./workspaces.js";
 export * from "./accounts.js";
 export * from "./transactions.js";
+export * from "./transaction_items.js";
 export * from "./postings.js";
 export * from "./documents.js";
 export * from "./audit.js";

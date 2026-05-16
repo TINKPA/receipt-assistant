@@ -19,6 +19,7 @@ import { contextMiddleware } from "./http/context.js";
 import { problemHandler } from "./http/problem.js";
 import { accountsRouter } from "./routes/accounts.js";
 import { transactionsRouter } from "./routes/transactions.js";
+import { itemsRouter } from "./routes/items.js";
 import { postingsRouter } from "./routes/postings.js";
 import { documentsRouter } from "./routes/documents.js";
 import {
@@ -71,6 +72,7 @@ export function buildApp(): Express {
   // ── v1 resource routers ─────────────────────────────────────────────
   app.use("/v1/accounts", accountsRouter);
   app.use("/v1/transactions", transactionsRouter);
+  app.use("/v1/items", itemsRouter);
   app.use("/v1/postings", postingsRouter);
   app.use("/v1/documents", documentsRouter);
   app.use("/v1/ingest", ingestRouter);

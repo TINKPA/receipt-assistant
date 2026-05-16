@@ -22,6 +22,7 @@ import { BuildInfoResponse, HealthResponse } from "./schemas/health.js";
 import { ProblemDetails } from "./schemas/v1/common.js";
 import { registerAccountsOpenApi } from "./routes/accounts.js";
 import { registerTransactionsOpenApi } from "./routes/transactions.js";
+import { registerItemsOpenApi } from "./routes/items.js";
 import { registerPostingsOpenApi } from "./routes/postings.js";
 import { registerDocumentsOpenApi } from "./routes/documents.js";
 import { registerIngestOpenApi } from "./routes/ingest.js";
@@ -75,6 +76,7 @@ export function buildRegistry(): OpenAPIRegistry {
   // v1 resource routers register their own paths + response schemas.
   registerAccountsOpenApi(registry);
   registerTransactionsOpenApi(registry);
+  registerItemsOpenApi(registry);
   registerPostingsOpenApi(registry);
   registerDocumentsOpenApi(registry);
   registerIngestOpenApi(registry);

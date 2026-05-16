@@ -15,6 +15,7 @@ import { sql, eq, and, inArray } from "drizzle-orm";
 import { db } from "../db/client.js";
 import {
   transactions,
+  transactionItems,
   postings,
   accounts,
   documents,
@@ -68,6 +69,28 @@ export interface PostingRow {
   created_at: string;
 }
 
+/**
+ * Per-line item DTO. Mirrors `TransactionItem` in
+ * `src/schemas/v1/transaction.ts` exactly. Source priority:
+ *   1. `transaction_items` rows (post-#81 Phase 2 — relational SSOT)
+ *   2. `metadata.items` JSONB array (pre-#81 Phase 2 fallback)
+ */
+export interface TransactionItemRow {
+  line_no: number;
+  raw_name: string;
+  normalized_name: string | null;
+  quantity: number | null;
+  unit: string | null;
+  unit_price_minor: number | null;
+  line_total_minor: number;
+  currency: string;
+  item_class: "durable" | "consumable" | "food_drink" | "service" | "other";
+  durability_tier: "luxury" | "standard" | null;
+  food_kind: "restaurant_dish" | "grocery_food" | "beverage" | null;
+  tags: string[] | null;
+  confidence: "high" | "medium" | "low";
+}
+
 export interface TransactionRow {
   id: string;
   workspace_id: string;
@@ -92,6 +115,13 @@ export interface TransactionRow {
    * the places feature, or when the row has been unlinked.
    */
   place: PlaceRow | null;
+  /**
+   * Receipt line items (#81). Phase 2 reads `transaction_items`;
+   * empty array means the receipt has no items section (e.g. the
+   * agent emitted no rows, or this is a `statement_pdf` parent),
+   * NOT "items missing from this response".
+   */
+  items: TransactionItemRow[];
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -181,12 +211,61 @@ function mapPostingRow(row: any): PostingRow {
   };
 }
 
+/**
+ * Coerce a single row from `transaction_items` or a JSONB object to the
+ * `TransactionItemRow` DTO. The two sources are intentionally aligned
+ * field-for-field so this can swallow either shape.
+ */
+function mapTransactionItem(row: any): TransactionItemRow {
+  return {
+    line_no: Number(row.lineNo ?? row.line_no),
+    raw_name: row.rawName ?? row.raw_name,
+    normalized_name: row.normalizedName ?? row.normalized_name ?? null,
+    quantity:
+      row.quantity === null || row.quantity === undefined
+        ? null
+        : Number(row.quantity),
+    unit: row.unit ?? null,
+    unit_price_minor:
+      (row.unitPriceMinor ?? row.unit_price_minor) === null ||
+      (row.unitPriceMinor ?? row.unit_price_minor) === undefined
+        ? null
+        : Number(row.unitPriceMinor ?? row.unit_price_minor),
+    line_total_minor: Number(row.lineTotalMinor ?? row.line_total_minor),
+    currency: row.currency,
+    item_class: row.itemClass ?? row.item_class,
+    durability_tier: row.durabilityTier ?? row.durability_tier ?? null,
+    food_kind: row.foodKind ?? row.food_kind ?? null,
+    tags: Array.isArray(row.tags) ? row.tags : null,
+    confidence: row.confidence,
+  };
+}
+
+/**
+ * Read items for a transaction, preferring the relational table; fall
+ * back to `metadata.items` for rows ingested before #81 Phase 2.
+ */
+function itemsFromMetadataFallback(metadata: unknown): TransactionItemRow[] {
+  if (!metadata || typeof metadata !== "object") return [];
+  const raw = (metadata as Record<string, unknown>).items;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((x): x is Record<string, unknown> => !!x && typeof x === "object")
+    .map(mapTransactionItem);
+}
+
 function mapTransactionRow(
   row: any,
   posts: any[],
   docs: Array<{ id: string; kind: string }>,
   place: PlaceRow | null = null,
+  itemRows: any[] = [],
 ): TransactionRow {
+  const metadata = row.metadata ?? {};
+  const items =
+    itemRows.length > 0
+      ? itemRows.map(mapTransactionItem)
+      : itemsFromMetadataFallback(metadata);
   return {
     id: row.id,
     workspace_id: row.workspaceId ?? row.workspace_id,
@@ -200,13 +279,14 @@ function mapTransactionRow(
     voided_by_id: row.voidedById ?? row.voided_by_id ?? null,
     source_ingest_id: row.sourceIngestId ?? row.source_ingest_id ?? null,
     trip_id: row.tripId ?? row.trip_id ?? null,
-    metadata: row.metadata ?? {},
+    metadata,
     version: Number(row.version),
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
     postings: posts.map(mapPostingRow),
     documents: docs,
     place,
+    items,
   };
 }
 
@@ -237,7 +317,12 @@ async function loadTransactionFull(
     .where(eq(documentLinks.transactionId, id));
   const placeMap = t.placeId ? await loadPlacesByIds([t.placeId]) : null;
   const place = placeMap?.get(t.placeId!) ?? null;
-  return mapTransactionRow(t, posts, docLinks, place);
+  const itemRows = await runner
+    .select()
+    .from(transactionItems)
+    .where(eq(transactionItems.transactionId, id))
+    .orderBy(transactionItems.lineNo);
+  return mapTransactionRow(t, posts, docLinks, place, itemRows);
 }
 
 async function loadWorkspaceBaseCurrency(
@@ -569,12 +654,25 @@ export async function listTransactions(
     .filter((v): v is string => typeof v === "string" && v.length > 0);
   const placeMap = placeIds.length > 0 ? await loadPlacesByIds(placeIds) : null;
 
+  // Bulk-load relational line-items for this page. Empty → fallback
+  // path in mapTransactionRow reads metadata.items for pre-#81 rows.
+  const itemRes = await db.execute(
+    sql`SELECT * FROM transaction_items WHERE transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)}) ORDER BY transaction_id, line_no ASC`,
+  );
+  const itemsByTx = new Map<string, any[]>();
+  for (const it of itemRes.rows as any[]) {
+    const arr = itemsByTx.get(it.transaction_id) ?? [];
+    arr.push(it);
+    itemsByTx.set(it.transaction_id, arr);
+  }
+
   const items = page.map((r) =>
     mapTransactionRow(
       r,
       postByTx.get(r.id) ?? [],
       docByTx.get(r.id) ?? [],
       r.place_id && placeMap ? (placeMap.get(r.place_id) ?? null) : null,
+      itemsByTx.get(r.id) ?? [],
     ),
   );
 
