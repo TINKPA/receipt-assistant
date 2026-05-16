@@ -5969,6 +5969,109 @@
         }
       }
     },
+    "/v1/places/{id}/map": {
+      "get": {
+        "summary": "Stream a Google Static Maps thumbnail for a place (#96).",
+        "description": "Proxies Google Static Maps. Server-side caches the PNG to disk keyed on (place_id, lat, lng, size, zoom, marker) so subsequent requests don't hit Google. Image is rendered at 2× scale for retina; POI text labels suppressed. Marker is an orange dot at the place's coords. Returns 404 when the place has no lat/lng, 400 for bad size/zoom, 502 on Google upstream error, 503 when the server has no GOOGLE_MAPS_API_KEY configured.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{2,4}x\\d{2,4}$"
+            },
+            "required": false,
+            "name": "size",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "required": false,
+            "name": "zoom",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "marker",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PNG image bytes",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not modified — ETag matched"
+          },
+          "400": {
+            "description": "Bad size or zoom",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Place not found or has no lat/lng",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google Static Maps upstream error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "GOOGLE_MAPS_API_KEY not configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/places/{id}/photos/{rank}/content": {
       "get": {
         "summary": "Stream the binary of a cached Google Places photo.",

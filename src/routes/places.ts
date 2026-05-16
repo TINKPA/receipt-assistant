@@ -26,13 +26,21 @@ import {
   reDerivePlace,
   refreshPlace,
 } from "./places.service.js";
+import { getUploadDir } from "./documents.service.js";
 import {
   GooglePlacesApiKeyMissing,
   GooglePlacesError,
 } from "../google/places-fetch.js";
 import {
+  ensureStaticMapCached,
+  GoogleStaticMapsApiKeyMissing,
+  GoogleStaticMapsError,
+  StaticMapOptsInvalid,
+} from "../google/static-map.js";
+import {
   GooglePlacesUnavailableProblem,
   GooglePlacesUpstreamProblem,
+  HttpProblem,
 } from "../http/problem.js";
 import {
   Place,
@@ -110,6 +118,76 @@ placesRouter.post(
     }
     if (!result) throw new NotFoundProblem("Place", id);
     res.json(result);
+  }),
+);
+
+placesRouter.get(
+  "/:id/map",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const place = await loadPlaceById(id);
+    if (!place) throw new NotFoundProblem("Place", id);
+    if (!place.lat || !place.lng) {
+      throw new NotFoundProblem("Place", id);
+    }
+
+    // Parse + clamp the optional knobs. Bad input → 400.
+    const sizeRaw = typeof req.query.size === "string" ? req.query.size : undefined;
+    const zoomRaw = typeof req.query.zoom === "string" ? req.query.zoom : undefined;
+    const markerRaw =
+      typeof req.query.marker === "string" ? req.query.marker : undefined;
+
+    const opts = {
+      size: sizeRaw,
+      zoom: zoomRaw !== undefined ? Number(zoomRaw) : undefined,
+      marker: markerRaw !== undefined ? markerRaw !== "false" && markerRaw !== "0" : undefined,
+    };
+
+    let cached;
+    try {
+      cached = await ensureStaticMapCached({
+        uploadDir: getUploadDir(),
+        googlePlaceId: place.google_place_id,
+        lat: place.lat,
+        lng: place.lng,
+        opts,
+      });
+    } catch (err) {
+      if (err instanceof StaticMapOptsInvalid) {
+        throw new HttpProblem(
+          400,
+          "static-map-opts-invalid",
+          "Invalid static-map options",
+          err.message,
+        );
+      }
+      if (err instanceof GoogleStaticMapsApiKeyMissing) {
+        throw new GooglePlacesUnavailableProblem();
+      }
+      if (err instanceof GoogleStaticMapsError) {
+        throw new GooglePlacesUpstreamProblem(
+          err.status,
+          err.googlePlaceId,
+          "en",
+        );
+      }
+      throw err;
+    }
+
+    // Cache reads should be cheap. If the request brought an
+    // `If-None-Match` matching our ETag, respond 304 — saves both
+    // the disk read and the bandwidth.
+    const inm = req.header("if-none-match");
+    if (inm && inm === cached.etag) {
+      res.status(304).setHeader("ETag", cached.etag).end();
+      return;
+    }
+
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.setHeader("ETag", cached.etag);
+    res.setHeader("X-Cache", cached.cacheHit ? "HIT" : "MISS");
+    createReadStream(cached.filePath).pipe(res);
   }),
 );
 
@@ -236,6 +314,40 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
         description: "GOOGLE_MAPS_API_KEY not configured",
         content: problemContent,
       },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/v1/places/{id}/map",
+    summary: "Stream a Google Static Maps thumbnail for a place (#96).",
+    description:
+      "Proxies Google Static Maps. Server-side caches the PNG to disk " +
+      "keyed on (place_id, lat, lng, size, zoom, marker) so subsequent " +
+      "requests don't hit Google. Image is rendered at 2× scale for " +
+      "retina; POI text labels suppressed. Marker is an orange dot at " +
+      "the place's coords. Returns 404 when the place has no lat/lng, " +
+      "400 for bad size/zoom, 502 on Google upstream error, 503 when " +
+      "the server has no GOOGLE_MAPS_API_KEY configured.",
+    tags: ["places"],
+    request: {
+      params: z.object({ id: Uuid }),
+      query: z.object({
+        size: z.string().regex(/^\d{2,4}x\d{2,4}$/).optional(),
+        zoom: z.string().regex(/^\d+$/).optional(),
+        marker: z.string().optional(),
+      }),
+    },
+    responses: {
+      200: {
+        description: "PNG image bytes",
+        content: { "image/png": { schema: { type: "string", format: "binary" } } },
+      },
+      304: { description: "Not modified — ETag matched" },
+      400: { description: "Bad size or zoom", content: problemContent },
+      404: { description: "Place not found or has no lat/lng", content: problemContent },
+      502: { description: "Google Static Maps upstream error", content: problemContent },
+      503: { description: "GOOGLE_MAPS_API_KEY not configured", content: problemContent },
     },
   });
 
