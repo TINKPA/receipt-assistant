@@ -2755,6 +2755,42 @@
           "derivation_event_id"
         ]
       },
+      "RefreshPlaceResponse": {
+        "type": "object",
+        "properties": {
+          "place_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "google_place_id": {
+            "type": "string"
+          },
+          "snapshot_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "derivation_event_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "changed_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "place_id",
+          "google_place_id",
+          "snapshot_id",
+          "derivation_event_id",
+          "changed_keys"
+        ]
+      },
       "ReDeriveBatchResponse": {
         "type": "object",
         "properties": {
@@ -5743,6 +5779,69 @@
           },
           "422": {
             "description": "Place has no raw_response — nothing to project from",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/places/{id}/refresh": {
+      "post": {
+        "summary": "Re-fetch Google v1 + re-derive Layer 2 in one step.",
+        "description": "Calls Google Places v1 (dual-language, FieldMask=*), appends a `place_snapshots` row, overwrites `places.raw_response`, then delegates to `/v1/places/{id}/re-derive` so Layer 2 columns reflect the new body. Layer 3 (`custom_name_zh`) and OCR-sourced zh fields are shielded by the re-derive step. Yelp re-fetch is deferred until a Yelp client lands (separate epic). Returns 503 when `GOOGLE_MAPS_API_KEY` is unset and 502 on upstream errors.",
+        "tags": [
+          "places"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Refresh committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshPlaceResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Place not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google v1 upstream error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "GOOGLE_MAPS_API_KEY not configured",
             "content": {
               "application/problem+json": {
                 "schema": {

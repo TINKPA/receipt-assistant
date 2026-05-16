@@ -24,11 +24,21 @@ import {
   updatePlace,
   loadPlacePhotoForStream,
   reDerivePlace,
+  refreshPlace,
 } from "./places.service.js";
+import {
+  GooglePlacesApiKeyMissing,
+  GooglePlacesError,
+} from "../google/places-fetch.js";
+import {
+  GooglePlacesUnavailableProblem,
+  GooglePlacesUpstreamProblem,
+} from "../http/problem.js";
 import {
   Place,
   UpdatePlaceRequest,
   ReDerivePlaceResponse,
+  RefreshPlaceResponse,
 } from "../schemas/v1/place.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
 import { z } from "zod";
@@ -73,6 +83,31 @@ placesRouter.post(
   ah(async (req, res) => {
     const id = String(req.params.id);
     const result = await reDerivePlace(req.ctx.workspaceId, id);
+    if (!result) throw new NotFoundProblem("Place", id);
+    res.json(result);
+  }),
+);
+
+placesRouter.post(
+  "/:id/refresh",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    let result;
+    try {
+      result = await refreshPlace(req.ctx.workspaceId, id);
+    } catch (err) {
+      if (err instanceof GooglePlacesApiKeyMissing) {
+        throw new GooglePlacesUnavailableProblem();
+      }
+      if (err instanceof GooglePlacesError) {
+        throw new GooglePlacesUpstreamProblem(
+          err.status,
+          err.googlePlaceId,
+          err.languageCode,
+        );
+      }
+      throw err;
+    }
     if (!result) throw new NotFoundProblem("Place", id);
     res.json(result);
   }),
@@ -171,6 +206,34 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
       404: { description: "Place not found", content: problemContent },
       422: {
         description: "Place has no raw_response — nothing to project from",
+        content: problemContent,
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/places/{id}/refresh",
+    summary: "Re-fetch Google v1 + re-derive Layer 2 in one step.",
+    description:
+      "Calls Google Places v1 (dual-language, FieldMask=*), appends a " +
+      "`place_snapshots` row, overwrites `places.raw_response`, then " +
+      "delegates to `/v1/places/{id}/re-derive` so Layer 2 columns " +
+      "reflect the new body. Layer 3 (`custom_name_zh`) and OCR-sourced " +
+      "zh fields are shielded by the re-derive step. Yelp re-fetch is " +
+      "deferred until a Yelp client lands (separate epic). Returns " +
+      "503 when `GOOGLE_MAPS_API_KEY` is unset and 502 on upstream errors.",
+    tags: ["places"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      200: {
+        description: "Refresh committed",
+        content: { "application/json": { schema: RefreshPlaceResponse } },
+      },
+      404: { description: "Place not found", content: problemContent },
+      502: { description: "Google v1 upstream error", content: problemContent },
+      503: {
+        description: "GOOGLE_MAPS_API_KEY not configured",
         content: problemContent,
       },
     },

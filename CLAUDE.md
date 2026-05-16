@@ -159,6 +159,46 @@ The migration (`drizzle/0012_place_snapshots.sql`) does a one-time backfill: eve
 
 Phase 4 (refresh) will INSERT a new snapshot for every Google / Yelp re-fetch, then diff snapshot N vs N−1 to surface what changed (renamed merchant, moved address, closed business). Without this table refresh would be destructive; with it, every re-fetch is non-lossy from day one.
 
+## Refresh — `places` (Phase 4a of #80)
+
+Phase 4a of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), first of three sub-PRs).
+
+```
+POST /v1/places/{id}/refresh    # re-fetch Google v1 + re-derive in one step
+```
+
+### What it does
+
+1. Re-fetches `places/{google_place_id}` from Google v1 dual-language (en + zh-CN, `X-Goog-FieldMask: *`) via `src/google/places-fetch.ts ::fetchPlaceV1Dual` — a server-side TS port of the curl block that the ingest agent runs at `src/ingest/prompt.ts` Phase 3c.
+2. INSERTs a new `place_snapshots` row with the fresh body (Phase 3 / #90 plumbing).
+3. UPDATEs `places.raw_response` to the new envelope, bumps `last_seen_at`, increments `hit_count`.
+4. Delegates to `reDerivePlace(workspaceId, placeId)` (Phase 2 / #89). That step writes the `derivation_events` row, applies projection, and protects Layer 3 + OCR-sourced zh fields.
+
+The endpoint returns `{place_id, google_place_id, snapshot_id, derivation_event_id, changed_keys}`. `changed_keys=[]` is a successful no-op refresh — Google returned the same data, snapshot still landed for audit, no Layer-2 diff.
+
+### Why no Yelp call
+
+The issue body says "re-fetch Google + Yelp" but no Yelp client exists yet — `places.yelp_business_id`, `places.yelp_raw_response`, etc. are placeholder columns waiting on a Yelp ingest epic. Phase 4a is Google-only; when Yelp ingest lands, this endpoint will pick up the second fetch in the same `db.transaction` block.
+
+### Why not atomic across the whole refresh
+
+Snapshot insert + `places.raw_response` UPDATE happen in one transaction; `reDerivePlace` is a separate call (it opens its own transaction internally). A process crash between them leaves the new snapshot + new `raw_response` committed but Layer 2 columns stale. The next refresh re-projects correctly; the only artifact is one extra `place_snapshots` row with identical body to the previous. Acceptable — snapshot history is append-only by design and the duplicate is benign.
+
+### Error shapes
+
+| Condition | Status | `type` |
+|---|---|---|
+| Place not in DB | 404 | `errors/not-found` (matches existing convention) |
+| `GOOGLE_MAPS_API_KEY` unset on the server | 503 | `errors/google-places-unavailable` |
+| Google v1 returns non-2xx | 502 | `errors/google-places-upstream` (carries `upstream_status`, `google_place_id`, `language_code`) |
+
+The 503 is intentionally a server-side fault: callers should retry once the deployment is fixed. The 502 surfaces the upstream status so frontends can distinguish "this place_id is dead in Google" (404 from Google) from "Google is having a bad day" (5xx) without re-doing the call.
+
+### What's NOT included (deferred to 91b/91c)
+
+- `POST /v1/documents/:id/re-extract` — re-running `claude -p` against retained image bytes, UPDATE-in-place of an existing transaction, Layer 3 shielding on the transaction surface. Sub-PR 91b lays the schema groundwork (`documents.ocr_model_version` column + Layer-3 tx field allowlist); 91c implements the prompt variant.
+- Merchant cascade — if `places.display_name_en` changes, should `merchants.canonical_name` follow? Current answer: no (`merchants.canonical_name` comes from the LLM looking at the **receipt**, not from `places` projection — see "Why no merchants cascade" above). The cascade slot belongs to 91c (re-extract) when re-reading the receipt with new place data can plausibly change the merchant.
+
 ## Known Pitfalls
 
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:

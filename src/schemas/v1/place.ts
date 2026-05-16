@@ -104,6 +104,24 @@ export const ReDerivePlaceResponse = z
   .openapi("ReDerivePlaceResponse");
 
 /**
+ * Response from `POST /v1/places/:id/refresh` (#91). Reports the
+ * audit anchors a caller needs to follow up: `snapshot_id` for the
+ * new row in `place_snapshots`; `derivation_event_id` + `changed_keys`
+ * for the re-projection that follows. `changed_keys=[]` is a
+ * successful no-op refresh — the fetch happened, the snapshot landed,
+ * but Google returned the same data we had.
+ */
+export const RefreshPlaceResponse = z
+  .object({
+    place_id: Uuid,
+    google_place_id: z.string(),
+    snapshot_id: Uuid,
+    derivation_event_id: Uuid,
+    changed_keys: z.array(z.string()),
+  })
+  .openapi("RefreshPlaceResponse");
+
+/**
  * Query params for `POST /v1/admin/re-derive`. Only `scope=places`
  * is implemented in Phase 2 (#89); Phase 3+ will add `merchants`,
  * `documents`, and the LLM-backed paths.

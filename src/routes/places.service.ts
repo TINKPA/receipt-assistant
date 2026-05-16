@@ -24,6 +24,8 @@ import {
 import { PROMPT_VERSION } from "../ingest/prompt.js";
 import { buildInfo } from "../generated/build-info.js";
 import { NoRawResponseProblem } from "../http/problem.js";
+import { placeSnapshots } from "../schema/place_snapshots.js";
+import { fetchPlaceV1Dual } from "../google/places-fetch.js";
 
 /**
  * Public-facing shape of a place. Mirrors the v1 zod Place schema —
@@ -432,6 +434,100 @@ export async function reDerivePlace(
       derivation_event_id: evt!.id,
     };
   });
+}
+
+export interface RefreshPlaceResult {
+  place_id: string;
+  google_place_id: string;
+  snapshot_id: string;
+  /** Inherits the `reDerivePlace` post-condition: a `derivation_events`
+   *  row is always written, even when the re-projection produces no
+   *  diff. */
+  derivation_event_id: string;
+  changed_keys: string[];
+}
+
+/**
+ * Re-fetch a `places` row from Google v1 (dual-language), append a
+ * `place_snapshots` row, overwrite `places.raw_response`, then
+ * delegate to `reDerivePlace` so Layer 2 columns reflect the new
+ * body.
+ *
+ * Layer 3 (`custom_name_zh`) and OCR-sourced zh fields ride through
+ * untouched — `reDerivePlace` already handles both.
+ *
+ * Not atomic across the two transactions (snapshot+raw_response in
+ * one, re-derive in another). If the process crashes between them
+ * the next refresh just re-fetches + re-projects, leaving one extra
+ * snapshot row — still idempotent at the user level. Snapshot
+ * history is append-only by design, so an extra row is benign.
+ *
+ * No Yelp call here — `places.yelp_*` are placeholder columns until
+ * a Yelp client lands (separate epic). Issue body's "Re-fetch Google
+ * + Yelp" deferred for that reason.
+ */
+export async function refreshPlace(
+  workspaceId: string,
+  placeId: string,
+): Promise<RefreshPlaceResult | null> {
+  const isUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      placeId,
+    );
+  const rows = await db
+    .select({
+      id: places.id,
+      googlePlaceId: places.googlePlaceId,
+    })
+    .from(places)
+    .where(isUuid ? eq(places.id, placeId) : eq(places.googlePlaceId, placeId));
+  if (rows.length === 0) return null;
+  const row = rows[0]!;
+
+  const envelope = await fetchPlaceV1Dual(row.googlePlaceId);
+
+  const snapshotId = await db.transaction(async (tx) => {
+    const [snap] = await tx
+      .insert(placeSnapshots)
+      .values({
+        placeId: row.id,
+        source: "google_places",
+        rawResponse: envelope as unknown as Record<string, unknown>,
+        fetchedBySha: buildInfo.gitShortSha,
+      })
+      .returning({ id: placeSnapshots.id });
+
+    await tx
+      .update(places)
+      .set({
+        rawResponse: envelope as unknown as Record<string, unknown>,
+        lastSeenAt: new Date(),
+        hitCount: sql`${places.hitCount} + 1`,
+      })
+      .where(eq(places.id, row.id));
+
+    return snap!.id;
+  });
+
+  // Re-derive lifts the new raw_response into Layer 2 columns +
+  // writes the audit event. Throws NoRawResponseProblem only if
+  // the row vanished between our UPDATE and this call, which is
+  // a race we don't try to handle.
+  const re = await reDerivePlace(workspaceId, row.id);
+  if (re == null) {
+    // The row vanished between fetch and re-derive. Surface as null
+    // so the route returns 404; the snapshot we wrote is harmless
+    // because the FK cascade deleted it with the place.
+    return null;
+  }
+
+  return {
+    place_id: row.id,
+    google_place_id: row.googlePlaceId,
+    snapshot_id: snapshotId,
+    derivation_event_id: re.derivation_event_id,
+    changed_keys: re.changed_keys,
+  };
 }
 
 /**

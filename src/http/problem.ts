@@ -165,6 +165,44 @@ export class NoRawResponseProblem extends HttpProblem {
   }
 }
 
+/**
+ * Returned by `POST /v1/places/:id/refresh` when the server has no
+ * `GOOGLE_MAPS_API_KEY` configured. 503 because the fault is the
+ * deployment's, not the caller's — retry once the key is set.
+ */
+export class GooglePlacesUnavailableProblem extends HttpProblem {
+  constructor() {
+    super(
+      503,
+      "google-places-unavailable",
+      "Google Places fetch unavailable",
+      "Server has no GOOGLE_MAPS_API_KEY configured; refresh cannot fetch new place data.",
+    );
+  }
+}
+
+/**
+ * Returned by `POST /v1/places/:id/refresh` when the upstream
+ * Google v1 call returns non-2xx. Surfaces the upstream status
+ * so the caller can distinguish "bad place_id" (404 from Google)
+ * from "Google having a bad day" (5xx).
+ */
+export class GooglePlacesUpstreamProblem extends HttpProblem {
+  constructor(upstreamStatus: number, placeId: string, languageCode: string) {
+    super(
+      502,
+      "google-places-upstream",
+      "Google Places upstream error",
+      `Google v1 returned ${upstreamStatus} for ${placeId} (${languageCode}).`,
+      {
+        upstream_status: upstreamStatus,
+        google_place_id: placeId,
+        language_code: languageCode,
+      },
+    );
+  }
+}
+
 export class DocumentHasLinksProblem extends HttpProblem {
   constructor(documentId: string, linkCount: number) {
     super(
