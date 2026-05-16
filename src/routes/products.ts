@@ -7,7 +7,7 @@
  * at the surviving row. This router only exposes read + user-truth
  * edits. The merge endpoint and admin recompute land in #84 Phase 3.
  */
-import { Router, type Request, type Response, type NextFunction } from "express";
+import express, { Router, type Request, type Response, type NextFunction } from "express";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and } from "drizzle-orm";
@@ -33,6 +33,11 @@ import {
 } from "../http/pagination.js";
 
 export const productsRouter: Router = Router();
+
+// `application/merge-patch+json` body parser — see owned-items.ts.
+productsRouter.use(
+  express.json({ type: "application/merge-patch+json", limit: "1mb" }),
+);
 
 interface ProductsCursor {
   updated_at: string;

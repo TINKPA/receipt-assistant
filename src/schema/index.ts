@@ -5,6 +5,7 @@ export * from "./accounts.js";
 export * from "./transactions.js";
 export * from "./products.js";
 export * from "./transaction_items.js";
+export * from "./owned_items.js";
 export * from "./postings.js";
 export * from "./documents.js";
 export * from "./audit.js";
