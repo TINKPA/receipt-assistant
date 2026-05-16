@@ -12,12 +12,21 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { products } from "../schema/index.js";
+import {
+  products,
+  transactionItems,
+  ownedItems,
+  derivationEvents,
+} from "../schema/index.js";
+import { buildInfo } from "../generated/build-info.js";
+import { PROMPT_VERSION } from "../ingest/prompt.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   Product,
   UpdateProductRequest,
   ListProductsQuery,
+  MergeProductRequest,
+  MergeProductResponse,
 } from "../schemas/v1/product.js";
 import { ProblemDetails, paginated, Uuid } from "../schemas/v1/common.js";
 import {
@@ -220,11 +229,287 @@ productsRouter.patch(
   },
 );
 
+// ── POST /v1/products/:id/merge_into ───────────────────────────────────
+
+/**
+ * Recompute aggregate stats for one product from its live
+ * transaction_items set. Used by merge_into and the admin endpoint.
+ * Returns `purchase_count` etc. so callers can echo the new state.
+ */
+async function recomputeProductStats(
+  workspaceId: string,
+  productId: string,
+): Promise<{
+  purchase_count: number;
+  total_spent_minor: number;
+  first_purchased_on: string | null;
+  last_purchased_on: string | null;
+}> {
+  const res = await db.execute(
+    sql`
+      WITH stats AS (
+        SELECT
+          MIN(t.occurred_on) AS first_on,
+          MAX(t.occurred_on) AS last_on,
+          COUNT(DISTINCT ti.transaction_id) AS purchases,
+          COALESCE(SUM(ti.effective_total_minor), 0) AS total_minor
+        FROM transaction_items ti
+        JOIN transactions t ON t.id = ti.transaction_id
+        WHERE ti.product_id = ${productId}::uuid
+          AND ti.workspace_id = ${workspaceId}::uuid
+          AND ti.retired_at IS NULL
+          AND ti.line_type = 'product'
+      )
+      UPDATE products p SET
+        first_purchased_on = stats.first_on,
+        last_purchased_on  = stats.last_on,
+        purchase_count     = COALESCE(stats.purchases, 0),
+        total_spent_minor  = stats.total_minor,
+        updated_at         = NOW()
+      FROM stats
+      WHERE p.id = ${productId}::uuid
+        AND p.workspace_id = ${workspaceId}::uuid
+      RETURNING
+        p.purchase_count,
+        p.total_spent_minor,
+        p.first_purchased_on,
+        p.last_purchased_on
+    `,
+  );
+  const r = res.rows[0] as any;
+  return {
+    purchase_count: Number(r?.purchase_count ?? 0),
+    total_spent_minor: Number(r?.total_spent_minor ?? 0),
+    first_purchased_on: r?.first_purchased_on
+      ? toIsoDate(r.first_purchased_on)
+      : null,
+    last_purchased_on: r?.last_purchased_on
+      ? toIsoDate(r.last_purchased_on)
+      : null,
+  };
+}
+
+productsRouter.post(
+  "/:id/merge_into",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const sourceId = String(req.params.id);
+      const body = MergeProductRequest.parse(req.body);
+      if (sourceId === body.target_id) {
+        throw new HttpProblem(
+          400,
+          "self-merge",
+          "Cannot merge a product into itself",
+          "POST /v1/products/:id/merge_into requires target_id != source id.",
+        );
+      }
+
+      const result = await db.transaction(async (tx) => {
+        // Load both rows (workspace-scoped).
+        const both = await tx
+          .select()
+          .from(products)
+          .where(
+            and(
+              eq(products.workspaceId, req.ctx.workspaceId),
+              sql`${products.id} IN (${sql.raw(`'${sourceId}', '${body.target_id}'`)})`,
+            ),
+          );
+        const source = both.find((r) => r.id === sourceId);
+        const target = both.find((r) => r.id === body.target_id);
+        if (!source) throw new NotFoundProblem("Product", sourceId);
+        if (!target) {
+          throw new NotFoundProblem("Product", body.target_id);
+        }
+        if (source.retiredFromCatalogAt) {
+          throw new HttpProblem(
+            409,
+            "already-retired",
+            "Source product is already retired",
+            `Product ${sourceId} was retired at ${source.retiredFromCatalogAt.toISOString()}; cannot re-merge.`,
+          );
+        }
+
+        // Snapshot before for the audit event.
+        const beforeSnap = {
+          source: {
+            id: source.id,
+            product_key: source.productKey,
+            canonical_name: source.canonicalName,
+            purchase_count: Number(source.purchaseCount),
+            total_spent_minor: Number(source.totalSpentMinor),
+            retired_from_catalog_at: source.retiredFromCatalogAt,
+          },
+          target: {
+            id: target.id,
+            product_key: target.productKey,
+            canonical_name: target.canonicalName,
+            purchase_count: Number(target.purchaseCount),
+            total_spent_minor: Number(target.totalSpentMinor),
+          },
+        };
+
+        // Re-point transaction_items.
+        const tiMoved = await tx
+          .update(transactionItems)
+          .set({ productId: body.target_id })
+          .where(
+            and(
+              eq(transactionItems.productId, sourceId),
+              eq(transactionItems.workspaceId, req.ctx.workspaceId),
+            ),
+          )
+          .returning({ id: transactionItems.id });
+
+        // Re-point owned_items.
+        const oiMoved = await tx
+          .update(ownedItems)
+          .set({ productId: body.target_id })
+          .where(
+            and(
+              eq(ownedItems.productId, sourceId),
+              eq(ownedItems.workspaceId, req.ctx.workspaceId),
+            ),
+          )
+          .returning({ id: ownedItems.id });
+
+        // Retire source. Also push the source's product_key into
+        // target's metadata.aliases so a future agent canonicalization
+        // pass can collapse the old key to the new id without human
+        // input.
+        await tx
+          .update(products)
+          .set({
+            retiredFromCatalogAt: new Date(),
+            updatedAt: new Date(),
+            purchaseCount: 0,
+            totalSpentMinor: 0,
+          })
+          .where(eq(products.id, sourceId));
+
+        await tx.execute(
+          sql`UPDATE products SET metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb),
+                '{aliases}',
+                COALESCE(metadata->'aliases', '[]'::jsonb) || ${JSON.stringify([source.productKey])}::jsonb
+              )
+              WHERE id = ${body.target_id}::uuid`,
+        );
+
+        // No `recomputeProductStats` call inside this txn — it uses
+        // db.execute directly which would deadlock against the same
+        // transaction. Compute via raw sql inline:
+        await tx.execute(
+          sql`
+            WITH stats AS (
+              SELECT
+                MIN(t.occurred_on) AS first_on,
+                MAX(t.occurred_on) AS last_on,
+                COUNT(DISTINCT ti.transaction_id) AS purchases,
+                COALESCE(SUM(ti.effective_total_minor), 0) AS total_minor
+              FROM transaction_items ti
+              JOIN transactions t ON t.id = ti.transaction_id
+              WHERE ti.product_id = ${body.target_id}::uuid
+                AND ti.workspace_id = ${req.ctx.workspaceId}::uuid
+                AND ti.retired_at IS NULL
+                AND ti.line_type = 'product'
+            )
+            UPDATE products p SET
+              first_purchased_on = stats.first_on,
+              last_purchased_on  = stats.last_on,
+              purchase_count     = COALESCE(stats.purchases, 0),
+              total_spent_minor  = stats.total_minor,
+              updated_at         = NOW()
+            FROM stats
+            WHERE p.id = ${body.target_id}::uuid
+          `,
+        );
+
+        // Re-read target for the audit snapshot.
+        const [refreshedTarget] = await tx
+          .select()
+          .from(products)
+          .where(eq(products.id, body.target_id));
+
+        const afterSnap = {
+          source: {
+            id: sourceId,
+            retired_from_catalog_at: new Date(),
+          },
+          target: {
+            id: body.target_id,
+            purchase_count: Number(refreshedTarget!.purchaseCount),
+            total_spent_minor: Number(refreshedTarget!.totalSpentMinor),
+          },
+        };
+
+        const [evt] = await tx
+          .insert(derivationEvents)
+          .values({
+            workspaceId: req.ctx.workspaceId,
+            entityType: "product",
+            entityId: body.target_id,
+            promptVersion: PROMPT_VERSION,
+            promptGitSha: buildInfo.gitSha,
+            model: "ts-deterministic",
+            before: beforeSnap,
+            after: afterSnap,
+            changedKeys: ["merged_in", "purchase_count", "total_spent_minor"],
+          })
+          .returning({ id: derivationEvents.id });
+
+        return {
+          source_id: sourceId,
+          target_id: body.target_id,
+          moved_transaction_items: tiMoved.length,
+          moved_owned_items: oiMoved.length,
+          derivation_event_id: evt!.id,
+        };
+      });
+
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ── POST /v1/products/:id/recompute ────────────────────────────────────
+//
+// Idempotent: recomputes one product's aggregates from the live
+// transaction_items set. Useful after a manual data fix or if you
+// suspect drift. Returns the new stats.
+
+productsRouter.post(
+  "/:id/recompute",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const id = String(req.params.id);
+      const exists = await db
+        .select({ id: products.id })
+        .from(products)
+        .where(
+          and(
+            eq(products.id, id),
+            eq(products.workspaceId, req.ctx.workspaceId),
+          ),
+        );
+      if (exists.length === 0) throw new NotFoundProblem("Product", id);
+      const stats = await recomputeProductStats(req.ctx.workspaceId, id);
+      res.json({ id, ...stats });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // ── OpenAPI registration ───────────────────────────────────────────────
 
 export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Product", Product);
   registry.register("UpdateProductRequest", UpdateProductRequest);
+  registry.register("MergeProductRequest", MergeProductRequest);
+  registry.register("MergeProductResponse", MergeProductResponse);
 
   const problemContent = {
     "application/problem+json": { schema: ProblemDetails },
@@ -277,6 +562,53 @@ export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
       200: {
         description: "OK",
         content: { "application/json": { schema: Product } },
+      },
+      404: { description: "Not Found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/products/{id}/merge_into",
+    summary: "Merge this product into the target — re-points transaction_items + owned_items, retires source",
+    tags: ["products"],
+    request: {
+      params: z.object({ id: Uuid }),
+      body: {
+        content: { "application/json": { schema: MergeProductRequest } },
+      },
+    },
+    responses: {
+      200: {
+        description: "OK",
+        content: { "application/json": { schema: MergeProductResponse } },
+      },
+      400: { description: "Bad request (e.g. self-merge)", content: problemContent },
+      404: { description: "Source or target not found", content: problemContent },
+      409: { description: "Source already retired", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/products/{id}/recompute",
+    summary: "Recompute aggregate stats from the live transaction_items set",
+    tags: ["products"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      200: {
+        description: "OK",
+        content: {
+          "application/json": {
+            schema: z.object({
+              id: Uuid,
+              purchase_count: z.number().int(),
+              total_spent_minor: z.number().int(),
+              first_purchased_on: z.string().nullable(),
+              last_purchased_on: z.string().nullable(),
+            }),
+          },
+        },
       },
       404: { description: "Not Found", content: problemContent },
     },

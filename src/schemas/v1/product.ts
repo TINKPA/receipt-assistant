@@ -74,3 +74,26 @@ export const ListProductsQuery = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });
+
+/**
+ * `POST /v1/products/:id/merge_into` body. Collapses two products
+ * into one: all `transaction_items` and `owned_items` re-point to
+ * `target_id`; the source product is retired and its aggregates
+ * zeroed. The target's aggregates are recomputed from the live
+ * `transaction_items` set.
+ */
+export const MergeProductRequest = z
+  .object({
+    target_id: Uuid,
+  })
+  .openapi("MergeProductRequest");
+
+export const MergeProductResponse = z
+  .object({
+    source_id: Uuid,
+    target_id: Uuid,
+    moved_transaction_items: z.number().int(),
+    moved_owned_items: z.number().int(),
+    derivation_event_id: Uuid,
+  })
+  .openapi("MergeProductResponse");

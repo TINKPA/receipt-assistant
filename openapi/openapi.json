@@ -1438,6 +1438,52 @@
           }
         }
       },
+      "MergeProductRequest": {
+        "type": "object",
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          }
+        },
+        "required": [
+          "target_id"
+        ]
+      },
+      "MergeProductResponse": {
+        "type": "object",
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "moved_transaction_items": {
+            "type": "integer"
+          },
+          "moved_owned_items": {
+            "type": "integer"
+          },
+          "derivation_event_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          }
+        },
+        "required": [
+          "source_id",
+          "target_id",
+          "moved_transaction_items",
+          "moved_owned_items",
+          "derivation_event_id"
+        ]
+      },
       "OwnedItem": {
         "type": "object",
         "properties": {
@@ -5135,6 +5181,151 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Product"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/products/{id}/merge_into": {
+      "post": {
+        "summary": "Merge this product into the target — re-points transaction_items + owned_items, retires source",
+        "tags": [
+          "products"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeProductRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeProductResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (e.g. self-merge)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source or target not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Source already retired",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/products/{id}/recompute": {
+      "post": {
+        "summary": "Recompute aggregate stats from the live transaction_items set",
+        "tags": [
+          "products"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid",
+                      "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                    },
+                    "purchase_count": {
+                      "type": "integer"
+                    },
+                    "total_spent_minor": {
+                      "type": "integer"
+                    },
+                    "first_purchased_on": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "last_purchased_on": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "purchase_count",
+                    "total_spent_minor",
+                    "first_purchased_on",
+                    "last_purchased_on"
+                  ]
                 }
               }
             }
