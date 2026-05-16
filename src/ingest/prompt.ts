@@ -17,7 +17,7 @@ import { buildInfo } from "../generated/build-info.js";
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.5";
+export const PROMPT_VERSION = "2.6";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -90,8 +90,121 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   (CNY vs JPY).
   category_hint : one of
                   groceries | dining | retail | cafe | transport | other
-  items         : optional list of line items (for later inventory use)
+  items         : REQUIRED structured line-item array (#81). Each
+                  item is one object with the exact shape below;
+                  the array MUST be non-empty for receipt_image /
+                  receipt_email / receipt_pdf. Statement PDFs
+                  continue to skip items (each statement row IS a
+                  transaction, no sub-itemization possible).
   raw_text      : optional full transcription (helps debugging)
+
+── items[] shape (per line on the receipt) ───────────────────────────
+
+Each \`item\` object has these fields:
+
+  line_no            int      1-based, preserves the order printed
+                              on the receipt
+  raw_name           text     the line as printed, verbatim (don't
+                              normalize — preserve abbreviations,
+                              brand prefixes, codes)
+  normalized_name    text|null brand-stripped human-readable form
+                              (e.g. "KS PPR TWLS 12CT" → "Paper
+                              Towels"). NULL when the raw name is
+                              already clean or impossible to clean.
+  quantity           num|null  2, 0.5, 1 default if unprinted
+  unit               text|null "ct", "lb", "kg", "oz", "ea", "ml",
+                              or NULL when not printed
+  unit_price_minor   int|null  minor units (cents for USD), NULL when
+                              not printed (single line items often omit)
+  line_total_minor   int       REQUIRED. Minor units. Signed —
+                              negative for line-level discounts /
+                              coupons / store-applied promos
+  currency           text      ISO 4217, same as the transaction
+  item_class         enum      one of:
+                                 durable      — expected life ≥ 1 year
+                                                (electronics, furniture,
+                                                appliances, clothing,
+                                                kitchenware, tools)
+                                 consumable   — used up in weeks/months
+                                                (cleaning supplies,
+                                                toiletries, batteries,
+                                                fuel, OTC meds, paper
+                                                products, light bulbs)
+                                 food_drink   — anything edible/potable
+                                 service      — non-physical (massage,
+                                                haircut, delivery fee,
+                                                itemized service charge)
+                                 other        — refunds, gift cards,
+                                                tax appearing as its
+                                                own line. Rare; if you
+                                                use this often, the
+                                                receipt is probably
+                                                ambiguous — flag in tags.
+  durability_tier    enum|null only when item_class='durable':
+                                 luxury   — line total > \$200 OR brand
+                                            is luxury-list (Apple
+                                            high-end, LV, Hermès, …)
+                                 standard — otherwise
+                                NULL for non-durable items.
+  food_kind          enum|null only when item_class='food_drink':
+                                 restaurant_dish — dining/cafe merchant
+                                 grocery_food    — market for home cook
+                                 beverage        — drinks bought as
+                                                   drinks (latte, water,
+                                                   beer). Alcohol →
+                                                   add "alcohol" tag.
+                                NULL for non-food items.
+  tags               text[]|null freeform low-trust signals:
+                                ["alcohol","cold","organic","sale",
+                                 "imported","handwritten","unclear"]
+  confidence         enum      one of:
+                                 high   — line crisp, totals tie
+                                 medium — readable but ambiguous
+                                 low    — thermal-paper smudge,
+                                          ink fade, partial occlusion
+
+Arithmetic invariant — Σ line_total_minor across all items SHOULD
+approximate the receipt's printed subtotal (within \$0.01 rounding;
+tax/tip/discount lines are themselves items or excluded — see
+Examples). When the sum is off by more than \$0.50, drop confidence
+to "low" on the items that look most suspect.
+
+If you cannot itemize at all (total-only receipt, unreadable item
+section, illegible thermal print) emit ONE item with
+item_class='other', confidence='low', raw_name='TOTAL ONLY',
+line_total_minor=<TOTAL_MINOR>, and a tags entry explaining why
+("unreadable", "no-item-section").
+
+── Worked examples ───────────────────────────────────────────────────
+
+Costco gas (single line):
+  items = [
+    {"line_no":1, "raw_name":"GAS REG", "normalized_name":"Regular Gas",
+     "quantity":12.345, "unit":"gal", "unit_price_minor":419,
+     "line_total_minor":5176, "currency":"USD",
+     "item_class":"consumable", "tags":["fuel"], "confidence":"high"}
+  ]
+
+AYCE sushi dinner ($46.20):
+  items = [
+    {"line_no":1, "raw_name":"AYCE Lunch", "normalized_name":"All-You-Can-Eat Lunch",
+     "quantity":2, "unit":"ea", "unit_price_minor":2199,
+     "line_total_minor":4398, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"restaurant_dish", "confidence":"high"},
+    {"line_no":2, "raw_name":"Hot Tea", "normalized_name":"Hot Tea",
+     "quantity":2, "unit":"ea", "unit_price_minor":150,
+     "line_total_minor":300, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"beverage", "confidence":"high"}
+  ]
+
+Best Buy laptop ($1,599):
+  items = [
+    {"line_no":1, "raw_name":"MBA M3 13 256GB", "normalized_name":"MacBook Air M3 13\" 256GB",
+     "quantity":1, "unit":"ea", "unit_price_minor":159900,
+     "line_total_minor":159900, "currency":"USD",
+     "item_class":"durable", "durability_tier":"luxury",
+     "tags":["electronics","apple"], "confidence":"high"}
+  ]
 
 For statement_pdf, pull rows: { date, payee, amount_minor }.
 
@@ -606,8 +719,12 @@ them first):
             'prompt_git_sha', '${buildInfo.gitSha}',
             'model',          '${process.env.CLAUDE_MODEL ?? "sonnet"}',
             'ran_at',         NOW()
-          )
-          -- add tax/tip/items/raw_text here if useful, as extra JSONB keys
+          ),
+          -- items[] is REQUIRED for receipt_image / receipt_email /
+          -- receipt_pdf per #81 / PROMPT_VERSION 2.6. Statement_pdf
+          -- omits this key. Each object follows the schema in Phase 2.
+          'items', '<ITEMS_JSON_ARRAY>'::jsonb
+          -- add tax/tip/raw_text here if useful, as extra JSONB keys
         ),
         '${ctx.userId}'
       )

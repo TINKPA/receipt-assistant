@@ -175,3 +175,55 @@ export const BulkResultItem = z
 export const BulkResponse = z
   .object({ results: z.array(BulkResultItem) })
   .openapi("BulkResponse");
+
+// ── Line items (#81 Phase 1) ───────────────────────────────────────────
+
+/**
+ * Per-line item shape stored under `transactions.metadata.items` (#81
+ * Phase 1 — JSONB only, no dedicated table yet). The agent populates
+ * this array on every ingest and re-extract of receipt_image /
+ * receipt_email / receipt_pdf; statement_pdf transactions omit items
+ * (their rows ARE the line equivalents).
+ *
+ * Read-only from the API today — clients consume `Transaction.metadata.items`
+ * via this typed view. Phase 2 lifts the data to a `transaction_items`
+ * table; the field names stay identical so client code doesn't change
+ * shape on that migration.
+ */
+export const TransactionItem = z
+  .object({
+    /** 1-based, preserves the printed order on the receipt. */
+    line_no: z.number().int().positive(),
+    /** Verbatim line as printed (abbreviations, brand prefixes preserved). */
+    raw_name: z.string(),
+    /** Brand-stripped human-readable form, or NULL when raw is already clean. */
+    normalized_name: z.string().nullable(),
+    quantity: z.number().nullable(),
+    /** "ct", "lb", "kg", "oz", "ea", "ml", "gal", or NULL. */
+    unit: z.string().nullable(),
+    /** Minor units (cents for USD). NULL for single-line items that omit. */
+    unit_price_minor: z.number().int().nullable(),
+    /** Minor units, signed. Negative for line-level discounts / coupons. */
+    line_total_minor: z.number().int(),
+    /** ISO 4217. Matches the parent transaction's currency in MVP. */
+    currency: z.string(),
+    item_class: z.enum([
+      "durable",
+      "consumable",
+      "food_drink",
+      "service",
+      "other",
+    ]),
+    /** Only when `item_class='durable'`. NULL otherwise. */
+    durability_tier: z.enum(["luxury", "standard"]).nullable().optional(),
+    /** Only when `item_class='food_drink'`. NULL otherwise. */
+    food_kind: z
+      .enum(["restaurant_dish", "grocery_food", "beverage"])
+      .nullable()
+      .optional(),
+    tags: z.array(z.string()).nullable().optional(),
+    confidence: z.enum(["high", "medium", "low"]),
+  })
+  .openapi("TransactionItem");
+
+export type TransactionItemShape = z.infer<typeof TransactionItem>;

@@ -37,7 +37,7 @@ import { buildInfo } from "../generated/build-info.js";
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.0";
+export const REEXTRACT_PROMPT_VERSION = "1.1";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -100,6 +100,39 @@ guess, never fall back to today's date.
                   handwritten tips if visible.
   currency      : ISO 4217 (USD, CNY, EUR, JPY, …)
   raw_text      : full transcription (for \`documents.ocr_text\`)
+  items         : REQUIRED structured line-item array per #81 / REEXTRACT_PROMPT_VERSION 1.1.
+                  Each item is one object with these fields:
+                    line_no            int (1-based, preserves order)
+                    raw_name           text (verbatim line)
+                    normalized_name    text|null (brand-stripped)
+                    quantity           num|null
+                    unit               text|null ("ct","lb","ea",…)
+                    unit_price_minor   int|null (minor units)
+                    line_total_minor   int REQUIRED (signed; negative for discounts)
+                    currency           ISO 4217 (same as transaction)
+                    item_class         enum:
+                                         durable    — life ≥ 1 year
+                                         consumable — used in weeks/months (fuel, paper, batteries)
+                                         food_drink — edible/potable
+                                         service    — non-physical (massage, delivery fee)
+                                         other      — refunds, gift cards, rare
+                    durability_tier    enum|null (only if durable): luxury|standard
+                                       (luxury when single-line total > \$200 OR known
+                                        luxury brand: Apple high-end, LV, Hermès, …)
+                    food_kind          enum|null (only if food_drink):
+                                         restaurant_dish|grocery_food|beverage
+                    tags               text[]|null (freeform: alcohol, cold, organic,
+                                                   sale, imported, handwritten, unclear)
+                    confidence         enum: high|medium|low
+
+                  Σ line_total_minor across items SHOULD approximate the
+                  receipt's subtotal (within \$0.01). If sum is off by >\$0.50,
+                  drop confidence='low' on items that look suspect.
+
+                  If you cannot itemize at all (total-only receipt, illegible
+                  thermal print), emit ONE item with item_class='other',
+                  confidence='low', raw_name='TOTAL ONLY',
+                  line_total_minor=<TOTAL_MINOR>, tags=['no-item-section'].
 
 Place resolution and merchant canonicalization are OUT OF SCOPE for
 re-extract — those have their own endpoints (\`POST /v1/places/:id/refresh\`
@@ -134,15 +167,19 @@ user override survives this re-extract.
     END,
     metadata = jsonb_set(
       jsonb_set(
-        COALESCE(metadata, '{}'::jsonb),
-        '{extraction}',
-        jsonb_build_object(
-          'prompt_version', '${REEXTRACT_PROMPT_VERSION}',
-          'prompt_git_sha', '${buildInfo.gitSha}',
-          'model',          '${REEXTRACT_MODEL}',
-          'ran_at',         NOW()::text,
-          'source',         're-extract'
-        )
+        jsonb_set(
+          COALESCE(metadata, '{}'::jsonb),
+          '{extraction}',
+          jsonb_build_object(
+            'prompt_version', '${REEXTRACT_PROMPT_VERSION}',
+            'prompt_git_sha', '${buildInfo.gitSha}',
+            'model',          '${REEXTRACT_MODEL}',
+            'ran_at',         NOW()::text,
+            'source',         're-extract'
+          )
+        ),
+        '{items}',
+        '<ITEMS_JSON_ARRAY>'::jsonb
       ),
       '{re_extracted_at}',
       to_jsonb(NOW()::text)

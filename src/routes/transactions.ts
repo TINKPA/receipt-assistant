@@ -26,6 +26,7 @@ import {
   BulkRequest,
   Transaction as TransactionSchema,
   Posting as PostingSchema,
+  TransactionItem,
   BulkResponse,
 } from "../schemas/v1/transaction.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -457,6 +458,7 @@ transactionsRouter.delete(
 export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);
   registry.register("Posting", PostingSchema);
+  registry.register("TransactionItem", TransactionItem);
   registry.register("BulkResponse", BulkResponse);
 
   const problemContent = {

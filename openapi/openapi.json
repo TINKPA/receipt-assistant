@@ -1033,6 +1033,108 @@
           "place"
         ]
       },
+      "TransactionItem": {
+        "type": "object",
+        "properties": {
+          "line_no": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          },
+          "raw_name": {
+            "type": "string"
+          },
+          "normalized_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quantity": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit_price_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "line_total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "item_class": {
+            "type": "string",
+            "enum": [
+              "durable",
+              "consumable",
+              "food_drink",
+              "service",
+              "other"
+            ]
+          },
+          "durability_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "luxury",
+              "standard"
+            ]
+          },
+          "food_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "restaurant_dish",
+              "grocery_food",
+              "beverage"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        },
+        "required": [
+          "line_no",
+          "raw_name",
+          "normalized_name",
+          "quantity",
+          "unit",
+          "unit_price_minor",
+          "line_total_minor",
+          "currency",
+          "item_class",
+          "confidence"
+        ]
+      },
       "BulkResultItem": {
         "type": "object",
         "properties": {
