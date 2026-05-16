@@ -7,9 +7,10 @@
  * a kebab-case `brand_id`. The frontend uses brand_id for shareable URLs
  * (`/merchant/starbucks`); UUID is for internal cross-references.
  */
-import { Router, type Request, type Response, type NextFunction } from "express";
+import express, { Router, type Request, type Response, type NextFunction } from "express";
 import { and, eq, sql } from "drizzle-orm";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
+import { z } from "zod";
 import { createReadStream } from "fs";
 import { stat } from "fs/promises";
 
@@ -17,12 +18,14 @@ import { db } from "../db/client.js";
 import { merchants } from "../schema/merchants.js";
 import { places, placePhotos } from "../schema/places.js";
 import { parseOrThrow } from "../http/validate.js";
-import { NotFoundProblem } from "../http/problem.js";
+import { HttpProblem, NotFoundProblem } from "../http/problem.js";
 import {
   MerchantDetail,
   MerchantPathParams,
   MerchantTransactionsQuery,
   MerchantTransactionsResponse,
+  Merchant,
+  UpdateMerchantRequest,
 } from "../schemas/v1/merchant.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
 
@@ -83,6 +86,7 @@ function rowToMerchantDto(m: typeof merchants.$inferSelect) {
       m.enrichmentAttemptedAt instanceof Date
         ? m.enrichmentAttemptedAt.toISOString()
         : m.enrichmentAttemptedAt,
+    custom_name: m.customName ?? null,
     created_at:
       m.createdAt instanceof Date ? m.createdAt.toISOString() : m.createdAt,
     updated_at:
@@ -91,6 +95,16 @@ function rowToMerchantDto(m: typeof merchants.$inferSelect) {
 }
 
 export const merchantsRouter = Router({ mergeParams: true });
+
+// PATCH body parser — accepts both application/json and merge-patch+json
+// per RFC 7396. Body is small (one nullable string), 1mb limit is more
+// than generous and matches the brands router precedent.
+merchantsRouter.use(
+  express.json({
+    type: ["application/json", "application/merge-patch+json"],
+    limit: "1mb",
+  }),
+);
 
 /**
  * GET /v1/merchants/:id — single merchant + KPIs.
@@ -287,6 +301,47 @@ merchantsRouter.get(
   }),
 );
 
+// ── PATCH /v1/merchants/:id (#79 Phase C) ──────────────────────────────
+//
+// Currently exposes only `custom_name` — Layer-3 brand-level rename
+// override. Other merchant fields are agent-owned via the ingest
+// extractor and not user-editable from this endpoint. Accepts either
+// brand_id slug or UUID in `:id`.
+
+merchantsRouter.patch(
+  "/:id",
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const merchant = await resolveMerchant(req.ctx.workspaceId, id);
+    if (!merchant) throw new NotFoundProblem("Merchant", id);
+
+    const body = parseOrThrow(UpdateMerchantRequest, req.body);
+    const updates: Record<string, unknown> = {};
+    if ("custom_name" in body) {
+      const cn = body.custom_name ?? null;
+      updates["customName"] = cn === null ? null : cn.trim() === "" ? null : cn.trim();
+    }
+    if (Object.keys(updates).length === 0) {
+      throw new HttpProblem(
+        400,
+        "no-fields",
+        "No editable fields supplied",
+        "PATCH /v1/merchants/:id needs at least one field. Currently only `custom_name` is editable.",
+      );
+    }
+    updates["updatedAt"] = new Date();
+
+    const updated = await db
+      .update(merchants)
+      .set(updates)
+      .where(
+        and(eq(merchants.workspaceId, req.ctx.workspaceId), eq(merchants.id, merchant.id)),
+      )
+      .returning();
+    res.json(rowToMerchantDto(updated[0]!));
+  }),
+);
+
 // ── OpenAPI registration ───────────────────────────────────────────────
 
 const problemResponse = {
@@ -294,8 +349,10 @@ const problemResponse = {
 };
 
 export function registerMerchantsOpenApi(registry: OpenAPIRegistry): void {
+  registry.register("Merchant", Merchant);
   registry.register("MerchantDetail", MerchantDetail);
   registry.register("MerchantTransactionsResponse", MerchantTransactionsResponse);
+  registry.register("UpdateMerchantRequest", UpdateMerchantRequest);
 
   registry.registerPath({
     method: "get",
@@ -353,6 +410,34 @@ export function registerMerchantsOpenApi(registry: OpenAPIRegistry): void {
           "application/json": { schema: MerchantTransactionsResponse },
         },
       },
+      404: { description: "Merchant not found", ...problemResponse },
+    },
+  });
+
+  registry.registerPath({
+    method: "patch",
+    path: "/v1/merchants/{id}",
+    summary: "Update a merchant — brand-level Layer-3 custom_name override (#79)",
+    description:
+      "Currently only `custom_name` is editable. Other merchant fields are " +
+      "agent-owned via the ingest extractor and not user-editable from this endpoint. " +
+      "Pass `custom_name: null` to clear the override.",
+    tags: ["merchants"],
+    request: {
+      params: MerchantPathParams,
+      body: {
+        content: {
+          "application/json": { schema: UpdateMerchantRequest },
+          "application/merge-patch+json": { schema: UpdateMerchantRequest },
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: "Updated merchant",
+        content: { "application/json": { schema: Merchant } },
+      },
+      400: { description: "No editable fields supplied", ...problemResponse },
       404: { description: "Merchant not found", ...problemResponse },
     },
   });

@@ -72,6 +72,16 @@ export const merchants = pgTable(
     enrichmentAttemptedAt: timestamp("enrichment_attempted_at", {
       withTimezone: true,
     }),
+    /**
+     * Layer-3 user override (#79 Phase C). Brand-level rename — when
+     * set, frontend `displayName()` prefers this over Google/OCR-derived
+     * names when no per-place override is set. One rename here
+     * propagates to every place row under this brand_id within the
+     * workspace; users who've been to N branches no longer have to
+     * rename each individually. Workspace-scoped (re: the table-level
+     * contract), and never touched by re-extract.
+     */
+    customName: text("custom_name"),
     createdAt,
     updatedAt,
   },

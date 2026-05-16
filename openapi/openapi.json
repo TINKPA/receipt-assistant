@@ -3159,6 +3159,12 @@
             ],
             "format": "date-time"
           },
+          "custom_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -3182,6 +3188,7 @@
           "lng",
           "enrichment_status",
           "enrichment_attempted_at",
+          "custom_name",
           "created_at",
           "updated_at"
         ]
@@ -3304,6 +3311,19 @@
           "items",
           "next_cursor"
         ]
+      },
+      "UpdateMerchantRequest": {
+        "type": "object",
+        "properties": {
+          "custom_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 200
+          }
+        },
+        "additionalProperties": false
       },
       "NewPosting": {
         "type": "object",
@@ -7472,6 +7492,70 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MerchantDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Merchant not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update a merchant — brand-level Layer-3 custom_name override (#79)",
+        "description": "Currently only `custom_name` is editable. Other merchant fields are agent-owned via the ingest extractor and not user-editable from this endpoint. Pass `custom_name: null` to clear the override.",
+        "tags": [
+          "merchants"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMerchantRequest"
+              }
+            },
+            "application/merge-patch+json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMerchantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated merchant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Merchant"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No editable fields supplied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }

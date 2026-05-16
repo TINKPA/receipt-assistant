@@ -35,10 +35,31 @@ export const Merchant = z
     lng: z.number().nullable(),
     enrichment_status: MerchantEnrichmentStatus,
     enrichment_attempted_at: IsoDateTime.nullable(),
+    /**
+     * Layer-3 user override (#79 Phase C). Brand-level rename that
+     * `displayName()` prefers over Google/OCR-derived names when no
+     * per-place override is set. Workspace-scoped via the merchants
+     * row; re-extract never touches this field.
+     */
+    custom_name: z.string().nullable(),
     created_at: IsoDateTime,
     updated_at: IsoDateTime,
   })
   .openapi("Merchant");
+
+/**
+ * PATCH /v1/merchants/:id body (#79 Phase C). Currently exposes only
+ * the brand-level rename; other merchant fields are agent-owned via
+ * the ingest extractor and not user-editable from this endpoint.
+ *
+ * Pass `null` to clear the override (revert to displayName cascade).
+ */
+export const UpdateMerchantRequest = z
+  .object({
+    custom_name: z.string().max(200).nullable().optional(),
+  })
+  .strict()
+  .openapi("UpdateMerchantRequest");
 
 /**
  * Aggregated KPIs computed by the merchant detail endpoint. Currency is
