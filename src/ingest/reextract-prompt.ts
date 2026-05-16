@@ -37,7 +37,7 @@ import { buildInfo } from "../generated/build-info.js";
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.2";
+export const REEXTRACT_PROMPT_VERSION = "1.3";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -193,34 +193,123 @@ user override survives this re-extract.
     updated_at        = NOW()
   WHERE id = '${ctx.documentId}' AND workspace_id = '${ctx.workspaceId}';
 
-  -- #81 Phase 2: refresh relational items in lockstep with metadata.
-  -- DELETE-then-INSERT inside the same txn is idempotent because the
-  -- UNIQUE (transaction_id, line_no) constraint would otherwise reject
-  -- a second pass. Always reset, even on a no-item receipt (the agent
-  -- emits the 'TOTAL ONLY' fallback row in that case).
-  DELETE FROM transaction_items
-  WHERE transaction_id = '${ctx.transactionId}';
+  -- #84 Phase 1: re-extract is now versioned (extraction_run counter
+  -- bumps; old run rows soft-deleted via retired_at). Live aggregates
+  -- read WHERE retired_at IS NULL, so old purchases drop out and new
+  -- ones count immediately — purchase_count stays correct, no drift.
+  -- Soft-delete every live item belonging to this tx.
+  UPDATE transaction_items
+  SET retired_at = NOW()
+  WHERE transaction_id = '${ctx.transactionId}'
+    AND retired_at IS NULL;
 
+  -- Insert the freshly extracted rows under run = MAX(prev)+1.
+  -- Capture the run number in a temp var via WITH ... SELECT, then
+  -- INSERT. The agent computes this run number inline below.
+  WITH next_run AS (
+    SELECT COALESCE(MAX(extraction_run), 0) + 1 AS run
+    FROM transaction_items
+    WHERE transaction_id = '${ctx.transactionId}'
+  ),
+  p_upsert AS (
+    INSERT INTO products (
+      workspace_id, merchant_id, product_key, canonical_name,
+      item_class, brand_id, model, color, size, variant, sku,
+      manufacturer
+    )
+    SELECT '${ctx.workspaceId}',
+           CASE WHEN item.product_merchant_exclusive THEN
+             (SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')
+           ELSE NULL END,
+           item.product_key,
+           COALESCE(item.normalized_name, item.raw_name),
+           item.item_class, item.product_brand_id,
+           item.product_model, item.product_color, item.product_size,
+           item.product_variant, item.product_sku, item.product_manufacturer
+    FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+      line_no int, raw_name text, normalized_name text,
+      quantity numeric, unit text,
+      unit_price_minor bigint, line_total_minor bigint, currency text,
+      item_class text, durability_tier text, food_kind text,
+      tags text[], confidence text,
+      line_type text, product_key text, product_brand_id text,
+      product_merchant_exclusive boolean, product_model text,
+      product_color text, product_size text, product_variant text,
+      product_sku text, product_manufacturer text,
+      tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
+    )
+    WHERE COALESCE(item.line_type, 'product') = 'product' AND item.product_key IS NOT NULL
+    ON CONFLICT (workspace_id, merchant_id, product_key) DO UPDATE
+      SET updated_at = NOW(),
+          canonical_name = COALESCE(EXCLUDED.canonical_name, products.canonical_name),
+          brand_id       = COALESCE(EXCLUDED.brand_id,       products.brand_id),
+          item_class     = COALESCE(EXCLUDED.item_class,     products.item_class)
+    RETURNING id, product_key, merchant_id
+  )
   INSERT INTO transaction_items (
     id, workspace_id, transaction_id, line_no,
     raw_name, normalized_name, quantity, unit,
     unit_price_minor, line_total_minor, currency,
     item_class, durability_tier, food_kind, tags, confidence,
-    extraction_version
+    line_type, product_id, tax_minor, tip_share_minor,
+    discount_share_minor, extraction_run, extraction_version
   )
   SELECT gen_random_uuid(), '${ctx.workspaceId}', '${ctx.transactionId}', item.line_no,
          item.raw_name, item.normalized_name, item.quantity, item.unit,
          item.unit_price_minor, item.line_total_minor, item.currency,
          item.item_class, item.durability_tier, item.food_kind,
          item.tags, item.confidence,
+         COALESCE(item.line_type, 'product'),
+         (SELECT pu.id FROM p_upsert pu
+            WHERE pu.product_key = item.product_key
+              AND pu.merchant_id IS NOT DISTINCT FROM
+                  (CASE WHEN item.product_merchant_exclusive THEN
+                     (SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')
+                   ELSE NULL END)
+            LIMIT 1),
+         item.tax_minor, item.tip_share_minor, item.discount_share_minor,
+         (SELECT run FROM next_run),
          '${REEXTRACT_PROMPT_VERSION}'
   FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
     line_no int, raw_name text, normalized_name text,
     quantity numeric, unit text,
     unit_price_minor bigint, line_total_minor bigint, currency text,
     item_class text, durability_tier text, food_kind text,
-    tags text[], confidence text
+    tags text[], confidence text,
+    line_type text, product_key text, product_brand_id text,
+    product_merchant_exclusive boolean, product_model text,
+    product_color text, product_size text, product_variant text,
+    product_sku text, product_manufacturer text,
+    tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
   );
+
+  -- #84: recompute aggregate stats for every product whose live
+  -- transaction_items set just changed. The WHERE clause unions
+  -- old-touched + new-touched products by reading the live set,
+  -- which now reflects the post-soft-delete state.
+  WITH stats AS (
+    SELECT ti.product_id,
+           MIN(t.occurred_on) AS first_on,
+           MAX(t.occurred_on) AS last_on,
+           COUNT(DISTINCT ti.transaction_id) AS purchases,
+           SUM(ti.effective_total_minor) AS total_minor
+    FROM transaction_items ti
+    JOIN transactions t ON t.id = ti.transaction_id
+    WHERE ti.workspace_id = '${ctx.workspaceId}'
+      AND ti.product_id IS NOT NULL
+      AND ti.retired_at IS NULL
+      AND ti.line_type = 'product'
+    GROUP BY ti.product_id
+  )
+  UPDATE products p SET
+    first_purchased_on = stats.first_on,
+    last_purchased_on  = stats.last_on,
+    purchase_count     = stats.purchases,
+    total_spent_minor  = stats.total_minor,
+    updated_at         = NOW()
+  FROM stats
+  WHERE p.id = stats.product_id
+    AND p.workspace_id = '${ctx.workspaceId}';
 
   INSERT INTO transaction_events (
     id, workspace_id, transaction_id, event_type, actor_id, payload

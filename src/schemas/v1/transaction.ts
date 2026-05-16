@@ -94,6 +94,20 @@ export const TransactionItem = z
       .optional(),
     tags: z.array(z.string()).nullable().optional(),
     confidence: z.enum(["high", "medium", "low"]),
+    /** #84 — recommended values product / tax / tip / discount /
+     *  shipping / surcharge / service_fee / gift_card. Free text
+     *  so the agent can invent labels for novel cases. */
+    line_type: z.string().default("product"),
+    /** #84 — catalog linkage; null on non-product rows and on lines
+     *  the agent judged not worth canonicalizing. */
+    product_id: Uuid.nullable().default(null),
+    /** #84 — per-line tax allocated from the printed aggregate. */
+    tax_minor: z.number().int().nullable().default(null),
+    tip_share_minor: z.number().int().nullable().default(null),
+    discount_share_minor: z.number().int().nullable().default(null),
+    /** #84 — generated column on `transaction_items`:
+     *  `line_total + tax + tip - discount`. */
+    effective_total_minor: z.number().int(),
   })
   .openapi("TransactionItem");
 
