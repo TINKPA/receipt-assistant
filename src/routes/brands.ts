@@ -176,6 +176,65 @@ brandsRouter.get(
   },
 );
 
+// ── GET /v1/brands/:brandId/assets/:assetId/icon ──────────────────────
+//
+// Streams the bytes of an arbitrary candidate (NOT just the preferred
+// one). Powers the Brand-detail picker UI so the user can visually
+// compare candidates before clicking "Pick" — embedding `source_url`
+// directly fails for iTunes lookup URLs, logo.dev URLs without the
+// token, and any CDN that blocks hotlinking. Scoped by brand_id so an
+// asset_id can't be enumerated across brands.
+
+brandsRouter.get(
+  "/:brandId/assets/:assetId/icon",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const brandId = String(req.params.brandId);
+      const assetId = String(req.params.assetId);
+      const rows = await db
+        .select({
+          localPath: brandAssets.localPath,
+          contentType: brandAssets.contentType,
+          retiredAt: brandAssets.retiredAt,
+        })
+        .from(brandAssets)
+        .where(
+          and(eq(brandAssets.id, assetId), eq(brandAssets.brandId, brandId)),
+        );
+      if (rows.length === 0) {
+        throw new NotFoundProblem(
+          "Brand asset",
+          `asset_id=${assetId} not found under brand=${brandId}`,
+        );
+      }
+      const asset = rows[0]!;
+      if (asset.retiredAt !== null) {
+        throw new NotFoundProblem(
+          "Brand asset",
+          `asset_id=${assetId} is retired`,
+        );
+      }
+      const absPath = isAbsolute(asset.localPath)
+        ? asset.localPath
+        : join(BRAND_ASSETS_ROOT, asset.localPath);
+      try {
+        const st = await stat(absPath);
+        if (!st.isFile()) throw new Error("not a file");
+      } catch {
+        throw new NotFoundProblem(
+          "Brand asset",
+          `File missing on disk: ${absPath}`,
+        );
+      }
+      res.setHeader("Content-Type", asset.contentType);
+      res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+      createReadStream(absPath).pipe(res);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // ── GET /v1/brands/:brandId/icon ───────────────────────────────────────
 //
 // Resolves the brand's preferred_asset_id and streams the bytes from
@@ -355,6 +414,22 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
           },
         },
       },
+      404: { description: "Not Found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/v1/brands/{brandId}/assets/{assetId}/icon",
+    summary: "Stream an individual candidate asset's bytes",
+    description:
+      "Streams any candidate (not just preferred) so the UI picker can render thumbnails. Scoped by brand_id to prevent cross-brand asset_id enumeration. 404 if missing, retired, or the file is gone from disk.",
+    tags: ["brands"],
+    request: {
+      params: z.object({ brandId: z.string(), assetId: z.string() }),
+    },
+    responses: {
+      200: { description: "Asset bytes" },
       404: { description: "Not Found", content: problemContent },
     },
   });
