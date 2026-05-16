@@ -11,5 +11,6 @@ export * from "./batches.js";
 export * from "./ingests.js";
 export * from "./reconcile_proposals.js";
 export * from "./places.js";
+export * from "./place_snapshots.js";
 export * from "./merchants.js";
 export * from "./derivation_events.js";

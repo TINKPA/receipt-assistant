@@ -712,6 +712,18 @@ returned NULL for a field never overwrites a previously-good value.
             google_maps_uri          = COALESCE(EXCLUDED.google_maps_uri,          places.google_maps_uri)
             -- Note: custom_name_zh is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches.
       RETURNING id
+    ),
+    -- #90 Phase 3: append-only history of every Google/Yelp fetch.
+    -- One row per ingest that touched this place; \`places.raw_response\`
+    -- is the latest pointer, \`place_snapshots\` is the full audit
+    -- trail that #91 refresh will diff against.  Use the SAME
+    -- \`<RAW_JSON_STRING_WITH_BOTH_LANGS>\` body you passed into the
+    -- \`places\` upsert above and the SAME \`<google_geocode|google_places>\`
+    -- source string.
+    snapshot AS (
+      INSERT INTO place_snapshots (place_id, source, raw_response, fetched_by_sha)
+      SELECT id, '<google_geocode|google_places>', '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb, '${buildInfo.gitShortSha}'
+        FROM place
     )
   UPDATE transactions SET place_id = (SELECT id FROM place), updated_at = NOW()
    WHERE id = '<TX_ID>' AND workspace_id = '${ctx.workspaceId}';

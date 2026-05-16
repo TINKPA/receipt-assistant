@@ -126,6 +126,39 @@ The `places.metadata.derivation` jsonb on the row itself answers "what produced 
 
 The user-facing question raised during planning was: when re-derive changes `places.display_name_en`, should `merchants.canonical_name` auto-update for the linked brand? The code says no — `merchants.canonical_name` / `brand_id` / `category` come from the LLM looking at the **receipt** at ingest time, not from `places` projection output. `merchants.address` / `lat` / `lng` come from `src/enrichment/merchants.ts` calling Google's `findPlaceFromText` endpoint, which is separate from `places.raw_response`. So a `places` projection change doesn't introduce any new inconsistency in `merchants`, and a cascade UPDATE would be dead code. The cascade architecture slot belongs to [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (re-extract), where re-reading the receipt with new place data can plausibly change `canonical_name`.
 
+## Raw-response history — `place_snapshots` (Phase 3 of #80)
+
+Phase 3 of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#90](https://github.com/TINKPA/receipt-assistant/issues/90)) adds an append-only history of every Google / Yelp `raw_response` we've ever fetched for a place. `places.raw_response` becomes the *latest pointer*; `place_snapshots` is the full audit trail.
+
+### What the table records
+
+```sql
+SELECT place_id, source, fetched_at, fetched_by_sha
+  FROM place_snapshots
+ WHERE place_id = $1
+ ORDER BY fetched_at DESC;
+```
+
+One row per ingest that touched the place. `source` mirrors `places.source` (`'google_geocode' | 'google_places' | 'yelp'`). `fetched_by_sha` is `buildInfo.gitShortSha` at fetch time — NULL for rows produced by the migration backfill (provenance unknown for historical fetches). `raw_response` is the full body, identical to whatever was written to `places.raw_response` in the same transaction.
+
+### Ingest write path
+
+The CTE in `src/ingest/prompt.ts:704-727` inserts the new `place_snapshots` row in the **same statement** as the `places` upsert — `places` returns the (possibly-just-created) row id, `place_snapshots` reads it from the upsert CTE and inserts atomically. Both rows reflect the same fetch; if either fails the other rolls back. The snapshot insert is unconditional — even when the upsert is a no-op COALESCE round-trip on cached data, the visit is recorded.
+
+### Why a separate table instead of versioning `places`
+
+`places` is the hot read path: every transaction render joins it. Keeping it flat (one row per Google place_id) keeps that read cheap. Snapshot history is queried by hand or by the future refresh path (#91) — putting that cost into a sibling table that's only touched on writes and audit reads is the textbook split.
+
+The same principle drove [`derivation_events`](#audit-log--derivation_events) (Phase 2) — Layer 2 stays a flat snapshot, audit history lives in a separate append-only table. `place_snapshots` is the same shape applied to Layer 1.
+
+### Backfill
+
+The migration (`drizzle/0012_place_snapshots.sql`) does a one-time backfill: every existing `places` row with `raw_response IS NOT NULL` gets one snapshot row, using `last_seen_at` as a best-effort `fetched_at` and `fetched_by_sha = NULL`. The `count(snapshots) ≥ count(places with raw_response)` invariant holds from the moment the migration commits.
+
+### Hand-off to #91
+
+Phase 4 (refresh) will INSERT a new snapshot for every Google / Yelp re-fetch, then diff snapshot N vs N−1 to surface what changed (renamed merchant, moved address, closed business). Without this table refresh would be destructive; with it, every re-fetch is non-lossy from day one.
+
 ## Known Pitfalls
 
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:
