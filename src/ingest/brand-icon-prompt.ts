@@ -204,6 +204,20 @@ source URL, or filename. Score axes:
     shopping bag for "Apple", a purple Dashboard tile for "Stripe".
     Those are the App Store app's icon and Stripe's Dashboard
     product's icon, not the brand mark. agent_relevance ≤ 20.
+
+    **CRITICAL trap that has burned every prior agent run on this
+    project: when merchant brand_id is 'apple' OR 'apple-store',
+    the iTunes "com.apple.store.Jolly" shopping-bag icon is NOT
+    the Apple Store retail brand mark — it is the icon of the App
+    Store iOS app (a separate Apple product). The proper visual
+    identity for the entire Apple family of brands (apple,
+    apple-store, app-store, applecare) is the Apple silhouette
+    logo. SVGL provides this as a clean monochrome vector — Apple
+    IS monochrome by design, so DO NOT penalize the svgl Apple
+    result for being monochrome; it should score 90+. Any iTunes
+    bundleId matching com.apple.store.* OR any image that looks
+    like a shopping/download bag with a logo inside MUST score
+    ≤ 15 and be retired regardless of merchant brand_id.**
   - Generated letter-fallback placeholder. Single capital letter,
     generic sans-serif, white background → 0; also retire the asset
     so future re-acquisition skips it.
