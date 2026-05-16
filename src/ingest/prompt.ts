@@ -17,7 +17,7 @@ import { buildInfo } from "../generated/build-info.js";
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.7";
+export const PROMPT_VERSION = "2.8";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -1104,6 +1104,42 @@ record \`file_path\` accordingly:
 Also stamp the document row (ties it back to this ingest):
 
   psql "\$DATABASE_URL" -c "UPDATE documents SET source_ingest_id = '${ctx.ingestId}' WHERE id = '${ctx.documentId}';"
+
+### 4a-bis. owned_items judgment (#84 Phase 2)
+
+For each line where you set \`item_class='durable'\` AND assigned a
+\`product_id\` AND judge the item **worth tracking as a real-world
+thing**, insert N owned_items rows (instance_index 1..quantity).
+Pure judgment, no threshold:
+
+  - Limited-edition / luxury / high-value goods                  → YES
+  - Anything with a serial number printed on the receipt          → YES
+  - Items the user plausibly tracks warranty / location for       → YES
+  - Cheap commodity durables ($5 hammer, basic kitchenware)       → NO
+  - One-time-use durables (party plates that *technically* last)  → NO
+
+Leave \`serial_number\`, \`location\`, \`warranty_until\`, \`condition\`,
+\`notes\` blank — the user fills those in. \`acquired_on\` defaults to
+the transaction's \`occurred_on\`.
+
+Query back the just-inserted transaction_items.id for each durable
+line you want to track, then INSERT into owned_items:
+
+  psql "\$DATABASE_URL" <<'SQL'
+  INSERT INTO owned_items (workspace_id, product_id, transaction_item_id, instance_index, acquired_on)
+  SELECT '${ctx.workspaceId}', ti.product_id, ti.id, gs.idx, '<occurred_on>'::date
+  FROM transaction_items ti
+  CROSS JOIN LATERAL generate_series(1, COALESCE(ti.quantity, 1)::int) gs(idx)
+  WHERE ti.transaction_id = '<TX_ID>'
+    AND ti.line_no = <LINE_NO>            -- one statement per durable line
+    AND ti.item_class = 'durable'
+    AND ti.product_id IS NOT NULL
+  ON CONFLICT (transaction_item_id, instance_index) DO NOTHING;
+  SQL
+
+The ON CONFLICT clause makes the insert safe to re-run. Skip this
+step entirely for non-durable items, for durables you judge not
+worth tracking, and for product-less lines.
 
 ### 4b. statement_pdf
 
