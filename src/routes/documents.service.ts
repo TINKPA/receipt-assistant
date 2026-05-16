@@ -33,6 +33,10 @@ export interface DocumentRow {
   mime_type: string | null;
   sha256: string;
   ocr_text: string | null;
+  /** Model identifier under which `ocr_text` was produced. NULL on
+   *  legacy rows (pre-#91 Phase 4b). Set by ingest going forward;
+   *  overwritten by re-extract (Phase 4c). */
+  ocr_model_version: string | null;
   extraction_meta: Record<string, unknown> | null;
   source_ingest_id: string | null;
   deleted_at: string | null;
@@ -88,6 +92,7 @@ function rowToApi(r: {
   mimeType: string | null;
   sha256: string;
   ocrText: string | null;
+  ocrModelVersion: string | null;
   extractionMeta: unknown;
   sourceIngestId: string | null;
   deletedAt: Date | null;
@@ -102,6 +107,7 @@ function rowToApi(r: {
     mime_type: r.mimeType,
     sha256: r.sha256,
     ocr_text: r.ocrText,
+    ocr_model_version: r.ocrModelVersion,
     extraction_meta:
       r.extractionMeta == null
         ? null

@@ -28,6 +28,16 @@ export const documents = pgTable(
     mimeType: text("mime_type"),
     sha256: text("sha256").notNull(),
     ocrText: text("ocr_text"),
+    /** Model identifier under which `ocr_text` was produced. NULL on
+     *  legacy rows (anything ingested before #91 / Phase 4b). Set by
+     *  the ingest worker on new uploads and overwritten by
+     *  `POST /v1/documents/:id/re-extract` (Phase 4c). Distinct from
+     *  `transactions.metadata.extraction.model` (#88) because OCR text
+     *  and transaction-structure extraction can in principle run
+     *  under different models (vision OCR vs structured extraction).
+     *  Today they share one call, so both fields end up equal — the
+     *  split matters once re-extract decouples them. */
+    ocrModelVersion: text("ocr_model_version"),
     extractionMeta: jsonb("extraction_meta"),
     sourceIngestId: uuid("source_ingest_id").references(
       (): AnyPgColumn => ingests.id,

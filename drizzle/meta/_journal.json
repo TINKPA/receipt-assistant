@@ -92,6 +92,13 @@
       "when": 1778899238110,
       "tag": "0012_place_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1778901566060,
+      "tag": "0013_documents_ocr_model_version",
+      "breakpoints": true
     }
   ]
 }
