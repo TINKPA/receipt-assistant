@@ -1960,6 +1960,15 @@
           }
         }
       },
+      "UploadBrandAssetForm": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary"
+          }
+        }
+      },
       "Document": {
         "type": "object",
         "properties": {
@@ -6046,6 +6055,75 @@
           },
           "404": {
             "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Upload a user-provided brand icon",
+        "description": "Multipart upload (field name `file`) — saves bytes to the brand-assets bind-mount, inserts a brand_assets row with tier=user_upload, and stamps user_chose_at + preferred_asset_id to the new asset (the upload IS the user's choice; Layer-3 lock per #101). Re-uploading identical bytes returns the existing row 200 OK (UNIQUE on (brand_id, content_hash)); new bytes return 201.",
+        "tags": [
+          "brands"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "brandId",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadBrandAssetForm"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dedup hit — existing asset returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandAsset"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "New asset created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandAsset"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Brand not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
             "content": {
               "application/problem+json": {
                 "schema": {

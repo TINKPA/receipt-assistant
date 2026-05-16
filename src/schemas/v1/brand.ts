@@ -20,6 +20,17 @@ export const BrandAssetTier = z.enum([
   "manual_url",
 ]);
 
+/**
+ * Multipart form for `POST /v1/brands/:brandId/assets`. Zod can't fully
+ * model multipart bodies; this exists so the OpenAPI doc reflects the
+ * expected field shape. The actual parsing is done by multer.
+ */
+export const UploadBrandAssetForm = z
+  .object({
+    file: z.any().openapi({ type: "string", format: "binary" }),
+  })
+  .openapi("UploadBrandAssetForm");
+
 export const BrandAsset = z
   .object({
     id: Uuid,

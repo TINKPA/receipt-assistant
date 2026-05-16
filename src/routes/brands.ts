@@ -13,8 +13,10 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull } from "drizzle-orm";
 import { createReadStream } from "fs";
-import { stat } from "fs/promises";
-import { join, isAbsolute } from "path";
+import { mkdir, stat, writeFile } from "fs/promises";
+import { join, isAbsolute, dirname } from "path";
+import { createHash } from "crypto";
+import multer from "multer";
 import { db } from "../db/client.js";
 import { brands, brandAssets } from "../schema/index.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -22,11 +24,13 @@ import {
   Brand,
   BrandAsset,
   UpdateBrandRequest,
+  UploadBrandAssetForm,
 } from "../schemas/v1/brand.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
 import {
   HttpProblem,
   NotFoundProblem,
+  ValidationProblem,
 } from "../http/problem.js";
 
 // Where the bind-mount lands inside the container. Phase 4b writes each
@@ -40,6 +44,41 @@ export const brandsRouter: Router = Router();
 brandsRouter.use(
   express.json({ type: "application/merge-patch+json", limit: "1mb" }),
 );
+
+// Multer for user-uploaded brand icons. Memory storage so we can sha256
+// the bytes before writing to disk (UNIQUE (brand_id, content_hash)
+// catches re-uploads of the same image).
+const uploadBrandAsset = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB — icons are small
+});
+
+const ACCEPTED_ICON_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/svg+xml",
+  "image/webp",
+  "image/gif",
+]);
+
+function extensionForMime(mime: string): string {
+  switch (mime) {
+    case "image/png":
+      return "png";
+    case "image/jpeg":
+    case "image/jpg":
+      return "jpg";
+    case "image/svg+xml":
+      return "svg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    default:
+      return "bin";
+  }
+}
 
 function toIsoString(v: unknown): string {
   if (v instanceof Date) return v.toISOString();
@@ -170,6 +209,129 @@ brandsRouter.get(
         items: rows.map(rowToAssetDto),
         next_cursor: null,
       });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ── POST /v1/brands/:brandId/assets ────────────────────────────────────
+//
+// User uploads a brand icon (multipart/form-data, field name `file`).
+// The upload IS the user's choice — we auto-set preferred_asset_id and
+// stamp user_chose_at so re-extract honors it (Layer-3 lock per #101).
+//
+// Dedup via UNIQUE (brand_id, content_hash). Re-uploading the same bytes
+// returns the existing row 200 OK; new bytes 201 Created.
+//
+// Bytes are stored at `${BRAND_ASSETS_ROOT}/<brand_id>/user-upload/<sha>.<ext>`
+// — same directory convention as the agent-fetched tiers so the streaming
+// endpoint at /:brandId/assets/:assetId/icon works uniformly.
+
+brandsRouter.post(
+  "/:brandId/assets",
+  uploadBrandAsset.single("file"),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const brandId = String(req.params.brandId);
+      const file = req.file;
+      if (!file) {
+        throw new ValidationProblem([
+          { path: "file", code: "required", message: "multipart field `file` is required" },
+        ]);
+      }
+      const mime = (file.mimetype || "application/octet-stream").toLowerCase();
+      if (!ACCEPTED_ICON_MIMES.has(mime)) {
+        throw new ValidationProblem([
+          {
+            path: "file",
+            code: "unsupported_mime",
+            message: `Unsupported icon MIME type "${mime}". Accepted: ${Array.from(ACCEPTED_ICON_MIMES).join(", ")}`,
+          },
+        ]);
+      }
+      const brandRows = await db
+        .select({ id: brands.brandId })
+        .from(brands)
+        .where(eq(brands.brandId, brandId));
+      if (brandRows.length === 0) throw new NotFoundProblem("Brand", brandId);
+
+      const bytes = file.buffer;
+      const sha = createHash("sha256").update(bytes).digest("hex");
+      const ext = extensionForMime(mime);
+      const relPath = `${brandId}/user-upload/${sha}.${ext}`;
+      const absPath = join(BRAND_ASSETS_ROOT, relPath);
+
+      // Dedup: if (brand_id, content_hash) already exists, surface that row.
+      // Whether or not we just wrote the bytes (race-safe: writeFile is
+      // idempotent for the same payload, and ON CONFLICT short-circuits).
+      const existing = await db
+        .select()
+        .from(brandAssets)
+        .where(
+          and(
+            eq(brandAssets.brandId, brandId),
+            eq(brandAssets.contentHash, sha),
+          ),
+        );
+
+      let assetId: string;
+      let created: boolean;
+      if (existing.length > 0) {
+        const row = existing[0]!;
+        // If retired earlier, un-retire it (the user is explicitly choosing it now).
+        if (row.retiredAt !== null) {
+          await db
+            .update(brandAssets)
+            .set({ retiredAt: null, lastSeenAt: new Date() })
+            .where(eq(brandAssets.id, row.id));
+        } else {
+          await db
+            .update(brandAssets)
+            .set({ lastSeenAt: new Date() })
+            .where(eq(brandAssets.id, row.id));
+        }
+        assetId = row.id;
+        created = false;
+      } else {
+        await mkdir(dirname(absPath), { recursive: true });
+        await writeFile(absPath, bytes);
+        const inserted = await db
+          .insert(brandAssets)
+          .values({
+            brandId,
+            tier: "user_upload",
+            sourceUrl: null,
+            localPath: relPath,
+            contentHash: sha,
+            contentType: mime,
+            bytes: bytes.length,
+            userUploaded: true,
+            // agent_relevance left null — user upload is by definition
+            // the chosen one; doesn't need a numeric score to compete.
+          })
+          .returning({ id: brandAssets.id });
+        assetId = inserted[0]!.id;
+        created = true;
+      }
+
+      // Layer-3 user-truth: stamp user_chose_at + point preferred at the
+      // uploaded asset. Re-extract's Phase 4c never overwrites a row with
+      // user_chose_at IS NOT NULL.
+      await db
+        .update(brands)
+        .set({
+          preferredAssetId: assetId,
+          userChoseAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(brands.brandId, brandId));
+
+      const finalRows = await db
+        .select()
+        .from(brandAssets)
+        .where(eq(brandAssets.id, assetId));
+      res.status(created ? 201 : 200).json(rowToAssetDto(finalRows[0]!));
     } catch (err) {
       next(err);
     }
@@ -369,6 +531,7 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Brand", Brand);
   registry.register("BrandAsset", BrandAsset);
   registry.register("UpdateBrandRequest", UpdateBrandRequest);
+  registry.register("UploadBrandAssetForm", UploadBrandAssetForm);
 
   const problemContent = {
     "application/problem+json": { schema: ProblemDetails },
@@ -428,6 +591,36 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
         },
       },
       404: { description: "Not Found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/brands/{brandId}/assets",
+    summary: "Upload a user-provided brand icon",
+    description:
+      "Multipart upload (field name `file`) — saves bytes to the brand-assets bind-mount, inserts a brand_assets row with tier=user_upload, and stamps user_chose_at + preferred_asset_id to the new asset (the upload IS the user's choice; Layer-3 lock per #101). Re-uploading identical bytes returns the existing row 200 OK (UNIQUE on (brand_id, content_hash)); new bytes return 201.",
+    tags: ["brands"],
+    request: {
+      params: z.object({ brandId: z.string() }),
+      body: {
+        required: true,
+        content: {
+          "multipart/form-data": { schema: UploadBrandAssetForm },
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: "Dedup hit — existing asset returned",
+        content: { "application/json": { schema: BrandAsset } },
+      },
+      201: {
+        description: "New asset created",
+        content: { "application/json": { schema: BrandAsset } },
+      },
+      404: { description: "Brand not found", content: problemContent },
+      422: { description: "Validation failed", content: problemContent },
     },
   });
 
