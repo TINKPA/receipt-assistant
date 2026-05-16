@@ -909,6 +909,108 @@
           "photos"
         ]
       },
+      "TransactionItem": {
+        "type": "object",
+        "properties": {
+          "line_no": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          },
+          "raw_name": {
+            "type": "string"
+          },
+          "normalized_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quantity": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit_price_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "line_total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "item_class": {
+            "type": "string",
+            "enum": [
+              "durable",
+              "consumable",
+              "food_drink",
+              "service",
+              "other"
+            ]
+          },
+          "durability_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "luxury",
+              "standard"
+            ]
+          },
+          "food_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "restaurant_dish",
+              "grocery_food",
+              "beverage"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        },
+        "required": [
+          "line_no",
+          "raw_name",
+          "normalized_name",
+          "quantity",
+          "unit",
+          "unit_price_minor",
+          "line_total_minor",
+          "currency",
+          "item_class",
+          "confidence"
+        ]
+      },
       "Transaction": {
         "type": "object",
         "properties": {
@@ -1012,6 +1114,12 @@
           },
           "place": {
             "$ref": "#/components/schemas/Place"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionItem"
+            }
           }
         },
         "required": [
@@ -1030,109 +1138,8 @@
           "updated_at",
           "postings",
           "documents",
-          "place"
-        ]
-      },
-      "TransactionItem": {
-        "type": "object",
-        "properties": {
-          "line_no": {
-            "type": "integer",
-            "exclusiveMinimum": 0
-          },
-          "raw_name": {
-            "type": "string"
-          },
-          "normalized_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "quantity": {
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "unit": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "unit_price_minor": {
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "line_total_minor": {
-            "type": "integer"
-          },
-          "currency": {
-            "type": "string"
-          },
-          "item_class": {
-            "type": "string",
-            "enum": [
-              "durable",
-              "consumable",
-              "food_drink",
-              "service",
-              "other"
-            ]
-          },
-          "durability_tier": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "enum": [
-              "luxury",
-              "standard"
-            ]
-          },
-          "food_kind": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "enum": [
-              "restaurant_dish",
-              "grocery_food",
-              "beverage"
-            ]
-          },
-          "tags": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "string"
-            }
-          },
-          "confidence": {
-            "type": "string",
-            "enum": [
-              "high",
-              "medium",
-              "low"
-            ]
-          }
-        },
-        "required": [
-          "line_no",
-          "raw_name",
-          "normalized_name",
-          "quantity",
-          "unit",
-          "unit_price_minor",
-          "line_total_minor",
-          "currency",
-          "item_class",
-          "confidence"
+          "place",
+          "items"
         ]
       },
       "BulkResultItem": {
@@ -1163,6 +1170,34 @@
         },
         "required": [
           "results"
+        ]
+      },
+      "ListedTransactionItem": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TransactionItem"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "transaction_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "created_at": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "transaction_id",
+              "created_at"
+            ]
+          }
         ]
       },
       "Document": {
@@ -4321,6 +4356,124 @@
           },
           "422": {
             "description": "Would leave <2 postings",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/items": {
+      "get": {
+        "summary": "List transaction items (admin / aggregation)",
+        "tags": [
+          "items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "durable",
+                "consumable",
+                "food_drink",
+                "service",
+                "other"
+              ]
+            },
+            "required": false,
+            "name": "class",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "required": false,
+            "name": "from",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "required": false,
+            "name": "to",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "required": false,
+            "name": "transaction_id",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "tag",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "cursor",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ListedTransactionItem"
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "next_cursor"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
             "content": {
               "application/problem+json": {
                 "schema": {

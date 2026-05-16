@@ -747,6 +747,39 @@ them first):
       SELECT '${ctx.documentId}', tx.id FROM tx
       ON CONFLICT DO NOTHING
       RETURNING transaction_id
+    ),
+    -- #81 Phase 2: relational line-items. One INSERT per item from
+    -- your Phase 2 items[] array. The shape is identical to the
+    -- jsonb_build_object's 'items' key — both stay in sync this
+    -- release; clients read items off the table, the metadata copy
+    -- is the on-the-wire archive of the agent's exact emission.
+    -- Use ARRAY[]::text[] when tags is empty / NULL.
+    -- Re-extract on the same tx clears + reinserts via the (tx_id,
+    -- line_no) unique constraint; ingest only ever inserts (the
+    -- transaction is brand new here, so no conflicts possible).
+    ti AS (
+      INSERT INTO transaction_items (
+        id, workspace_id, transaction_id, line_no,
+        raw_name, normalized_name, quantity, unit,
+        unit_price_minor, line_total_minor, currency,
+        item_class, durability_tier, food_kind, tags, confidence,
+        extraction_version
+      )
+      SELECT gen_random_uuid(), '${ctx.workspaceId}', tx.id, item.line_no,
+             item.raw_name, item.normalized_name, item.quantity, item.unit,
+             item.unit_price_minor, item.line_total_minor, item.currency,
+             item.item_class, item.durability_tier, item.food_kind,
+             item.tags, item.confidence,
+             '${PROMPT_VERSION}'
+      FROM tx,
+        jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+          line_no int, raw_name text, normalized_name text,
+          quantity numeric, unit text,
+          unit_price_minor bigint, line_total_minor bigint, currency text,
+          item_class text, durability_tier text, food_kind text,
+          tags text[], confidence text
+        )
+      RETURNING id
     )
   SELECT tx.id AS tx_id FROM tx;
   COMMIT;
