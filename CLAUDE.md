@@ -417,6 +417,62 @@ Local dev defaults:
 - Public key: `pk-receipt-local`
 - Secret key: `sk-receipt-local`
 
+### Live trace: tail the JSONL while the extractor is running (recommended for debugging hangs / errors)
+
+Langfuse only ingests the trace **after** `claude -p` exits — so if an extraction hangs, times out, or crashes mid-loop, Langfuse never sees it and you have nothing to inspect. **This is the right tool when something looks stuck.**
+
+`src/ingest/extractor.ts` (both `defaultClaudeExtractor` and `defaultClaudeReExtractor`) logs the live transcript path to stdout the instant it spawns the subprocess. Grep `docker logs` for the spawn line, then `tail -f` the JSONL on the host — it's bind-mounted, so no `docker exec` needed and the file is being written in real time by the in-container `claude` CLI:
+
+```bash
+# 1. Find the spawn line for the most recent extraction (or grep by ingestId).
+docker logs receipt-assistant --since 5m 2>&1 | grep '\[claude\] extract' | tail -3
+# → [claude] extract ingestId=<id> sessionId=<uuid> jsonl=/home/node/.claude/projects/-app/<uuid>.jsonl
+
+# 2. Translate the container path to the host bind-mount and tail it.
+#    /home/node/.claude/  ←→  ~/Developer/receipt-assistant-data/claude/
+SID=<uuid-from-spawn-line>
+tail -f ~/Developer/receipt-assistant-data/claude/projects/-app/$SID.jsonl
+
+# 3. To pretty-print as the agent runs (one event per line, type + tool + short payload):
+tail -f ~/Developer/receipt-assistant-data/claude/projects/-app/$SID.jsonl \
+  | python3 -c "
+import json, sys
+for line in sys.stdin:
+    e = json.loads(line)
+    t = e.get('type')
+    if t == 'assistant':
+        for b in e.get('message', {}).get('content', []) or []:
+            if b.get('type') == 'tool_use':
+                cmd = b.get('input', {}).get('command') or b.get('input', {}).get('file_path') or ''
+                print(f'  tool: {b[\"name\"]:>10}  {str(cmd)[:120]}')
+            elif b.get('type') == 'thinking' and b.get('thinking'):
+                print(f'  think: {b[\"thinking\"][:140]}')
+            elif b.get('type') == 'text' and b.get('text'):
+                print(f'  text : {b[\"text\"][:140]}')
+    elif t == 'user':
+        c = e.get('message', {}).get('content', [])
+        if isinstance(c, list):
+            for b in c:
+                if b.get('type') == 'tool_result':
+                    inner = b.get('content', '')
+                    if isinstance(inner, list):
+                        inner = ' '.join(x.get('text','') for x in inner if x.get('type')=='text')
+                    print(f'  result: {str(inner)[:120]}')
+"
+```
+
+When to reach for this vs. Langfuse:
+
+| Symptom | Use |
+|---|---|
+| Extraction is stuck in `processing` for >2 min | **Tail the JSONL** — Langfuse hasn't seen anything yet |
+| `claude -p` timed out / hit `CLAUDE_TIMEOUT_MS` | **Tail the JSONL** — Langfuse's trace will be missing or partial; the JSONL has the last events the agent emitted |
+| Agent exited with a SQL error, want to see what it tried to write | **Tail the JSONL** for the `tool_use:Bash` blocks; Langfuse compresses these |
+| Reviewing a past, completed extraction | **Langfuse REST API** — that's its job |
+| Comparing date-OCR accuracy across many receipts | **Langfuse REST API** + the app's `/v1/transactions` |
+
+The JSONL is the source of truth Langfuse ingests from — when the two ever disagree, the JSONL is right.
+
 ### Manual Verification Flow
 
 No verify script. Three curl calls are the contract:

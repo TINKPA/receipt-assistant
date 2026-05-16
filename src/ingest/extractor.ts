@@ -8,6 +8,7 @@
  */
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { getSessionJsonlPath } from "../langfuse.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
 import {
   buildReExtractPrompt,
@@ -118,6 +119,13 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     userId: input.userId,
   };
   const prompt = buildExtractorPrompt(ctx);
+  // Log the live-transcript path BEFORE spawn so an operator can
+  // `tail -f` it mid-run. The agent loop can take 30-900s and may hang;
+  // Langfuse only ingests on exit, so without this line there is no
+  // way to see what the agent is doing in real time.
+  console.log(
+    `[claude] extract ingestId=${input.ingestId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
+  );
   const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
   return { sessionId, stdout };
 };
@@ -159,6 +167,9 @@ export const defaultClaudeReExtractor: ReExtractor = async (input) => {
     userId: input.userId,
   };
   const prompt = buildReExtractPrompt(ctx);
+  console.log(
+    `[claude] re-extract txId=${input.transactionId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
+  );
   const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
   return { sessionId, stdout };
 };
