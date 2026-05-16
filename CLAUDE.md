@@ -199,6 +199,66 @@ The 503 is intentionally a server-side fault: callers should retry once the depl
 - `POST /v1/documents/:id/re-extract` — re-running `claude -p` against retained image bytes, UPDATE-in-place of an existing transaction, Layer 3 shielding on the transaction surface. Sub-PR 91b lays the schema groundwork (`documents.ocr_model_version` column + Layer-3 tx field allowlist); 91c implements the prompt variant.
 - Merchant cascade — if `places.display_name_en` changes, should `merchants.canonical_name` follow? Current answer: no (`merchants.canonical_name` comes from the LLM looking at the **receipt**, not from `places` projection — see "Why no merchants cascade" above). The cascade slot belongs to 91c (re-extract) when re-reading the receipt with new place data can plausibly change the merchant.
 
+## Re-extract prep — `transactions` Layer 3 contract (Phase 4b of #80)
+
+Phase 4b of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), second of three sub-PRs). Pure schema + contract — no endpoints. The point is to ship the surface that 91c (re-extract) reads from, isolated so 91c's PR is purely the prompt variant + UPDATE plumbing.
+
+### `documents.ocr_model_version` (new column)
+
+```sql
+ALTER TABLE documents ADD COLUMN ocr_model_version text;
+```
+
+Records which model produced the current `documents.ocr_text`. NULL on legacy rows (anything ingested before Phase 4b). Set by the ingest worker on new uploads; overwritten by re-extract (Phase 4c).
+
+Distinct from `transactions.metadata.extraction.model` (#88) because OCR text and transaction-structure extraction can in principle run under different models — today they share one call, so both end up equal, but the split matters once re-extract decouples them. Backfill is intentionally not attempted: we cannot reconstruct which model ran on each historical row.
+
+### Layer 3 on `transactions`
+
+`src/projection/layer3.ts` codifies which transaction columns re-extract MUST NOT overwrite. Two flavors:
+
+**HARD Layer 3** — fields the ingest agent never writes from extraction. Any non-default value is by definition user state or system identity. Re-extract omits these from its UPDATE column list entirely (same pattern as `places.custom_name_zh`):
+
+```ts
+HARD_LAYER3_TX_FIELDS = [
+  "status",            // explicit user actions (void/reconcile)
+  "voided_by_id",
+  "trip_id",           // user-assigned grouping
+  "narration",         // user notes
+  "id",                // immutable identity
+  "workspace_id",
+  "source_ingest_id",
+  "created_by",
+  "created_at",
+  "version",           // optimistic concurrency — re-extract sets `version + 1`, never an arbitrary value
+];
+```
+
+**SOFT Layer 3** — fields extraction DOES write but `PATCH /v1/transactions/:id` (via `UpdateTransactionRequest`) lets the user override. We can't distinguish "agent-written → user-accepted" from "agent-written → user-overrode" without a flag. Convention:
+
+```jsonc
+// transactions.metadata
+{
+  "user_edited": {
+    "payee": true,
+    "occurred_on": true
+  }
+}
+```
+
+`updateTransaction` will set the flag whenever a PATCH body specifies a value for one of `SOFT_LAYER3_TX_FIELDS` (`occurred_on`, `occurred_at`, `payee`). Re-extract reads via `isFieldUserEdited(metadata, field)` and skips flagged fields. The wire-up for both sides lands in 91c; 91b publishes the contract so both readers point at one source.
+
+### Why a flag set, not per-field timestamps
+
+Re-extract only needs to know *whether* the user has touched a field. The timestamp of the edit is recoverable from `transaction_events` if anyone asks — no need to duplicate it onto the row. Keeping `metadata.user_edited` boolean-shaped keeps the read cheap and the write path simple.
+
+### What 91c will add
+
+- `POST /v1/documents/:id/re-extract` — the actual endpoint
+- A new prompt variant (or a flag on the existing prompt) that knows to UPDATE the existing transaction by `source_ingest_id` lookup, instead of INSERT-ing a new one
+- Writer side of `metadata.user_edited` flagging in `updateTransaction`
+- `derivation_events` rows with `entity_type='document'` (the audit-table extension was already designed into #89's schema)
+
 ## Known Pitfalls
 
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:

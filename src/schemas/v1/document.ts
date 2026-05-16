@@ -21,6 +21,10 @@ export const Document = z
     mime_type: z.string().nullable(),
     sha256: z.string(),
     ocr_text: z.string().nullable(),
+    /** Model identifier under which `ocr_text` was produced. NULL on
+     *  legacy rows (pre-#91 Phase 4b). Independent of
+     *  `transactions.metadata.extraction.model` — see schema header. */
+    ocr_model_version: z.string().nullable(),
     extraction_meta: z.record(z.string(), z.unknown()).nullable(),
     source_ingest_id: Uuid.nullable(),
     deleted_at: IsoDateTime.nullable(),

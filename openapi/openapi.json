@@ -1100,6 +1100,12 @@
               "null"
             ]
           },
+          "ocr_model_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "extraction_meta": {
             "type": [
               "object",
@@ -1139,6 +1145,7 @@
           "mime_type",
           "sha256",
           "ocr_text",
+          "ocr_model_version",
           "extraction_meta",
           "source_ingest_id",
           "deleted_at",
