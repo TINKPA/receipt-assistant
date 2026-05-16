@@ -7,9 +7,10 @@
  * MUST NOT overwrite these — doing so destroys work and silently
  * loses information the user expected to be preserved.
  *
- * `places.custom_name_zh` is the canonical Layer-3 example for the
- * `places` table; this module establishes the equivalent for
- * `transactions`. The contract has two flavors:
+ * `places.custom_name` (renamed from `custom_name_zh` in #79) is
+ * the canonical Layer-3 example for the `places` table; this module
+ * establishes the equivalent for `transactions`. The contract has
+ * two flavors:
  *
  * 1. HARD Layer 3 — fields the ingest agent never writes from
  *    extraction. Any non-default value is by definition user-set
@@ -34,7 +35,7 @@
 
 /**
  * Transaction columns that re-extract NEVER writes. Mirrors the
- * `places.custom_name_zh` shielding in `src/routes/places.service.ts
+ * `places.custom_name` shielding in `src/routes/places.service.ts
  * ::reDerivePlace` — the field is simply absent from the UPDATE
  * column list, not COALESCE-protected. Omission is unconditional.
  *

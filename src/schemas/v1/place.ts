@@ -32,6 +32,14 @@ export const Place = z
      *  gloss for a globally-English brand. Drives whether the
      *  display selector promotes it to primary. NULL = unknown. */
     display_name_zh_is_native: z.boolean().nullable(),
+    /** User-supplied name override. Wins over every derived
+     *  `display_name_*` in the UI fallback chain. Language-agnostic
+     *  (renamed from `custom_name_zh` in #79 — was previously
+     *  marketed as Chinese-only). */
+    custom_name: z.string().nullable(),
+    /** @deprecated Use `custom_name`. Kept as an alias for one release
+     *  so existing clients keep rendering the override without an
+     *  immediate frontend update. Removed in a follow-up. */
     custom_name_zh: z.string().nullable(),
 
     // typing
@@ -82,9 +90,16 @@ export type PlaceShape = z.infer<typeof Place>;
 /**
  * Patch body for `PATCH /v1/places/:id`. Only the user-overridable
  * field — everything else is Google-canonical and never user-edited.
+ *
+ * Both `custom_name` (preferred) and `custom_name_zh` (deprecated
+ * alias from #79) are accepted; both write the same column. If both
+ * are sent, `custom_name` wins.
  */
 export const UpdatePlaceRequest = z
   .object({
+    custom_name: z.string().nullable().optional(),
+    /** @deprecated Use `custom_name`. Kept for one release for
+     *  backward compatibility. */
     custom_name_zh: z.string().nullable().optional(),
   })
   .openapi("UpdatePlaceRequest");

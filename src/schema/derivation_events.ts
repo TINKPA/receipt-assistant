@@ -33,7 +33,7 @@ import { workspaces } from "./workspaces.js";
  * string), and future `document` / `transaction` events use
  * UUIDs. A text column accepts both without an extra join.
  *
- * Layer-3 user-truth columns (e.g. `places.custom_name_zh`,
+ * Layer-3 user-truth columns (e.g. `places.custom_name`,
  * `documents.deleted_at`) are NEVER part of `before` / `after`
  * — re-derive omits them from the UPDATE entirely, so they
  * never reach this table. This is enforced at the service layer,

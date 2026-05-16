@@ -641,7 +641,7 @@ If you have a geocode result, run this AFTER the main transaction
 The INSERT is a full multilingual upsert (#74). For uncached places
 include every column you extracted in Phase 3c/3d. For cached places
 the ON CONFLICT clause keeps existing per-language data and the
-\`custom_name_zh\` user override; only \`last_seen_at\` and \`hit_count\`
+\`custom_name\` user override (renamed from \`custom_name_zh\` in #79); only \`last_seen_at\` and \`hit_count\`
 bump. \`COALESCE(EXCLUDED.x, places.x)\` ensures a NEW fetch that
 returned NULL for a field never overwrites a previously-good value.
 
@@ -710,7 +710,7 @@ returned NULL for a field never overwrites a previously-good value.
             national_phone_number    = COALESCE(EXCLUDED.national_phone_number,    places.national_phone_number),
             website_uri              = COALESCE(EXCLUDED.website_uri,              places.website_uri),
             google_maps_uri          = COALESCE(EXCLUDED.google_maps_uri,          places.google_maps_uri)
-            -- Note: custom_name_zh is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches.
+            -- Note: custom_name is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches. (Renamed from custom_name_zh in #79.)
       RETURNING id
     ),
     -- #90 Phase 3: append-only history of every Google/Yelp fetch.

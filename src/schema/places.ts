@@ -27,8 +27,9 @@ import { createdAt } from "./common.js";
  * Multilingual columns (#74): every receipt-relevant Google v1 field is
  * stored at first fetch in both `en` and `zh-CN`. `raw_response` keeps
  * the full v1 response in both languages so anything not column-promoted
- * is still queryable. `custom_name_zh` is the user override that wins
- * over `display_name_zh` in the UI fallback chain.
+ * is still queryable. `custom_name` (renamed from `custom_name_zh` in
+ * #79) is the user override that wins over every `display_name_*`
+ * field in the UI fallback chain.
  */
 export const places = pgTable(
   "places",
@@ -96,13 +97,18 @@ export const places = pgTable(
      *    google_text             → derived from heuristic (mixed Latin+CJK
      *                              in the response → true; pure CJK while
      *                              en is pure Latin → false)
-     *    user_override           → N/A (custom_name_zh has its own column)
+     *    user_override           → N/A (`custom_name` has its own column)
      *  NULL means unknown — selector treats as false (conservative). */
     displayNameZhIsNative: boolean("display_name_zh_is_native"),
-    /** User-supplied Chinese name. Wins over `display_name_zh` in the
-     *  UI fallback chain. The user can correct OCR errors or supply a
-     *  name Google never had. */
-    customNameZh: text("custom_name_zh"),
+    /** User-supplied name override. Wins over every derived
+     *  `display_name_*` field in the UI fallback chain. Language-
+     *  agnostic: the user may type Chinese, English, or anything
+     *  else — the field is "the user's name for this place", not
+     *  Chinese specifically. Renamed from `custom_name_zh` in #79.
+     *  PATCH body still accepts `custom_name_zh` as a deprecated
+     *  alias for one release; clients should migrate to
+     *  `custom_name`. */
+    customName: text("custom_name"),
 
     // ── typing ────────────────────────────────────────────────────
     primaryType: text("primary_type"),

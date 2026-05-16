@@ -3,13 +3,13 @@
  *
  * Routes:
  *   GET    /v1/places/:id                       — full place record
- *   PATCH  /v1/places/:id                       — set custom_name_zh
+ *   PATCH  /v1/places/:id                       — set custom_name
  *   GET    /v1/places/:id/photos/:rank/content  — binary stream of a
  *                                                 cached Google photo
  *
  * Writes for the multilingual / photo fields happen agent-side during
  * ingest (see `src/ingest/prompt.ts` Phase 3); the only writer-facing
- * endpoint here is the `custom_name_zh` patch — the user override that
+ * endpoint here is the `custom_name` patch — the user override that
  * wins over `display_name_zh` in the UI fallback chain.
  */
 import { type Request, type Response, type NextFunction, Router } from "express";
@@ -170,7 +170,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/places/{id}",
     summary: "Update user-overridable place fields.",
     description:
-      "Currently exposes only `custom_name_zh` — the user override that wins over " +
+      "Currently exposes only `custom_name` — the user override that wins over " +
       "`display_name_zh` in the UI fallback chain. Pass null to clear.",
     tags: ["places"],
     request: {
@@ -190,7 +190,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Re-applies the current projection logic to the cached Google " +
       "Places response, overwriting derived columns. Layer 3 user-truth " +
-      "(`custom_name_zh`) is never touched. OCR-sourced zh fields " +
+      "(`custom_name`) is never touched. OCR-sourced zh fields " +
       "(`display_name_zh_source IN ('photo_ocr','receipt_ocr')`) are " +
       "preserved verbatim. Every run inserts a `derivation_events` row " +
       "with a `before`/`after` jsonb diff; the returned " +
@@ -219,7 +219,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
       "Calls Google Places v1 (dual-language, FieldMask=*), appends a " +
       "`place_snapshots` row, overwrites `places.raw_response`, then " +
       "delegates to `/v1/places/{id}/re-derive` so Layer 2 columns " +
-      "reflect the new body. Layer 3 (`custom_name_zh`) and OCR-sourced " +
+      "reflect the new body. Layer 3 (`custom_name`) and OCR-sourced " +
       "zh fields are shielded by the re-derive step. Yelp re-fetch is " +
       "deferred until a Yelp client lands (separate epic). Returns " +
       "503 when `GOOGLE_MAPS_API_KEY` is unset and 502 on upstream errors.",

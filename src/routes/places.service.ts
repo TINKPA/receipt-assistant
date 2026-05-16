@@ -8,7 +8,9 @@
  * Writes still happen agent-side during ingest — the extractor issues
  * `INSERT ... ON CONFLICT (google_place_id) DO UPDATE` inline inside
  * its BEGIN/COMMIT block. The only writer-side helper here is the
- * user-facing PATCH that sets `custom_name_zh`.
+ * user-facing PATCH that sets `custom_name` (renamed from
+ * `custom_name_zh` in #79; the old name still works as a deprecated
+ * alias for one release).
  */
 import { and, eq, inArray, sql, isNotNull } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -52,6 +54,10 @@ export interface PlaceRow {
    *  (true) or a Google-translated gloss (false). See `places.ts`
    *  schema for the full definition. */
   display_name_zh_is_native: boolean | null;
+  /** User-supplied name override. Wins over every derived
+   *  `display_name_*` in the UI fallback chain. */
+  custom_name: string | null;
+  /** @deprecated Alias for `custom_name`. Removed in a follow-up. */
   custom_name_zh: string | null;
 
   primary_type: string | null;
@@ -104,7 +110,12 @@ function rowToApi(r: typeof places.$inferSelect): Omit<PlaceRow, "photos"> {
     display_name_zh_source:
       (r.displayNameZhSource as PlaceRow["display_name_zh_source"]) ?? null,
     display_name_zh_is_native: r.displayNameZhIsNative,
-    custom_name_zh: r.customNameZh,
+    // Emit BOTH for one release: `custom_name` is the new field;
+    // `custom_name_zh` is the deprecated alias from #79 and just
+    // mirrors `custom_name` so existing clients keep rendering the
+    // override without an immediate update.
+    custom_name: r.customName,
+    custom_name_zh: r.customName,
     primary_type: r.primaryType,
     primary_type_display_zh: r.primaryTypeDisplayZh,
     maps_type_label_zh: r.mapsTypeLabelZh,
@@ -188,14 +199,20 @@ export async function loadPlaceById(id: string): Promise<PlaceRow | null> {
 /**
  * Update the user-overridable field. Returns the new full row, or null
  * if the place doesn't exist.
+ *
+ * Accepts both `custom_name` (preferred, post-#79) and
+ * `custom_name_zh` (deprecated alias from before the column rename).
+ * If both keys appear in the patch, `custom_name` wins.
  */
 export async function updatePlace(
   id: string,
-  patch: { custom_name_zh?: string | null },
+  patch: { custom_name?: string | null; custom_name_zh?: string | null },
 ): Promise<PlaceRow | null> {
   const set: Partial<typeof places.$inferInsert> = {};
-  if ("custom_name_zh" in patch) {
-    set.customNameZh = patch.custom_name_zh ?? null;
+  if ("custom_name" in patch) {
+    set.customName = patch.custom_name ?? null;
+  } else if ("custom_name_zh" in patch) {
+    set.customName = patch.custom_name_zh ?? null;
   }
   if (Object.keys(set).length === 0) {
     return loadPlaceById(id);
@@ -318,8 +335,9 @@ export interface ReDeriveResult {
  *
  * Behavior contract (Phase 2 / #89):
  *   - 422 `NoRawResponseProblem` when `raw_response IS NULL`.
- *   - `places.custom_name_zh` is NEVER in the UPDATE column list
- *     (Layer 3 user-truth — see schema header).
+ *   - `places.custom_name` is NEVER in the UPDATE column list
+ *     (Layer 3 user-truth — see schema header). Renamed from
+ *     `custom_name_zh` in #79.
  *   - When the current `display_name_zh_source` is `'photo_ocr'`
  *     or `'receipt_ocr'`, the four zh-related fields are preserved
  *     verbatim (the projection only handles Google-source data).
@@ -421,9 +439,9 @@ export async function reDerivePlace(
         nationalPhoneNumber: projected.national_phone_number,
         websiteUri: projected.website_uri,
         googleMapsUri: projected.google_maps_uri,
-        // Layer-3 (customNameZh) and physical facts (lat/lng,
-        // formattedAddress) are intentionally absent — see
-        // service header.
+        // Layer-3 (customName, renamed from customNameZh in #79)
+        // and physical facts (lat/lng, formattedAddress) are
+        // intentionally absent — see service header.
         metadata: sql`jsonb_set(COALESCE(${places.metadata}, '{}'::jsonb), '{derivation}', ${JSON.stringify(derivation)}::jsonb)`,
       })
       .where(eq(places.id, row.id));
@@ -453,8 +471,9 @@ export interface RefreshPlaceResult {
  * delegate to `reDerivePlace` so Layer 2 columns reflect the new
  * body.
  *
- * Layer 3 (`custom_name_zh`) and OCR-sourced zh fields ride through
- * untouched — `reDerivePlace` already handles both.
+ * Layer 3 (`custom_name`, renamed from `custom_name_zh` in #79) and
+ * OCR-sourced zh fields ride through untouched — `reDerivePlace`
+ * already handles both.
  *
  * Not atomic across the two transactions (snapshot+raw_response in
  * one, re-derive in another). If the process crashes between them

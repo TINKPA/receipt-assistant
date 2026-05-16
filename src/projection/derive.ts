@@ -26,7 +26,8 @@
  *
  * Domain boundary: this module only projects from Google data. It
  * NEVER touches:
- *   - `places.custom_name_zh`     (Layer 3 user-truth)
+ *   - `places.custom_name`        (Layer 3 user-truth — renamed
+ *                                  from `custom_name_zh` in #79)
  *   - `places.display_name_zh_*`  when the current source is
  *                                  `photo_ocr` / `receipt_ocr`
  *                                  (different input domain — the
