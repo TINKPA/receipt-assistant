@@ -34,6 +34,7 @@ import {
   DocumentKind,
   CreateDocumentLinkRequest,
   UploadDocumentForm,
+  ReExtractDocumentResponse,
 } from "../schemas/v1/document.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
 import { NotFoundProblem } from "../http/problem.js";
@@ -48,6 +49,7 @@ import {
   hardDeleteDocument,
   restoreDocument,
   cascadeDeleteDocument,
+  reExtractDocument,
   extForMime,
   type DocumentKindValue,
 } from "./documents.service.js";
@@ -284,6 +286,22 @@ documentsRouter.post(
   }),
 );
 
+// ── POST /v1/documents/:id/re-extract ──────────────────────────────────
+
+documentsRouter.post(
+  "/:id/re-extract",
+  asyncHandler(async (req, res) => {
+    const { id } = parseOrThrow(IdOnlyParams, req.params);
+    const out = await reExtractDocument(
+      req.ctx.workspaceId,
+      req.ctx.userId,
+      id,
+    );
+    if (!out) throw new NotFoundProblem("Document", id);
+    res.json(out);
+  }),
+);
+
 // ── OpenAPI registration ───────────────────────────────────────────────
 
 export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
@@ -462,6 +480,41 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       },
       404: {
         description: "Document not found or not deleted",
+        content: problemContent,
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/documents/{id}/re-extract",
+    summary: "Re-OCR the receipt and UPDATE the linked transaction in place.",
+    description:
+      "Phase 4c of the 3-layer rollout (#80 / #91). Spawns `claude -p` " +
+      "with a narrow re-extract prompt; the agent reads the cached " +
+      "image bytes and refreshes `transactions.{payee, occurred_on, " +
+      "occurred_at, metadata.extraction}` plus `documents.{ocr_text, " +
+      "ocr_model_version}`. **Out of scope**: postings, place_id, " +
+      "merchant_id, document_links — those have their own paths. " +
+      "**Layer-3 shielded**: HARD fields (status, narration, trip_id, " +
+      "identity columns) never touched; SOFT fields (occurred_on, " +
+      "occurred_at, payee) protected by `metadata.user_edited.<field>` " +
+      "CASE expressions, so user PATCH overrides survive. " +
+      "Returns 422 if the document has zero or >1 linked transactions.",
+    tags: ["documents"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      200: {
+        description: "Re-extract committed",
+        content: { "application/json": { schema: ReExtractDocumentResponse } },
+      },
+      404: {
+        description: "Document not found or soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description:
+          "Document not linked to exactly one transaction, or has no file_path",
         content: problemContent,
       },
     },

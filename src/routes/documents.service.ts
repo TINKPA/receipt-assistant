@@ -11,12 +11,22 @@ import { and, eq, sql, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { documents, documentLinks } from "../schema/documents.js";
 import { transactions, postings, transactionEvents } from "../schema/index.js";
+import { derivationEvents } from "../schema/derivation_events.js";
 import { newId } from "../http/uuid.js";
 import {
   DocumentHasLinksProblem,
   HttpProblem,
   NotFoundProblem,
 } from "../http/problem.js";
+import {
+  defaultClaudeReExtractor,
+  type ReExtractor,
+} from "../ingest/extractor.js";
+import {
+  REEXTRACT_PROMPT_VERSION,
+  REEXTRACT_MODEL,
+} from "../ingest/reextract-prompt.js";
+import { buildInfo } from "../generated/build-info.js";
 
 export type DocumentKindValue =
   | "receipt_image"
@@ -641,4 +651,223 @@ async function voidTransactionInTx(
       payload: { voids: txId, reason },
     },
   ]);
+}
+
+// ── Re-extract (Phase 4c of #80 / #91) ─────────────────────────────────
+
+export interface ReExtractDocumentResult {
+  document_id: string;
+  transaction_id: string;
+  derivation_event_id: string;
+  changed_keys: string[];
+  /** Convenience flag so the caller can tell "OCR text actually changed"
+   *  from "only metadata.extraction was stamped." */
+  ocr_text_changed: boolean;
+  /** Re-extract is observability-first; carry the session id so the
+   *  operator can pull the Langfuse trace without a join. */
+  session_id: string;
+}
+
+/**
+ * Re-OCR an already-ingested receipt and UPDATE the linked transaction
+ * in place. Layer-3 shielded — see `src/projection/layer3.ts`.
+ *
+ * Contract:
+ *   - Resolves the linked transaction via `document_links`. If the
+ *     document has zero links or more than one, returns null (404) or
+ *     422 respectively — re-extract is per-tx and we don't pick.
+ *   - Snapshots Layer-2 tx fields BEFORE spawning the agent. The agent
+ *     writes the UPDATE itself (Layer-3 CASE shielding lives in the
+ *     prompt). After the agent returns we snapshot again, diff, and
+ *     INSERT a `derivation_events` row with `entity_type='document'`
+ *     so the audit trail is unified with re-derive (#89).
+ *   - Soft-deleted documents are rejected (404).
+ *   - Out-of-scope: postings, place_id, merchant_id, document_links.
+ *     See `src/ingest/reextract-prompt.ts` header for why.
+ *
+ * Returns null when the document is missing or soft-deleted.
+ * Throws a `MultipleLinksProblem` (422) when the document links to
+ * more than one transaction.
+ */
+export async function reExtractDocument(
+  workspaceId: string,
+  userId: string,
+  documentId: string,
+  options: { reExtractor?: ReExtractor } = {},
+): Promise<ReExtractDocumentResult | null> {
+  const reExtractor = options.reExtractor ?? defaultClaudeReExtractor;
+
+  // 1) Resolve the document + linked transaction.
+  const docRows = await db
+    .select({
+      id: documents.id,
+      workspaceId: documents.workspaceId,
+      filePath: documents.filePath,
+      ocrText: documents.ocrText,
+      deletedAt: documents.deletedAt,
+    })
+    .from(documents)
+    .where(
+      and(
+        eq(documents.id, documentId),
+        eq(documents.workspaceId, workspaceId),
+      ),
+    );
+  if (docRows.length === 0) return null;
+  const doc = docRows[0]!;
+  if (doc.deletedAt) return null;
+  if (!doc.filePath) {
+    throw new HttpProblem(
+      422,
+      "document-no-file-path",
+      "Re-extract requires the original file",
+      "Document has no file_path on disk; re-extract has nothing to read.",
+      { document_id: documentId },
+    );
+  }
+
+  const linkRows = await db
+    .select({ transactionId: documentLinks.transactionId })
+    .from(documentLinks)
+    .where(eq(documentLinks.documentId, documentId));
+  if (linkRows.length === 0) {
+    throw new HttpProblem(
+      422,
+      "document-no-transaction",
+      "Document not linked to a transaction",
+      "Re-extract operates per-transaction; this document has zero linked transactions.",
+      { document_id: documentId },
+    );
+  }
+  if (linkRows.length > 1) {
+    throw new HttpProblem(
+      422,
+      "document-multiple-transactions",
+      "Document linked to multiple transactions",
+      "Re-extract refuses when a document links to more than one transaction; pick a tx and use a per-tx flow.",
+      {
+        document_id: documentId,
+        transaction_ids: linkRows.map((r) => r.transactionId),
+      },
+    );
+  }
+  const transactionId = linkRows[0]!.transactionId;
+
+  // 2) Snapshot BEFORE — projection-domain tx fields only. Layer-3
+  //    fields are excluded from the diff because re-extract can't
+  //    change them anyway; including them would clutter `changed_keys`.
+  const beforeSnapshot = await snapshotReExtractFields(transactionId, doc.id);
+
+  // 3) Spawn the agent. Errors here bubble to the route handler;
+  //    nothing has been written yet so the DB state is untouched.
+  const { sessionId, stdout } = await reExtractor({
+    filePath: doc.filePath,
+    workspaceId,
+    documentId,
+    transactionId,
+    userId,
+  });
+
+  // 4) Snapshot AFTER. Agent has now UPDATEd transactions + documents.
+  const afterSnapshot = await snapshotReExtractFields(transactionId, doc.id);
+
+  // 5) Compute diff and write derivation_events. We do this in TS
+  //    (not the prompt) so the audit row reflects ground truth after
+  //    the agent's writes have committed, not the agent's intent.
+  const changedKeys: string[] = [];
+  const beforeAny = beforeSnapshot as unknown as Record<string, unknown>;
+  const afterAny = afterSnapshot as unknown as Record<string, unknown>;
+  for (const k of Object.keys(beforeAny)) {
+    if (!reExtractFieldEq(beforeAny[k], afterAny[k])) changedKeys.push(k);
+  }
+
+  const [evt] = await db
+    .insert(derivationEvents)
+    .values({
+      workspaceId,
+      entityType: "document",
+      entityId: documentId,
+      promptVersion: REEXTRACT_PROMPT_VERSION,
+      promptGitSha: buildInfo.gitSha,
+      model: REEXTRACT_MODEL,
+      ranAt: new Date(),
+      before: beforeSnapshot as unknown as Record<string, unknown>,
+      after: afterSnapshot as unknown as Record<string, unknown>,
+      // (`as unknown as` so TS accepts the cast across the
+      // ReExtractSnapshot → Record<string, unknown> jump.)
+      changedKeys,
+    })
+    .returning({ id: derivationEvents.id });
+
+  // Surface stdout to console so operators can grep DONE/ERROR lines.
+  if (stdout && stdout.trim().length > 0) {
+    console.info(`[re-extract] doc=${documentId} tx=${transactionId} ${stdout.trim().split("\n").pop()}`);
+  }
+
+  return {
+    document_id: documentId,
+    transaction_id: transactionId,
+    derivation_event_id: evt!.id,
+    changed_keys: changedKeys,
+    ocr_text_changed: !reExtractFieldEq(
+      beforeSnapshot.ocr_text,
+      afterSnapshot.ocr_text,
+    ),
+    session_id: sessionId,
+  };
+}
+
+interface ReExtractSnapshot {
+  payee: string | null;
+  occurred_on: string | null;
+  occurred_at: string | null;
+  metadata_extraction: unknown;
+  ocr_text: string | null;
+  ocr_model_version: string | null;
+}
+
+async function snapshotReExtractFields(
+  transactionId: string,
+  documentId: string,
+): Promise<ReExtractSnapshot> {
+  const tx = await db
+    .select({
+      payee: transactions.payee,
+      occurredOn: transactions.occurredOn,
+      occurredAt: transactions.occurredAt,
+      metadata: transactions.metadata,
+    })
+    .from(transactions)
+    .where(eq(transactions.id, transactionId));
+
+  const doc = await db
+    .select({
+      ocrText: documents.ocrText,
+      ocrModelVersion: documents.ocrModelVersion,
+    })
+    .from(documents)
+    .where(eq(documents.id, documentId));
+
+  const t = tx[0]!;
+  const d = doc[0]!;
+  const meta = (t.metadata as Record<string, unknown> | null) ?? {};
+
+  return {
+    payee: t.payee,
+    occurred_on: t.occurredOn,
+    occurred_at:
+      t.occurredAt instanceof Date ? t.occurredAt.toISOString() : null,
+    metadata_extraction: meta.extraction ?? null,
+    ocr_text: d.ocrText,
+    ocr_model_version: d.ocrModelVersion,
+  };
+}
+
+function reExtractFieldEq(a: unknown, b: unknown): boolean {
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  if (typeof a === "object" || typeof b === "object") {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+  return a === b;
 }

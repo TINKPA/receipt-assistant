@@ -1104,7 +1104,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Model identifier under which ocr_text was produced. NULL on legacy rows."
           },
           "extraction_meta": {
             "type": [
@@ -2724,6 +2725,48 @@
             ]
           }
         }
+      },
+      "ReExtractDocumentResponse": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "derivation_event_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "changed_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ocr_text_changed": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          }
+        },
+        "required": [
+          "document_id",
+          "transaction_id",
+          "derivation_event_id",
+          "changed_keys",
+          "ocr_text_changed",
+          "session_id"
+        ]
       },
       "UpdatePlaceRequest": {
         "type": "object",
@@ -4693,6 +4736,59 @@
           },
           "404": {
             "description": "Document not found or not deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/documents/{id}/re-extract": {
+      "post": {
+        "summary": "Re-OCR the receipt and UPDATE the linked transaction in place.",
+        "description": "Phase 4c of the 3-layer rollout (#80 / #91). Spawns `claude -p` with a narrow re-extract prompt; the agent reads the cached image bytes and refreshes `transactions.{payee, occurred_on, occurred_at, metadata.extraction}` plus `documents.{ocr_text, ocr_model_version}`. **Out of scope**: postings, place_id, merchant_id, document_links — those have their own paths. **Layer-3 shielded**: HARD fields (status, narration, trip_id, identity columns) never touched; SOFT fields (occurred_on, occurred_at, payee) protected by `metadata.user_edited.<field>` CASE expressions, so user PATCH overrides survive. Returns 422 if the document has zero or >1 linked transactions.",
+        "tags": [
+          "documents"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Re-extract committed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReExtractDocumentResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Document not found or soft-deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Document not linked to exactly one transaction, or has no file_path",
             "content": {
               "application/problem+json": {
                 "schema": {

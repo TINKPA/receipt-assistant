@@ -259,6 +259,63 @@ Re-extract only needs to know *whether* the user has touched a field. The timest
 - Writer side of `metadata.user_edited` flagging in `updateTransaction`
 - `derivation_events` rows with `entity_type='document'` (the audit-table extension was already designed into #89's schema)
 
+## Re-extract — `documents` (Phase 4c of #80)
+
+Phase 4c of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), last sub-PR — closes #91).
+
+```
+POST /v1/documents/{id}/re-extract    # re-OCR + UPDATE linked transaction
+```
+
+### What it does
+
+1. Resolves the linked transaction via `document_links` (errors 422 on zero or >1 links — we don't pick).
+2. Snapshots Layer-2 transaction fields (`payee`, `occurred_on`, `occurred_at`, `metadata.extraction`) + `documents.ocr_text` + `documents.ocr_model_version` BEFORE.
+3. Spawns `claude -p` with `src/ingest/reextract-prompt.ts ::buildReExtractPrompt` — a narrow prompt that tells the agent to UPDATE the existing transaction by id, NOT INSERT a new one.
+4. Agent re-reads the receipt image and runs one psql block:
+   - `UPDATE transactions` with Layer-3 CASE shielding (see below)
+   - `UPDATE documents` setting `ocr_text` + `ocr_model_version`
+   - `INSERT INTO transaction_events` with `event_type='re_extracted'`
+5. Snapshots AFTER, computes diff, writes one `derivation_events` row with `entity_type='document'`.
+
+### Layer-3 shielding (the safety contract)
+
+**HARD Layer 3** (`HARD_LAYER3_TX_FIELDS` in `src/projection/layer3.ts`): `status`, `voided_by_id`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. The prompt's UPDATE doesn't mention these columns at all (omission = perfect shielding). `version` is the lone exception — re-extract always bumps it via `version + 1` to advance optimistic-concurrency.
+
+**SOFT Layer 3** (`SOFT_LAYER3_TX_FIELDS`): `payee`, `occurred_on`, `occurred_at`. The agent generates new values but the SQL wraps them in CASE expressions:
+
+```sql
+payee = CASE
+  WHEN (metadata->'user_edited'->>'payee')::boolean IS TRUE THEN payee
+  ELSE '<NEW_PAYEE>'
+END
+```
+
+`metadata.user_edited.<field> = true` is set by `updateTransaction` (PATCH path) whenever the user changes that field. The flag survives re-extract; once flagged, the field is read-only to re-extract forever (the user can re-flag by PATCHing back to the new agent value if they want re-extract to take over again).
+
+### What's NOT included (deferred)
+
+- **Postings rewrite.** Re-extract does not DELETE+INSERT `postings` for the transaction. Reason: postings carry the sum-to-zero ledger invariant; re-running extraction could produce different categories / amounts and risk balance violations. If category drift matters, edit postings explicitly via the postings endpoints. A later scope (call it 91d) can extend re-extract to safely rewrite postings inside a balance-checking transaction.
+- **`place_id` / `merchant_id`.** Place refresh is `POST /v1/places/:id/refresh` (Phase 4a). Merchant aggregation has its own enrichment loop.
+- **`document_links` rebuild.** The link is already correct — re-extract doesn't change which document points to which transaction.
+
+### Error shapes
+
+| Condition | Status | `type` |
+|---|---|---|
+| Document not found (or soft-deleted) | 404 | `errors/not-found` |
+| Document has no `file_path` | 422 | `errors/document-no-file-path` |
+| Document linked to zero transactions | 422 | `errors/document-no-transaction` |
+| Document linked to >1 transaction | 422 | `errors/document-multiple-transactions` (carries `transaction_ids[]`) |
+
+### Observability
+
+The `session_id` field in the response is the pre-allocated UUID passed to `claude -p`; query the Langfuse trace API at `http://localhost:3333/api/public/traces?sessionId=<X>` to inspect the model's reasoning and the SQL it wrote. Re-extract follows the same Langfuse pattern as ingest — no UI scraping, REST only.
+
+### Idempotency, sort of
+
+Re-running re-extract on the same document with the same `REEXTRACT_PROMPT_VERSION` and model should produce no Layer-2 diff in the *transaction* (the agent should produce the same payee/date). It will always produce a `metadata.extraction` diff (the `ran_at` timestamp moves) and may produce an `ocr_text` diff (vision OCR is not 100% deterministic — punctuation, line-break differences). The `derivation_events` row is written every time regardless, so the audit trail tracks every re-run.
+
 ## Known Pitfalls
 
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:

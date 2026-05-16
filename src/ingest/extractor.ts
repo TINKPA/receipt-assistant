@@ -9,6 +9,10 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
+import {
+  buildReExtractPrompt,
+  type ReExtractPromptContext,
+} from "./reextract-prompt.js";
 
 const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 300_000);
 
@@ -109,6 +113,47 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     userId: input.userId,
   };
   const prompt = buildExtractorPrompt(ctx);
+  const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
+  return { sessionId, stdout };
+};
+
+// ── Re-extract path (Phase 4c of #80 / #91) ────────────────────────────
+
+export interface ReExtractorInput {
+  /** Absolute path on disk for the original upload. */
+  filePath: string;
+  workspaceId: string;
+  /** Document row whose `ocr_text` / `ocr_model_version` re-extract refreshes. */
+  documentId: string;
+  /** Transaction row re-extract UPDATEs in place. */
+  transactionId: string;
+  /** Owner user id, recorded in `transaction_events`. */
+  userId: string;
+}
+
+export interface ReExtractorResult {
+  sessionId: string;
+  stdout: string;
+}
+
+export type ReExtractor = (input: ReExtractorInput) => Promise<ReExtractorResult>;
+
+/**
+ * Re-extract spawn — same shape as `defaultClaudeExtractor` but with
+ * the narrower re-extract prompt (no classify, no postings, no place
+ * fetch). The agent writes directly to Postgres via psql; this fn
+ * just spawns + waits.
+ */
+export const defaultClaudeReExtractor: ReExtractor = async (input) => {
+  const sessionId = randomUUID();
+  const ctx: ReExtractPromptContext = {
+    filePath: input.filePath,
+    workspaceId: input.workspaceId,
+    documentId: input.documentId,
+    transactionId: input.transactionId,
+    userId: input.userId,
+  };
+  const prompt = buildReExtractPrompt(ctx);
   const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
   return { sessionId, stdout };
 };

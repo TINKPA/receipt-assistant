@@ -24,7 +24,10 @@ export const Document = z
     /** Model identifier under which `ocr_text` was produced. NULL on
      *  legacy rows (pre-#91 Phase 4b). Independent of
      *  `transactions.metadata.extraction.model` — see schema header. */
-    ocr_model_version: z.string().nullable(),
+    ocr_model_version: z.string().nullable().openapi({
+      description:
+        "Model identifier under which ocr_text was produced. NULL on legacy rows.",
+    }),
     extraction_meta: z.record(z.string(), z.unknown()).nullable(),
     source_ingest_id: Uuid.nullable(),
     deleted_at: IsoDateTime.nullable(),
@@ -36,6 +39,24 @@ export const Document = z
 export const CreateDocumentLinkRequest = z
   .object({ transaction_id: Uuid })
   .openapi("CreateDocumentLinkRequest");
+
+/**
+ * Response from `POST /v1/documents/:id/re-extract` (Phase 4c of #80 / #91).
+ * The agent has re-OCR'd the receipt and UPDATEd the linked transaction
+ * + document. `changed_keys` reflects what actually moved (Layer-3
+ * shielding may have suppressed some changes the agent attempted).
+ * `derivation_event_id` lets the caller correlate against the audit log.
+ */
+export const ReExtractDocumentResponse = z
+  .object({
+    document_id: Uuid,
+    transaction_id: Uuid,
+    derivation_event_id: Uuid,
+    changed_keys: z.array(z.string()),
+    ocr_text_changed: z.boolean(),
+    session_id: Uuid,
+  })
+  .openapi("ReExtractDocumentResponse");
 
 // Multipart form is described inline in the route registration;
 // Zod can't fully model multipart, but we register the field shape

@@ -620,17 +620,26 @@ export async function updateTransaction(
 
     const updates: Record<string, unknown> = {};
     const oldSnap: Record<string, unknown> = {};
+    // SOFT Layer-3 fields (see `src/projection/layer3.ts`) — when the
+    // user PATCHes one of these, we flag `metadata.user_edited.<field>`
+    // so re-extract (#91 Phase 4c) preserves the user value across
+    // a re-OCR. Builds up alongside the column updates and is merged
+    // into the final `metadata` update below.
+    const userEditedAdditions: Record<string, true> = {};
     if (patch.occurred_on !== undefined) {
       updates.occurredOn = patch.occurred_on;
       oldSnap.occurred_on = current.occurredOn;
+      userEditedAdditions.occurred_on = true;
     }
     if (patch.occurred_at !== undefined) {
       updates.occurredAt = patch.occurred_at === null ? null : new Date(patch.occurred_at);
       oldSnap.occurred_at = current.occurredAt;
+      userEditedAdditions.occurred_at = true;
     }
     if (patch.payee !== undefined) {
       updates.payee = patch.payee;
       oldSnap.payee = current.payee;
+      userEditedAdditions.payee = true;
     }
     if (patch.narration !== undefined) {
       updates.narration = patch.narration;
@@ -643,6 +652,30 @@ export async function updateTransaction(
     if (patch.metadata !== undefined) {
       updates.metadata = patch.metadata;
       oldSnap.metadata = current.metadata;
+    }
+
+    // Merge user_edited flags into the metadata write. If the patch
+    // didn't specify `metadata`, we still need to update it (to add
+    // the flags); if it did, we layer flags on top so they always
+    // win — the user can't accidentally drop their own edit-protection
+    // by sending a `metadata: {}` patch.
+    if (Object.keys(userEditedAdditions).length > 0) {
+      const currentMetadata =
+        (current.metadata as Record<string, unknown> | null) ?? {};
+      const patchMetadata =
+        (patch.metadata as Record<string, unknown> | undefined) ?? null;
+      const baseMetadata = patchMetadata ?? currentMetadata;
+      const existingUserEdited =
+        (baseMetadata.user_edited as Record<string, unknown> | undefined) ??
+        (currentMetadata.user_edited as Record<string, unknown> | undefined) ??
+        {};
+      updates.metadata = {
+        ...baseMetadata,
+        user_edited: {
+          ...existingUserEdited,
+          ...userEditedAdditions,
+        },
+      };
     }
 
     if (Object.keys(updates).length === 0) {
