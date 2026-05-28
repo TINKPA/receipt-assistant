@@ -155,6 +155,13 @@
       "when": 1778939586594,
       "tag": "0021_new_lethal_legion",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1779963043381,
+      "tag": "0022_stale_slipstream",
+      "breakpoints": true
     }
   ]
 }

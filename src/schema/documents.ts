@@ -39,6 +39,17 @@ export const documents = pgTable(
      *  split matters once re-extract decouples them. */
     ocrModelVersion: text("ocr_model_version"),
     extractionMeta: jsonb("extraction_meta"),
+    /** RFC822 Message-ID for email-sourced documents (kind=receipt_email).
+     *  NULL for non-email docs. This is the dedup key for the email
+     *  channel: a re-forwarded copy of the same email has different bytes
+     *  (so the sha256 index misses it) but the same Message-ID. Enforced
+     *  by the partial unique index below. See #122. */
+    messageId: text("message_id"),
+    /** Channel provenance for non-image sources, kept separate from
+     *  `extraction_meta` (which records what produced the row). For
+     *  email: `{channel:'eml', sender, subject, received_at, message_id}`.
+     *  See #122. */
+    sourceMeta: jsonb("source_meta"),
     sourceIngestId: uuid("source_ingest_id").references(
       (): AnyPgColumn => ingests.id,
       { onDelete: "set null" },
@@ -55,6 +66,12 @@ export const documents = pgTable(
     // Content dedupe per workspace. Spans soft-deleted rows on purpose:
     // re-uploading identical bytes hits the same row and resurrects it.
     uniqueIndex("documents_workspace_sha_uniq").on(t.workspaceId, t.sha256),
+    // Email-channel dedup: one document per (workspace, Message-ID).
+    // Partial so it only constrains email docs; non-email rows have a
+    // NULL message_id and are unaffected. See #122.
+    uniqueIndex("documents_workspace_message_id_uniq")
+      .on(t.workspaceId, t.messageId)
+      .where(sql`${t.messageId} IS NOT NULL`),
     index("documents_kind_idx").on(t.workspaceId, t.kind),
     index("documents_source_ingest_idx").on(t.sourceIngestId),
     // Partial index for the hot path: list/get default to live rows.

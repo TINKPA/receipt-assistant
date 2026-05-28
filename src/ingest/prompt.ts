@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.9";
+export const PROMPT_VERSION = "2.10";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -781,6 +781,37 @@ Invariants you MUST honor:
   - All rows take workspace_id = WORKSPACE_ID.
 
 ### 4a. receipt_image / receipt_email / receipt_pdf
+
+**Email-only pre/post steps (receipt_email). #122.**
+For \`receipt_email\`, first parse the \`.eml\` headers: From, Subject,
+Date, Message-ID.
+
+1. **Dedup pre-check — skip the WHOLE ingest if this email was already
+   ingested.** A re-forwarded copy has different bytes (so the sha256
+   dedup misses it) but the same Message-ID. Run:
+
+     psql "\$DATABASE_URL" -tAc "SELECT id FROM documents WHERE workspace_id = '${ctx.workspaceId}' AND message_id = '<MESSAGE_ID>' AND id <> '${ctx.documentId}' LIMIT 1"
+
+   If it returns a row, do **NOT** write a transaction — go straight to
+   Phase 5 and close the ingest as \`done\` with
+   \`produced.transaction_ids = []\` and \`error = 'duplicate Message-ID'\`.
+   (The \`(workspace_id, message_id)\` unique index is the hard backstop;
+   this pre-check is the graceful path.)
+
+2. **After the transaction commits**, stamp the document so future
+   dedup and the frontend "Original email" fold work:
+
+     psql "\$DATABASE_URL" <<'SQL'
+       UPDATE documents
+          SET message_id  = '<MESSAGE_ID>',
+              source_meta = jsonb_build_object(
+                'channel', 'eml',
+                'sender', '<FROM>',
+                'subject', '<SUBJECT>',
+                'received_at', '<RFC822 Date as ISO-8601>',
+                'message_id', '<MESSAGE_ID>')
+        WHERE id = '${ctx.documentId}';
+     SQL
 
 **Pre-step — brand FK guard.** Phase 2.6 ensured the merchant's
 brand_id is in \`brands\`. Items may also carry \`product_brand_id\`

@@ -154,7 +154,13 @@ export interface TransactionRow {
   created_at: string;
   updated_at: string;
   postings: PostingRow[];
-  documents: Array<{ id: string; kind: string }>;
+  documents: Array<{
+    id: string;
+    kind: string;
+    /** Channel provenance (email sender/subject/received_at). Present on
+     *  the single-tx detail read; omitted on the list view. #122. */
+    source_meta?: Record<string, unknown> | null;
+  }>;
   /**
    * Optional Google Places entry for this transaction's merchant
    * location. Null when the extraction agent declined to geocode (no
@@ -331,7 +337,7 @@ function itemsFromMetadataFallback(metadata: unknown): TransactionItemRow[] {
 function mapTransactionRow(
   row: any,
   posts: any[],
-  docs: Array<{ id: string; kind: string }>,
+  docs: Array<{ id: string; kind: string; sourceMeta?: unknown }>,
   place: PlaceRow | null = null,
   itemRows: any[] = [],
   merchant: MerchantRefRow | null = null,
@@ -359,7 +365,11 @@ function mapTransactionRow(
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
     postings: posts.map(mapPostingRow),
-    documents: docs,
+    documents: docs.map((d) => ({
+      id: d.id,
+      kind: d.kind,
+      source_meta: (d.sourceMeta ?? null) as Record<string, unknown> | null,
+    })),
     place,
     merchant,
     items,
@@ -387,7 +397,11 @@ async function loadTransactionFull(
     .where(eq(postings.transactionId, id))
     .orderBy(postings.createdAt);
   const docLinks = await runner
-    .select({ id: documents.id, kind: documents.kind })
+    .select({
+      id: documents.id,
+      kind: documents.kind,
+      sourceMeta: documents.sourceMeta,
+    })
     .from(documentLinks)
     .innerJoin(documents, eq(documents.id, documentLinks.documentId))
     .where(eq(documentLinks.transactionId, id));

@@ -5,8 +5,10 @@
  * under `UPLOAD_DIR`, insert into `documents`, etc.
  */
 import { createHash } from "crypto";
-import { mkdir, writeFile, rename } from "fs/promises";
+import { mkdir, writeFile, rename, readFile, stat } from "fs/promises";
 import * as path from "path";
+import { simpleParser } from "mailparser";
+import sanitizeHtml from "sanitize-html";
 import { and, eq, sql, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { documents, documentLinks } from "../schema/documents.js";
@@ -48,6 +50,11 @@ export interface DocumentRow {
    *  overwritten by re-extract (Phase 4c). */
   ocr_model_version: string | null;
   extraction_meta: Record<string, unknown> | null;
+  /** RFC822 Message-ID for email-sourced docs; NULL otherwise (#122). */
+  message_id: string | null;
+  /** Channel provenance, e.g. `{channel,sender,subject,received_at}` for
+   *  email; NULL otherwise (#122). */
+  source_meta: Record<string, unknown> | null;
   source_ingest_id: string | null;
   deleted_at: string | null;
   created_at: string;
@@ -104,6 +111,8 @@ function rowToApi(r: {
   ocrText: string | null;
   ocrModelVersion: string | null;
   extractionMeta: unknown;
+  messageId: string | null;
+  sourceMeta: unknown;
   sourceIngestId: string | null;
   deletedAt: Date | null;
   createdAt: Date;
@@ -122,6 +131,11 @@ function rowToApi(r: {
       r.extractionMeta == null
         ? null
         : (r.extractionMeta as Record<string, unknown>),
+    message_id: r.messageId,
+    source_meta:
+      r.sourceMeta == null
+        ? null
+        : (r.sourceMeta as Record<string, unknown>),
     source_ingest_id: r.sourceIngestId,
     deleted_at: r.deletedAt ? r.deletedAt.toISOString() : null,
     created_at: r.createdAt.toISOString(),
@@ -207,6 +221,87 @@ export async function getDocumentById(
     .from(documents)
     .where(and(...conds));
   return rows.length > 0 ? rowToApi(rows[0]!) : null;
+}
+
+// ── Email rendering (#122) ──────────────────────────────────────────────
+//
+// A receipt_email document's `file_path` holds the raw RFC822 `.eml`,
+// which is not directly renderable (MIME, quoted-printable). This decodes
+// it to the HTML body and sanitizes it for the frontend's "Original email"
+// fold. Remote images are intentionally KEPT (product decision: fidelity
+// over tracking-pixel privacy for a single-user app). The real XSS
+// boundary is the frontend's sandboxed iframe + a strict CSP on the
+// response; this sanitize pass is defense-in-depth (drops script/iframe/
+// form/event-handlers) while preserving inline styles, tables, and imgs.
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+const EMAIL_SANITIZE: sanitizeHtml.IOptions = {
+  allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+    "img", "center", "font", "table", "thead", "tbody", "tfoot",
+    "tr", "td", "th", "colgroup", "col", "h1", "h2", "h3", "h4", "h5",
+    "h6", "span", "u", "s", "strike", "small", "big", "sup", "sub",
+  ]),
+  allowedAttributes: {
+    "*": [
+      "style", "class", "align", "valign", "width", "height", "bgcolor",
+      "color", "dir", "colspan", "rowspan", "cellpadding", "cellspacing",
+      "border", "title",
+    ],
+    a: ["href", "name", "target", "rel"],
+    img: ["src", "alt", "width", "height", "style", "title"],
+    font: ["color", "face", "size"],
+  },
+  // Keep remote images (product decision). `cid:` covers inline parts.
+  allowedSchemes: ["http", "https", "mailto", "tel"],
+  allowedSchemesByTag: { img: ["http", "https", "data", "cid"] },
+  // Links open in a new tab and never leak referrer / opener.
+  transformTags: {
+    a: sanitizeHtml.simpleTransform("a", {
+      target: "_blank",
+      rel: "noopener noreferrer nofollow",
+    }),
+  },
+};
+
+/**
+ * Decode + sanitize the HTML body of a receipt_email document.
+ * Returns null when the document is missing/soft-deleted or its `.eml`
+ * file is unreadable (→ 404). Throws 422 for non-email documents.
+ */
+export async function renderEmailDocument(
+  workspaceId: string,
+  id: string,
+): Promise<string | null> {
+  const doc = await getDocumentById(workspaceId, id);
+  if (!doc) return null;
+  if (doc.kind !== "receipt_email") {
+    throw new HttpProblem(
+      422,
+      "document-not-email",
+      "Not an email document",
+      `Document ${id} has kind=${doc.kind}; /rendered only serves receipt_email documents.`,
+      { document_id: id, kind: doc.kind },
+    );
+  }
+  if (!doc.file_path) return null;
+  try {
+    await stat(doc.file_path);
+  } catch {
+    return null;
+  }
+  const raw = await readFile(doc.file_path);
+  const parsed = await simpleParser(raw);
+  const body =
+    typeof parsed.html === "string" && parsed.html.length > 0
+      ? parsed.html
+      : parsed.textAsHtml ?? `<pre>${escapeHtml(parsed.text ?? "")}</pre>`;
+  return sanitizeHtml(body, EMAIL_SANITIZE);
 }
 
 export async function linkDocumentToTransaction(params: {
