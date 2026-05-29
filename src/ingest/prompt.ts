@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.10";
+export const PROMPT_VERSION = "2.11";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -785,6 +785,21 @@ Invariants you MUST honor:
 **Email-only pre/post steps (receipt_email). #122.**
 For \`receipt_email\`, first parse the \`.eml\` headers: From, Subject,
 Date, Message-ID.
+
+**Decoding the body.** The \`.eml\` body is MIME-encoded. Quoted-printable
+parts are readable as-is (ignore \`=3D\` and soft \`=\\n\` line-breaks). But a
+\`Content-Transfer-Encoding: base64\` part is NOT human-readable — do NOT try
+to read the raw base64 blob. Decode it first, e.g.:
+
+     python3 - <<'PY'
+     import email,sys
+     m=email.message_from_file(open("${ctx.filePath}"))
+     for p in m.walk():
+         if p.get_content_type()=="text/html":
+             print(p.get_content()); break
+     PY
+
+   then read the decoded HTML. (stdlib \`email\` handles both QP and base64.)
 
 1. **Dedup pre-check — skip the WHOLE ingest if this email was already
    ingested.** A re-forwarded copy has different bytes (so the sha256
