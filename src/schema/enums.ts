@@ -58,12 +58,17 @@ export const batchStatusEnum = pgEnum("batch_status", [
 //   done        → classification + extraction wrote transactions/documents
 //   error       → extractor threw or DB write failed
 //   unsupported → agent classified as not-a-financial-document
+//   dedup       → L1 short-circuit (#124): the file is byte-identical to a
+//                 document already linked to a live transaction, so the
+//                 agent was never spawned. `produced.transaction_ids`
+//                 points at the pre-existing transaction. A terminal state.
 export const ingestStatusEnum = pgEnum("ingest_status", [
   "queued",
   "processing",
   "done",
   "error",
   "unsupported",
+  "dedup",
 ]);
 
 // Background-enrichment state for merchant rows (#64). New merchants land

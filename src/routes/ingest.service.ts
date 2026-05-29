@@ -21,7 +21,7 @@ import { db } from "../db/client.js";
 import { batches, ingests } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { NotFoundProblem } from "../http/problem.js";
-import { enqueue } from "../ingest/worker.js";
+import { enqueue, maybeCompleteBatch } from "../ingest/worker.js";
 import { uploadDocumentBytes, getUploadDir, extForMime } from "./documents.service.js";
 import {
   clampLimit,
@@ -39,7 +39,7 @@ export interface IngestRow {
   filename: string;
   mime_type: string | null;
   file_path: string;
-  status: "queued" | "processing" | "done" | "error" | "unsupported";
+  status: "queued" | "processing" | "done" | "error" | "unsupported" | "dedup";
   classification: string | null;
   produced: {
     receipt_ids: string[];
@@ -58,6 +58,8 @@ export interface BatchCounts {
   done: number;
   error: number;
   unsupported: number;
+  // L1 short-circuit hits (#124).
+  dedup: number;
 }
 
 export interface BatchSummaryRow {
@@ -118,6 +120,7 @@ async function fetchBatchCounts(batchId: string): Promise<BatchCounts> {
     done: 0,
     error: 0,
     unsupported: 0,
+    dedup: 0,
   };
   for (const row of res.rows as Array<{ status: string; n: number }>) {
     const n = Number(row.n);
@@ -208,6 +211,12 @@ export async function createBatchFromFiles(params: {
     filename: string;
     mimeType: string | null;
     filePath: string;
+    documentId: string;
+    // L1 dedup (#124): when the uploaded bytes are identical to a
+    // document already linked to a live transaction, this holds that
+    // transaction's id. The ingest is born terminal (`status='dedup'`)
+    // and is never enqueued — no Claude spawn, no duplicate transaction.
+    dedupOf: string | null;
   };
   const seeded: SeededIngest[] = [];
 
@@ -215,12 +224,24 @@ export async function createBatchFromFiles(params: {
     // Persist the raw bytes via documents.service so we get sha256 +
     // dedup. `kind` at ingest-time is a best guess by extension.
     const kind = guessDocumentKind(f.originalName, f.mimeType);
-    const { doc } = await uploadDocumentBytes({
+    const { doc, created } = await uploadDocumentBytes({
       workspaceId,
       bytes: f.bytes,
       mimeType: f.mimeType,
       kind,
     });
+
+    // L1 short-circuit (#124). Storage-layer sha256 dedup already
+    // returned an existing document (`created === false`); now ask the
+    // transaction-layer question the old code never asked: is this
+    // document ALREADY linked to a live transaction? If so, re-running
+    // extraction would mint a duplicate transaction (the 2026-05-16
+    // incident: 68 dup rows / ~$3,801 over-count). A freshly-created
+    // document can't have links yet, so only probe on a dedup hit.
+    let dedupOf: string | null = null;
+    if (!created) {
+      dedupOf = await findLiveTransactionForDocument(workspaceId, doc.id);
+    }
 
     const ingestId = newId();
     seeded.push({
@@ -233,25 +254,50 @@ export async function createBatchFromFiles(params: {
       // this is the canonical on-disk path sha256-deduped by the
       // documents service.
       filePath: doc.file_path!,
+      documentId: doc.id,
+      dedupOf,
     });
   }
 
   if (seeded.length > 0) {
     await db.insert(ingests).values(
-      seeded.map((s) => ({
-        id: s.id,
-        workspaceId: s.workspaceId,
-        batchId: s.batchId,
-        filename: s.filename,
-        mimeType: s.mimeType,
-        filePath: s.filePath,
-        status: "queued" as const,
-      })),
+      seeded.map((s) =>
+        s.dedupOf
+          ? {
+              id: s.id,
+              workspaceId: s.workspaceId,
+              batchId: s.batchId,
+              filename: s.filename,
+              mimeType: s.mimeType,
+              filePath: s.filePath,
+              status: "dedup" as const,
+              // Point provenance at the pre-existing transaction so the
+              // client can deep-link "already in your ledger → view it".
+              produced: {
+                receipt_ids: [],
+                transaction_ids: [s.dedupOf],
+                document_ids: [s.documentId],
+              },
+              error: "duplicate: identical file already linked to a transaction",
+              completedAt: new Date(),
+            }
+          : {
+              id: s.id,
+              workspaceId: s.workspaceId,
+              batchId: s.batchId,
+              filename: s.filename,
+              mimeType: s.mimeType,
+              filePath: s.filePath,
+              status: "queued" as const,
+            },
+      ),
     );
   }
 
   // Enqueue AFTER the DB commit so the worker never races the insert.
+  // Dedup hits are terminal already — never enqueue them.
   for (const s of seeded) {
+    if (s.dedupOf) continue;
     enqueue({
       ingestId: s.id,
       workspaceId: s.workspaceId,
@@ -260,6 +306,15 @@ export async function createBatchFromFiles(params: {
       mimeType: s.mimeType,
       filename: s.filename,
     });
+  }
+
+  // If every file deduped (or the batch is a mix and the real children
+  // are still queued), nudge the batch state machine: an all-dedup batch
+  // has no worker child to fire `onBatchChildTerminated`, so without this
+  // it would hang in `pending` forever. The UPDATE is guarded to no-op
+  // while any non-terminal child remains, so it's safe to always call.
+  if (seeded.some((s) => s.dedupOf)) {
+    await maybeCompleteBatch(batchId, workspaceId);
   }
 
   const counts = await fetchBatchCounts(batchId);
@@ -275,6 +330,32 @@ export async function createBatchFromFiles(params: {
       mime_type: s.mimeType,
     })),
   };
+}
+
+/**
+ * L1 dedup probe (#124). Returns the id of a LIVE transaction (posted or
+ * reconciled) already linked to `documentId`, or null if none. A `voided`
+ * or `draft` link must NOT suppress a re-ingest — the user may be
+ * re-uploading precisely because the prior transaction was voided. One
+ * O(ms) indexed lookup per dedup-hit file; `document_links_txn_idx` +
+ * the documents PK keep it cheap.
+ */
+async function findLiveTransactionForDocument(
+  workspaceId: string,
+  documentId: string,
+): Promise<string | null> {
+  const res = await db.execute(sql`
+    SELECT t.id
+      FROM document_links dl
+      JOIN transactions t ON t.id = dl.transaction_id
+     WHERE dl.document_id = ${documentId}::uuid
+       AND t.workspace_id = ${workspaceId}::uuid
+       AND t.status IN ('posted', 'reconciled')
+     ORDER BY t.created_at ASC
+     LIMIT 1
+  `);
+  const row = res.rows[0] as { id: string } | undefined;
+  return row?.id ?? null;
 }
 
 function guessDocumentKind(

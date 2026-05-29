@@ -41,6 +41,8 @@ export interface BatchCountsPayload {
   done: number;
   error: number;
   unsupported: number;
+  // L1 short-circuit hits (#124).
+  dedup: number;
 }
 
 export interface JobStartedPayload {

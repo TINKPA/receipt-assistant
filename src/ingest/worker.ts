@@ -109,6 +109,7 @@ async function fetchCountsForEvent(batchId: string): Promise<BatchCountsPayload>
     done: 0,
     error: 0,
     unsupported: 0,
+    dedup: 0,
   };
   for (const row of res.rows as Array<{ status: string; n: number }>) {
     const n = Number(row.n);
@@ -393,6 +394,11 @@ async function onBatchChildTerminated(
   // children finishing at the same moment will race into this code but
   // only one row will update. Only the winner fires `batch.extracted`
   // and kicks off auto-reconcile.
+  //
+  // `dedup` (#124) is terminal too: an L1 short-circuit hit never enters
+  // the worker, so its ingest row is born terminal. It must count as
+  // "done" for batch-completion or a mixed batch (some extracted, some
+  // deduped) would hang forever waiting on a child that never runs.
   const res = await db.execute(
     sql`UPDATE batches
          SET status = 'extracted',
@@ -403,7 +409,7 @@ async function onBatchChildTerminated(
          AND NOT EXISTS (
            SELECT 1 FROM ingests
             WHERE batch_id = ${batchId}::uuid
-              AND status NOT IN ('done','error','unsupported')
+              AND status NOT IN ('done','error','unsupported','dedup')
          )
       RETURNING id, auto_reconcile`,
   );
@@ -414,6 +420,26 @@ async function onBatchChildTerminated(
   if (flipped.auto_reconcile) {
     await triggerAutoReconcile(batchId, workspaceId);
   }
+}
+
+/**
+ * Public entry point for the L1 dedup path (#124).
+ *
+ * When `createBatchFromFiles` short-circuits one or more files (byte-
+ * identical to an already-linked document), those ingests are born in the
+ * terminal `dedup` state and never enqueued — so the per-child completion
+ * hook never fires for them. An all-dedup batch would otherwise stay
+ * `pending` forever, and a mixed batch's last real child must see `dedup`
+ * siblings as terminal. The service calls this after seeding the batch;
+ * the underlying UPDATE is guarded (status IN pending/processing + no
+ * non-terminal child), so it's a safe no-op while real children are still
+ * queued.
+ */
+export async function maybeCompleteBatch(
+  batchId: string,
+  workspaceId: string,
+): Promise<void> {
+  await onBatchChildTerminated(batchId, workspaceId);
 }
 
 // ── Langfuse trace ingestion (fire-and-forget) ───────────────────────
