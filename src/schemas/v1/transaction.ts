@@ -66,6 +66,10 @@ export const TransactionDocumentRef = z
   .object({
     id: Uuid,
     kind: z.string(),
+    /** Channel provenance for email-sourced docs (sender/subject/
+     *  received_at). Present on the single-tx detail read; omitted on
+     *  the list view. #122. */
+    source_meta: z.record(z.string(), z.unknown()).nullish(),
   })
   .openapi("TransactionDocumentRef");
 

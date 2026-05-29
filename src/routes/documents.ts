@@ -50,6 +50,7 @@ import {
   restoreDocument,
   cascadeDeleteDocument,
   reExtractDocument,
+  renderEmailDocument,
   extForMime,
   type DocumentKindValue,
 } from "./documents.service.js";
@@ -177,6 +178,32 @@ documentsRouter.get(
     );
     setEtag(res, DOC_VERSION);
     createReadStream(doc.file_path).pipe(res);
+  }),
+);
+
+// ── GET /v1/documents/:id/rendered ─────────────────────────────────────
+//
+// For receipt_email documents: decode the raw .eml and serve the
+// sanitized HTML body for the frontend's "Original email" fold (#122).
+// Safety: a strict CSP (no script-src) + the frontend's sandboxed iframe
+// neutralize any active content; the service-side sanitize is the third
+// layer. Remote images are allowed (product decision — fidelity).
+documentsRouter.get(
+  "/:id/rendered",
+  asyncHandler(async (req, res) => {
+    const { id } = parseOrThrow(IdOnlyParams, req.params);
+    const html = await renderEmailDocument(req.ctx.workspaceId, id);
+    if (html == null) throw new NotFoundProblem("Document content", id);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'none'; img-src http: https: data: cid:; " +
+        "style-src 'unsafe-inline' http: https:; font-src http: https: data:; " +
+        "base-uri 'none'; form-action 'none'",
+    );
+    setEtag(res, DOC_VERSION);
+    res.send(html);
   }),
 );
 
@@ -391,6 +418,30 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
         },
       },
       404: { description: "Not found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/v1/documents/{id}/rendered",
+    summary:
+      "Decoded + sanitized HTML body of a receipt_email document, for the " +
+      "frontend 'Original email' fold. Served with a strict CSP; render " +
+      "inside a sandboxed iframe.",
+    tags: ["documents"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      200: {
+        description: "Sanitized email HTML",
+        content: {
+          "text/html": { schema: { type: "string" } },
+        },
+      },
+      404: { description: "Not found / no file", content: problemContent },
+      422: {
+        description: "Document is not an email (kind != receipt_email)",
+        content: problemContent,
+      },
     },
   });
 

@@ -29,6 +29,14 @@ export const Document = z
         "Model identifier under which ocr_text was produced. NULL on legacy rows.",
     }),
     extraction_meta: z.record(z.string(), z.unknown()).nullable(),
+    message_id: z.string().nullable().openapi({
+      description:
+        "RFC822 Message-ID for email-sourced documents (kind=receipt_email); NULL otherwise.",
+    }),
+    source_meta: z.record(z.string(), z.unknown()).nullable().openapi({
+      description:
+        "Channel provenance for non-image sources. For email: {channel,sender,subject,received_at,message_id}.",
+    }),
     source_ingest_id: Uuid.nullable(),
     deleted_at: IsoDateTime.nullable(),
     created_at: IsoDateTime,
