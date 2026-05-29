@@ -2500,6 +2500,9 @@
           },
           "unsupported": {
             "type": "integer"
+          },
+          "dedup": {
+            "type": "integer"
           }
         },
         "required": [
@@ -2508,7 +2511,8 @@
           "processing",
           "done",
           "error",
-          "unsupported"
+          "unsupported",
+          "dedup"
         ]
       },
       "IngestStatus": {
@@ -2518,7 +2522,8 @@
           "processing",
           "done",
           "error",
-          "unsupported"
+          "unsupported",
+          "dedup"
         ]
       },
       "IngestClassification": {

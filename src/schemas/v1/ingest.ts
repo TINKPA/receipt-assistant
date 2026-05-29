@@ -23,7 +23,7 @@ export const BatchStatus = z
   .openapi("BatchStatus");
 
 export const IngestStatus = z
-  .enum(["queued", "processing", "done", "error", "unsupported"])
+  .enum(["queued", "processing", "done", "error", "unsupported", "dedup"])
   .openapi("IngestStatus");
 
 export const IngestClassification = z
@@ -75,6 +75,9 @@ export const BatchCounts = z
     done: z.number().int(),
     error: z.number().int(),
     unsupported: z.number().int(),
+    // L1 short-circuit hits (#124): files skipped before extraction
+    // because they were byte-identical to an already-ingested receipt.
+    dedup: z.number().int(),
   })
   .openapi("BatchCounts");
 
