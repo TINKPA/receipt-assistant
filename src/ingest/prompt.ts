@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.11";
+export const PROMPT_VERSION = "2.12";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -785,6 +785,14 @@ Invariants you MUST honor:
 **Email-only pre/post steps (receipt_email). #122.**
 For \`receipt_email\`, first parse the \`.eml\` headers: From, Subject,
 Date, Message-ID.
+
+**Canonical Message-ID — read this.** The header is \`Message-ID: <id@host>\`.
+Everywhere \`<MESSAGE_ID>\` appears below it means the id **with the
+surrounding angle brackets stripped** (\`id@host\`, NOT \`<id@host>\`). Use this
+exact bracket-free form in BOTH the dedup pre-check query AND when you store
+\`documents.message_id\` / \`source_meta.message_id\`. Storing one form and
+querying the other silently breaks dedup → duplicate transactions. One form,
+everywhere.
 
 **Decoding the body.** The \`.eml\` body is MIME-encoded. Quoted-printable
 parts are readable as-is (ignore \`=3D\` and soft \`=\\n\` line-breaks). But a
