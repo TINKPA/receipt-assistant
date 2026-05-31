@@ -1,0 +1,70 @@
+# Sandbox stack for frontend-test-runner.
+#
+#   docker compose -p receipts-test -f docker-compose.test.yml up -d --build
+#
+# Side-by-side with the production stack — different ports, different
+# postgres volume, different uploads dir, different container names.
+# Production stack stays running on 3000/5432 while this one runs on
+# 3001/5433. Synthetic test receipts uploaded here never touch the
+# iCloud-synced production uploads dir or the production DB.
+#
+# What's SEPARATE from prod (the whole point of the sandbox):
+#   • Postgres binary: ~/Developer/receipt-assistant-data/test-postgres/
+#   • Uploads dir:     ~/Developer/receipt-assistant-data/test-uploads/
+#     ↑ both are sibling dirs — NOT in any git repo, NOT in iCloud
+#   • Container names: receipts-test-postgres, receipt-assistant-test
+#   • Ports:           3001 (backend), 5433 (postgres) on the host
+#   • No Langfuse — sandbox runs don't pollute prod traces
+#
+# What's SHARED with prod (intentional, avoids running `claude /login` twice):
+#   • Claude OAuth credentials → ~/Developer/receipt-assistant-data/claude/
+#   • Brand assets cache       → ~/Developer/receipt-assistant-data/brand-assets/
+#     (icons are content-addressable, safe to share across stacks)
+#
+# Reset script: scripts/sandbox-reset.sh — TRUNCATEs all test tables and
+# nukes test-uploads/, fast (~1s) versus a full down/up cycle.
+
+services:
+  receipts-postgres:
+    image: docker.io/postgres:17
+    container_name: receipts-test-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: receipts
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5433:5432"
+    volumes:
+      - ${HOME}/Developer/receipt-assistant-data/test-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d receipts"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  receipt-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: receipt-assistant:local
+    container_name: receipt-assistant-test
+    depends_on:
+      receipts-postgres:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
+      MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
+      LOGODEV_PUBLISHABLE_KEY: ${LOGODEV_PUBLISHABLE_KEY:-}
+      LOGODEV_SECRET_KEY: ${LOGODEV_SECRET_KEY:-}
+    volumes:
+      - ${HOME}/Developer/receipt-assistant-data/test-uploads:/data
+      - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
+      - ${HOME}/Developer/receipt-assistant-data/brand-assets:/data/brand-assets
+    restart: unless-stopped
