@@ -46,13 +46,15 @@ export const documents = pgTable(
      *  by the partial unique index below. See #122. */
     messageId: text("message_id"),
     /** 64-bit DCT perceptual hash, 16 hex chars. Image documents only;
-     *  NULL for pdf/eml and for legacy rows until backfilled
-     *  (`scripts/backfill-phash.ts`). L2 dedup evidence (#134): two
-     *  byte-different copies of the same shot/screenshot land at
-     *  hamming distance ≤ 4 (calibrated on the real corpus 2026-06-10:
-     *  true dups at d≤2, empty d=4 bucket, false positives from d=6 —
-     *  so a pHash hit is EVIDENCE for the extraction agent's near-dup
-     *  decision, never a standalone merge trigger). */
+     *  NULL for pdf/eml, undecodable files, and legacy rows until
+     *  backfilled (`scripts/backfill-phash.ts`). L2 dedup signal
+     *  (#134): byte-different copies of the same shot land at d ≤ 2 —
+     *  but so can two DIFFERENT purchases captured from the same app
+     *  UI template (production calibration 2026-06-10), and same-table
+     *  re-shots of different receipts appear from d = 4. A pHash hit
+     *  is therefore a candidate-surfacing signal for the extraction
+     *  agent's near-dup decision; extracted fields decide, never the
+     *  hash alone. */
     phash: text("phash"),
     /** Channel provenance for non-image sources, kept separate from
      *  `extraction_meta` (which records what produced the row). For
