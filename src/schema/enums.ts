@@ -62,6 +62,15 @@ export const batchStatusEnum = pgEnum("batch_status", [
 //                 document already linked to a live transaction, so the
 //                 agent was never spawned. `produced.transaction_ids`
 //                 points at the pre-existing transaction. A terminal state.
+//   near_dup    → L2/L3a attach (#134): the agent extracted the document,
+//                 judged it a near-duplicate of an existing transaction
+//                 (pHash candidate + matching tiebreakers), and ATTACHED
+//                 the document to that transaction instead of inserting a
+//                 new one. `produced.transaction_ids` points at the
+//                 existing transaction; the worker verifies the link
+//                 really exists before trusting this state. Terminal.
+//                 Probabilistic (vs `dedup`'s byte-certainty) — the
+//                 attach is user-reversible by unlinking the document.
 export const ingestStatusEnum = pgEnum("ingest_status", [
   "queued",
   "processing",
@@ -69,6 +78,7 @@ export const ingestStatusEnum = pgEnum("ingest_status", [
   "error",
   "unsupported",
   "dedup",
+  "near_dup",
 ]);
 
 // Background-enrichment state for merchant rows (#64). New merchants land

@@ -183,6 +183,13 @@
       "when": 1781101418019,
       "tag": "0025_closed_vindicator",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1781103138621,
+      "tag": "0026_outstanding_ikaris",
+      "breakpoints": true
     }
   ]
 }
