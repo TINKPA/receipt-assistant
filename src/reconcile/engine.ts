@@ -33,7 +33,7 @@ import { batches, reconcileProposals, transactions } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { NotFoundProblem } from "../http/problem.js";
 import { voidTransaction } from "../routes/transactions.service.js";
-import { detectDuplicates } from "./dedup.js";
+import { detectDuplicates, detectNearDuplicates } from "./dedup.js";
 import {
   paymentLinkStub,
   inventoryStub,
@@ -213,6 +213,19 @@ async function voidDuplicate(params: {
   if (cur.status === "voided" || cur.status === "draft" || cur.status === "error") {
     return false;
   }
+  // #135: evidence survives the void. Re-point the duplicate's
+  // document_links at the canonical transaction (keep-both model —
+  // documents are never casualties of ledger repair), then drop the
+  // now-redundant link rows so the voided mirror doesn't claim them.
+  await db.execute(sql`
+    INSERT INTO document_links (document_id, transaction_id)
+    SELECT dl.document_id, ${canonicalId}::uuid
+      FROM document_links dl
+     WHERE dl.transaction_id = ${duplicateId}::uuid
+    ON CONFLICT DO NOTHING`);
+  await db.execute(
+    sql`DELETE FROM document_links WHERE transaction_id = ${duplicateId}::uuid`,
+  );
   await voidTransaction(
     workspaceId,
     userId,
@@ -295,6 +308,34 @@ export async function runReconcile(params: {
             resolvedAt: null,
           });
         }
+      }
+
+      // ── Step 1b: cross-batch near-duplicates (#135) ────────────────
+      // Weighted fuzzy pass against the prior 90 days outside this
+      // batch. Strong order/payment-id matches score 1.0 (auto-apply);
+      // everything else is capped at 0.9 → human-review proposal.
+      const nearPairs = await detectNearDuplicates({ workspaceId, batchId });
+      for (const np of nearPairs) {
+        newProposals.push({
+          id: newId(),
+          kind: "dedup",
+          payload: {
+            duplicate: np.duplicate_id,
+            duplicate_of: np.canonical_id,
+            near: true,
+            key: {
+              occurred_on: np.occurred_on,
+              canonical_occurred_on: np.canonical_occurred_on,
+              payee: np.payee,
+              canonical_payee: np.canonical_payee,
+              total_base_minor: np.total_base_minor,
+            },
+            reasons: np.reasons,
+          },
+          score: np.score,
+          status: "proposed",
+          resolvedAt: null,
+        });
       }
     }
 

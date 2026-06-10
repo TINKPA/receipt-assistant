@@ -124,3 +124,162 @@ export async function detectDuplicates(params: {
   }
   return groups;
 }
+
+// ── Near-duplicate detection across batches (#135, L3b) ────────────────
+//
+// The exact pass above only compares transactions WITHIN one batch — a
+// cross-batch duplicate (the same charge ingested weeks apart, or a
+// statement row duplicating a receipt with a settlement-date offset and
+// a processor-mangled payee string) is invisible to it. This fuzzy pass
+// compares the batch's transactions against the prior 90 days OUTSIDE
+// the batch, weighted-scores each candidate pair, and lets the engine
+// propose them. Conservative by design: the score is CAPPED below the
+// auto-apply threshold unless an order/payment identifier matches
+// exactly — same-day same-amount same-merchant can legitimately be two
+// purchases (the "two coffees" case), so cross-batch matches default to
+// human review.
+
+/** Extract a card last-4 from the agent's metadata.payment string
+ *  (e.g. "Visa ****7846 (Contactless)" / "Visa xxxxxxxx7846"). */
+function cardLast4(payment: string | null): string | null {
+  if (!payment) return null;
+  const m = payment.match(/(\d{4})(?!.*\d)/);
+  return m ? m[1]! : null;
+}
+
+export interface NearDuplicatePair {
+  /** The batch-side (newer) transaction proposed for voiding. */
+  duplicate_id: string;
+  /** The pre-existing transaction outside the batch. */
+  canonical_id: string;
+  score: number;
+  reasons: string[];
+  occurred_on: string;
+  canonical_occurred_on: string;
+  payee: string | null;
+  canonical_payee: string | null;
+  total_base_minor: number;
+}
+
+export async function detectNearDuplicates(params: {
+  workspaceId: string;
+  batchId: string;
+}): Promise<NearDuplicatePair[]> {
+  const { workspaceId, batchId } = params;
+  const res = await db.execute(sql`
+    WITH batch_txns AS (
+      SELECT t.id, t.occurred_on, t.payee, t.merchant_id, t.created_at,
+             t.metadata->>'order_number' AS order_number,
+             t.metadata->>'payment_id'   AS payment_id,
+             t.metadata->>'payment'      AS payment,
+             COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0) AS total
+        FROM transactions t
+        JOIN postings p ON p.transaction_id = t.id
+       WHERE t.workspace_id = ${workspaceId}::uuid
+         AND t.status IN ('posted', 'reconciled')
+         AND t.source_ingest_id IN (
+           SELECT id FROM ingests WHERE batch_id = ${batchId}::uuid
+         )
+       GROUP BY t.id
+    ),
+    outside AS (
+      SELECT t.id, t.occurred_on, t.payee, t.merchant_id, t.created_at,
+             t.metadata->>'order_number' AS order_number,
+             t.metadata->>'payment_id'   AS payment_id,
+             t.metadata->>'payment'      AS payment,
+             COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0) AS total
+        FROM transactions t
+        JOIN postings p ON p.transaction_id = t.id
+       WHERE t.workspace_id = ${workspaceId}::uuid
+         AND t.status IN ('posted', 'reconciled')
+         AND (t.source_ingest_id IS NULL OR t.source_ingest_id NOT IN (
+           SELECT id FROM ingests WHERE batch_id = ${batchId}::uuid
+         ))
+       GROUP BY t.id
+    )
+    SELECT b.id  AS b_id, b.occurred_on AS b_date, b.payee AS b_payee,
+           b.merchant_id AS b_merchant, b.order_number AS b_order,
+           b.payment_id AS b_payment_id, b.payment AS b_payment,
+           b.total AS total,
+           o.id  AS o_id, o.occurred_on AS o_date, o.payee AS o_payee,
+           o.merchant_id AS o_merchant, o.order_number AS o_order,
+           o.payment_id AS o_payment_id, o.payment AS o_payment
+      FROM batch_txns b
+      JOIN outside o
+        ON o.total = b.total
+       AND o.occurred_on BETWEEN b.occurred_on - 3 AND b.occurred_on + 3
+       AND o.occurred_on >= b.occurred_on - 90
+     WHERE b.total > 0
+     LIMIT 50
+  `);
+
+  const pairs: NearDuplicatePair[] = [];
+  for (const r of res.rows as Array<Record<string, unknown>>) {
+    const reasons: string[] = ["amount equal within ±3-day window"];
+    let score = 0.5;
+    const bDate = String(r.b_date).slice(0, 10);
+    const oDate = String(r.o_date).slice(0, 10);
+    if (bDate === oDate) {
+      score += 0.25;
+      reasons.push("same occurred_on");
+    }
+    const bPayee = (r.b_payee as string | null)?.trim().toLowerCase() ?? null;
+    const oPayee = (r.o_payee as string | null)?.trim().toLowerCase() ?? null;
+    if (
+      (bPayee && oPayee && bPayee === oPayee) ||
+      (r.b_merchant && r.b_merchant === r.o_merchant)
+    ) {
+      score += 0.15;
+      reasons.push("same payee/merchant");
+    }
+    const b4 = cardLast4(r.b_payment as string | null);
+    const o4 = cardLast4(r.o_payment as string | null);
+    if (b4 && o4) {
+      if (b4 === o4) {
+        score += 0.1;
+        reasons.push(`same card last-4 ${b4}`);
+      } else {
+        score -= 1.0;
+        reasons.push("card last-4 differs");
+      }
+    }
+    const bOrder = (r.b_order as string | null) ?? null;
+    const oOrder = (r.o_order as string | null) ?? null;
+    const bPid = (r.b_payment_id as string | null) ?? null;
+    const oPid = (r.o_payment_id as string | null) ?? null;
+    const strongIdMatch =
+      (bOrder && oOrder && bOrder === oOrder) || (bPid && oPid && bPid === oPid);
+    if (bOrder && oOrder && bOrder !== oOrder) {
+      score -= 1.0;
+      reasons.push("order numbers differ");
+    }
+    if (bPid && oPid && bPid !== oPid) {
+      score -= 1.0;
+      reasons.push("payment ids differ");
+    }
+    if (strongIdMatch) {
+      // Exact order/payment identifier — true identity, eligible for
+      // auto-apply.
+      score = 1.0;
+      reasons.push("order/payment identifier matches exactly");
+    } else {
+      // No strong identifier → cap below the auto-apply threshold so a
+      // cross-batch match is always a human-review proposal ("two
+      // coffees" false-positive class).
+      score = Math.min(score, 0.9);
+    }
+    if (score < 0.5) continue;
+    pairs.push({
+      duplicate_id: String(r.b_id),
+      canonical_id: String(r.o_id),
+      score: Math.max(0, Math.min(1, score)),
+      reasons,
+      occurred_on: bDate,
+      canonical_occurred_on: oDate,
+      payee: (r.b_payee as string | null) ?? null,
+      canonical_payee: (r.o_payee as string | null) ?? null,
+      total_base_minor: Number(r.total),
+    });
+  }
+  return pairs;
+}
