@@ -110,7 +110,9 @@ async function main(): Promise<void> {
       if (d <= 24) console.log(`  ${String(d).padStart(2)}  ${hist.get(d)}`);
     }
     close.sort((a, b) => a[0] - b[0]);
-    console.log(`\n[calibrate] pairs at d ≤ 8 (expect: true dups ≤4, FPs ≥6):`);
+    console.log(
+      `\n[calibrate] pairs at d ≤ 8 (true dups ≤2; FPs from d=4, and same-app-template screenshots can FP at d=2 — fields decide, see #134):`,
+    );
     for (const [d, a, b] of close) console.log(`  d=${d}  ${a}  ${b}`);
   }
 

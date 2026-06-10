@@ -11,10 +11,19 @@
  * Re-derive thresholds with `scripts/backfill-phash.ts --calibrate`
  * after any change here.
  *
- * Calibration result (189-image production corpus): true duplicates
- * (re-shots / re-captured screenshots) at d ≤ 2, d=4 empty, false
- * positives (same composition, different receipt) from d = 6. Treat
- * d ≤ 4 as strong evidence; never auto-merge on pHash alone.
+ * Production calibration (mini corpus, 180 images, THIS implementation,
+ * 2026-06-10 — full evidence in #134):
+ *   - true duplicates (re-shots, re-captured screenshots): d ≤ 2
+ *   - false positives appear from d = 4 (two different Costco receipts,
+ *     same table/paper/framing — composition dominates the DCT)
+ *   - app-screenshot receipts collide HARD: two *different* Starbucks
+ *     purchases (different date/amount/receipt#) land at d = 2 because
+ *     the app's UI template carries all the low-frequency energy.
+ * Therefore: a pHash hit (d ≤ 2) is a CANDIDATE-SURFACING signal only —
+ * it tells the extraction agent "compare these documents' extracted
+ * fields"; the fields (date, amount, order/receipt number) are always
+ * the deciding evidence. Never attach/merge on pHash alone, at any
+ * threshold.
  */
 import sharp from "sharp";
 
