@@ -17,7 +17,10 @@ export const Document = z
     id: Uuid,
     workspace_id: Uuid,
     kind: DocumentKind,
-    file_path: z.string().nullable(),
+    file_path: z.string().nullable().openapi({
+      description:
+        "Server-side storage path, relative to the server's uploads dir (#128). Opaque to clients — fetch bytes via /content or /rendered.",
+    }),
     mime_type: z.string().nullable(),
     sha256: z.string(),
     ocr_text: z.string().nullable(),

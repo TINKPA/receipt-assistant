@@ -31,6 +31,7 @@ import {
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
+import { resolveUploadPath } from "../routes/documents.service.js";
 import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
@@ -49,6 +50,8 @@ interface QueueItem {
   ingestId: string;
   workspaceId: string;
   batchId: string;
+  /** Stored form: relative to the uploads dir (#128). Resolve via
+   *  resolveUploadPath() before any filesystem access. */
   filePath: string;
   mimeType: string | null;
   filename: string;
@@ -294,7 +297,9 @@ async function runOne(item: QueueItem): Promise<void> {
   let result: ExtractorResult;
   try {
     result = await defaultClaudeExtractor({
-      filePath,
+      // Queue items carry the stored (uploads-relative, #128) path; the
+      // agent needs a container-absolute path it can open.
+      filePath: resolveUploadPath(filePath),
       mimeType,
       filename: item.filename,
       ingestId,

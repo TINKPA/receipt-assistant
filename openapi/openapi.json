@@ -2338,7 +2338,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Server-side storage path, relative to the server's uploads dir (#128). Opaque to clients — fetch bytes via /content or /rendered."
           },
           "mime_type": {
             "type": [

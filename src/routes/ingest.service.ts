@@ -250,9 +250,9 @@ export async function createBatchFromFiles(params: {
       batchId,
       filename: f.originalName,
       mimeType: f.mimeType,
-      // The worker reads bytes from doc.file_path via the filesystem —
-      // this is the canonical on-disk path sha256-deduped by the
-      // documents service.
+      // Stored form: relative to the uploads dir (#128), sha256-named by
+      // the documents service. The worker resolves it to an absolute
+      // path (resolveUploadPath) right before the filesystem read.
       filePath: doc.file_path!,
       documentId: doc.id,
       dedupOf,

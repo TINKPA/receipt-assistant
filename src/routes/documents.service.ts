@@ -71,6 +71,20 @@ export function getUploadDir(): string {
 }
 
 /**
+ * `documents.file_path` / `ingests.file_path` are stored RELATIVE to
+ * `getUploadDir()` (#128) so the same DB rows resolve on the host
+ * (`UPLOAD_DIR=.../data/uploads`) and in the container (`/data/uploads`)
+ * alike. Every filesystem access must go through this resolver.
+ *
+ * Legacy rows hold absolute paths from whichever environment ingested
+ * them; migration 0024 rewrites those, and the isAbsolute branch keeps
+ * a not-yet-migrated row readable in the environment that wrote it.
+ */
+export function resolveUploadPath(stored: string): string {
+  return path.isAbsolute(stored) ? stored : path.join(getUploadDir(), stored);
+}
+
+/**
  * Minimal mime → extension map. A dependency on the whole `mime-types`
  * package would be overkill for the ~6 content types we actually
  * ingest; the fallback just leaves the on-disk file extension-less,
@@ -197,7 +211,8 @@ export async function uploadDocumentBytes(params: {
       id,
       workspaceId,
       kind,
-      filePath: fullPath,
+      // Stored relative to the uploads dir (#128) — see resolveUploadPath.
+      filePath: filename,
       mimeType: mimeType ?? null,
       sha256: sha,
       ocrText: null,
@@ -290,12 +305,13 @@ export async function renderEmailDocument(
     );
   }
   if (!doc.file_path) return null;
+  const absPath = resolveUploadPath(doc.file_path);
   try {
-    await stat(doc.file_path);
+    await stat(absPath);
   } catch {
     return null;
   }
-  const raw = await readFile(doc.file_path);
+  const raw = await readFile(absPath);
   const parsed = await simpleParser(raw);
   const body =
     typeof parsed.html === "string" && parsed.html.length > 0
@@ -478,7 +494,7 @@ export async function hardDeleteDocument(params: {
 
   await db.delete(documents).where(eq(documents.id, documentId));
 
-  if (filePath) await quarantineFile(filePath);
+  if (filePath) await quarantineFile(resolveUploadPath(filePath));
   return true;
 }
 
@@ -646,7 +662,7 @@ export async function cascadeDeleteDocument(params: {
   });
 
   if (pendingFileUnlink) {
-    await quarantineFile(pendingFileUnlink);
+    await quarantineFile(resolveUploadPath(pendingFileUnlink));
   }
 
   return { ...report, hardDeletedFilePath: pendingFileUnlink };
@@ -856,7 +872,8 @@ export async function reExtractDocument(
   // 3) Spawn the agent. Errors here bubble to the route handler;
   //    nothing has been written yet so the DB state is untouched.
   const { sessionId, stdout } = await reExtractor({
-    filePath: doc.filePath,
+    // The agent needs a container-absolute path it can open (#128).
+    filePath: resolveUploadPath(doc.filePath),
     workspaceId,
     documentId,
     transactionId,
