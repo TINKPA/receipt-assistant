@@ -30,6 +30,15 @@ manifest is committed, the per-run report is not).
    `documents.sha256` dedupe so the worker actually re-runs `claude -p`
    on every fixture every run. Without this you'd score against cached
    extractions from weeks ago and miss any current-pipeline regressions.
+
+   > ⚠️ **#134 interaction — run evals against a RESET sandbox, never a
+   > populated DB.** The sha-bump trick no longer defeats dedup on its
+   > own: a re-encoded copy keeps its pHash, so against a DB that
+   > already holds the fixture's prior extraction the agent will (by
+   > design) take the Phase 4a.0 attach path and close `near_dup`
+   > instead of re-extracting — and the eval scores nothing. The
+   > sandbox stack + `scripts/sandbox-reset.sh` gives the empty-DB
+   > environment where every fixture genuinely re-extracts.
 4. POSTs all fixtures in a single multipart batch to `/v1/ingest/batch`.
 5. Polls `/v1/batches/<id>` every 3 s until every ingest reaches a
    terminal state (`done` / `unsupported` / `error`). 10 min timeout.
