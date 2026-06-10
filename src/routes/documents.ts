@@ -52,6 +52,7 @@ import {
   reExtractDocument,
   renderEmailDocument,
   extForMime,
+  resolveUploadPath,
   type DocumentKindValue,
 } from "./documents.service.js";
 
@@ -160,8 +161,9 @@ documentsRouter.get(
     if (!doc) throw new NotFoundProblem("Document", id);
     if (!doc.file_path) throw new NotFoundProblem("Document content", id);
 
+    const absPath = resolveUploadPath(doc.file_path);
     try {
-      await stat(doc.file_path);
+      await stat(absPath);
     } catch {
       throw new NotFoundProblem("Document content", id);
     }
@@ -177,7 +179,7 @@ documentsRouter.get(
       `inline; filename="${filename}"`,
     );
     setEtag(res, DOC_VERSION);
-    createReadStream(doc.file_path).pipe(res);
+    createReadStream(absPath).pipe(res);
   }),
 );
 
