@@ -342,6 +342,39 @@ async function runOne(item: QueueItem): Promise<void> {
     return;
   }
 
+  // #125 — don't trust the agent's self-reported `done`. For a receipt
+  // classification, `done` with zero transactions is silent data loss
+  // (the user/mail-ingest skill sees success and discards the source
+  // email). The only legitimate zero-transaction `done` is the email
+  // dedup skip (error sentinel below). `unsupported` has its own
+  // status, and the L1 byte-dedup path (#124) never enters the worker.
+  const RECEIPT_KINDS = ["receipt_image", "receipt_email", "receipt_pdf"];
+  if (
+    terminal.status === "done" &&
+    terminal.classification !== null &&
+    RECEIPT_KINDS.includes(terminal.classification) &&
+    terminal.produced.transaction_ids.length === 0 &&
+    !(terminal.error ?? "").startsWith("duplicate Message-ID")
+  ) {
+    const msg =
+      "receipt classified but no transaction written — forcing error (agent self-reported done; see #125)";
+    // Not markError(): that helper wipes `produced`, and the agent may
+    // have legitimately written document_ids worth keeping for triage.
+    await db
+      .update(ingests)
+      .set({
+        status: "error",
+        error: msg,
+        completedAt: new Date(),
+      })
+      .where(
+        and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
+      );
+    busEmit("job.error", { batchId, ingestId, error: msg });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+
   if (terminal.status === "error") {
     busEmit("job.error", {
       batchId,
