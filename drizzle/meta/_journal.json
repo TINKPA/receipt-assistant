@@ -176,6 +176,13 @@
       "when": 1781095505462,
       "tag": "0024_relative_file_paths",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1781101418019,
+      "tag": "0025_closed_vindicator",
+      "breakpoints": true
     }
   ]
 }

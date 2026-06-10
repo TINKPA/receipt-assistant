@@ -59,6 +59,14 @@ COPY --from=builder /app/dist ./dist
 # schema changes. Committing these into the image is deliberate: it means
 # the running container and the repo state at build time agree on schema.
 COPY --from=builder /app/drizzle ./drizzle
+# Admin/backfill scripts (scripts/backfill-*.ts) are documented as
+# `docker exec -i receipt-assistant npx tsx scripts/<name>.ts` — that
+# requires the TS sources in the runtime image too (tsx resolves their
+# `../src/...` imports from source, not dist). Small size cost so the
+# operational scripts stay runnable against production.
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/scripts ./scripts
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
 COPY package.json CLAUDE.md ./
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 
