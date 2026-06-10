@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.12";
+export const PROMPT_VERSION = "2.13";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -64,6 +64,13 @@ every SQL call. If you want a multi-statement block, use a heredoc:
 Optional: if you want to discover schema details, \`\\d\` works:
   psql "\$DATABASE_URL" -c "\\d transactions"
   psql "\$DATABASE_URL" -c "SELECT id, name, type FROM accounts WHERE workspace_id = '${ctx.workspaceId}' ORDER BY type, name"
+
+Tool discipline — SEQUENTIAL Bash calls only. Issue Bash tool calls one
+at a time and wait for each result before deciding the next command.
+NEVER batch multiple Bash invocations into one parallel tool-call block:
+if any one errors, every sibling call is cancelled mid-flight, and the
+cascade of cancellations is disorienting enough to corrupt your own
+extraction state (#126). One command, one result, then the next.
 
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
@@ -794,20 +801,20 @@ exact bracket-free form in BOTH the dedup pre-check query AND when you store
 querying the other silently breaks dedup → duplicate transactions. One form,
 everywhere.
 
-**Decoding the body.** The \`.eml\` body is MIME-encoded. Quoted-printable
-parts are readable as-is (ignore \`=3D\` and soft \`=\\n\` line-breaks). But a
-\`Content-Transfer-Encoding: base64\` part is NOT human-readable — do NOT try
-to read the raw base64 blob. Decode it first, e.g.:
+**Decoding the body.** The \`.eml\` body is MIME-encoded (quoted-printable
+or base64, sometimes with non-UTF-8 bytes). Do NOT try to read a raw
+base64 blob, and do NOT improvise your own decoder. Run exactly this
+tested one-liner (stdlib only — handles QP, base64, and charset quirks;
+note \`message_from_binary_file\` + \`policy=email.policy.default\`, both
+required):
 
-     python3 - <<'PY'
-     import email,sys
-     m=email.message_from_file(open("${ctx.filePath}"))
-     for p in m.walk():
-         if p.get_content_type()=="text/html":
-             print(p.get_content()); break
-     PY
+  python3 -c "import email,email.policy,sys; m=email.message_from_binary_file(open(sys.argv[1],'rb'),policy=email.policy.default); p=m.get_body(preferencelist=('html','plain')); print(p.get_content() if p else '(no text body found)')" "${ctx.filePath}" > /tmp/email-body.txt
 
-   then read the decoded HTML. (stdlib \`email\` handles both QP and base64.)
+then Read \`/tmp/email-body.txt\`. If (and only if) that command fails,
+fall back to reading the raw \`.eml\` directly — quoted-printable parts
+are human-readable as-is (ignore \`=3D\` and soft \`=\\n\` line-breaks).
+Try ONE approach at a time; never fire multiple decode attempts in
+parallel (see Tool discipline above).
 
 1. **Dedup pre-check — skip the WHOLE ingest if this email was already
    ingested.** A re-forwarded copy has different bytes (so the sha256
