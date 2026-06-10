@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.13";
+export const PROMPT_VERSION = "2.14";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -34,6 +34,30 @@ export interface ExtractorPromptContext {
   documentId: string;
   /** User owner of the workspace, used as `created_by` on transactions. */
   userId: string;
+  /** Perceptually-near existing documents (#134), pHash d ≤ 2, each
+   *  linked to a live transaction. Injected by the worker; candidate-
+   *  surfacing evidence for the near-dup decision in Phase 4a.0. */
+  phashNeighbors?: {
+    documentId: string;
+    transactionId: string;
+    distance: number;
+  }[];
+}
+
+/** Render the pHash-neighbor context block for Phase 4a.0. */
+function renderPhashNeighbors(
+  neighbors: ExtractorPromptContext["phashNeighbors"],
+): string {
+  if (!neighbors || neighbors.length === 0) {
+    return `(none — no perceptually-similar existing image was found for this
+upload. The SQL candidate check below still applies.)`;
+  }
+  return neighbors
+    .map(
+      (n) =>
+        `  - document ${n.documentId} (pHash distance ${n.distance}) → transaction ${n.transactionId}`,
+    )
+    .join("\n");
 }
 
 export function buildExtractorPrompt(ctx: ExtractorPromptContext): string {
@@ -865,6 +889,74 @@ discovery_failed check, so they cost nothing extra at ingest. They
 become eligible for discovery + icon acquisition if a future ingest
 sees the same brand as a merchant.
 
+**Phase 4a.0 — Near-duplicate pre-INSERT check (#134). MANDATORY for
+receipt_image / receipt_email / receipt_pdf, AFTER extraction and
+BEFORE any transaction INSERT.**
+
+The same purchase may already be in the ledger via another copy
+(re-shot photo, re-scanned PDF) or another evidence channel (the email
+for a PDF you're holding, the invoice for a receipt). Inserting again
+double-counts the money. Decide attach-vs-insert as follows.
+
+Perceptually-similar existing documents (pHash, candidate-surfacing
+ONLY — same-app screenshots of DIFFERENT purchases can land here, so
+the extracted fields below always decide, never this list by itself):
+
+${renderPhashNeighbors(ctx.phashNeighbors)}
+
+Candidate query — run it with YOUR extracted values (±3-day window
+covers settlement-date drift):
+
+  psql "\$DATABASE_URL" -c "SELECT t.id, t.payee, t.occurred_on, t.metadata->>'order_number' AS order_number, t.metadata->>'payment_id' AS payment_id, t.metadata->>'approval_code' AS approval_code, t.metadata->>'payment' AS payment FROM transactions t JOIN postings p ON p.transaction_id = t.id AND p.amount_minor > 0 WHERE t.workspace_id = '${ctx.workspaceId}' AND t.status IN ('posted','reconciled') AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3 GROUP BY t.id HAVING SUM(p.amount_minor) = <TOTAL_MINOR> LIMIT 5"
+
+Union the result with any pHash-neighbor transactions above, then walk
+this tree (tiebreaker strength: order/receipt number > payment auth
+code / card last-4 > time-of-day > items list):
+
+1. **No candidate** → proceed to the normal INSERT below.
+2. **A candidate matches on a STRONG tiebreaker** (same order/receipt
+   number, or same auth code, or same card last-4 + same time-of-day +
+   same items) AND same merchant → this purchase is already in the
+   ledger. Do NOT insert a transaction. Instead ATTACH:
+
+     psql "\$DATABASE_URL" <<'SQL'
+     BEGIN;
+     INSERT INTO document_links (document_id, transaction_id)
+     VALUES ('${ctx.documentId}', '<EXISTING_TX_ID>')
+     ON CONFLICT DO NOTHING;
+     UPDATE transactions
+        SET metadata = metadata || jsonb_build_object(
+              'merge_audit',
+              COALESCE(metadata->'merge_audit', '[]'::jsonb) || jsonb_build_object(
+                'attached_document_id', '${ctx.documentId}',
+                'source_ingest_id', '${ctx.ingestId}',
+                'reason', '<one line: which tiebreakers matched>',
+                'at', NOW()::text
+              )
+            )
+      WHERE id = '<EXISTING_TX_ID>';
+     COMMIT;
+     SQL
+
+   Still run the email post-step (message_id / source_meta stamp) if
+   classification is receipt_email. Then close the ingest in Phase 5
+   with **status='near_dup'** and
+   \`produced.transaction_ids = ['<EXISTING_TX_ID>']\`. Skip Phases
+   2.6/3/4b/4c entirely — the existing transaction already carries
+   merchant/place/brand data.
+3. **Candidates exist but a strong tiebreaker DISAGREES** (different
+   order numbers, different auth codes, or clearly different items /
+   time-of-day) → genuinely distinct purchases that coincide on
+   amount+date. Proceed to INSERT, and add
+   \`'near_dup_check', jsonb_build_object('candidate_transaction_id','<ID>','verdict','distinct','reason','<why>')\`
+   to the metadata object in the template.
+4. **Candidates exist but NEITHER side has a strong tiebreaker**
+   (no order number, no auth code on one or both) → NEVER attach on a
+   weak match. Proceed to INSERT, and add
+   \`'near_dup_check', jsonb_build_object('candidate_transaction_id','<ID>','verdict','uncertain','flagged_for_review',true,'reason','<why>')\`
+   to the metadata object. A flagged duplicate is recoverable; a wrong
+   merge silently loses a real purchase (#125's failure class).
+
 Write one balanced transaction. The expense account name is **exactly
 the \`merchant.category\` value you emitted in Phase 2.5** — one of the
 seven canonical accounts:
@@ -1256,7 +1348,7 @@ Regardless of classification, end with:
 
   psql "\$DATABASE_URL" <<SQL
   UPDATE ingests
-     SET status = '<done|unsupported>',
+     SET status = '<done|unsupported|near_dup>',
          classification = '<classification>',
          produced = jsonb_build_object(
            'transaction_ids', ARRAY[<quoted tx_ids, comma-separated>]::text[],
@@ -1271,6 +1363,12 @@ Regardless of classification, end with:
 
 Use status='unsupported' when classification is unsupported (set
 error = <one-line reason>).
+
+Use status='near_dup' ONLY for the Phase 4a.0 attach outcome (branch 2):
+\`transaction_ids\` must contain exactly the existing transaction you
+attached '${ctx.documentId}' to, and the \`document_links\` row must
+already be committed — the worker verifies the link exists and forces
+'error' if it doesn't. error = NULL.
 
 If any INSERT above fails (foreign key violation, balance trigger,
 constraint error), catch it and instead:

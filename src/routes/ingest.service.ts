@@ -39,7 +39,7 @@ export interface IngestRow {
   filename: string;
   mime_type: string | null;
   file_path: string;
-  status: "queued" | "processing" | "done" | "error" | "unsupported" | "dedup";
+  status: "queued" | "processing" | "done" | "error" | "unsupported" | "dedup" | "near_dup";
   classification: string | null;
   produced: {
     receipt_ids: string[];
@@ -60,6 +60,7 @@ export interface BatchCounts {
   unsupported: number;
   // L1 short-circuit hits (#124).
   dedup: number;
+  near_dup: number;
 }
 
 export interface BatchSummaryRow {
@@ -121,6 +122,7 @@ async function fetchBatchCounts(batchId: string): Promise<BatchCounts> {
     error: 0,
     unsupported: 0,
     dedup: 0,
+    near_dup: 0,
   };
   for (const row of res.rows as Array<{ status: string; n: number }>) {
     const n = Number(row.n);

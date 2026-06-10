@@ -37,6 +37,16 @@ export interface ExtractorInput {
   documentId: string;
   /** Owner user id the agent stamps on `transactions.created_by`. */
   userId: string;
+  /** Perceptually-near existing documents (#134): pHash distance ≤ 2,
+   *  each already linked to a live transaction. Candidate-surfacing
+   *  only — the agent compares extracted fields before deciding to
+   *  attach. Empty/omitted when the upload has no phash or no close
+   *  neighbors. */
+  phashNeighbors?: {
+    documentId: string;
+    transactionId: string;
+    distance: number;
+  }[];
 }
 
 export interface ExtractorResult {
@@ -117,6 +127,7 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     workspaceId: input.workspaceId,
     documentId: input.documentId,
     userId: input.userId,
+    phashNeighbors: input.phashNeighbors,
   };
   const prompt = buildExtractorPrompt(ctx);
   // Log the live-transcript path BEFORE spawn so an operator can

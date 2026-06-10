@@ -2504,6 +2504,9 @@
           },
           "dedup": {
             "type": "integer"
+          },
+          "near_dup": {
+            "type": "integer"
           }
         },
         "required": [
@@ -2513,7 +2516,8 @@
           "done",
           "error",
           "unsupported",
-          "dedup"
+          "dedup",
+          "near_dup"
         ]
       },
       "IngestStatus": {
@@ -2524,7 +2528,8 @@
           "done",
           "error",
           "unsupported",
-          "dedup"
+          "dedup",
+          "near_dup"
         ]
       },
       "IngestClassification": {

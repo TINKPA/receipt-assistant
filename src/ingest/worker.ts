@@ -32,6 +32,7 @@ import {
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
 import { resolveUploadPath } from "../routes/documents.service.js";
+import { phashDistance } from "../images/phash.js";
 import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
@@ -113,6 +114,7 @@ async function fetchCountsForEvent(batchId: string): Promise<BatchCountsPayload>
     error: 0,
     unsupported: 0,
     dedup: 0,
+    near_dup: 0,
   };
   for (const row of res.rows as Array<{ status: string; n: number }>) {
     const n = Number(row.n);
@@ -199,7 +201,7 @@ async function readIngestTerminal(
   ingestId: string,
   workspaceId: string,
 ): Promise<{
-  status: "done" | "unsupported" | "error";
+  status: "done" | "unsupported" | "error" | "near_dup";
   classification: string | null;
   produced: {
     transaction_ids: string[];
@@ -222,7 +224,8 @@ async function readIngestTerminal(
   if (
     row.status !== "done" &&
     row.status !== "unsupported" &&
-    row.status !== "error"
+    row.status !== "error" &&
+    row.status !== "near_dup"
   ) {
     return null;
   }
@@ -240,6 +243,53 @@ async function readIngestTerminal(
     },
     error: typeof row.error === "string" ? row.error : null,
   };
+}
+
+/**
+ * #134 L2: find existing documents perceptually near (pHash hamming
+ * distance <= 2) the just-uploaded one, restricted to documents already
+ * linked to a live transaction (the only useful attach targets).
+ * Returns at most 5, nearest first. Full scan over hashed rows — sub-ms
+ * at the current corpus scale; revisit if documents grows past ~10k.
+ */
+async function findPhashNeighbors(
+  workspaceId: string,
+  documentId: string,
+): Promise<{ documentId: string; transactionId: string; distance: number }[]> {
+  const self = await db.execute(
+    sql`SELECT phash FROM documents WHERE id = ${documentId}::uuid`,
+  );
+  const phash = (self.rows[0] as { phash: string | null } | undefined)?.phash;
+  if (!phash) return [];
+  const others = await db.execute(
+    sql`SELECT DISTINCT d.id AS document_id, d.phash, dl.transaction_id
+          FROM documents d
+          JOIN document_links dl ON dl.document_id = d.id
+          JOIN transactions t ON t.id = dl.transaction_id
+         WHERE d.workspace_id = ${workspaceId}::uuid
+           AND d.id <> ${documentId}::uuid
+           AND d.phash IS NOT NULL
+           AND d.deleted_at IS NULL
+           AND t.status IN ('posted','reconciled')`,
+  );
+  const out: { documentId: string; transactionId: string; distance: number }[] =
+    [];
+  for (const r of others.rows as {
+    document_id: string;
+    phash: string;
+    transaction_id: string;
+  }[]) {
+    const distance = phashDistance(phash, r.phash);
+    if (distance <= 2) {
+      out.push({
+        documentId: r.document_id,
+        transactionId: r.transaction_id,
+        distance,
+      });
+    }
+  }
+  out.sort((a, b) => a.distance - b.distance);
+  return out.slice(0, 5);
 }
 
 async function runOne(item: QueueItem): Promise<void> {
@@ -294,6 +344,14 @@ async function runOne(item: QueueItem): Promise<void> {
   await onBatchChildStarted(batchId, workspaceId);
   busEmit("job.started", { batchId, ingestId });
 
+  // #134 L2: surface perceptually-near existing documents (pHash d ≤ 2,
+  // linked to a live transaction) as candidates for the agent's Phase
+  // 4a.0 near-dup decision. Candidate-surfacing only — production
+  // calibration showed same-app-template screenshots of DIFFERENT
+  // purchases collide at d=2, so extracted fields decide, never the
+  // hash. Full scan is fine at corpus scale (~hundreds of rows).
+  const phashNeighbors = await findPhashNeighbors(workspaceId, documentId);
+
   let result: ExtractorResult;
   try {
     result = await defaultClaudeExtractor({
@@ -306,6 +364,7 @@ async function runOne(item: QueueItem): Promise<void> {
       workspaceId,
       documentId,
       userId,
+      phashNeighbors,
     });
   } catch (err) {
     // Agent died / timed out before closing out the ingest row. Stamp
@@ -347,12 +406,45 @@ async function runOne(item: QueueItem): Promise<void> {
     return;
   }
 
+  // #134 — verify an agent-reported `near_dup` before trusting it: the
+  // attach contract requires a committed document_links row pointing
+  // this document at a live transaction. An unverified near_dup would
+  // silently drop a receipt under the cover of "already in the ledger"
+  // — the same failure class #125 guards `done` against.
+  if (terminal.status === "near_dup") {
+    const target = terminal.produced.transaction_ids[0];
+    const linked = target
+      ? await db.execute(
+          sql`SELECT 1 FROM document_links dl
+                JOIN transactions t ON t.id = dl.transaction_id
+               WHERE dl.document_id = ${documentId}::uuid
+                 AND dl.transaction_id = ${target}::uuid
+                 AND t.workspace_id = ${workspaceId}::uuid
+                 AND t.status IN ('posted','reconciled')`,
+        )
+      : { rows: [] };
+    if (!target || linked.rows.length === 0) {
+      const msg =
+        "near_dup claimed but no committed document_links row to a live transaction — forcing error (#134 guard)";
+      await db
+        .update(ingests)
+        .set({ status: "error", error: msg, completedAt: new Date() })
+        .where(
+          and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
+        );
+      busEmit("job.error", { batchId, ingestId, error: msg });
+      await onBatchChildTerminated(batchId, workspaceId);
+      return;
+    }
+  }
+
   // #125 — don't trust the agent's self-reported `done`. For a receipt
   // classification, `done` with zero transactions is silent data loss
   // (the user/mail-ingest skill sees success and discards the source
   // email). The only legitimate zero-transaction `done` is the email
   // dedup skip (error sentinel below). `unsupported` has its own
-  // status, and the L1 byte-dedup path (#124) never enters the worker.
+  // status, the L1 byte-dedup path (#124) never enters the worker, and
+  // `near_dup` (#134) is verified above.
   const RECEIPT_KINDS = ["receipt_image", "receipt_email", "receipt_pdf"];
   if (
     terminal.status === "done" &&
@@ -361,23 +453,46 @@ async function runOne(item: QueueItem): Promise<void> {
     terminal.produced.transaction_ids.length === 0 &&
     !(terminal.error ?? "").startsWith("duplicate Message-ID")
   ) {
-    const msg =
-      "receipt classified but no transaction written — forcing error (agent self-reported done; see #125)";
-    // Not markError(): that helper wipes `produced`, and the agent may
-    // have legitimately written document_ids worth keeping for triage.
-    await db
-      .update(ingests)
-      .set({
-        status: "error",
-        error: msg,
-        completedAt: new Date(),
-      })
-      .where(
-        and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
+    // #133 — before forcing error, cross-check the ledger itself: the
+    // 2026-05-29 incident agent DID write a posted transaction but
+    // reported produced=[]. `transactions.source_ingest_id` is ground
+    // truth; if rows exist, self-heal `produced` instead of erroring.
+    const written = await db.execute(
+      sql`SELECT id FROM transactions
+           WHERE workspace_id = ${workspaceId}::uuid
+             AND source_ingest_id = ${ingestId}::uuid
+             AND status IN ('posted','reconciled','draft')`,
+    );
+    const foundIds = (written.rows as { id: string }[]).map((r) => r.id);
+    if (foundIds.length > 0) {
+      console.log(
+        `[worker] #133 self-heal: ingest ${ingestId} reported produced=[] but wrote tx [${foundIds.join(",")}] — repairing produced`,
       );
-    busEmit("job.error", { batchId, ingestId, error: msg });
-    await onBatchChildTerminated(batchId, workspaceId);
-    return;
+      await db.execute(
+        sql`UPDATE ingests
+               SET produced = jsonb_set(COALESCE(produced,'{}'::jsonb), '{transaction_ids}', ${JSON.stringify(foundIds)}::jsonb)
+             WHERE id = ${ingestId}::uuid AND workspace_id = ${workspaceId}::uuid`,
+      );
+      terminal.produced.transaction_ids = foundIds;
+    } else {
+      const msg =
+        "receipt classified but no transaction written — forcing error (agent self-reported done; see #125)";
+      // Not markError(): that helper wipes `produced`, and the agent may
+      // have legitimately written document_ids worth keeping for triage.
+      await db
+        .update(ingests)
+        .set({
+          status: "error",
+          error: msg,
+          completedAt: new Date(),
+        })
+        .where(
+          and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
+        );
+      busEmit("job.error", { batchId, ingestId, error: msg });
+      await onBatchChildTerminated(batchId, workspaceId);
+      return;
+    }
   }
 
   if (terminal.status === "error") {
@@ -447,7 +562,7 @@ async function onBatchChildTerminated(
          AND NOT EXISTS (
            SELECT 1 FROM ingests
             WHERE batch_id = ${batchId}::uuid
-              AND status NOT IN ('done','error','unsupported','dedup')
+              AND status NOT IN ('done','error','unsupported','dedup','near_dup')
          )
       RETURNING id, auto_reconcile`,
   );
