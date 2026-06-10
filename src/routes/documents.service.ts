@@ -14,6 +14,7 @@ import { db } from "../db/client.js";
 import { documents, documentLinks } from "../schema/documents.js";
 import { transactions, postings, transactionEvents } from "../schema/index.js";
 import { derivationEvents } from "../schema/derivation_events.js";
+import { computePhash, isHashableImageMime } from "../images/phash.js";
 import { newId } from "../http/uuid.js";
 import {
   DocumentHasLinksProblem,
@@ -204,6 +205,12 @@ export async function uploadDocumentBytes(params: {
   const fullPath = path.join(dir, filename);
   await writeFile(fullPath, bytes);
 
+  // L2 dedup evidence (#134): perceptual hash for images. Null on
+  // decode failure or non-image — never blocks the upload.
+  const phash = isHashableImageMime(mimeType)
+    ? await computePhash(bytes)
+    : null;
+
   const id = newId();
   const inserted = await db
     .insert(documents)
@@ -213,6 +220,7 @@ export async function uploadDocumentBytes(params: {
       kind,
       // Stored relative to the uploads dir (#128) — see resolveUploadPath.
       filePath: filename,
+      phash,
       mimeType: mimeType ?? null,
       sha256: sha,
       ocrText: null,
