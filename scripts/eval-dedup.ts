@@ -502,7 +502,7 @@ async function main(): Promise<void> {
       { name: "race-a.jpg", bytes: await reencode(RACE_IMAGE, 70), mime: "image/jpeg" },
       { name: "race-b.jpg", bytes: await reencode(RACE_IMAGE, 64), mime: "image/jpeg" },
     ]);
-    await pollBatch(up.batchId, 600_000);
+    await pollBatch(up.batchId, 1_200_000); // two concurrent heavy extractions + icon pipeline legitimately exceed 10 min
     const ings = await q<{ status: string }>(
       `SELECT status FROM ingests WHERE batch_id = $1`, [up.batchId]);
     const statuses = ings.map((i) => i.status).sort();
