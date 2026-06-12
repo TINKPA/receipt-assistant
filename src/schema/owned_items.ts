@@ -59,6 +59,9 @@ export const ownedItems = pgTable(
     condition: text("condition"),
     /** Sold / broken / given-away timestamp. NULL → still owned. */
     retiredAt: timestamp("retired_at", { withTimezone: true }),
+    /** Achievement-plan horizon in days (board screen 11): "use it for
+     *  5 years" → 1825. NULL = no plan; the UI offers class defaults. */
+    targetDays: integer("target_days"),
     notes: text("notes"),
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })

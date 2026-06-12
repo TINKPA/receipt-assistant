@@ -19,6 +19,7 @@ import { ownedItems, products } from "../schema/index.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   OwnedItem,
+  OwnedItemExpanded,
   CreateOwnedItemRequest,
   UpdateOwnedItemRequest,
   ListOwnedItemsQuery,
@@ -82,10 +83,30 @@ function rowToDto(row: any) {
       (row.retiredAt ?? row.retired_at) === undefined
         ? null
         : toIsoString(row.retiredAt ?? row.retired_at),
+    target_days:
+      (row.targetDays ?? row.target_days) === null ||
+      (row.targetDays ?? row.target_days) === undefined
+        ? null
+        : Number(row.targetDays ?? row.target_days),
     notes: row.notes ?? null,
     metadata: row.metadata ?? {},
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
+  };
+}
+
+/** `expand=product` row → DTO extras (board's Things grid context). */
+function expandedExtras(row: any) {
+  return {
+    product_name: row.product_name ?? null,
+    item_class: row.item_class ?? null,
+    paid_minor:
+      row.paid_minor === null || row.paid_minor === undefined
+        ? null
+        : Number(row.paid_minor),
+    paid_currency: row.paid_currency ?? null,
+    payee: row.payee ?? null,
+    merchant_brand_id: row.merchant_brand_id ?? null,
   };
 }
 
@@ -119,14 +140,35 @@ ownedItemsRouter.get(
       }
 
       const where = sql.join(conditions, sql` AND `);
+      // expand=product joins the catalog name/class plus the purchase
+      // context (effective paid amount, payee, brand) so the Things grid
+      // renders from one request. LEFT JOINs — manual rows (gifts) have
+      // no transaction item and still come back whole.
       const rowsRes = await db.execute(
-        sql`SELECT * FROM owned_items o WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`,
+        query.expand === "product"
+          ? sql`SELECT o.*,
+                  COALESCE(p.custom_name, p.canonical_name) AS product_name,
+                  p.item_class AS item_class,
+                  COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor,
+                  t.currency AS paid_currency,
+                  t.payee AS payee,
+                  t.merchant_brand_id AS merchant_brand_id
+                FROM owned_items o
+                LEFT JOIN products p ON p.id = o.product_id
+                LEFT JOIN transaction_items ti ON ti.id = o.transaction_item_id
+                LEFT JOIN transactions t ON t.id = ti.transaction_id
+                WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`
+          : sql`SELECT * FROM owned_items o WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`,
       );
       const rows = rowsRes.rows as any[];
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
 
-      const items = page.map(rowToDto);
+      const items = page.map((r) =>
+        query.expand === "product"
+          ? { ...rowToDto(r), ...expandedExtras(r) }
+          : rowToDto(r),
+      );
       const nextCursor = hasMore
         ? encodeCursor({
             updated_at: toIsoString(page[page.length - 1]!.updated_at),
@@ -236,6 +278,7 @@ ownedItemsRouter.patch(
       if (body.retired_at !== undefined) {
         updates["retiredAt"] = body.retired_at ? new Date(body.retired_at) : null;
       }
+      if (body.target_days !== undefined) updates["targetDays"] = body.target_days;
       if (Object.keys(updates).length === 0) {
         throw new HttpProblem(
           400,
@@ -291,6 +334,7 @@ ownedItemsRouter.delete(
 
 export function registerOwnedItemsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("OwnedItem", OwnedItem);
+  registry.register("OwnedItemExpanded", OwnedItemExpanded);
   registry.register("CreateOwnedItemRequest", CreateOwnedItemRequest);
   registry.register("UpdateOwnedItemRequest", UpdateOwnedItemRequest);
 
@@ -302,12 +346,16 @@ export function registerOwnedItemsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/owned-items",
     summary: "List owned physical-instance items",
+    description:
+      "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item.",
     tags: ["owned-items"],
     request: { query: ListOwnedItemsQuery },
     responses: {
       200: {
         description: "OK",
-        content: { "application/json": { schema: paginated(OwnedItem) } },
+        content: {
+          "application/json": { schema: paginated(OwnedItemExpanded) },
+        },
       },
     },
   });
