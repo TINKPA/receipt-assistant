@@ -27,6 +27,7 @@ import { registerProductsOpenApi } from "./routes/products.js";
 import { registerOwnedItemsOpenApi } from "./routes/owned-items.js";
 import { registerWishItemsOpenApi } from "./routes/wish-items.js";
 import { registerInsightsOpenApi } from "./routes/insights.js";
+import { registerPartiesOpenApi } from "./routes/parties.js";
 import { registerBrandsOpenApi } from "./routes/brands.js";
 import { registerPostingsOpenApi } from "./routes/postings.js";
 import { registerDocumentsOpenApi } from "./routes/documents.js";
@@ -86,6 +87,7 @@ export function buildRegistry(): OpenAPIRegistry {
   registerOwnedItemsOpenApi(registry);
   registerWishItemsOpenApi(registry);
   registerInsightsOpenApi(registry);
+  registerPartiesOpenApi(registry);
   registerBrandsOpenApi(registry);
   registerPostingsOpenApi(registry);
   registerDocumentsOpenApi(registry);
