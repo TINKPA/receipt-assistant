@@ -70,6 +70,13 @@ const RACE_IMAGE =
 
 const db = new pg.Client({ connectionString: PG_URL });
 
+// Per-run nonce: stub seeds carry it in payees/order-numbers so reruns
+// against a dirty sandbox never cross-match a previous run's rows
+// (fixed values would near-dup-match across runs and auto-void each
+// other — observed before this existed). Claude cases (b2/b3/race) use
+// real corpus images and DO require a reset sandbox.
+const NONCE = randomUUID().slice(0, 6);
+
 // ── helpers ────────────────────────────────────────────────────────────
 async function q<T = Record<string, unknown>>(
   text: string,
@@ -248,7 +255,7 @@ async function main(): Promise<void> {
     const { batchId, ingestIds } = await postBatch([
       stubFile({
         write_transaction: {
-          payee: "SelfHeal Mart",
+          payee: `SelfHeal Mart ${NONCE}`,
           occurred_on: "2026-06-01",
           total_minor: 1234,
           link_document: true,
@@ -288,10 +295,10 @@ async function main(): Promise<void> {
   let r1BatchB: string | null = null;
   await runCase("r1", false, async (notes) => {
     const seed = {
-      payee: "EdgeMart",
+      payee: `EdgeMart ${NONCE}`,
       occurred_on: "2026-06-02",
       total_minor: 5555,
-      metadata: { order_number: "ORD-EDGE-1", payment: "Visa ****1111" },
+      metadata: { order_number: `ORD-EDGE-${NONCE}`, payment: "Visa ****1111" },
       link_document: true,
     };
     const a = await postBatch([
@@ -335,7 +342,7 @@ async function main(): Promise<void> {
   // r2 — card-last4 conflict kills the pair → no proposal
   await runCase("r2", false, async (notes) => {
     const mk = (last4: string) => ({
-      payee: "CardConflict Deli",
+      payee: `CardConflict Deli ${NONCE}`,
       occurred_on: "2026-06-03",
       total_minor: 2750,
       metadata: { payment: `Visa ****${last4}` },
@@ -349,11 +356,21 @@ async function main(): Promise<void> {
       stubFile({ write_transaction: mk("2222"), terminal: { status: "done", transaction_ids: ["$TX"] } }),
     ]);
     await pollBatch(b.batchId);
+    // Assert specifically that the CONFLICT PAIR produced no proposal —
+    // a dirty sandbox can legitimately propose B against unrelated
+    // same-amount rows from earlier runs, which is correct behavior.
+    const [txAr] = await q<{ id: string }>(
+      `SELECT id FROM transactions WHERE source_ingest_id = $1`, [a.ingestIds[0]]);
+    const [txBr] = await q<{ id: string }>(
+      `SELECT id FROM transactions WHERE source_ingest_id = $1`, [b.ingestIds[0]]);
     const props = await q(
-      `SELECT 1 FROM reconcile_proposals WHERE batch_id = $1 AND kind='dedup'`,
-      [b.batchId],
+      `SELECT 1 FROM reconcile_proposals
+        WHERE kind='dedup'
+          AND ((payload->>'duplicate' = $1 AND payload->>'duplicate_of' = $2)
+            OR (payload->>'duplicate' = $2 AND payload->>'duplicate_of' = $1))`,
+      [txAr!.id, txBr!.id],
     );
-    assert(props.length === 0, `expected 0 proposals, got ${props.length}`);
+    assert(props.length === 0, `conflict pair got ${props.length} proposal(s)`);
     const [txB] = await q<{ status: string }>(
       `SELECT status FROM transactions WHERE source_ingest_id = $1`,
       [b.ingestIds[0]],
