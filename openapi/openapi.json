@@ -2145,6 +2145,121 @@
           "generated"
         ]
       },
+      "TransactionParty": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "transaction_item_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "channel",
+              "seller",
+              "maker",
+              "acquirer"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "brand_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "transaction_id",
+          "transaction_item_id",
+          "role",
+          "display_name",
+          "brand_id",
+          "created_at"
+        ]
+      },
+      "BrandPartySummary": {
+        "type": "object",
+        "properties": {
+          "brand_id": {
+            "type": "string"
+          },
+          "as_channel_tx_count": {
+            "type": "integer"
+          },
+          "as_seller_line_count": {
+            "type": "integer"
+          },
+          "as_maker_line_count": {
+            "type": "integer"
+          },
+          "top_sellers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                },
+                "brand_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "line_count": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "display_name",
+                "brand_id",
+                "line_count"
+              ]
+            }
+          }
+        },
+        "required": [
+          "brand_id",
+          "as_channel_tx_count",
+          "as_seller_line_count",
+          "as_maker_line_count",
+          "top_sellers"
+        ]
+      },
       "Brand": {
         "type": "object",
         "properties": {
@@ -6982,6 +7097,79 @@
               "application/problem+json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transactions/{id}/parties": {
+      "get": {
+        "summary": "Party graph rows for one transaction (channel/seller/maker/acquirer)",
+        "tags": [
+          "parties"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TransactionParty"
+                      }
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/brands/{brandId}/party-summary": {
+      "get": {
+        "summary": "Role counts + marketplace-seller share for a brand",
+        "tags": [
+          "parties"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": true,
+            "name": "brandId",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandPartySummary"
                 }
               }
             }

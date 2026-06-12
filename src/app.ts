@@ -24,6 +24,7 @@ import { productsRouter } from "./routes/products.js";
 import { ownedItemsRouter } from "./routes/owned-items.js";
 import { wishItemsRouter } from "./routes/wish-items.js";
 import { insightsRouter } from "./routes/insights.js";
+import { partiesRouter } from "./routes/parties.js";
 import { brandsRouter } from "./routes/brands.js";
 import { postingsRouter } from "./routes/postings.js";
 import { documentsRouter } from "./routes/documents.js";
@@ -82,6 +83,7 @@ export function buildApp(): Express {
   app.use("/v1/owned-items", ownedItemsRouter);
   app.use("/v1/wish-items", wishItemsRouter);
   app.use("/v1/insights", insightsRouter);
+  app.use("/v1", partiesRouter);
   app.use("/v1/brands", brandsRouter);
   app.use("/v1/postings", postingsRouter);
   app.use("/v1/documents", documentsRouter);

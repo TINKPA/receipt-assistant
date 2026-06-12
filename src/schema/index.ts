@@ -8,6 +8,7 @@ export * from "./transaction_items.js";
 export * from "./owned_items.js";
 export * from "./wish_items.js";
 export * from "./insights.js";
+export * from "./transaction_parties.js";
 export * from "./brands.js";
 export * from "./postings.js";
 export * from "./documents.js";

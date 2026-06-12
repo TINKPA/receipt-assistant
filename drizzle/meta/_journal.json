@@ -204,6 +204,13 @@
       "when": 1781261127486,
       "tag": "0028_rare_thunderbolt_ross",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1781261983094,
+      "tag": "0029_dear_wendell_vaughn",
+      "breakpoints": true
     }
   ]
 }
