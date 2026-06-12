@@ -446,8 +446,8 @@ async function main() {
   files.forEach((f, i) => ingestByFx.set(f.fixture, batch.items[i]!.ingestId));
 
   // 3. Poll until terminal.
-  console.error(`\n[3/4] Polling /v1/batches/${batch.batchId} until all terminal (timeout 30 min)`);
-  const batchRow = await pollBatch(args.base, batch.batchId, files.length, 30 * 60 * 1000);
+  console.error(`\n[3/4] Polling /v1/batches/${batch.batchId} until all terminal (timeout 60 min)`);
+  const batchRow = await pollBatch(args.base, batch.batchId, files.length, 60 * 60 * 1000);
   await cleanup();
 
   // 4. For each fixture, pull transaction details + score.
