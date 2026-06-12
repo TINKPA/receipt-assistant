@@ -42,7 +42,6 @@ export const OwnedItemExpanded = OwnedItem.extend({
   product_name: z.string().nullable().optional(),
   item_class: z.string().nullable().optional(),
   paid_minor: z.number().int().nullable().optional(),
-  paid_currency: z.string().nullable().optional(),
   payee: z.string().nullable().optional(),
   merchant_brand_id: z.string().nullable().optional(),
 }).openapi("OwnedItemExpanded");

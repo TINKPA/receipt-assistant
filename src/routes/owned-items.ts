@@ -104,7 +104,6 @@ function expandedExtras(row: any) {
       row.paid_minor === null || row.paid_minor === undefined
         ? null
         : Number(row.paid_minor),
-    paid_currency: row.paid_currency ?? null,
     payee: row.payee ?? null,
     merchant_brand_id: row.merchant_brand_id ?? null,
   };
@@ -150,13 +149,13 @@ ownedItemsRouter.get(
                   COALESCE(p.custom_name, p.canonical_name) AS product_name,
                   p.item_class AS item_class,
                   COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor,
-                  t.currency AS paid_currency,
                   t.payee AS payee,
-                  t.merchant_brand_id AS merchant_brand_id
+                  m.brand_id AS merchant_brand_id
                 FROM owned_items o
                 LEFT JOIN products p ON p.id = o.product_id
                 LEFT JOIN transaction_items ti ON ti.id = o.transaction_item_id
                 LEFT JOIN transactions t ON t.id = ti.transaction_id
+                LEFT JOIN merchants m ON m.id = t.merchant_id
                 WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`
           : sql`SELECT * FROM owned_items o WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`,
       );
