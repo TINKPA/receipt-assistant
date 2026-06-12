@@ -61,6 +61,10 @@ services:
       CLAUDE_CONFIG_DIR: /home/node/.claude
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
+      # Test-only: lets stub instruction files ("__stub__": true JSON)
+      # bypass `claude -p` so guard negative paths + L3b seeding are
+      # deterministic. NEVER set this on the production compose.
+      EXTRACTOR_STUB_ALLOWED: "1"
       LOGODEV_PUBLISHABLE_KEY: ${LOGODEV_PUBLISHABLE_KEY:-}
       LOGODEV_SECRET_KEY: ${LOGODEV_SECRET_KEY:-}
     volumes:

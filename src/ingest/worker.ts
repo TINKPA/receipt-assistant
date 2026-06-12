@@ -33,6 +33,20 @@ import {
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
 import { resolveUploadPath } from "../routes/documents.service.js";
 import { phashDistance } from "../images/phash.js";
+import { isStubFile, stubFileExtractor } from "./stub-extractor.js";
+
+/**
+ * Test-only escape hatch (#134/#135 hardening): when the sandbox sets
+ * EXTRACTOR_STUB_ALLOWED=1 AND the uploaded file is a stub instruction
+ * JSON, route to the stub extractor instead of `claude -p`. Both
+ * conditions are required; production compose never sets the env, so
+ * this is dead code there. Real receipts in the sandbox still go to
+ * the real agent — the two coexist per-file.
+ */
+async function pickExtractor(absPath: string) {
+  if (process.env.EXTRACTOR_STUB_ALLOWED !== "1") return defaultClaudeExtractor;
+  return (await isStubFile(absPath)) ? stubFileExtractor : defaultClaudeExtractor;
+}
 import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
@@ -352,9 +366,10 @@ async function runOne(item: QueueItem): Promise<void> {
   // hash. Full scan is fine at corpus scale (~hundreds of rows).
   const phashNeighbors = await findPhashNeighbors(workspaceId, documentId);
 
+  const extractor = await pickExtractor(resolveUploadPath(filePath));
   let result: ExtractorResult;
   try {
-    result = await defaultClaudeExtractor({
+    result = await extractor({
       // Queue items carry the stored (uploads-relative, #128) path; the
       // agent needs a container-absolute path it can open.
       filePath: resolveUploadPath(filePath),
