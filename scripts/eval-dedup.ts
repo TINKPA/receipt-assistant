@@ -133,7 +133,13 @@ async function pollBatch(batchId: string, timeoutMs = 420_000): Promise<any> {
 function stubFile(ins: Record<string, unknown>): UploadFile {
   return {
     name: `stub-${randomUUID().slice(0, 8)}.json`,
-    bytes: Buffer.from(JSON.stringify({ __stub__: true, ...ins }, null, 1)),
+    // __salt__ keeps every stub upload byte-unique — otherwise two
+    // identical instruction files trip L1 sha-dedup and the second
+    // batch is born `dedup` without ever running the stub (observed:
+    // r1's batch B). A correct L1 behavior, wrong test vehicle.
+    bytes: Buffer.from(
+      JSON.stringify({ __stub__: true, __salt__: randomUUID(), ...ins }, null, 1),
+    ),
     mime: "application/json",
   };
 }
@@ -312,13 +318,18 @@ async function main(): Promise<void> {
     assert(links.length === 2, `expected 2 links on canonical, got ${links.length}`);
     const orphan = await q(`SELECT 1 FROM document_links WHERE transaction_id = $1`, [txB!.id]);
     assert(orphan.length === 0, "voided duplicate still owns links");
+    // The 1.0 proposal may land in EITHER batch depending on which
+    // side's fire-and-forget reconcile saw the pair first (A's can run
+    // after B's txn commits). Either way the earlier txn must survive.
     const [prop] = await q<{ score: string; status: string }>(
-      `SELECT score, status FROM reconcile_proposals WHERE batch_id = $1 AND kind='dedup'`,
-      [b.batchId],
+      `SELECT score, status FROM reconcile_proposals
+        WHERE batch_id IN ($1, $2) AND kind='dedup'
+        ORDER BY score DESC LIMIT 1`,
+      [a.batchId, b.batchId],
     );
     assert(prop && Number(prop.score) === 1 && prop.status === "auto_applied",
       `proposal: ${JSON.stringify(prop)}`);
-    notes.push(`B auto-voided @1.0; canonical holds both documents`);
+    notes.push(`later txn auto-voided @1.0; earliest survives with both documents`);
   });
 
   // r2 — card-last4 conflict kills the pair → no proposal

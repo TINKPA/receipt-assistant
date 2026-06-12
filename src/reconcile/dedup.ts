@@ -200,10 +200,11 @@ export async function detectNearDuplicates(params: {
     SELECT b.id  AS b_id, b.occurred_on AS b_date, b.payee AS b_payee,
            b.merchant_id AS b_merchant, b.order_number AS b_order,
            b.payment_id AS b_payment_id, b.payment AS b_payment,
-           b.total AS total,
+           b.created_at AS b_created, b.total AS total,
            o.id  AS o_id, o.occurred_on AS o_date, o.payee AS o_payee,
            o.merchant_id AS o_merchant, o.order_number AS o_order,
-           o.payment_id AS o_payment_id, o.payment AS o_payment
+           o.payment_id AS o_payment_id, o.payment AS o_payment,
+           o.created_at AS o_created
       FROM batch_txns b
       JOIN outside o
         ON o.total = b.total
@@ -269,9 +270,18 @@ export async function detectNearDuplicates(params: {
       score = Math.min(score, 0.9);
     }
     if (score < 0.5) continue;
+    // Canonical = the EARLIER transaction, matching the exact pass's
+    // earliest-created_at rule. Without this, two near-simultaneous
+    // batches race: whichever batch reconciles first sees the OTHER
+    // side as "outside" and voids its own (earlier) txn — observed in
+    // the eval-dedup r1 case. Converges either way, but the survivor
+    // should be deterministic.
+    const bNewer =
+      new Date(String(r.b_created)).getTime() >=
+      new Date(String(r.o_created)).getTime();
     pairs.push({
-      duplicate_id: String(r.b_id),
-      canonical_id: String(r.o_id),
+      duplicate_id: String(bNewer ? r.b_id : r.o_id),
+      canonical_id: String(bNewer ? r.o_id : r.b_id),
       score: Math.max(0, Math.min(1, score)),
       reasons,
       occurred_on: bDate,
