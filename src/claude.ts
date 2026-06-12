@@ -33,7 +33,7 @@ export function getSessionJsonlPath(sessionId: string): string {
  * Automatically assigns a session ID for traceability.
  * stdin is closed immediately to avoid "no stdin data" warnings.
  */
-function runClaude(args: string[], timeoutMs: number): Promise<{ stdout: string; sessionId: string }> {
+export function runClaude(args: string[], timeoutMs: number): Promise<{ stdout: string; sessionId: string }> {
   const sessionId = randomUUID();
   const fullArgs = [...args, "--session-id", sessionId];
   return new Promise((resolve, reject) => {
@@ -73,7 +73,7 @@ function runClaude(args: string[], timeoutMs: number): Promise<{ stdout: string;
  * In Docker: psql is available directly.
  * Local dev: use docker exec to reach the postgres container.
  */
-async function detectPsqlCommand(): Promise<string> {
+export async function detectPsqlCommand(): Promise<string> {
   // Check if psql is available locally
   try {
     await new Promise<void>((resolve, reject) => {
