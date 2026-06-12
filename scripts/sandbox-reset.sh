@@ -56,7 +56,11 @@ echo "[sandbox-reset] truncating tables in ${CONTAINER}…"
 
 # TRUNCATE every user-data table. CASCADE follows FKs so order doesn't matter.
 # RESTART IDENTITY resets sequences too.
-docker exec "$CONTAINER" psql -U postgres -d receipts -v ON_ERROR_STOP=1 <<'SQL'
+# -i is load-bearing: without it the heredoc never reaches psql, which
+# exits 0 having truncated NOTHING — the script silently no-ops while
+# printing "done" (bit us 2026-06-11; the "clean" sandboxes that round
+# were clean only because the test pipeline ran its own TRUNCATE).
+docker exec -i "$CONTAINER" psql -U postgres -d receipts -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
 DECLARE
   tbl text;
