@@ -26,12 +26,26 @@ export const OwnedItem = z
     condition: z.string().nullable(),
     /** Sold / broken / given-away timestamp. NULL → still owned. */
     retired_at: IsoDateTime.nullable(),
+    /** Achievement-plan horizon in days (1825 = 5 years). NULL = unset. */
+    target_days: z.number().int().nullable(),
     notes: z.string().nullable(),
     metadata: Metadata,
     created_at: IsoDateTime,
     updated_at: IsoDateTime,
   })
   .openapi("OwnedItem");
+
+/** List rows with `expand=product`: the catalog + purchase context the
+ *  Things grid needs in one request (no client-side N+1). All nullable —
+ *  manual rows (gifts) have no linked transaction item. */
+export const OwnedItemExpanded = OwnedItem.extend({
+  product_name: z.string().nullable().optional(),
+  item_class: z.string().nullable().optional(),
+  paid_minor: z.number().int().nullable().optional(),
+  paid_currency: z.string().nullable().optional(),
+  payee: z.string().nullable().optional(),
+  merchant_brand_id: z.string().nullable().optional(),
+}).openapi("OwnedItemExpanded");
 
 export const CreateOwnedItemRequest = z
   .object({
@@ -60,6 +74,8 @@ export const UpdateOwnedItemRequest = z
     /** Sold / broken / given-away. Setting to non-null retires the
      *  instance; null un-retires (rare but supported). */
     retired_at: IsoDateTime.nullable().optional(),
+    /** Achievement-plan horizon in days; null clears the plan. */
+    target_days: z.number().int().positive().nullable().optional(),
     metadata: Metadata.optional(),
   })
   .openapi("UpdateOwnedItemRequest");
@@ -69,6 +85,8 @@ export const ListOwnedItemsQuery = z.object({
   location: z.string().optional(),
   /** Default: false → only currently-owned rows. */
   include_retired: z.coerce.boolean().optional(),
+  /** `product` joins catalog + purchase context (OwnedItemExpanded rows). */
+  expand: z.enum(["product"]).optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });

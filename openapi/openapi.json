@@ -1602,6 +1602,12 @@
             ],
             "format": "date-time"
           },
+          "target_days": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "notes": {
             "type": [
               "string",
@@ -1635,9 +1641,58 @@
           "warranty_until",
           "condition",
           "retired_at",
+          "target_days",
           "notes",
           "created_at",
           "updated_at"
+        ]
+      },
+      "OwnedItemExpanded": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OwnedItem"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "product_name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "item_class": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "paid_minor": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "paid_currency": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "payee": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "merchant_brand_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
         ]
       },
       "CreateOwnedItemRequest": {
@@ -1743,6 +1798,250 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "target_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          }
+        }
+      },
+      "WishItem": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "product_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "title": {
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_price_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "currency": {
+            "type": "string"
+          },
+          "planned_days": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "urgency": {
+            "type": "string",
+            "enum": [
+              "now",
+              "soon",
+              "someday"
+            ]
+          },
+          "snoozed_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "example": "2026-04-19"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "converted",
+              "declined"
+            ]
+          },
+          "converted_transaction_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "product_id",
+          "title",
+          "notes",
+          "target_price_minor",
+          "currency",
+          "planned_days",
+          "urgency",
+          "snoozed_until",
+          "status",
+          "converted_transaction_id",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "CreateWishItemRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "product_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "target_price_minor": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          },
+          "currency": {
+            "type": "string"
+          },
+          "planned_days": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          },
+          "urgency": {
+            "type": "string",
+            "enum": [
+              "now",
+              "soon",
+              "someday"
+            ]
+          },
+          "snoozed_until": {
+            "type": "string",
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "example": "2026-04-19"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          }
+        },
+        "required": [
+          "title"
+        ]
+      },
+      "UpdateWishItemRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "product_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_price_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "planned_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "urgency": {
+            "type": "string",
+            "enum": [
+              "now",
+              "soon",
+              "someday"
+            ]
+          },
+          "snoozed_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "example": "2026-04-19"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "converted",
+              "declined"
+            ]
+          },
+          "converted_transaction_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
           "metadata": {
             "type": "object",
@@ -5951,6 +6250,7 @@
     "/v1/owned-items": {
       "get": {
         "summary": "List owned physical-instance items",
+        "description": "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item.",
         "tags": [
           "owned-items"
         ],
@@ -5986,6 +6286,17 @@
           },
           {
             "schema": {
+              "type": "string",
+              "enum": [
+                "product"
+              ]
+            },
+            "required": false,
+            "name": "expand",
+            "in": "query"
+          },
+          {
+            "schema": {
               "type": "string"
             },
             "required": false,
@@ -6014,7 +6325,7 @@
                     "items": {
                       "type": "array",
                       "items": {
-                        "$ref": "#/components/schemas/OwnedItem"
+                        "$ref": "#/components/schemas/OwnedItemExpanded"
                       }
                     },
                     "next_cursor": {
@@ -6171,6 +6482,256 @@
         "summary": "Hard-delete an owned item (typically used by undo of manual create)",
         "tags": [
           "owned-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wish-items": {
+      "get": {
+        "summary": "List wishlist items",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "converted",
+                "declined"
+              ]
+            },
+            "required": false,
+            "name": "status",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "now",
+                "soon",
+                "someday"
+              ]
+            },
+            "required": false,
+            "name": "urgency",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "cursor",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/WishItem"
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "next_cursor"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Add a wish",
+        "tags": [
+          "wish-items"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWishItemRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wish-items/{id}": {
+      "get": {
+        "summary": "Fetch one wish",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/merge-patch+json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWishItemRequest"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWishItemRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Hard-delete a wish",
+        "tags": [
+          "wish-items"
         ],
         "parameters": [
           {
