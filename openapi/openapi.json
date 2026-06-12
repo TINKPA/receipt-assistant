@@ -1732,9 +1732,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "additionalProperties": {}
           }
         },
         "required": [
@@ -1802,9 +1800,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "additionalProperties": {}
           }
         }
       },
@@ -1960,9 +1956,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "additionalProperties": {}
           }
         },
         "required": [
@@ -2039,9 +2033,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "additionalProperties": {}
           }
         }
       },

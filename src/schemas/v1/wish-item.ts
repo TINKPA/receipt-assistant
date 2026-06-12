@@ -45,7 +45,7 @@ export const CreateWishItemRequest = z
     planned_days: z.number().int().positive().optional(),
     urgency: WishUrgency.optional(),
     snoozed_until: IsoDate.optional(),
-    metadata: Metadata.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .openapi("CreateWishItemRequest");
 
@@ -62,7 +62,7 @@ export const UpdateWishItemRequest = z
      *  transaction id. Setting back to active un-decides. */
     status: WishStatus.optional(),
     converted_transaction_id: Uuid.nullable().optional(),
-    metadata: Metadata.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .openapi("UpdateWishItemRequest");
 
