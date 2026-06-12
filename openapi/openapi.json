@@ -3746,6 +3746,42 @@
           }
         }
       },
+      "NearDupReviewResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "flagged_for_review": {
+            "type": "boolean"
+          },
+          "reviewed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "flagged_for_review",
+          "reviewed_at"
+        ]
+      },
+      "NearDupReviewRequest": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "dismiss"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
       "UnreconcileTransactionRequest": {
         "type": "object",
         "properties": {
@@ -4773,6 +4809,17 @@
             "schema": {
               "type": "string",
               "enum": [
+                "near_dup"
+              ]
+            },
+            "required": false,
+            "name": "flagged",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
                 "occurred_on",
                 "amount",
                 "created_at"
@@ -5056,6 +5103,57 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transactions/{id}/near-dup-review": {
+      "post": {
+        "summary": "Resolve a near-duplicate review flag (#134 branch 4); v1 action: dismiss",
+        "tags": [
+          "transactions"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NearDupReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Flag cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NearDupReviewResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found or not flagged",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }
