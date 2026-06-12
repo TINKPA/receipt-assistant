@@ -473,6 +473,30 @@ When to reach for this vs. Langfuse:
 
 The JSONL is the source of truth Langfuse ingests from — when the two ever disagree, the JSONL is right.
 
+### Dedup regression matrix — `scripts/eval-dedup.ts`
+
+The dedup system (#134/#135) has a dedicated sandbox-only regression
+harness. Run it after ANY change to `src/ingest/prompt.ts` Phase 4a.0,
+the worker guards, `src/reconcile/dedup.ts`, or the pHash code:
+
+```bash
+# sandbox up + reset first:
+#   docker compose -p receipts-test -f docker-compose.test.yml up -d --build
+#   ./scripts/sandbox-reset.sh
+npx tsx scripts/eval-dedup.ts --base=http://<mini>:3001 \
+  --pg=postgresql://postgres:postgres@<mini>:5433/receipts --with-claude
+```
+
+Stub cases (`g1-g3` worker guards, `r1-r3` reconcile edges) are
+deterministic seconds; `--with-claude` adds the agent decision-tree
+branches (`b2` attach, `b3` distinct-despite-pHash, `b4` flag+review
+round-trip) and the same-batch `race` case (~15 min total). The stub
+extractor it relies on is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
+test compose only + `{"__stub__":true}` file magic) — never enable
+that env on the production compose. Don't run the claude cases while
+an `eval-dates` batch is draining: both share the worker queue and
+the auth pool, and harness poll timeouts will fire while queued.
+
 ### Manual Verification Flow
 
 No verify script. Three curl calls are the contract:

@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.14";
+export const PROMPT_VERSION = "2.15";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -88,6 +88,21 @@ every SQL call. If you want a multi-statement block, use a heredoc:
 Optional: if you want to discover schema details, \`\\d\` works:
   psql "\$DATABASE_URL" -c "\\d transactions"
   psql "\$DATABASE_URL" -c "SELECT id, name, type FROM accounts WHERE workspace_id = '${ctx.workspaceId}' ORDER BY type, name"
+
+Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
+concurrently in this container and /tmp is shared: a generic name like
+/tmp/receipt_rot.jpg WILL be overwritten by a sibling agent mid-run,
+and you will silently read someone else's receipt (#143 — this
+happened: an agent extracted the neighbor's Trader Joe's receipt under
+a Kelly's Coffee ingest and rationalized the mismatch as a stale EXIF
+preview). Rules:
+  - First command before any image work:
+      mkdir -p /tmp/${ctx.ingestId}
+    and create EVERY scratch file inside that directory.
+  - If a crop/rotation ever shows a DIFFERENT merchant than your first
+    read of the original upload, do NOT rationalize it (no "stale
+    preview" theories). Re-read the ORIGINAL file at
+    ${ctx.filePath} and trust only what it shows.
 
 Tool discipline — SEQUENTIAL Bash calls only. Issue Bash tool calls one
 at a time and wait for each result before deciding the next command.
