@@ -1673,12 +1673,6 @@
                   "null"
                 ]
               },
-              "paid_currency": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
               "payee": {
                 "type": [
                   "string",
