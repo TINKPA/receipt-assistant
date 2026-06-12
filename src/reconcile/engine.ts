@@ -380,6 +380,29 @@ export async function runReconcile(params: {
       }
     }
 
+    // ── Idempotency vs prior runs (#135 hardening) ───────────────────
+    // A batch normally reconciles once, but operators can flip status
+    // back and re-run (verification, replays). Without this filter every
+    // re-run would re-mint identical dedup proposals. Key on
+    // (kind, duplicate, duplicate_of) within the batch, regardless of
+    // the prior proposal's resolution state.
+    {
+      const prior = await db
+        .select({ kind: reconcileProposals.kind, payload: reconcileProposals.payload })
+        .from(reconcileProposals)
+        .where(eq(reconcileProposals.batchId, batchId));
+      const keyOf = (kind: string, payload: Record<string, unknown>): string =>
+        `${kind}:${String(payload.duplicate ?? "")}:${String(payload.duplicate_of ?? "")}`;
+      const seen = new Set(
+        prior.map((p) => keyOf(p.kind, (p.payload ?? {}) as Record<string, unknown>)),
+      );
+      for (let i = newProposals.length - 1; i >= 0; i--) {
+        const k = keyOf(newProposals[i]!.kind, newProposals[i]!.payload);
+        if (seen.has(k)) newProposals.splice(i, 1);
+        else seen.add(k);
+      }
+    }
+
     // ── Insert proposals row-by-row so we have IDs for auto-apply ────
     if (newProposals.length > 0) {
       await db.insert(reconcileProposals).values(
