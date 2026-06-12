@@ -58,7 +58,7 @@ export const CreateOwnedItemRequest = z
     warranty_until: IsoDate.optional(),
     condition: z.string().optional(),
     notes: z.string().optional(),
-    metadata: Metadata.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .openapi("CreateOwnedItemRequest");
 
@@ -75,7 +75,7 @@ export const UpdateOwnedItemRequest = z
     retired_at: IsoDateTime.nullable().optional(),
     /** Achievement-plan horizon in days; null clears the plan. */
     target_days: z.number().int().positive().nullable().optional(),
-    metadata: Metadata.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .openapi("UpdateOwnedItemRequest");
 
