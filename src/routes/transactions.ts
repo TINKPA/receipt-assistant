@@ -19,6 +19,8 @@ import {
   CreateTransactionRequest,
   UpdateTransactionRequest,
   VoidTransactionRequest,
+  NearDupReviewRequest,
+  NearDupReviewResponse,
   UnreconcileTransactionRequest,
   UpdatePostingRequest,
   NewPosting,
@@ -51,6 +53,7 @@ import {
   updateTransaction,
   deleteTransaction,
   voidTransaction,
+  dismissNearDupFlag,
   reconcileTransaction,
   unreconcileTransaction,
   addPosting,
@@ -455,6 +458,29 @@ transactionsRouter.delete(
 
 // ── OpenAPI registration ───────────────────────────────────────────────
 
+transactionsRouter.post(
+  "/:id/near-dup-review",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = parseOrThrow(IdParam, req.params);
+      parseOrThrow(NearDupReviewRequest, req.body ?? {});
+      // No If-Match: clearing a review flag is an idempotent, last-write-
+      // wins toggle with no payload to clobber — unlike void/reconcile,
+      // which mutate ledger state.
+      const out = await dismissNearDupFlag(
+        req.ctx.workspaceId,
+        req.ctx.userId,
+        id,
+      );
+      if (!out) throw new NotFoundProblem("Flagged transaction", id);
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+
 export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);
   registry.register("Posting", PostingSchema);
@@ -589,6 +615,26 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         description: "Mirror transaction created",
         content: { "application/json": { schema: TransactionSchema } },
       },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/transactions/{id}/near-dup-review",
+    summary: "Resolve a near-duplicate review flag (#134 branch 4); v1 action: dismiss",
+    tags: ["transactions"],
+    request: {
+      params: z.object({ id: Uuid }),
+      body: {
+        content: { "application/json": { schema: NearDupReviewRequest } },
+      },
+    },
+    responses: {
+      200: {
+        description: "Flag cleared",
+        content: { "application/json": { schema: NearDupReviewResponse } },
+      },
+      404: { description: "Not found or not flagged", content: problemContent },
     },
   });
 

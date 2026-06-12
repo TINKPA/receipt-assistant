@@ -694,6 +694,11 @@ export async function listTransactions(
   if (query.amount_max_minor !== undefined) {
     conditions.push(sql`EXISTS (SELECT 1 FROM postings p WHERE p.transaction_id = t.id AND ABS(p.amount_base_minor) <= ${query.amount_max_minor})`);
   }
+  if (query.flagged === "near_dup") {
+    conditions.push(
+      sql`(t.metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`,
+    );
+  }
   if (query.has_document === true) {
     conditions.push(sql`EXISTS (SELECT 1 FROM document_links dl WHERE dl.transaction_id = t.id)`);
   } else if (query.has_document === false) {
@@ -1491,4 +1496,41 @@ export async function getPosting(
     );
   if (rows.length === 0) throw new NotFoundProblem("Posting", id);
   return mapPostingRow(rows[0]!);
+}
+
+/**
+ * Resolve a #134 branch-4 near-dup flag (v1: dismiss only). Clears
+ * `metadata.near_dup_check.flagged_for_review`, stamps `reviewed_at`,
+ * and appends a transaction_events row so the review is auditable.
+ * Returns null when the transaction doesn't exist or isn't flagged
+ * (idempotent dismiss of an unflagged row is a 404 — the queue is the
+ * only caller and it only shows flagged rows).
+ */
+export async function dismissNearDupFlag(
+  workspaceId: string,
+  userId: string,
+  txId: string,
+): Promise<{ id: string; flagged_for_review: boolean; reviewed_at: string } | null> {
+  const reviewedAt = new Date().toISOString();
+  const res = await db.execute(sql`
+    UPDATE transactions
+       SET metadata = jsonb_set(
+             jsonb_set(metadata, '{near_dup_check,flagged_for_review}', 'false'::jsonb),
+             '{near_dup_check,reviewed_at}', to_jsonb(${reviewedAt}::text)
+           ),
+           updated_at = NOW()
+     WHERE id = ${txId}::uuid
+       AND workspace_id = ${workspaceId}::uuid
+       AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE
+     RETURNING id`);
+  if (res.rows.length === 0) return null;
+  await db.insert(transactionEvents).values({
+    id: newId(),
+    workspaceId,
+    transactionId: txId,
+    eventType: "near_dup_reviewed",
+    actorId: userId,
+    payload: { action: "dismiss", reviewed_at: reviewedAt },
+  });
+  return { id: txId, flagged_for_review: false, reviewed_at: reviewedAt };
 }

@@ -234,6 +234,11 @@ export const ListTransactionsQuery = z.object({
   trip_id: Uuid.optional(),
   has_document: z.coerce.boolean().optional(),
   source_ingest_id: Uuid.optional(),
+  /** flagged=near_dup → only transactions whose extraction recorded
+   *  metadata.near_dup_check.flagged_for_review=true (#134 branch 4:
+   *  a same-amount/date candidate existed but neither side had a
+   *  strong tiebreaker, so the agent inserted AND flagged). */
+  flagged: z.enum(["near_dup"]).optional(),
   sort: z.enum(["occurred_on", "amount", "created_at"]).optional(),
   order: z.enum(["asc", "desc"]).optional(),
   cursor: z.string().optional(),
@@ -272,3 +277,20 @@ export const BulkResponse = z
   .object({ results: z.array(BulkResultItem) })
   .openapi("BulkResponse");
 
+
+/** POST /v1/transactions/:id/near-dup-review — resolve a #134 branch-4
+ *  flag. v1 supports only dismiss ("I checked; they are distinct
+ *  purchases"): clears flagged_for_review and stamps reviewed_at. A
+ *  future "merge" action would attach this txn's documents to the
+ *  candidate and void — that's the reconcile apply path's job today. */
+export const NearDupReviewRequest = z
+  .object({ action: z.literal("dismiss") })
+  .openapi("NearDupReviewRequest");
+
+export const NearDupReviewResponse = z
+  .object({
+    id: Uuid,
+    flagged_for_review: z.boolean(),
+    reviewed_at: IsoDateTime,
+  })
+  .openapi("NearDupReviewResponse");
