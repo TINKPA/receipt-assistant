@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.16";
+export const PROMPT_VERSION = "2.17";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -1345,20 +1345,36 @@ worth tracking, and for product-less lines.
 The card statement sees one merchant; the receipt sees more. Record
 every party the receipt TEXT states, one row per (role, party):
 
-  - **channel** (tx-level, transaction_item_id NULL): who charged the
-    card / the platform the order went through. ALWAYS write exactly
-    one channel row — it duplicates the merchant you resolved in
-    Phase 2.5, with its brand_id.
-  - **seller** (tx- or line-level): only when the receipt explicitly
-    names a seller different from the channel — "Sold by: AnkerDirect"
-    on a marketplace order (line-level), the restaurant behind a
-    DoorDash/UberEats order (tx-level). Same-as-channel → NO row.
+  - **channel** (tx-level, transaction_item_id NULL): the platform /
+    statement entity that took the order — what shows up as the line on
+    a card statement. ALWAYS write exactly one channel row.
+    · DEFAULT (a normal in-store / single-merchant receipt): the
+      channel IS the merchant you resolved in Phase 2.5 — duplicate it
+      with its brand_id.
+    · DELIVERY / MARKETPLACE PLATFORM ORDERS (DoorDash, Uber Eats,
+      Grubhub, Postmates, Caviar; Amazon when a third-party "Sold by"
+      seller is named): the **platform is the channel**, even when
+      Phase 2.5 resolved the merchant to the restaurant/seller behind
+      it. Detect the platform from the receipt header / email sender
+      ("Your order from <restaurant>" emails are DoorDash-style). The
+      restaurant/seller then becomes the **seller** row below — NOT the
+      channel, and the platform is NEVER an acquirer.
+  - **seller** (tx- or line-level): the party that actually sold the
+    goods when it differs from the channel.
+    · Platform orders: the restaurant / store behind the platform —
+      i.e. the merchant Phase 2.5 resolved (tx-level seller row). On a
+      bb.q Chicken order via DoorDash: channel=DoorDash,
+      seller=bb.q Chicken.
+    · Marketplace lines: "Sold by: AnkerDirect" (line-level).
+    Same party as the channel → NO seller row.
   - **maker** (line-level): the product's brand, only when the line
     text itself states it ("Anker MagGo 610" → Anker; "KS WATER 40PK"
     → Kirkland Signature). Don't infer makers from world knowledge
     when the text doesn't name them.
-  - **acquirer** (tx-level): payment processor when printed ("Powered
-    by Stripe/Square") — rare; skip when absent.
+  - **acquirer** (tx-level): payment PROCESSOR only — Stripe, Square,
+    Adyen, Toast, Block ("Powered by Stripe"). A delivery platform
+    (DoorDash etc.) is a channel, NEVER an acquirer. Rare; skip when
+    absent.
 
 \`display_name\` = the string as printed. \`brand_id\`: reuse the
 channel's resolved brand for the channel row; for sellers/makers, set
