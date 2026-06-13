@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.15";
+export const PROMPT_VERSION = "2.16";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -1339,6 +1339,54 @@ line you want to track, then INSERT into owned_items:
 The ON CONFLICT clause makes the insert safe to re-run. Skip this
 step entirely for non-durable items, for durables you judge not
 worth tracking, and for product-less lines.
+
+### 4a-ter. transaction_parties — the party graph (#149 P4)
+
+The card statement sees one merchant; the receipt sees more. Record
+every party the receipt TEXT states, one row per (role, party):
+
+  - **channel** (tx-level, transaction_item_id NULL): who charged the
+    card / the platform the order went through. ALWAYS write exactly
+    one channel row — it duplicates the merchant you resolved in
+    Phase 2.5, with its brand_id.
+  - **seller** (tx- or line-level): only when the receipt explicitly
+    names a seller different from the channel — "Sold by: AnkerDirect"
+    on a marketplace order (line-level), the restaurant behind a
+    DoorDash/UberEats order (tx-level). Same-as-channel → NO row.
+  - **maker** (line-level): the product's brand, only when the line
+    text itself states it ("Anker MagGo 610" → Anker; "KS WATER 40PK"
+    → Kirkland Signature). Don't infer makers from world knowledge
+    when the text doesn't name them.
+  - **acquirer** (tx-level): payment processor when printed ("Powered
+    by Stripe/Square") — rare; skip when absent.
+
+\`display_name\` = the string as printed. \`brand_id\`: reuse the
+channel's resolved brand for the channel row; for sellers/makers, set
+it ONLY when a brands row already exists (check with a SELECT) or the
+party is unambiguously a known brand — then upsert a brands row first
+(brand_id = lowercase-hyphenated name; for a marketplace seller whose
+parent brand is obvious, e.g. AnkerDirect → anker, set parent_id).
+Otherwise leave brand_id NULL — a text-only row is still useful.
+
+Insert after 4a's items exist (line-level rows reference
+transaction_items by line):
+
+  psql "\$DATABASE_URL" <<'SQL'
+  INSERT INTO transaction_parties
+    (workspace_id, transaction_id, transaction_item_id, role, display_name, brand_id)
+  VALUES
+    ('${ctx.workspaceId}', '<TX_ID>', NULL, 'channel', '<as printed>', '<brand_id-or-NULL>')
+    -- , line-level example:
+    -- ('${ctx.workspaceId}', '<TX_ID>',
+    --   (SELECT id FROM transaction_items WHERE transaction_id='<TX_ID>' AND line_no=<N>),
+    --   'maker', 'Anker', 'anker')
+  ON CONFLICT ON CONSTRAINT transaction_parties_identity_uq DO NOTHING;
+  SQL
+
+Don't fabricate parties; a plain single-merchant receipt legitimately
+produces just the one channel row. This step is additive — never let
+a parties failure roll back the transaction itself (run it in its own
+statement after COMMIT).
 
 ### 4b. statement_pdf
 
