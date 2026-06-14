@@ -214,13 +214,23 @@ export async function createBatchFromFiles(params: {
     mimeType: string | null;
     filePath: string;
     documentId: string;
-    // L1 dedup (#124): when the uploaded bytes are identical to a
-    // document already linked to a live transaction, this holds that
-    // transaction's id. The ingest is born terminal (`status='dedup'`)
-    // and is never enqueued — no Claude spawn, no duplicate transaction.
+    // L1 dedup (#124): the ingest is born terminal (`status='dedup'`) and
+    // is never enqueued — no Claude spawn, no duplicate transaction. See
+    // the loop below for why `bornDedup` is decided by "bytes already
+    // known", NOT by "a live transaction was found".
+    bornDedup: boolean;
+    // When known, the pre-existing live transaction these bytes already
+    // produced — used only for provenance (deep-link "view it"). May be
+    // null on a race-born dedup (the sibling's transaction isn't committed
+    // yet); the dup is still suppressed regardless.
     dedupOf: string | null;
   };
   const seeded: SeededIngest[] = [];
+  // Docs THIS request has already committed to extracting — so a second
+  // byte-identical file in the SAME upload dedups against the first even
+  // before any ingest row is inserted (the in-flight DB probe can't see
+  // an uncommitted sibling). Keyed by document id.
+  const willExtractDocIds = new Set<string>();
 
   for (const f of files) {
     // Persist the raw bytes via documents.service so we get sha256 +
@@ -233,17 +243,38 @@ export async function createBatchFromFiles(params: {
       kind,
     });
 
-    // L1 short-circuit (#124). Storage-layer sha256 dedup already
-    // returned an existing document (`created === false`); now ask the
-    // transaction-layer question the old code never asked: is this
-    // document ALREADY linked to a live transaction? If so, re-running
-    // extraction would mint a duplicate transaction (the 2026-05-16
-    // incident: 68 dup rows / ~$3,801 over-count). A freshly-created
-    // document can't have links yet, so only probe on a dedup hit.
+    // L1 short-circuit (#124, race-hardened 2026-06-13). A sha256
+    // collision (`created === false`) means these EXACT bytes are already
+    // a known document — that alone is a 100% duplicate signal. The old
+    // code gated the skip on "is there a live transaction yet?", which is
+    // a TOCTOU race: the sibling ingest's transaction is still minutes
+    // deep in the queue, so the probe returns null and the dup falls
+    // through to extraction (the 2026-05-16 incident: 68 dup rows /
+    // ~$3,801 over-count; and the 3× New York Chicken seen 2026-06-13).
+    // So decide `bornDedup` from "are these bytes already being handled",
+    // not from "did I find the transaction". A byte-dup is suppressed
+    // when it matches a live transaction, OR a sibling ingest still in
+    // flight (another request, or an earlier file in THIS request). The
+    // only `!created` case we still extract is a genuine restore: prior
+    // transaction voided/errored, nothing live and nothing in flight
+    // (findLiveTransactionForDocument deliberately ignores voided links).
+    let bornDedup = false;
     let dedupOf: string | null = null;
     if (!created) {
       dedupOf = await findLiveTransactionForDocument(workspaceId, doc.id);
+      if (dedupOf) {
+        bornDedup = true;
+      } else if (
+        willExtractDocIds.has(doc.id) ||
+        (await hasInFlightIngestForDocument(workspaceId, doc.file_path!))
+      ) {
+        // Duplicate of an extraction already in progress; its transaction
+        // doesn't exist yet, so provenance (dedupOf) stays null. The dup
+        // is still correctly suppressed — that's the part that matters.
+        bornDedup = true;
+      }
     }
+    if (!bornDedup) willExtractDocIds.add(doc.id);
 
     const ingestId = newId();
     seeded.push({
@@ -257,6 +288,7 @@ export async function createBatchFromFiles(params: {
       // path (resolveUploadPath) right before the filesystem read.
       filePath: doc.file_path!,
       documentId: doc.id,
+      bornDedup,
       dedupOf,
     });
   }
@@ -264,7 +296,7 @@ export async function createBatchFromFiles(params: {
   if (seeded.length > 0) {
     await db.insert(ingests).values(
       seeded.map((s) =>
-        s.dedupOf
+        s.bornDedup
           ? {
               id: s.id,
               workspaceId: s.workspaceId,
@@ -275,12 +307,16 @@ export async function createBatchFromFiles(params: {
               status: "dedup" as const,
               // Point provenance at the pre-existing transaction so the
               // client can deep-link "already in your ledger → view it".
+              // On a race-born dedup (sibling not committed yet) dedupOf is
+              // null — provenance is empty but the dup is still suppressed.
               produced: {
                 receipt_ids: [],
-                transaction_ids: [s.dedupOf],
+                transaction_ids: s.dedupOf ? [s.dedupOf] : [],
                 document_ids: [s.documentId],
               },
-              error: "duplicate: identical file already linked to a transaction",
+              error: s.dedupOf
+                ? "duplicate: identical file already linked to a transaction"
+                : "duplicate: identical file already being processed",
               completedAt: new Date(),
             }
           : {
@@ -299,7 +335,7 @@ export async function createBatchFromFiles(params: {
   // Enqueue AFTER the DB commit so the worker never races the insert.
   // Dedup hits are terminal already — never enqueue them.
   for (const s of seeded) {
-    if (s.dedupOf) continue;
+    if (s.bornDedup) continue;
     enqueue({
       ingestId: s.id,
       workspaceId: s.workspaceId,
@@ -315,7 +351,7 @@ export async function createBatchFromFiles(params: {
   // has no worker child to fire `onBatchChildTerminated`, so without this
   // it would hang in `pending` forever. The UPDATE is guarded to no-op
   // while any non-terminal child remains, so it's safe to always call.
-  if (seeded.some((s) => s.dedupOf)) {
+  if (seeded.some((s) => s.bornDedup)) {
     await maybeCompleteBatch(batchId, workspaceId);
   }
 
@@ -358,6 +394,31 @@ async function findLiveTransactionForDocument(
   `);
   const row = res.rows[0] as { id: string } | undefined;
   return row?.id ?? null;
+}
+
+/**
+ * Race guard for L1 dedup (#124, 2026-06-13). True when a NON-terminal
+ * ingest (`queued` | `processing`) already exists for these exact bytes —
+ * i.e. a sibling extraction is mid-flight and will produce the canonical
+ * transaction. Lets the scaffold suppress a byte-identical re-upload even
+ * before that transaction is committed, closing the TOCTOU window that
+ * `findLiveTransactionForDocument` alone leaves open. Keyed on the stored
+ * sha256-named `file_path`, which is 1:1 with the document. One O(ms)
+ * indexed lookup (`ingests_status_idx`).
+ */
+async function hasInFlightIngestForDocument(
+  workspaceId: string,
+  filePath: string,
+): Promise<boolean> {
+  const res = await db.execute(sql`
+    SELECT 1
+      FROM ingests
+     WHERE workspace_id = ${workspaceId}::uuid
+       AND file_path = ${filePath}
+       AND status IN ('queued', 'processing')
+     LIMIT 1
+  `);
+  return res.rows.length > 0;
 }
 
 function guessDocumentKind(
