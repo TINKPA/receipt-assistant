@@ -23,12 +23,15 @@ import {
   text,
   integer,
   bigint,
+  smallint,
+  boolean,
   date,
   timestamp,
   jsonb,
   index,
   uniqueIndex,
   check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces.js";
@@ -81,6 +84,16 @@ export const products = pgTable(
       withTimezone: true,
     }),
 
+    // Product imagery (#159, mirrors the #101 brand-asset pattern).
+    // `productAssets` retains every candidate; the chosen one is pointed
+    // at here. NULL preferred → frontend renders a category fallback.
+    preferredAssetId: uuid("preferred_asset_id"),
+    /** Layer-3 lock — when NOT NULL, re-extract / re-seed leaves
+     *  `preferred_asset_id` alone (a choice has been made). */
+    preferredAssetChosenAt: timestamp("preferred_asset_chosen_at", {
+      withTimezone: true,
+    }),
+
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -105,6 +118,66 @@ export const products = pgTable(
     check(
       "products_item_class_ck",
       sql`${t.itemClass} IN ('durable','consumable','food_drink','service','other')`,
+    ),
+  ],
+);
+
+/**
+ * #159 — multi-candidate product imagery, mirroring `brand_assets`
+ * (#101). Each row is one product hero/photo candidate. `tier` is
+ * provenance ("where this image came from"), NOT priority. The render
+ * path does NOT consult tier; it reads `products.preferred_asset_id`.
+ *
+ * Layer separation:
+ *   - raw      : local_path, source_url, tier, content_hash, dimensions
+ *   - derived  : agent_relevance, agent_notes, extraction_version
+ *   - user     : user_rating, user_uploaded, user_notes
+ */
+export const productAssets = pgTable(
+  "product_assets",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    productId: uuid("product_id")
+      .notNull()
+      .references((): AnyPgColumn => products.id, { onDelete: "cascade" }),
+    tier: text("tier").notNull(),
+    sourceUrl: text("source_url"),
+    /** Path under `~/Developer/receipt-assistant-data/product-assets/`,
+     *  bind-mounted into the container at `/data/product-assets`. */
+    localPath: text("local_path").notNull(),
+    /** Content-addressable dedup key. */
+    contentHash: text("content_hash").notNull(),
+    contentType: text("content_type").notNull(),
+    width: integer("width"),
+    height: integer("height"),
+    bytes: integer("bytes"),
+    acquiredAt: timestamp("acquired_at", { withTimezone: true })
+      .notNull()
+      .default(sql`NOW()`),
+    /** Bumped on byte-equal re-acquisition. */
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true })
+      .notNull()
+      .default(sql`NOW()`),
+
+    // Derived layer.
+    agentRelevance: smallint("agent_relevance"),
+    agentNotes: text("agent_notes"),
+    extractionVersion: integer("extraction_version").notNull().default(1),
+
+    // User-truth layer.
+    userRating: smallint("user_rating"),
+    userUploaded: boolean("user_uploaded").notNull().default(false),
+    userNotes: text("user_notes"),
+
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
+    metadata: jsonb("metadata").notNull().default({}),
+  },
+  (t) => [
+    uniqueIndex("product_assets_product_hash_uq").on(t.productId, t.contentHash),
+    index("product_assets_product_idx").on(t.productId),
+    check(
+      "product_assets_tier_ck",
+      sql`${t.tier} IN ('manual_seed','user_upload','agent_fetch')`,
     ),
   ],
 );
