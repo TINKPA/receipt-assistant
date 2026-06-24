@@ -171,6 +171,9 @@ async function main() {
           WHERE workspace_id = ${workspaceId}::uuid
             AND brand_id = 'apple'
             AND retired_from_catalog_at IS NULL
+            AND item_class = 'durable'
+            AND canonical_name NOT ILIKE '%applecare%'
+            AND canonical_name NOT ILIKE '%service%'
             AND (${pred()})`,
     );
     const ids = (matchRows.rows as Array<{ id: string }>).map((r) => r.id);
