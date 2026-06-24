@@ -76,7 +76,7 @@ ENV DB_PATH=/data/receipts.db
 ENV UPLOAD_DIR=/data/uploads
 ENV HOME=/home/node
 
-RUN mkdir -p /data/uploads /home/node/.claude && \
+RUN mkdir -p /data/uploads /data/product-assets /home/node/.claude && \
     chown -R node:node /data /home/node /app
 
 USER node

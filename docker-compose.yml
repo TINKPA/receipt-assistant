@@ -116,4 +116,11 @@ services:
       # dedup semantics on byte-equal re-fetch). On a fresh machine:
       #   mkdir -p ~/Developer/receipt-assistant-data/brand-assets
       - ${HOME}/Developer/receipt-assistant-data/brand-assets:/data/brand-assets
+      # Product image assets cache (#159). Each product_assets row's
+      # `local_path` is relative to /data/product-assets/, structure:
+      #   <product_id>/<tier>/<sha8>.<ext>
+      # SIBLING dir same rationale as brand-assets — outside git and
+      # outside iCloud. On a fresh machine:
+      #   mkdir -p ~/Developer/receipt-assistant-data/product-assets
+      - ${HOME}/Developer/receipt-assistant-data/product-assets:/data/product-assets
     restart: unless-stopped
