@@ -361,6 +361,19 @@ Re-running re-extract on the same document with the same `REEXTRACT_PROMPT_VERSI
    confidence on a result where it missed the date entirely.
    Don't use confidence_score as sole quality gate.
 
+4. **`npm run db:migrate` fails in the prod runtime image — `tsx` is
+   dev-only.** That script runs `tsx scripts/migrate.ts`, but the
+   production image installs prod deps only, so `tsx` is absent
+   (`tsx: not found`). To apply migrations manually inside the
+   container, use the **compiled, tsx-free** entry:
+   `docker exec receipt-assistant npm run db:migrate:prod`
+   (= `node dist/db/migrate.js`). `src/db/migrate.ts` has a main-guard
+   so the same compiled file both *exports* `runMigrations()` (used by
+   `server.ts` at boot) and *runs* migrations when executed directly.
+   Idempotent — re-applying already-applied migrations is a no-op.
+   (Server boot auto-migrates anyway; this is for manual mid-deploy
+   application, as in #159.)
+
 ## Schema editing workflow (OpenAPI contract)
 
 The HTTP API contract lives in `src/schemas/` (one zod file per resource: `receipt.ts`, `job.ts`, `summary.ts`, `ask.ts`, `health.ts`, `common.ts`). Routes are registered in `src/openapi.ts`. The generated `openapi/openapi.json` is a build artifact — **never edit it by hand**, it gets overwritten.

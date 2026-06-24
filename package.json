@@ -8,6 +8,7 @@
     "build": "tsc",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
+    "db:migrate:prod": "node dist/db/migrate.js",
     "db:seed": "tsx scripts/seed.ts",
     "openapi:generate": "tsx scripts/generate-openapi.ts",
     "eval:dates": "tsx scripts/eval-dates.ts"
