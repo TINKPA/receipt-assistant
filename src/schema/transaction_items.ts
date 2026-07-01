@@ -35,8 +35,20 @@ export const transactionItems = pgTable(
       .notNull()
       .references(() => transactions.id, { onDelete: "cascade" }),
     lineNo: integer("line_no").notNull(),
+    /** #162 — canonical two-level line-items. When this row is a paid
+     *  modifier / add-on (its own priced line), points at the `line_no`
+     *  of the owning parent item within the same transaction+run. NULL
+     *  for top-level items and for non-product audit rows. */
+    parentLineNo: integer("parent_line_no"),
     rawName: text("raw_name").notNull(),
     normalizedName: text("normalized_name"),
+    /** #162 — zero-cost customizations that describe THIS item (少糖/去冰/
+     *  no cilantro / free spice level) collapse into a single human-
+     *  readable variant string here instead of spawning peer rows.
+     *  Paid add-ons never live here — they become their own priced
+     *  child rows via `parentLineNo`. NULL when the item has no free
+     *  customizations. */
+    productVariant: text("product_variant"),
     quantity: numeric("quantity"),
     unit: text("unit"),
     unitPriceMinor: bigint("unit_price_minor", { mode: "number" }),

@@ -41,7 +41,7 @@ import {
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.5";
+export const REEXTRACT_PROMPT_VERSION = "1.6";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -107,8 +107,22 @@ guess, never fall back to today's date.
   items         : REQUIRED structured line-item array per #81 / REEXTRACT_PROMPT_VERSION 1.1.
                   Each item is one object with these fields:
                     line_no            int (1-based, preserves order)
+                    parent_line_no     int|null #162 — when this line is a
+                                       PAID modifier/add-on/topping/size-
+                                       upgrade of another item, set to that
+                                       owning item's line_no; NULL for top-
+                                       level items and tax/tip/discount rows.
                     raw_name           text (verbatim line)
-                    normalized_name    text|null (brand-stripped)
+                    normalized_name    text|null (brand-stripped) — #162:
+                                       CLEAN ITEM NAME ONLY, never append a
+                                       relational suffix like "(curry
+                                       modifier)"/"(topping)".
+                    product_variant    text|null #162 — one string of THIS
+                                       line's ZERO-COST customizations
+                                       (少糖/去冰/"Less Sugar"/"no cilantro"/
+                                       free spice level), joined by ", ".
+                                       NEVER a paid add-on (that is its own
+                                       priced child line). NULL when none.
                     quantity           num|null
                     unit               text|null ("ct","lb","ea",…)
                     unit_price_minor   int|null (minor units)
@@ -137,6 +151,25 @@ guess, never fall back to today's date.
                   thermal print), emit ONE item with item_class='other',
                   confidence='low', raw_name='TOTAL ONLY',
                   line_total_minor=<TOTAL_MINOR>, tags=['no-item-section'].
+
+                  #162 TWO-LEVEL RULE (modifiers). One test: does the
+                  modifier have a PRICE?
+                    PRICED add-on → its OWN item object with a real
+                      line_total_minor and parent_line_no = the owning
+                      dish/drink's line_no. Clean normalized_name (e.g.
+                      "Fish Cutlet", "Large Rice"), NO "(curry modifier)"
+                      suffix. Keep item_class/food_kind like the parent.
+                    ZERO-COST option → NOT a line; fold into the parent's
+                      product_variant string ("Less Sugar, No Ice").
+                  Never bury a priced add-on in product_variant (it would
+                  vanish from totals); never spawn a peer line for a free
+                  option. If a paid add-on's price is not itemized on the
+                  source, keep its name in the parent's product_variant and
+                  add a 'variant-price-unresolved' tag on the parent.
+                  Example: CoCo "Fried Chicken Curry" (line 1, $9.00,
+                  product_variant="Less Sauce") with +Large Rice $1.00,
+                  +Spice Level 4 $0.80, +Fish Cutlet $3.00 → three extra
+                  items, each parent_line_no=1, clean names, own prices.
 
 Place resolution and merchant canonicalization are OUT OF SCOPE for
 re-extract — those have their own endpoints (\`POST /v1/places/:id/refresh\`
@@ -244,7 +277,7 @@ user override survives this re-extract.
            item.product_model, item.product_color, item.product_size,
            item.product_variant, item.product_sku, item.product_manufacturer
     FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-      line_no int, raw_name text, normalized_name text,
+      line_no int, parent_line_no int, raw_name text, normalized_name text,
       quantity numeric, unit text,
       unit_price_minor bigint, line_total_minor bigint, currency text,
       item_class text, durability_tier text, food_kind text,
@@ -264,15 +297,17 @@ user override survives this re-extract.
     RETURNING id, product_key, merchant_id
   )
   INSERT INTO transaction_items (
-    id, workspace_id, transaction_id, line_no,
-    raw_name, normalized_name, quantity, unit,
+    id, workspace_id, transaction_id, line_no, parent_line_no,
+    raw_name, normalized_name, product_variant, quantity, unit,
     unit_price_minor, line_total_minor, currency,
     item_class, durability_tier, food_kind, tags, confidence,
     line_type, product_id, tax_minor, tip_share_minor,
     discount_share_minor, extraction_run, extraction_version
   )
   SELECT gen_random_uuid(), '${ctx.workspaceId}', '${ctx.transactionId}', item.line_no,
-         item.raw_name, item.normalized_name, item.quantity, item.unit,
+         item.parent_line_no,
+         item.raw_name, item.normalized_name, item.product_variant,
+         item.quantity, item.unit,
          item.unit_price_minor, item.line_total_minor, item.currency,
          item.item_class, item.durability_tier, item.food_kind,
          item.tags, item.confidence,
@@ -288,7 +323,7 @@ user override survives this re-extract.
          (SELECT run FROM next_run),
          '${REEXTRACT_PROMPT_VERSION}'
   FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-    line_no int, raw_name text, normalized_name text,
+    line_no int, parent_line_no int, raw_name text, normalized_name text,
     quantity numeric, unit text,
     unit_price_minor bigint, line_total_minor bigint, currency text,
     item_class text, durability_tier text, food_kind text,

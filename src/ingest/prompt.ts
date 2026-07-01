@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.17";
+export const PROMPT_VERSION = "2.18";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -154,6 +154,15 @@ Each \`item\` object has these fields:
 
   line_no            int      1-based, preserves the order printed
                               on the receipt
+  parent_line_no     int|null  #162 CANONICAL TWO-LEVEL RULE. When this
+                              line is a PAID modifier / add-on / topping /
+                              size-upgrade that belongs to another item,
+                              set this to that owning item's line_no. NULL
+                              for top-level items and for tax/tip/discount
+                              audit rows. See the "Two-level line-items"
+                              block below — this is how a "+$3.00 Fish
+                              Cutlet" add-on attaches to its parent dish
+                              instead of floating as a peer line.
   raw_name           text     the line as printed, verbatim (don't
                               normalize — preserve abbreviations,
                               brand prefixes, codes)
@@ -161,6 +170,11 @@ Each \`item\` object has these fields:
                               (e.g. "KS PPR TWLS 12CT" → "Paper
                               Towels"). NULL when the raw name is
                               already clean or impossible to clean.
+                              #162: this is the CLEAN ITEM NAME ONLY —
+                              never append a relational suffix like
+                              "(curry modifier)" / "(curry topping)".
+                              A modifier's name is just "Fish Cutlet",
+                              and parent_line_no carries the relationship.
   quantity           num|null  2, 0.5, 1 default if unprinted
   unit               text|null "ct", "lb", "kg", "oz", "ea", "ml",
                               or NULL when not printed
@@ -262,7 +276,18 @@ Each \`item\` object has these fields:
   product_model      text|null   "M3 13\\" 256GB", "iPad Pro 11\\""
   product_color      text|null   "Natural Titanium", "Black", "Red"
   product_size       text|null   "L", "12 ct", "750 ml"
-  product_variant    text|null   free-text catch-all (flavor, fit, finish)
+  product_variant    text|null   #162 CANONICAL: a single human-readable
+                                string of THIS line's ZERO-COST
+                                customizations — free options that change
+                                the item but add no price (少糖 / 半糖 /
+                                去冰 / "Less Sugar" / "Ice Blended" /
+                                "no cilantro" / a free spice level).
+                                Join multiple with ", ". NEVER put a PAID
+                                add-on here (those become their own priced
+                                child line via parent_line_no). Also used
+                                as the catalog product's free-text variant
+                                (flavor, fit, finish). NULL when the line
+                                has no free customizations.
   product_sku        text|null   when printed on the receipt
   product_manufacturer text|null when the brand and the manufacturer
                                 differ ("kirkland" brand made by
@@ -291,7 +316,99 @@ item_class='other', confidence='low', raw_name='TOTAL ONLY',
 line_total_minor=<TOTAL_MINOR>, and a tags entry explaining why
 ("unreadable", "no-item-section").
 
+── Two-level line-items — the ONE rule for modifiers (#162) ───────────
+
+Restaurant / cafe / boba receipts print a dish or drink followed by
+its modifiers (toppings, add-ons, size upgrades, sugar/ice levels,
+spice levels). Decide each modifier's fate by ONE test — does it have
+a PRICE?
+
+  PRICED add-on  → it is a LINE.
+    Emit it as its OWN item object with a real line_total_minor, and
+    set parent_line_no = the owning dish/drink's line_no. Give it a
+    clean normalized_name ("Fish Cutlet", "Large Rice", "Soybean
+    Mousse") — NO "(curry modifier)" / "(topping)" relational suffix;
+    parent_line_no already encodes the relationship.
+    Keep item_class/food_kind consistent with the parent (a paid
+    topping on a dish is still food_drink / restaurant_dish).
+
+  ZERO-COST option → it is an ATTRIBUTE.
+    Do NOT emit a separate line. Fold it into the PARENT item's
+    product_variant string ("Less Sugar", "No Ice", "Spice Level 2",
+    "no cilantro"). Multiple free options join with ", ".
+
+Never do the reverse: never bury a priced add-on inside a
+product_variant string (it would vanish from the ledger totals), and
+never spawn a peer line for a free customization (it would double the
+item count and break Σ line_total).
+
+If a modifier's price is genuinely not itemized on the source (some
+receipts bundle "Milk Tea +Boba" at one blended price with no
+breakout), you cannot invent a split: keep the add-on name in the
+parent's product_variant and add a "variant-price-unresolved" tag on
+the parent so the limitation is auditable. Prefer a priced child line
+whenever the source shows any separable price.
+
 ── Worked examples ───────────────────────────────────────────────────
+
+Two-level dish with paid modifiers (#162) — real CoCo Ichibanya order:
+two plain dishes, then a "Fried Chicken Curry" $14.64 base with three
+separately-PRICED modifiers (Large Rice $1.00, Level 4 spice $0.80,
+Fish Cutlet $3.00). Every modifier here is priced, so every one is its
+own child line (none go to product_variant); if any had been free
+("Less Sauce", "No Onion") it would instead ride on line 3's
+product_variant string:
+  items = [
+    {"line_no":1, "raw_name":"Naan Bread", "normalized_name":"Naan Bread",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "unit_price_minor":250, "line_total_minor":250, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "confidence":"high"},
+    {"line_no":2, "raw_name":"Garlic Naan", "normalized_name":"Garlic Naan",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "unit_price_minor":300, "line_total_minor":300, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "confidence":"high"},
+    {"line_no":3, "raw_name":"Fried Chicken Curry",
+     "normalized_name":"Fried Chicken Curry", "parent_line_no":null,
+     "quantity":1, "unit":"ea", "unit_price_minor":1464,
+     "line_total_minor":1464, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"restaurant_dish", "confidence":"high"},
+    {"line_no":4, "raw_name":"Large Rice", "normalized_name":"Large Rice",
+     "parent_line_no":3, "quantity":1, "unit":"ea",
+     "unit_price_minor":100, "line_total_minor":100, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "confidence":"high"},
+    {"line_no":5, "raw_name":"Level 4", "normalized_name":"Spice Level 4",
+     "parent_line_no":3, "quantity":1, "unit":"ea",
+     "unit_price_minor":80, "line_total_minor":80, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "confidence":"high"},
+    {"line_no":6, "raw_name":"Fish Cutlet", "normalized_name":"Fish Cutlet",
+     "parent_line_no":3, "quantity":1, "unit":"ea",
+     "unit_price_minor":300, "line_total_minor":300, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "confidence":"high"}
+    // + a tax line ($1.93) with line_type='tax'. Σ product lines = $24.94
+    // subtotal. Modifiers are children of line 3, NOT peers named
+    // "Fish Cutlet (curry topping)", NOT folded into product_variant.
+  ]
+
+Boba drink, free customizations only (#162)
+(3CAT "Brown Sugar Milk Tea" $5.50, Less Sugar + Ice Blended, both free):
+  items = [
+    {"line_no":1, "raw_name":"Brown Sugar Milk Tea",
+     "normalized_name":"Brown Sugar Milk Tea", "parent_line_no":null,
+     "product_variant":"Less Sugar, Ice Blended",
+     "quantity":1, "unit":"ea", "unit_price_minor":550,
+     "line_total_minor":550, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"beverage", "confidence":"high"}
+  ]
+  If that same drink instead showed "+Soybean Mousse $0.75" printed
+  with a price, Soybean Mousse becomes line_no 2 with parent_line_no=1
+  and line_total_minor=75. If the price is NOT itemized, keep
+  "+Soybean Mousse" in product_variant and tag line 1
+  "variant-price-unresolved".
 
 Costco gas (single line):
   items = [
@@ -1078,7 +1195,7 @@ them first):
              item.product_model, item.product_color, item.product_size,
              item.product_variant, item.product_sku, item.product_manufacturer
       FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-        line_no int, raw_name text, normalized_name text,
+        line_no int, parent_line_no int, raw_name text, normalized_name text,
         quantity numeric, unit text,
         unit_price_minor bigint, line_total_minor bigint, currency text,
         item_class text, durability_tier text, food_kind text,
@@ -1103,15 +1220,17 @@ them first):
     -- ingest path always writes the first run (run=1, retired_at=NULL).
     ti AS (
       INSERT INTO transaction_items (
-        id, workspace_id, transaction_id, line_no,
-        raw_name, normalized_name, quantity, unit,
+        id, workspace_id, transaction_id, line_no, parent_line_no,
+        raw_name, normalized_name, product_variant, quantity, unit,
         unit_price_minor, line_total_minor, currency,
         item_class, durability_tier, food_kind, tags, confidence,
         line_type, product_id, tax_minor, tip_share_minor,
         discount_share_minor, extraction_run, extraction_version
       )
       SELECT gen_random_uuid(), '${ctx.workspaceId}', tx.id, item.line_no,
-             item.raw_name, item.normalized_name, item.quantity, item.unit,
+             item.parent_line_no,
+             item.raw_name, item.normalized_name, item.product_variant,
+             item.quantity, item.unit,
              item.unit_price_minor, item.line_total_minor, item.currency,
              item.item_class, item.durability_tier, item.food_kind,
              item.tags, item.confidence,
@@ -1125,7 +1244,7 @@ them first):
              1, '${PROMPT_VERSION}'
       FROM tx,
         jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-          line_no int, raw_name text, normalized_name text,
+          line_no int, parent_line_no int, raw_name text, normalized_name text,
           quantity numeric, unit text,
           unit_price_minor bigint, line_total_minor bigint, currency text,
           item_class text, durability_tier text, food_kind text,

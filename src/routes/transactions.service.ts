@@ -114,8 +114,14 @@ export interface PostingRow {
  */
 export interface TransactionItemRow {
   line_no: number;
+  /** #162 — parent item's line_no when this row is a paid modifier;
+   *  NULL for top-level items and audit rows. */
+  parent_line_no: number | null;
   raw_name: string;
   normalized_name: string | null;
+  /** #162 — zero-cost customizations folded into one string; NULL when
+   *  the item has no free customizations. */
+  product_variant: string | null;
   quantity: number | null;
   unit: string | null;
   unit_price_minor: number | null;
@@ -284,10 +290,16 @@ function mapTransactionItem(row: any): TransactionItemRow {
   const lineTotal = Number(row.lineTotalMinor ?? row.line_total_minor);
   const effective =
     row.effectiveTotalMinor ?? row.effective_total_minor ?? null;
+  const parentLineNo = row.parentLineNo ?? row.parent_line_no ?? null;
   return {
     line_no: Number(row.lineNo ?? row.line_no),
+    parent_line_no:
+      parentLineNo === null || parentLineNo === undefined
+        ? null
+        : Number(parentLineNo),
     raw_name: row.rawName ?? row.raw_name,
     normalized_name: row.normalizedName ?? row.normalized_name ?? null,
+    product_variant: row.productVariant ?? row.product_variant ?? null,
     quantity:
       row.quantity === null || row.quantity === undefined
         ? null
