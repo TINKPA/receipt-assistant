@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.18";
+export const PROMPT_VERSION = "2.19";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -332,6 +332,22 @@ a PRICE?
     Keep item_class/food_kind consistent with the parent (a paid
     topping on a dish is still food_drink / restaurant_dish).
 
+    ADDITIVE vs INCLUSIVE pricing — get the parent's line_total right:
+    • ADDITIVE (e.g. CoCo): the dish shows a base price and each paid
+      modifier is printed with its own price ADDED on top. Keep the
+      parent at its base; the children carry their own prices; they
+      sum naturally.
+    • INCLUSIVE (common on Snackpass / boba / combo receipts): the
+      item shows ONE all-in customized price and the modifier prices
+      are COMPONENTS of it, not charged on top. To split without
+      double-counting, REDUCE the parent's line_total to the base =
+      (displayed price − Σ priced add-ons); the children then re-add
+      up to the displayed price.
+    INVARIANT either way: parent base + Σ its child add-ons = the price
+    actually charged for that item. NEVER leave the parent at the
+    all-in price AND also emit priced children — that double-counts and
+    breaks Σ line_total = subtotal.
+
   ZERO-COST option → it is an ATTRIBUTE.
     Do NOT emit a separate line. Fold it into the PARENT item's
     product_variant string ("Less Sugar", "No Ice", "Spice Level 2",
@@ -409,6 +425,33 @@ Boba drink, free customizations only (#162)
   and line_total_minor=75. If the price is NOT itemized, keep
   "+Soybean Mousse" in product_variant and tag line 1
   "variant-price-unresolved".
+
+Boba drink, INCLUSIVE paid add-ons (#162)
+(3CAT "Avomango Sweet Dew" shown at ONE all-in $9.49; its +Soybean
+Mousse ($1.25) and +Agar Boba ($0.75) are COMPONENTS of that $9.49,
+and Less Sugar / Ice Blended are free). Reduce the parent to base
+$7.49 so base + add-ons re-sum to the $9.49 actually charged:
+  items = [
+    {"line_no":1, "raw_name":"Avomango Sweet Dew",
+     "normalized_name":"Avomango Sweet Dew", "parent_line_no":null,
+     "product_variant":"Less Sugar, Ice Blended",
+     "quantity":1, "unit":"ea", "unit_price_minor":749,
+     "line_total_minor":749, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"beverage", "confidence":"high"},
+    {"line_no":2, "raw_name":"Soybean Mousse",
+     "normalized_name":"Soybean Mousse", "parent_line_no":1,
+     "quantity":1, "unit":"ea", "unit_price_minor":125,
+     "line_total_minor":125, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"beverage", "confidence":"high"},
+    {"line_no":3, "raw_name":"Agar Boba", "normalized_name":"Agar Boba",
+     "parent_line_no":1, "quantity":1, "unit":"ea",
+     "unit_price_minor":75, "line_total_minor":75, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"beverage", "confidence":"high"}
+    // base 749 + 125 + 75 = 949 = the price charged for the drink.
+    // Do NOT emit the parent at 949 AND these children — that is 1074,
+    // double-counting $1.25+$0.75. If the add-on prices were NOT shown,
+    // keep them in product_variant + "variant-price-unresolved" instead.
+  ]
 
 Costco gas (single line):
   items = [

@@ -41,7 +41,7 @@ import {
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.6";
+export const REEXTRACT_PROMPT_VERSION = "1.7";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -166,6 +166,17 @@ guess, never fall back to today's date.
                   option. If a paid add-on's price is not itemized on the
                   source, keep its name in the parent's product_variant and
                   add a 'variant-price-unresolved' tag on the parent.
+                  ADDITIVE vs INCLUSIVE: if the item shows ONE all-in price
+                  that already CONTAINS its add-ons (Snackpass / boba /
+                  combo), REDUCE the parent's line_total to base =
+                  (displayed − Σ priced add-ons) so base + children re-sum
+                  to the charged price. INVARIANT: parent base + Σ children
+                  = price charged; never keep the parent at the all-in price
+                  AND emit priced children (double-counts, breaks Σ=subtotal).
+                  E.g. 3CAT "Avomango Sweet Dew" all-in $9.49 incl. +Soybean
+                  Mousse $1.25 + +Agar Boba $0.75 → parent base $7.49 + two
+                  child lines ($1.25, $0.75), free "Less Sugar, Ice Blended"
+                  in product_variant.
                   Example: CoCo "Fried Chicken Curry" (line 1, $9.00,
                   product_variant="Less Sauce") with +Large Rice $1.00,
                   +Spice Level 4 $0.80, +Fish Cutlet $3.00 → three extra
