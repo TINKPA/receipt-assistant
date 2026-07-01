@@ -41,7 +41,7 @@ import {
  * into `transactions.metadata.extraction.prompt_version` on every run
  * (overwriting the prior value), and into `derivation_events.prompt_version`.
  */
-export const REEXTRACT_PROMPT_VERSION = "1.7";
+export const REEXTRACT_PROMPT_VERSION = "1.8";
 
 /**
  * The model identifier we stamp into `documents.ocr_model_version`.
@@ -142,10 +142,28 @@ guess, never fall back to today's date.
                     tags               text[]|null (freeform: alcohol, cold, organic,
                                                    sale, imported, handwritten, unclear)
                     confidence         enum: high|medium|low
+                    line_type          enum: product|tax|tip|discount|
+                                       shipping|fee (default 'product'). #162:
+                                       ALWAYS emit the printed tax / tip /
+                                       discount / fee rows THEMSELVES as named
+                                       items with the matching line_type and
+                                       product_key=NULL — e.g. a "Snackpass
+                                       Credit" −\$5.00 row is line_type=
+                                       'discount' (tags=['promo']); a "Taxes &
+                                       Fees" \$0.51 row is line_type='tax'. Keep
+                                       the printed NAME in raw_name /
+                                       normalized_name. NEVER collapse them into
+                                       the top-level tax_minor/discount_minor
+                                       numbers only — that loses the name.
+                                       parent_line_no NULL for these rows.
 
-                  Σ line_total_minor across items SHOULD approximate the
-                  receipt's subtotal (within \$0.01). If sum is off by >\$0.50,
-                  drop confidence='low' on items that look suspect.
+                  Σ line_total_minor across line_type='product' items SHOULD
+                  approximate the receipt's subtotal (within \$0.01); the tax /
+                  tip / discount / fee rows carry the rest (discount rows are
+                  negative), so Σ of ALL rows ≈ the final total. If the product
+                  sum is off by >\$0.50, drop confidence='low' on suspect items.
+                  Self-check before COMMIT: Σ tax rows ≈ printed tax, Σ discount
+                  rows ≈ printed discount, Σ product effective ≈ transaction total.
 
                   If you cannot itemize at all (total-only receipt, illegible
                   thermal print), emit ONE item with item_class='other',
