@@ -957,6 +957,14 @@
             "type": "integer",
             "exclusiveMinimum": 0
           },
+          "parent_line_no": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "default": null
+          },
           "raw_name": {
             "type": "string"
           },
@@ -965,6 +973,13 @@
               "string",
               "null"
             ]
+          },
+          "product_variant": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
           },
           "quantity": {
             "type": [

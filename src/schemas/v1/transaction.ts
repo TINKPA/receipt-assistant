@@ -86,10 +86,20 @@ export const TransactionItem = z
   .object({
     /** 1-based, preserves the printed order on the receipt. */
     line_no: z.number().int().positive(),
+    /** #162 — canonical two-level structure. When set, this row is a
+     *  paid modifier / add-on and this value is the `line_no` of its
+     *  owning parent item (same transaction + extraction run). NULL for
+     *  top-level items and for tax/tip/discount audit rows. */
+    parent_line_no: z.number().int().positive().nullable().default(null),
     /** Verbatim line as printed (abbreviations, brand prefixes preserved). */
     raw_name: z.string(),
     /** Brand-stripped human-readable form, or NULL when raw is already clean. */
     normalized_name: z.string().nullable(),
+    /** #162 — human-readable string of this item's ZERO-cost
+     *  customizations (少糖 / 去冰 / no cilantro / free spice level).
+     *  Paid add-ons are NEVER folded in here — they are their own
+     *  priced child lines (`parent_line_no`). NULL when none. */
+    product_variant: z.string().nullable().default(null),
     quantity: z.number().nullable(),
     /** "ct", "lb", "kg", "oz", "ea", "ml", "gal", or NULL. */
     unit: z.string().nullable(),
