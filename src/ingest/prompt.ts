@@ -21,7 +21,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.19";
+export const PROMPT_VERSION = "2.20";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -132,9 +132,16 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
   occurred_on   : date in YYYY-MM-DD form (read from the document —
                   NEVER fall back to today's date). If year is missing,
                   infer from nearby context (statement period etc.).
-  total_minor   : FINAL amount paid in the currency's minor unit
-                  (integer cents for USD, whole units for JPY).
-                  Include handwritten tips if present.
+  total_minor   : the receipt's FINAL "Grand Total" — the amount actually
+                  charged — in the currency's minor unit (integer cents for
+                  USD, whole units for JPY). Include handwritten tips.
+                  ⚠ Read the GRAND TOTAL line, never the item subtotal. When
+                  Gift Card / Rewards Points / store credit bring the order to
+                  \$0.00, total_minor = 0 — that IS the out-of-pocket amount
+                  charged (the goods still get itemized in items[]; the money
+                  was counted when the card/points were loaded). For a PARTIAL
+                  gift-card order, use the printed residual Grand Total, not
+                  the pre-credit subtotal.
   currency      : ISO 4217 code (USD, CNY, EUR, JPY, …). Detect from
                   symbols: \$→USD, €→EUR, £→GBP, ¥ needs context
                   (CNY vs JPY).
@@ -985,6 +992,12 @@ Invariants you MUST honor:
     already the workspace base currency (USD for this workspace).
   - Generate UUIDs via gen_random_uuid() inside the SQL.
   - All rows take workspace_id = WORKSPACE_ID.
+  - The items[] JSON is embedded via PostgreSQL dollar-quoting
+    (\`$items$<ITEMS_JSON_ARRAY>$items$::jsonb\`): drop your JSON array
+    directly between the \`$items$\` markers with NO surrounding single
+    quotes and NO escaping — this is what keeps apostrophes in product
+    titles ("World's", 12" pan) from breaking the write. Never revert it
+    to a single-quoted \`'...'::jsonb\` literal.
 
 ### 4a. receipt_image / receipt_email / receipt_pdf
 
@@ -1052,7 +1065,7 @@ every distinct product_brand_id present in items[]:
   psql "\$DATABASE_URL" <<'SQL'
     INSERT INTO brands (brand_id, name)
     SELECT DISTINCT product_brand_id, product_brand_id
-      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb)
+      FROM jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb)
         AS item(product_brand_id text)
      WHERE product_brand_id IS NOT NULL
     ON CONFLICT (brand_id) DO NOTHING;
@@ -1189,7 +1202,7 @@ them first):
           -- items[] is REQUIRED for receipt_image / receipt_email /
           -- receipt_pdf per #81 / PROMPT_VERSION 2.6. Statement_pdf
           -- omits this key. Each object follows the schema in Phase 2.
-          'items', '<ITEMS_JSON_ARRAY>'::jsonb
+          'items', $items$<ITEMS_JSON_ARRAY>$items$::jsonb
           -- add tax/tip/raw_text here if useful, as extra JSONB keys
         ),
         '${ctx.userId}'
@@ -1237,7 +1250,7 @@ them first):
              item.item_class, item.product_brand_id,
              item.product_model, item.product_color, item.product_size,
              item.product_variant, item.product_sku, item.product_manufacturer
-      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+      FROM jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb) AS item(
         line_no int, parent_line_no int, raw_name text, normalized_name text,
         quantity numeric, unit text,
         unit_price_minor bigint, line_total_minor bigint, currency text,
@@ -1286,7 +1299,7 @@ them first):
              item.tax_minor, item.tip_share_minor, item.discount_share_minor,
              1, '${PROMPT_VERSION}'
       FROM tx,
-        jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
+        jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb) AS item(
           line_no int, parent_line_no int, raw_name text, normalized_name text,
           quantity numeric, unit text,
           unit_price_minor bigint, line_total_minor bigint, currency text,
@@ -1312,7 +1325,16 @@ optional; use the workspace base currency snapshot already on
 \`postings.amount_base_minor\` for total_spent_minor:
 
   psql "\$DATABASE_URL" <<'SQL'
-  WITH stats AS (
+  WITH touched AS (
+    -- Only the products THIS ingest touched — recomputing the whole
+    -- workspace every ingest is O(N) per receipt → O(N²) over a backfill.
+    SELECT DISTINCT ti.product_id
+    FROM transaction_items ti
+    JOIN transactions t ON t.id = ti.transaction_id
+    WHERE t.source_ingest_id = '${ctx.ingestId}'
+      AND ti.product_id IS NOT NULL
+  ),
+  stats AS (
     SELECT ti.product_id,
            MIN(t.occurred_on)          AS first_on,
            MAX(t.occurred_on)          AS last_on,
@@ -1321,7 +1343,7 @@ optional; use the workspace base currency snapshot already on
     FROM transaction_items ti
     JOIN transactions t ON t.id = ti.transaction_id
     WHERE ti.workspace_id = '${ctx.workspaceId}'
-      AND ti.product_id IS NOT NULL
+      AND ti.product_id IN (SELECT product_id FROM touched)
       AND ti.retired_at IS NULL
       AND ti.line_type = 'product'
     GROUP BY ti.product_id
