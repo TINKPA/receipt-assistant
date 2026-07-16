@@ -50,7 +50,7 @@ import {
   restoreDocument,
   cascadeDeleteDocument,
   reExtractDocument,
-  renderEmailDocument,
+  renderDocumentHtml,
   extForMime,
   resolveUploadPath,
   type DocumentKindValue,
@@ -170,14 +170,30 @@ documentsRouter.get(
 
     const ext = extForMime(doc.mime_type) ?? path.extname(doc.file_path).replace(/^\./, "");
     const filename = ext ? `${doc.id}.${ext}` : doc.id;
-    res.setHeader(
-      "Content-Type",
-      doc.mime_type ?? "application/octet-stream",
-    );
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${filename}"`,
-    );
+
+    // /content streams the raw stored bytes. HTML/XML/SVG can execute
+    // script if a browser renders them inline same-origin (the detail
+    // viewer's PDF <iframe>, or a direct navigation), and this endpoint
+    // has no sanitize pass. Such docs are never legitimately viewed here
+    // — HTML receipts go through /rendered (sanitized + CSP + sandboxed)
+    // — so serve any active-content doc as an opaque, non-executable
+    // download instead of inline. Detected by mime OR extension so a
+    // near-miss mime (e.g. a .html uploaded as application/xhtml+xml)
+    // can't slip through. Images and PDFs are unchanged (rendered inline
+    // by <img> / the PDF viewer). #137 security review.
+    const baseMime = (doc.mime_type ?? "").split(";")[0]!.trim().toLowerCase();
+    const fileExt = path.extname(doc.file_path).toLowerCase();
+    const isActiveContent =
+      ["text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml"].includes(baseMime) ||
+      [".html", ".htm", ".xhtml", ".svg", ".xml"].includes(fileExt);
+    if (isActiveContent) {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    } else {
+      res.setHeader("Content-Type", doc.mime_type ?? "application/octet-stream");
+      res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    }
     setEtag(res, DOC_VERSION);
     createReadStream(absPath).pipe(res);
   }),
@@ -185,8 +201,9 @@ documentsRouter.get(
 
 // ── GET /v1/documents/:id/rendered ─────────────────────────────────────
 //
-// For receipt_email documents: decode the raw .eml and serve the
-// sanitized HTML body for the frontend's "Original email" fold (#122).
+// Serve a sanitized HTML rendering for the detail page's "Original
+// receipt / email" fold. Two sources: a receipt_email `.eml` (decoded,
+// #122) or a raw text/html document (sanitized as-is, #137).
 // Safety: a strict CSP (no script-src) + the frontend's sandboxed iframe
 // neutralize any active content; the service-side sanitize is the third
 // layer. Remote images are allowed (product decision — fidelity).
@@ -194,8 +211,12 @@ documentsRouter.get(
   "/:id/rendered",
   asyncHandler(async (req, res) => {
     const { id } = parseOrThrow(IdOnlyParams, req.params);
-    const html = await renderEmailDocument(req.ctx.workspaceId, id);
-    if (html == null) throw new NotFoundProblem("Document content", id);
+    const html = await renderDocumentHtml(req.ctx.workspaceId, id);
+    // Treat an empty render (e.g. a 0-byte HTML file) as missing rather
+    // than serving a blank 200 that shows as an empty iframe. #137.
+    if (html == null || html.trim() === "") {
+      throw new NotFoundProblem("Document content", id);
+    }
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader(
@@ -427,21 +448,24 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/documents/{id}/rendered",
     summary:
-      "Decoded + sanitized HTML body of a receipt_email document, for the " +
-      "frontend 'Original email' fold. Served with a strict CSP; render " +
-      "inside a sandboxed iframe.",
+      "Sanitized HTML rendering of a document for the frontend's " +
+      "'Original receipt / email' fold: a decoded receipt_email (.eml) " +
+      "body or a sanitized raw text/html document (#137). Served with a " +
+      "strict CSP; render inside a sandboxed iframe.",
     tags: ["documents"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
       200: {
-        description: "Sanitized email HTML",
+        description: "Sanitized HTML (email body or text/html document)",
         content: {
           "text/html": { schema: { type: "string" } },
         },
       },
-      404: { description: "Not found / no file", content: problemContent },
+      404: { description: "Not found / no file / empty render", content: problemContent },
       422: {
-        description: "Document is not an email (kind != receipt_email)",
+        description:
+          "Document has no HTML rendering (neither receipt_email nor " +
+          "text/html); code document-not-renderable",
         content: problemContent,
       },
     },

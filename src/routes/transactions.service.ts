@@ -163,6 +163,10 @@ export interface TransactionRow {
   documents: Array<{
     id: string;
     kind: string;
+    /** Raw content type; drives the viewer's render path (text/html →
+     *  sanitized /rendered). Present on the detail read, null on the
+     *  list view. #137. */
+    mime_type?: string | null;
     /** Channel provenance (email sender/subject/received_at). Present on
      *  the single-tx detail read; omitted on the list view. #122. */
     source_meta?: Record<string, unknown> | null;
@@ -349,7 +353,7 @@ function itemsFromMetadataFallback(metadata: unknown): TransactionItemRow[] {
 function mapTransactionRow(
   row: any,
   posts: any[],
-  docs: Array<{ id: string; kind: string; sourceMeta?: unknown }>,
+  docs: Array<{ id: string; kind: string; mimeType?: unknown; sourceMeta?: unknown }>,
   place: PlaceRow | null = null,
   itemRows: any[] = [],
   merchant: MerchantRefRow | null = null,
@@ -380,6 +384,7 @@ function mapTransactionRow(
     documents: docs.map((d) => ({
       id: d.id,
       kind: d.kind,
+      mime_type: (d.mimeType ?? null) as string | null,
       source_meta: (d.sourceMeta ?? null) as Record<string, unknown> | null,
     })),
     place,
@@ -412,6 +417,7 @@ async function loadTransactionFull(
     .select({
       id: documents.id,
       kind: documents.kind,
+      mimeType: documents.mimeType,
       sourceMeta: documents.sourceMeta,
     })
     .from(documentLinks)
