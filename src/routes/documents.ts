@@ -515,7 +515,7 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Default: soft delete (sets deleted_at). " +
       "?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. " +
-      "?cascade=true: linked posted transactions are voided, draft/error transactions are hard-deleted, voided transactions are left intact, reconciled transactions abort the operation with 409. " +
+      "?cascade=true: linked posted transactions are soft-deleted, draft/error transactions are hard-deleted, already-deleted transactions are left intact, reconciled transactions abort the operation with 409. " +
       "?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). " +
       "Reconciled transactions always block hard cascades — unreconcile first.",
     tags: ["documents"],

@@ -2,8 +2,9 @@
  * `/v1/reports/*` — read-only aggregate endpoints on top of the ledger.
  *
  * All rollups query `postings` ⨝ `transactions` ⨝ `accounts`. No new
- * tables; no migrations. Voided transactions (`status='voided'`) are
- * excluded from every report.
+ * tables; no migrations. Only money-counting rows are included:
+ * `status IN ('posted','reconciled') AND deleted_at IS NULL`. Soft-deleted
+ * (e.g. deduped) transactions are excluded from every report.
  *
  * The aggregates are small relative to raw ledger size (bounded by
  * user-supplied date range and the number of accounts), so these
@@ -124,7 +125,7 @@ export async function getSummaryReport(
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${args.workspaceId}::uuid
-        AND t.status <> 'voided'
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         AND a.type = 'expense'
         AND p.amount_base_minor > 0
         ${fromFilter}
@@ -214,7 +215,7 @@ export async function getTrendsReport(
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${args.workspaceId}::uuid
-        AND t.status <> 'voided'
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         AND a.type = 'expense'
         AND p.amount_base_minor > 0
         ${fromFilter}
@@ -305,7 +306,7 @@ export async function getNetWorthReport(
       a.name          AS name,
       a.type::text    AS type,
       COALESCE(SUM(p.amount_base_minor) FILTER (
-        WHERE t.status = 'posted' AND t.occurred_on <= ${asOf}::date
+        WHERE t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND t.occurred_on <= ${asOf}::date
       ), 0)::bigint AS balance_minor
     FROM accounts a
     LEFT JOIN postings p ON p.account_id = a.id AND p.workspace_id = a.workspace_id
@@ -392,7 +393,7 @@ export async function getCashflowReport(
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${args.workspaceId}::uuid
-        AND t.status <> 'voided'
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         AND a.type IN ('income', 'expense')
         ${fromFilter}
         ${toFilter}

@@ -139,7 +139,7 @@ export const BalanceQuery = z.object({
 export const RegisterQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
-  include_voided: z.coerce.boolean().optional(),
+  include_deleted: z.coerce.boolean().optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });

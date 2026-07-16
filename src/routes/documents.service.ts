@@ -529,22 +529,21 @@ export async function hardDeleteDocument(params: {
 
 interface CascadeReport {
   unlinked: number;
-  txns_voided: string[];
+  txns_soft_deleted: string[];
   txns_hard_deleted: string[];
-  txns_skipped_voided: string[];
+  txns_skipped: string[];
 }
 
 /**
  * One-call "delete this whole receipt" orchestration.
  *
- * Soft mode (default): linked posted txns → voided; linked draft/error
- * txns → hard-deleted (no audit value); linked already-voided txns →
- * left alone, link kept for history; document → soft-deleted.
+ * Soft mode (default): linked posted txns → soft-deleted (deleted_at);
+ * linked draft/error txns → hard-deleted (no audit value); linked
+ * already-deleted txns → left alone, link kept for history; document →
+ * soft-deleted.
  *
  * Hard mode (`hard=true`): all linked txns are hard-deleted (postings
- * cascade via FK; void mirrors are NOT chased — orphan mirrors become
- * the user's problem, matching "user takes responsibility"); document
- * → hard-deleted (row + image file).
+ * cascade via FK); document → hard-deleted (row + image file).
  *
  * Both modes refuse if any linked txn is `reconciled`: 409, no writes.
  * Caller must unreconcile first.
@@ -579,7 +578,7 @@ export async function cascadeDeleteDocument(params: {
       .select({
         id: transactions.id,
         status: transactions.status,
-        voidedById: transactions.voidedById,
+        deletedAt: transactions.deletedAt,
         version: transactions.version,
       })
       .from(documentLinks)
@@ -598,7 +597,7 @@ export async function cascadeDeleteDocument(params: {
       );
     }
 
-    const txnsVoided: string[] = [];
+    const txnsSoftDeleted: string[] = [];
     const txnsHardDeleted: string[] = [];
     const txnsSkipped: string[] = [];
 
@@ -635,15 +634,18 @@ export async function cascadeDeleteDocument(params: {
 
       return {
         unlinked: linkCount,
-        txns_voided: txnsVoided,
+        txns_soft_deleted: txnsSoftDeleted,
         txns_hard_deleted: txnsHardDeleted,
-        txns_skipped_voided: txnsSkipped,
+        txns_skipped: txnsSkipped,
       };
     }
 
     // Soft mode.
     for (const t of linkedTxns) {
-      if (t.status === "draft" || t.status === "error") {
+      if (t.deletedAt) {
+        // Already removed. Leave alone; link survives as historical record.
+        txnsSkipped.push(t.id);
+      } else if (t.status === "draft" || t.status === "error") {
         await tx.insert(transactionEvents).values({
           id: newId(),
           workspaceId,
@@ -658,20 +660,26 @@ export async function cascadeDeleteDocument(params: {
         });
         await tx.delete(transactions).where(eq(transactions.id, t.id));
         txnsHardDeleted.push(t.id);
-      } else if (t.status === "posted") {
-        await voidTransactionInTx(tx, {
+      } else {
+        // posted (reconciled short-circuited above) → soft-delete the
+        // transaction: it stays restorable but drops out of money queries.
+        await tx
+          .update(transactions)
+          .set({ deletedAt: new Date() })
+          .where(eq(transactions.id, t.id));
+        await tx.insert(transactionEvents).values({
+          id: newId(),
           workspaceId,
-          userId,
-          txId: t.id,
-          expectedVersion: Number(t.version),
-          reason: `cascade_soft_delete_document:${documentId}`,
+          transactionId: t.id,
+          eventType: "deleted",
+          actorId: userId,
+          payload: {
+            reason: `cascade_soft_delete_document:${documentId}`,
+            prior_status: t.status,
+          },
         });
-        txnsVoided.push(t.id);
-      } else if (t.status === "voided") {
-        // Leave alone. Link survives as historical record.
-        txnsSkipped.push(t.id);
+        txnsSoftDeleted.push(t.id);
       }
-      // 'reconciled' already short-circuited above.
     }
 
     // Soft-delete the doc itself (idempotent).
@@ -684,9 +692,9 @@ export async function cascadeDeleteDocument(params: {
 
     return {
       unlinked: 0,
-      txns_voided: txnsVoided,
+      txns_soft_deleted: txnsSoftDeleted,
       txns_hard_deleted: txnsHardDeleted,
-      txns_skipped_voided: txnsSkipped,
+      txns_skipped: txnsSkipped,
     };
   });
 
@@ -695,102 +703,6 @@ export async function cascadeDeleteDocument(params: {
   }
 
   return { ...report, hardDeletedFilePath: pendingFileUnlink };
-}
-
-// Internal: void a transaction inside an existing tx scope. Mirrors
-// `voidTransaction` in transactions.service.ts but without spinning a
-// new outer transaction, so cascades remain atomic. Kept private to
-// avoid drift — the public path stays voidTransaction.
-async function voidTransactionInTx(
-  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
-  args: {
-    workspaceId: string;
-    userId: string;
-    txId: string;
-    expectedVersion: number;
-    reason: string;
-  },
-): Promise<void> {
-  const { workspaceId, userId, txId, expectedVersion, reason } = args;
-  const rows = await tx
-    .select()
-    .from(transactions)
-    .where(
-      and(eq(transactions.id, txId), eq(transactions.workspaceId, workspaceId)),
-    );
-  if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
-  const current = rows[0]!;
-  if (Number(current.version) !== expectedVersion) {
-    const { VersionMismatchProblem } = await import("../http/problem.js");
-    throw new VersionMismatchProblem(Number(current.version), expectedVersion);
-  }
-
-  const originalPostings = await tx
-    .select()
-    .from(postings)
-    .where(eq(postings.transactionId, txId));
-
-  const mirrorId = newId();
-  const existingMeta = (current.metadata ?? {}) as Record<string, unknown>;
-  const mirrorMeta: Record<string, unknown> = {
-    ...existingMeta,
-    voided: txId,
-    void_reason: reason,
-  };
-
-  await tx.insert(transactions).values({
-    id: mirrorId,
-    workspaceId,
-    occurredOn: typeof current.occurredOn === "string"
-      ? current.occurredOn
-      : (current.occurredOn as Date).toISOString().slice(0, 10),
-    occurredAt: current.occurredAt,
-    payee: `VOID: ${current.payee ?? ""}`.trim(),
-    narration: current.narration,
-    status: "posted",
-    tripId: current.tripId,
-    metadata: mirrorMeta,
-    createdBy: userId,
-  });
-
-  await tx.insert(postings).values(
-    originalPostings.map((p) => ({
-      id: newId(),
-      workspaceId,
-      transactionId: mirrorId,
-      accountId: p.accountId,
-      amountMinor: -BigInt(p.amountMinor),
-      currency: p.currency,
-      fxRate: p.fxRate,
-      amountBaseMinor:
-        p.amountBaseMinor === null ? null : -BigInt(p.amountBaseMinor),
-      memo: p.memo,
-    })),
-  );
-
-  await tx
-    .update(transactions)
-    .set({ status: "voided", voidedById: mirrorId })
-    .where(eq(transactions.id, txId));
-
-  await tx.insert(transactionEvents).values([
-    {
-      id: newId(),
-      workspaceId,
-      transactionId: txId,
-      eventType: "voided",
-      actorId: userId,
-      payload: { voided_by: mirrorId, reason },
-    },
-    {
-      id: newId(),
-      workspaceId,
-      transactionId: mirrorId,
-      eventType: "created",
-      actorId: userId,
-      payload: { voids: txId, reason },
-    },
-  ]);
 }
 
 // ── Re-extract (Phase 4c of #80 / #91) ─────────────────────────────────

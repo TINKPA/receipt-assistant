@@ -410,7 +410,7 @@ export async function getBalanceService(
            WHERE p.workspace_id = ${args.workspaceId}::uuid
              AND p.account_id IN (SELECT id FROM subtree)
              AND t.occurred_on <= ${asOf}::date
-             AND t.status = 'posted'
+             AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         `
       : sql`
           SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint AS balance,
@@ -420,7 +420,7 @@ export async function getBalanceService(
            WHERE p.workspace_id = ${args.workspaceId}::uuid
              AND p.account_id = ${args.accountId}::uuid
              AND t.occurred_on <= ${asOf}::date
-             AND t.status = 'posted'
+             AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         `,
   );
   const row = result.rows[0] as {
@@ -448,7 +448,7 @@ export interface RegisterArgs {
   accountId: string;
   from?: string;
   to?: string;
-  includeVoided?: boolean;
+  includeDeleted?: boolean;
   cursor?: string;
   limit?: number;
 }
@@ -477,9 +477,9 @@ export async function getRegisterService(
   // (occurred_on ASC, posting_id ASC) — so older rows accumulate first.
   // We *display* rows in descending order (most recent first) but the
   // cumulative sum is still evaluated in chronological order.
-  const statusFilter = args.includeVoided
-    ? sql``
-    : sql`AND t.status = 'posted'`;
+  const statusFilter = args.includeDeleted
+    ? sql`AND t.status IN ('posted', 'reconciled')`
+    : sql`AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL`;
   const fromFilter = args.from
     ? sql`AND t.occurred_on >= ${args.from}::date`
     : sql``;
@@ -773,7 +773,7 @@ accountsRouter.get(
       accountId: id,
       from: q.from,
       to: q.to,
-      includeVoided: q.include_voided,
+      includeDeleted: q.include_deleted,
       cursor: q.cursor,
       limit: q.limit,
     });

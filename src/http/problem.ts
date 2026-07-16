@@ -133,18 +133,6 @@ export class AccountInUseProblem extends HttpProblem {
   }
 }
 
-export class MustVoidInsteadProblem extends HttpProblem {
-  constructor(txId: string, status: string) {
-    super(
-      409,
-      "must-void-instead",
-      "Use POST /void instead of DELETE",
-      `Transaction ${txId} is in status=${status}. Only draft/error transactions can be hard-deleted; posted/reconciled transactions must be voided.`,
-      { transaction_id: txId, status },
-    );
-  }
-}
-
 export class PostingsImbalanceProblem extends HttpProblem {
   constructor(detail: string, violations: Violation[]) {
     super(422, "postings-imbalance", "Postings do not balance", detail, {

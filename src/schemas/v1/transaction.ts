@@ -32,7 +32,6 @@ export const TransactionMerchantRef = z
 export const TxnStatus = z.enum([
   "draft",
   "posted",
-  "voided",
   "reconciled",
   "error",
 ]);
@@ -159,7 +158,10 @@ export const Transaction = z
     payee: z.string().nullable(),
     narration: z.string().nullable(),
     status: TxnStatus,
-    voided_by_id: Uuid.nullable(),
+    /** Soft-delete tombstone (#171). Non-null = removed (e.g. deduped);
+     *  such rows are excluded from every money query and can be restored
+     *  via POST /:id/restore. */
+    deleted_at: IsoDateTime.nullable(),
     source_ingest_id: Uuid.nullable(),
     trip_id: Uuid.nullable(),
     metadata: Metadata,
@@ -214,12 +216,6 @@ export const UpdateTransactionRequest = z
   })
   .openapi("UpdateTransactionRequest");
 
-export const VoidTransactionRequest = z
-  .object({
-    reason: z.string().optional(),
-  })
-  .openapi("VoidTransactionRequest");
-
 export const UnreconcileTransactionRequest = z
   .object({
     reason: z.string().optional(),
@@ -249,6 +245,8 @@ export const ListTransactionsQuery = z.object({
   status: TxnStatus.optional(),
   trip_id: Uuid.optional(),
   has_document: z.coerce.boolean().optional(),
+  /** Include soft-deleted (e.g. deduped) rows. Default false. #171 */
+  include_deleted: z.coerce.boolean().optional(),
   source_ingest_id: Uuid.optional(),
   /** flagged=near_dup → only transactions whose extraction recorded
    *  metadata.near_dup_check.flagged_for_review=true (#134 branch 4:
@@ -273,7 +271,6 @@ export const ListPostingsQuery = z.object({
 // Bulk operations (RPC-style)
 export const BulkOperation = z.discriminatedUnion("op", [
   z.object({ op: z.literal("update"), id: Uuid, if_match: z.string(), patch: UpdateTransactionRequest }),
-  z.object({ op: z.literal("void"),   id: Uuid, if_match: z.string(), reason: z.string().optional() }),
   z.object({ op: z.literal("reconcile"), id: Uuid, if_match: z.string() }),
 ]);
 

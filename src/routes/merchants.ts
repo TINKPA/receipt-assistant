@@ -137,7 +137,7 @@ merchantsRouter.get(
         JOIN postings p ON p.transaction_id = t.id
         WHERE t.workspace_id = ${req.ctx.workspaceId}::uuid
           AND t.merchant_id = ${merchant.id}::uuid
-          AND t.status <> 'voided'
+          AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
       )
       SELECT
         s.txn_count, s.lifetime_spend, s.current_month_spend, s.last_date,
@@ -213,6 +213,7 @@ merchantsRouter.get(
       FROM transactions t
       WHERE t.workspace_id = ${req.ctx.workspaceId}::uuid
         AND t.merchant_id = ${merchant.id}::uuid
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         ${cursorClause}
       ORDER BY t.occurred_on DESC, t.id DESC
       LIMIT ${limit + 1}
@@ -222,7 +223,7 @@ merchantsRouter.get(
       id: string;
       occurred_on: string;
       payee: string | null;
-      status: "draft" | "posted" | "voided" | "reconciled" | "error";
+      status: "draft" | "posted" | "reconciled" | "error";
       total_minor: string | number;
       currency: string | null;
       document_id: string | null;

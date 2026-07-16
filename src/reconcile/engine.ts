@@ -16,23 +16,23 @@
  *     on its own thread.
  *
  * Apply / reject:
- *   - `applyProposals` handles each proposal kind. For `dedup` it voids
- *     the duplicate transaction via the existing v1 service (so the
- *     balance trigger + audit log still fire) and stamps the proposal
- *     `status='user_applied'`.
+ *   - `applyProposals` handles each proposal kind. For `dedup` it
+ *     soft-deletes the duplicate transaction via the v1 service (audit
+ *     event fires, evidence links re-point to the canonical row) and
+ *     stamps the proposal `status='user_applied'`.
  *   - `rejectProposals` just flips `status='rejected'` — no ledger
  *     mutation, proposal is frozen for future audit.
  *
  * Apply and auto-apply share the same action function so a dedup
- * voided above the auto-apply threshold and one applied by a human
- * produce identical ledger effects (one void + one voided-by link).
+ * removed above the auto-apply threshold and one applied by a human
+ * produce identical ledger effects (the duplicate is soft-deleted).
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { batches, reconcileProposals, transactions } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { NotFoundProblem } from "../http/problem.js";
-import { voidTransaction } from "../routes/transactions.service.js";
+import { softDeleteTransaction } from "../routes/transactions.service.js";
 import { detectDuplicates, detectNearDuplicates } from "./dedup.js";
 import {
   paymentLinkStub,
@@ -188,11 +188,13 @@ export async function getReconcileResult(
 // ── Dedup application (shared by auto-apply + user apply) ─────────────
 
 /**
- * Void the duplicate transaction via the ledger service. Returns true
- * if the void happened; false if the row was already voided (idempotent
- * replay).
+ * Soft-delete the duplicate transaction via the ledger service. Returns
+ * true if the delete happened; false if the row was already removed or
+ * isn't a live money row (idempotent replay). The bank statement is the
+ * ledger's ground truth and a receipt is just detail, so a duplicate is
+ * simply removed (reversibly), not reversed with a negated mirror (#171).
  */
-async function voidDuplicate(params: {
+async function softDeleteDuplicate(params: {
   workspaceId: string;
   userId: string;
   duplicateId: string;
@@ -200,7 +202,11 @@ async function voidDuplicate(params: {
 }): Promise<boolean> {
   const { workspaceId, userId, duplicateId, canonicalId } = params;
   const rows = await db
-    .select({ version: transactions.version, status: transactions.status })
+    .select({
+      version: transactions.version,
+      status: transactions.status,
+      deletedAt: transactions.deletedAt,
+    })
     .from(transactions)
     .where(
       and(
@@ -210,13 +216,13 @@ async function voidDuplicate(params: {
     );
   if (rows.length === 0) return false;
   const cur = rows[0]!;
-  if (cur.status === "voided" || cur.status === "draft" || cur.status === "error") {
+  if (cur.deletedAt || cur.status === "draft" || cur.status === "error") {
     return false;
   }
-  // #135: evidence survives the void. Re-point the duplicate's
+  // #135: evidence survives the delete. Re-point the duplicate's
   // document_links at the canonical transaction (keep-both model —
   // documents are never casualties of ledger repair), then drop the
-  // now-redundant link rows so the voided mirror doesn't claim them.
+  // now-redundant link rows so the removed duplicate doesn't claim them.
   await db.execute(sql`
     INSERT INTO document_links (document_id, transaction_id)
     SELECT dl.document_id, ${canonicalId}::uuid
@@ -226,13 +232,10 @@ async function voidDuplicate(params: {
   await db.execute(
     sql`DELETE FROM document_links WHERE transaction_id = ${duplicateId}::uuid`,
   );
-  await voidTransaction(
-    workspaceId,
+  await softDeleteTransaction(workspaceId, duplicateId, Number(cur.version), {
     userId,
-    duplicateId,
-    Number(cur.version),
-    `reconcile: duplicate of ${canonicalId}`,
-  );
+    reason: `reconcile: duplicate of ${canonicalId}`,
+  });
   return true;
 }
 
@@ -429,21 +432,21 @@ export async function runReconcile(params: {
         duplicate_of: string;
       };
       try {
-        const voided = await voidDuplicate({
+        const removed = await softDeleteDuplicate({
           workspaceId,
           userId,
           duplicateId: payload.duplicate,
           canonicalId: payload.duplicate_of,
         });
-        if (voided) {
+        if (removed) {
           await db
             .update(reconcileProposals)
             .set({ status: "auto_applied", resolvedAt: new Date() })
             .where(eq(reconcileProposals.id, p.id));
         } else {
-          // Row was already voided — mark the proposal resolved as
+          // Row was already removed — mark the proposal resolved as
           // user_applied-retroactive so we don't leave a stuck
-          // `proposed` row pointing at a void.
+          // `proposed` row pointing at a deleted duplicate.
           await db
             .update(reconcileProposals)
             .set({ status: "auto_applied", resolvedAt: new Date() })
@@ -541,7 +544,7 @@ export async function applyProposals(params: {
         continue;
       }
       try {
-        await voidDuplicate({
+        await softDeleteDuplicate({
           workspaceId,
           userId,
           duplicateId: payload.duplicate,
@@ -556,7 +559,7 @@ export async function applyProposals(params: {
         skipped.push({
           id: pid,
           reason:
-            err instanceof Error ? `void_failed: ${err.message}` : "void_failed",
+            err instanceof Error ? `delete_failed: ${err.message}` : "delete_failed",
         });
       }
     } else {
