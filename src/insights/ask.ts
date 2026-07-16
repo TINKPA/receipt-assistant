@@ -15,7 +15,7 @@ import { runClaude, detectPsqlCommand } from "../claude.js";
 
 const SCHEMA_DIGEST = `
 LEDGER SCHEMA (PostgreSQL; amounts in MINOR units — divide by 100 for dollars):
-- transactions(id, workspace_id, occurred_on DATE, payee, narration, status[draft|posted|reconciled|voided], merchant_id, place_id, metadata)
+- transactions(id, workspace_id, occurred_on DATE, payee, narration, status[draft|posted|reconciled|error], deleted_at TIMESTAMPTZ NULL, merchant_id, place_id, metadata)
 - postings(id, transaction_id, account_id, amount_minor, amount_base_minor, currency) — double-entry; expense side is POSITIVE amount_base_minor
 - accounts(id, name, type[asset|liability|equity|income|expense]) — expense account name IS the spending category (e.g. 'Food & Drinks','Services','Travel','Transportation','Entertainment','Shopping','Groceries')
 - transaction_items(id, transaction_id, product_id, description, quantity, unit_price_minor, line_total_minor, effective_total_minor[incl. tax/tip share])
@@ -24,7 +24,7 @@ LEDGER SCHEMA (PostgreSQL; amounts in MINOR units — divide by 100 for dollars)
 - owned_items(id, product_id, transaction_item_id, acquired_on, condition, retired_at, target_days)
 - wish_items(id, title, target_price_minor, planned_days, urgency, status)
 - documents(id, kind, ocr_text) + document_links(document_id, transaction_id)
-CONVENTIONS: spending total for a period = SUM(p.amount_base_minor) joined to expense accounts with amount_base_minor > 0 and t.status <> 'voided'. Dates are local; occurred_on is the receipt date.`;
+CONVENTIONS: spending total for a period = SUM(p.amount_base_minor) joined to expense accounts with amount_base_minor > 0 and t.status IN ('posted','reconciled') AND t.deleted_at IS NULL. Dates are local; occurred_on is the receipt date.`;
 
 export async function askLedger(
   workspaceId: string,

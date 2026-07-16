@@ -18,7 +18,6 @@ import { eq, and } from "drizzle-orm";
 import {
   CreateTransactionRequest,
   UpdateTransactionRequest,
-  VoidTransactionRequest,
   NearDupReviewRequest,
   NearDupReviewResponse,
   UnreconcileTransactionRequest,
@@ -52,7 +51,8 @@ import {
   listTransactions,
   updateTransaction,
   deleteTransaction,
-  voidTransaction,
+  softDeleteTransaction,
+  restoreTransaction,
   dismissNearDupFlag,
   reconcileTransaction,
   unreconcileTransaction,
@@ -171,15 +171,6 @@ transactionsRouter.post(
               op.patch,
             );
             results.push({ index: i, status: 200, body: out });
-          } else if (op.op === "void") {
-            const out = await voidTransaction(
-              req.ctx.workspaceId,
-              req.ctx.userId,
-              op.id,
-              expected,
-              op.reason,
-            );
-            results.push({ index: i, status: 201, body: out });
           } else if (op.op === "reconcile") {
             const out = await reconcileTransaction(
               req.ctx.workspaceId,
@@ -274,11 +265,10 @@ transactionsRouter.patch(
 
 // ── DELETE /v1/transactions/:id ────────────────────────────────────────
 //
-// Default: only `draft` / `error` may be hard-deleted; posted requires
-// POST /void instead (returns 409 must-void-instead).
-// `?hard=true`: caller forces a hard delete on posted/voided as well —
-// rows + postings + document_links cascade. `reconciled` is the one
-// status that still rejects (must unreconcile first).
+// Default: reversible soft delete (sets deleted_at; restorable via
+// POST /:id/restore). `?hard=true`: physical delete — rows + postings +
+// document_links cascade, irreversible. `reconciled` rejects either way
+// (must unreconcile first).
 
 const TxnDeleteQuery = z.object({
   hard: z.union([z.literal("true"), z.literal("1"), z.literal("false"), z.literal("0")]).optional(),
@@ -290,13 +280,20 @@ transactionsRouter.delete(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const q = parseOrThrow(TxnDeleteQuery, req.query);
-      const force = q.hard === "true" || q.hard === "1";
+      const hard = q.hard === "true" || q.hard === "1";
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
       requireIfMatch(req, currentVersion);
-      await deleteTransaction(req.ctx.workspaceId, id, currentVersion, {
-        force,
-        userId: req.ctx.userId,
-      });
+      // Default: reversible soft delete (deleted_at). ?hard=true: physical
+      // delete. Reconciled transactions reject either way (unreconcile first).
+      if (hard) {
+        await deleteTransaction(req.ctx.workspaceId, id, currentVersion, {
+          userId: req.ctx.userId,
+        });
+      } else {
+        await softDeleteTransaction(req.ctx.workspaceId, id, currentVersion, {
+          userId: req.ctx.userId,
+        });
+      }
       res.status(204).end();
     } catch (err) {
       next(err);
@@ -304,26 +301,23 @@ transactionsRouter.delete(
   },
 );
 
-// ── POST /v1/transactions/:id/void ─────────────────────────────────────
+// ── POST /v1/transactions/:id/restore ──────────────────────────────────
 
 transactionsRouter.post(
-  "/:id/void",
+  "/:id/restore",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { id } = parseOrThrow(IdParam, req.params);
-      const body = parseOrThrow(VoidTransactionRequest, req.body ?? {});
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
       requireIfMatch(req, currentVersion);
-      const result = await voidTransaction(
+      const result = await restoreTransaction(
         req.ctx.workspaceId,
-        req.ctx.userId,
         id,
         currentVersion,
-        body.reason,
+        { userId: req.ctx.userId },
       );
-      res.setHeader("Location", `/v1/transactions/${result.id}`);
       setEtag(res, result.version);
-      res.status(201).json(result);
+      res.status(200).json(result);
     } catch (err) {
       next(err);
     }
@@ -574,9 +568,10 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/transactions/{id}",
     summary: "Delete a transaction",
     description:
-      "Default: only draft/error transactions may be hard-deleted; posted/voided return 409 (must-void-instead). " +
-      "?hard=true forces a hard delete of any non-reconciled transaction (postings + document_links cascade). " +
-      "Reconciled transactions always reject — unreconcile first.",
+      "Default: reversible soft delete (sets deleted_at; the row drops out of every " +
+      "money query but is restorable via POST /:id/restore). ?hard=true forces a physical " +
+      "delete (postings + document_links cascade; irreversible). Reconciled transactions " +
+      "reject either way — unreconcile first.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -584,15 +579,14 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       query: z.object({
         hard: z.enum(["true", "false", "1", "0"]).optional().openapi({
           description:
-            "Force hard delete of posted/voided transactions. Reconciled is still rejected.",
+            "Force a physical delete instead of the default soft delete. Reconciled is still rejected.",
         }),
       }),
     },
     responses: {
       204: { description: "Deleted" },
       409: {
-        description:
-          "Must void instead (posted, no ?hard=true), or transaction is reconciled.",
+        description: "Transaction is reconciled — unreconcile first.",
         content: problemContent,
       },
     },
@@ -600,21 +594,20 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
 
   registry.registerPath({
     method: "post",
-    path: "/v1/transactions/{id}/void",
-    summary: "Void a posted transaction",
+    path: "/v1/transactions/{id}/restore",
+    summary: "Restore a soft-deleted transaction",
+    description: "Clears deleted_at so the transaction counts again. 404 if it wasn't deleted.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
       headers: z.object({ "If-Match": z.string() }),
-      body: {
-        content: { "application/json": { schema: VoidTransactionRequest } },
-      },
     },
     responses: {
-      201: {
-        description: "Mirror transaction created",
+      200: {
+        description: "Restored transaction",
         content: { "application/json": { schema: TransactionSchema } },
       },
+      404: { description: "Not found / not deleted", content: problemContent },
     },
   });
 
@@ -686,7 +679,7 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.registerPath({
     method: "post",
     path: "/v1/transactions/bulk",
-    summary: "Bulk update/void/reconcile",
+    summary: "Bulk update/reconcile",
     tags: ["transactions"],
     request: {
       body: { content: { "application/json": { schema: BulkRequest } } },

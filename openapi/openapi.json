@@ -1154,18 +1154,16 @@
             "enum": [
               "draft",
               "posted",
-              "voided",
               "reconciled",
               "error"
             ]
           },
-          "voided_by_id": {
+          "deleted_at": {
             "type": [
               "string",
               "null"
             ],
-            "format": "uuid",
-            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            "format": "date-time"
           },
           "source_ingest_id": {
             "type": [
@@ -1233,7 +1231,7 @@
           "payee",
           "narration",
           "status",
-          "voided_by_id",
+          "deleted_at",
           "source_ingest_id",
           "trip_id",
           "version",
@@ -2853,7 +2851,6 @@
             "enum": [
               "draft",
               "posted",
-              "voided",
               "reconciled",
               "error"
             ]
@@ -4224,7 +4221,6 @@
             "enum": [
               "draft",
               "posted",
-              "voided",
               "reconciled",
               "error"
             ]
@@ -4347,7 +4343,6 @@
             "enum": [
               "draft",
               "posted",
-              "voided",
               "reconciled",
               "error"
             ]
@@ -4428,14 +4423,6 @@
           }
         }
       },
-      "VoidTransactionRequest": {
-        "type": "object",
-        "properties": {
-          "reason": {
-            "type": "string"
-          }
-        }
-      },
       "NearDupReviewResponse": {
         "type": "object",
         "properties": {
@@ -4513,33 +4500,6 @@
                     "id",
                     "if_match",
                     "patch"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "properties": {
-                    "op": {
-                      "type": "string",
-                      "enum": [
-                        "void"
-                      ]
-                    },
-                    "id": {
-                      "type": "string",
-                      "format": "uuid",
-                      "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
-                    },
-                    "if_match": {
-                      "type": "string"
-                    },
-                    "reason": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "op",
-                    "id",
-                    "if_match"
                   ]
                 },
                 {
@@ -5252,7 +5212,7 @@
               ]
             },
             "required": false,
-            "name": "include_voided",
+            "name": "include_deleted",
             "in": "query"
           },
           {
@@ -5455,7 +5415,6 @@
               "enum": [
                 "draft",
                 "posted",
-                "voided",
                 "reconciled",
                 "error"
               ]
@@ -5483,6 +5442,17 @@
             },
             "required": false,
             "name": "has_document",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "required": false,
+            "name": "include_deleted",
             "in": "query"
           },
           {
@@ -5695,7 +5665,7 @@
       },
       "delete": {
         "summary": "Delete a transaction",
-        "description": "Default: only draft/error transactions may be hard-deleted; posted/voided return 409 (must-void-instead). ?hard=true forces a hard delete of any non-reconciled transaction (postings + document_links cascade). Reconciled transactions always reject — unreconcile first.",
+        "description": "Default: reversible soft delete (sets deleted_at; the row drops out of every money query but is restorable via POST /:id/restore). ?hard=true forces a physical delete (postings + document_links cascade; irreversible). Reconciled transactions reject either way — unreconcile first.",
         "tags": [
           "transactions"
         ],
@@ -5719,7 +5689,7 @@
                 "1",
                 "0"
               ],
-              "description": "Force hard delete of posted/voided transactions. Reconciled is still rejected."
+              "description": "Force a physical delete instead of the default soft delete. Reconciled is still rejected."
             },
             "required": false,
             "name": "hard",
@@ -5739,7 +5709,7 @@
             "description": "Deleted"
           },
           "409": {
-            "description": "Must void instead (posted, no ?hard=true), or transaction is reconciled.",
+            "description": "Transaction is reconciled — unreconcile first.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5751,9 +5721,10 @@
         }
       }
     },
-    "/v1/transactions/{id}/void": {
+    "/v1/transactions/{id}/restore": {
       "post": {
-        "summary": "Void a posted transaction",
+        "summary": "Restore a soft-deleted transaction",
+        "description": "Clears deleted_at so the transaction counts again. 404 if it wasn't deleted.",
         "tags": [
           "transactions"
         ],
@@ -5777,22 +5748,23 @@
             "in": "header"
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/VoidTransactionRequest"
-              }
-            }
-          }
-        },
         "responses": {
-          "201": {
-            "description": "Mirror transaction created",
+          "200": {
+            "description": "Restored transaction",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found / not deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }
@@ -5973,7 +5945,7 @@
     },
     "/v1/transactions/bulk": {
       "post": {
-        "summary": "Bulk update/void/reconcile",
+        "summary": "Bulk update/reconcile",
         "tags": [
           "transactions"
         ],
@@ -8218,7 +8190,7 @@
       },
       "delete": {
         "summary": "Delete a document. Soft-deletes by default; ?hard=true removes the row and quarantines the file under .trash/; ?cascade=true also handles linked transactions.",
-        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: linked posted transactions are voided, draft/error transactions are hard-deleted, voided transactions are left intact, reconciled transactions abort the operation with 409. ?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). Reconciled transactions always block hard cascades — unreconcile first.",
+        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: linked posted transactions are soft-deleted, draft/error transactions are hard-deleted, already-deleted transactions are left intact, reconciled transactions abort the operation with 409. ?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). Reconciled transactions always block hard cascades — unreconcile first.",
         "tags": [
           "documents"
         ],

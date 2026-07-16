@@ -225,6 +225,20 @@
       "when": 1782891944144,
       "tag": "0031_hard_arclight",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1784186220105,
+      "tag": "0032_perpetual_madrox",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1784186368107,
+      "tag": "0033_strange_sally_floyd",
+      "breakpoints": true
     }
   ]
 }

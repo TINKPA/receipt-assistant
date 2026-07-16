@@ -28,10 +28,12 @@ export const transactions = pgTable(
     payee: text("payee"),
     narration: text("narration"),
     status: txnStatusEnum("status").notNull().default("posted"),
-    voidedById: uuid("voided_by_id").references(
-      (): AnyPgColumn => transactions.id,
-      { onDelete: "set null" },
-    ),
+    // Soft-delete tombstone (#171). NULL = live; set to NOW() when a
+    // transaction is removed (e.g. dedup deletes a duplicate). Mirrors
+    // documents.deleted_at. Replaces the removed `void` machinery — a
+    // deduped/deleted transaction is hidden here, not reversed with a
+    // negated mirror. Every money query filters `deleted_at IS NULL`.
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
     // FK to `ingests` added in `0002_batch_ingest.sql`. Originally
     // introduced as a bare UUID in 0000_init.sql because `ingests`
     // didn't exist yet; the Drizzle definition now uses `.references()`

@@ -50,7 +50,7 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${workspaceId}::uuid
-        AND t.status <> 'voided' AND a.type = 'expense' AND p.amount_base_minor > 0
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense' AND p.amount_base_minor > 0
         AND to_char(t.occurred_on, 'YYYY-MM') = ${thisYm}
       GROUP BY 1
     ), prev AS (
@@ -59,7 +59,7 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${workspaceId}::uuid
-        AND t.status <> 'voided' AND a.type = 'expense' AND p.amount_base_minor > 0
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense' AND p.amount_base_minor > 0
         AND to_char(t.occurred_on, 'YYYY-MM') = ${prevYm}
         AND EXTRACT(DAY FROM t.occurred_on) <= ${dayOfMonth}
       GROUP BY 1
@@ -95,14 +95,14 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
       SELECT t.payee, COUNT(*) AS n
       FROM transactions t
       WHERE t.workspace_id = ${workspaceId}::uuid
-        AND t.status <> 'voided' AND t.payee IS NOT NULL
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND t.payee IS NOT NULL
         AND to_char(t.occurred_on, 'YYYY-MM') = ${thisYm}
       GROUP BY 1
     ), prev AS (
       SELECT t.payee, COUNT(*) AS n
       FROM transactions t
       WHERE t.workspace_id = ${workspaceId}::uuid
-        AND t.status <> 'voided' AND t.payee IS NOT NULL
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND t.payee IS NOT NULL
         AND to_char(t.occurred_on, 'YYYY-MM') = ${prevYm}
       GROUP BY 1
     )

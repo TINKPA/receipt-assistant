@@ -67,7 +67,6 @@ import {
   NotFoundProblem,
   PostingsImbalanceProblem,
   ValidationProblem,
-  MustVoidInsteadProblem,
 } from "../http/problem.js";
 import type {
   CreateTransactionRequest,
@@ -151,8 +150,8 @@ export interface TransactionRow {
   occurred_at: string | null;
   payee: string | null;
   narration: string | null;
-  status: "draft" | "posted" | "voided" | "reconciled" | "error";
-  voided_by_id: string | null;
+  status: "draft" | "posted" | "reconciled" | "error";
+  deleted_at: string | null;
   source_ingest_id: string | null;
   trip_id: string | null;
   metadata: Record<string, unknown>;
@@ -373,7 +372,10 @@ function mapTransactionRow(
     payee: row.payee ?? null,
     narration: row.narration ?? null,
     status: row.status,
-    voided_by_id: row.voidedById ?? row.voided_by_id ?? null,
+    deleted_at:
+      row.deletedAt ?? row.deleted_at
+        ? toIsoString(row.deletedAt ?? row.deleted_at)
+        : null,
     source_ingest_id: row.sourceIngestId ?? row.source_ingest_id ?? null,
     trip_id: row.tripId ?? row.trip_id ?? null,
     metadata,
@@ -696,6 +698,8 @@ export async function listTransactions(
 
   const conditions: ReturnType<typeof sql>[] = [];
   conditions.push(sql`t.workspace_id = ${workspaceId}::uuid`);
+  // Hide soft-deleted (e.g. deduped) rows unless explicitly requested. #171
+  if (!query.include_deleted) conditions.push(sql`t.deleted_at IS NULL`);
   if (query.occurred_from) conditions.push(sql`t.occurred_on >= ${query.occurred_from}::date`);
   if (query.occurred_to) conditions.push(sql`t.occurred_on <= ${query.occurred_to}::date`);
   if (query.status) conditions.push(sql`t.status = ${query.status}`);
@@ -964,7 +968,7 @@ export async function deleteTransaction(
   workspaceId: string,
   id: string,
   expectedVersion: number,
-  opts: { force?: boolean; userId?: string } = {},
+  opts: { userId?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
     const rows = await tx
@@ -979,9 +983,8 @@ export async function deleteTransaction(
       const { VersionMismatchProblem } = await import("../http/problem.js");
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
-    // Reconciled is the one status the force flag still won't override
-    // — bank-matched rows must be unreconciled first so the user makes
-    // the deliberate choice.
+    // Reconciled rows must be unreconciled first — a deliberate gate so
+    // bank-matched entries aren't destroyed by accident.
     if (current.status === "reconciled") {
       throw new HttpProblem(
         409,
@@ -991,129 +994,115 @@ export async function deleteTransaction(
         { transaction_id: id, status: current.status },
       );
     }
-    if (!opts.force && current.status !== "draft" && current.status !== "error") {
-      throw new MustVoidInsteadProblem(id, current.status);
-    }
-    if (opts.force) {
-      await tx.insert(transactionEvents).values({
-        id: newId(),
-        workspaceId,
-        transactionId: id,
-        eventType: "hard_deleted",
-        actorId: opts.userId ?? null,
-        payload: { reason: "force_delete", prior_status: current.status },
-      });
-    }
-    // Hard-delete: postings + document_links cascade via FK.
+    await tx.insert(transactionEvents).values({
+      id: newId(),
+      workspaceId,
+      transactionId: id,
+      eventType: "hard_deleted",
+      actorId: opts.userId ?? null,
+      payload: { reason: "hard_delete", prior_status: current.status },
+    });
+    // Hard-delete: postings + document_links cascade via FK. Irreversible
+    // — the default DELETE path is the reversible soft delete below.
     await tx.delete(transactions).where(eq(transactions.id, id));
   });
 }
 
-// ── Void ───────────────────────────────────────────────────────────────
-
-export async function voidTransaction(
+/**
+ * Soft delete: set `deleted_at = NOW()`. The row survives (audit trail
+ * intact, restorable) but drops out of every money query. This is the
+ * default delete path and what dedup uses to remove a duplicate — the
+ * reversible replacement for the removed `void` machinery (#171).
+ */
+export async function softDeleteTransaction(
   workspaceId: string,
-  userId: string,
   id: string,
   expectedVersion: number,
-  reason?: string,
-): Promise<TransactionRow> {
-  return await mapBalanceErrors(async () => {
-    return await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-      const current = rows[0]!;
-      if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
-        throw new VersionMismatchProblem(Number(current.version), expectedVersion);
-      }
-      if (current.status === "voided" || current.status === "draft" || current.status === "error") {
-        throw new HttpProblem(
-          409,
-          "invalid-state",
-          "Cannot void transaction",
-          `Transaction ${id} is in status=${current.status}; only posted/reconciled may be voided.`,
-          { transaction_id: id, status: current.status },
-        );
-      }
-
-      const originalPostings = await tx
-        .select()
-        .from(postings)
-        .where(eq(postings.transactionId, id));
-
-      const mirrorId = newId();
-      const existingMeta = (current.metadata ?? {}) as Record<string, unknown>;
-      const mirrorMeta: Record<string, unknown> = {
-        ...existingMeta,
-        voided: id,
-        ...(reason ? { void_reason: reason } : {}),
-      };
-
-      await tx.insert(transactions).values({
-        id: mirrorId,
-        workspaceId,
-        occurredOn: toIsoDate(current.occurredOn),
-        occurredAt: current.occurredAt,
-        payee: `VOID: ${current.payee ?? ""}`.trim(),
-        narration: current.narration,
-        status: "posted",
-        tripId: current.tripId,
-        metadata: mirrorMeta,
-        createdBy: userId,
-      });
-
-      await tx.insert(postings).values(
-        originalPostings.map((p) => ({
-          id: newId(),
-          workspaceId,
-          transactionId: mirrorId,
-          accountId: p.accountId,
-          amountMinor: -BigInt(p.amountMinor),
-          currency: p.currency,
-          fxRate: p.fxRate,
-          amountBaseMinor:
-            p.amountBaseMinor === null ? null : -BigInt(p.amountBaseMinor),
-          memo: p.memo,
-        })),
+  opts: { userId?: string; reason?: string } = {},
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(transactions)
+      .where(
+        and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
       );
-
-      await tx
-        .update(transactions)
-        .set({ status: "voided", voidedById: mirrorId })
-        .where(eq(transactions.id, id));
-
-      await tx.insert(transactionEvents).values([
-        {
-          id: newId(),
-          workspaceId,
-          transactionId: id,
-          eventType: "voided",
-          actorId: userId,
-          payload: { voided_by: mirrorId, reason: reason ?? null },
-        },
-        {
-          id: newId(),
-          workspaceId,
-          transactionId: mirrorId,
-          eventType: "created",
-          actorId: userId,
-          payload: { voids: id, reason: reason ?? null },
-        },
-      ]);
-
-      const full = await loadTransactionFull(
-        tx as unknown as typeof db,
-        workspaceId,
-        mirrorId,
+    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
+    const current = rows[0]!;
+    if (Number(current.version) !== expectedVersion) {
+      const { VersionMismatchProblem } = await import("../http/problem.js");
+      throw new VersionMismatchProblem(Number(current.version), expectedVersion);
+    }
+    if (current.deletedAt) throw new NotFoundProblem("Transaction", id);
+    if (current.status === "reconciled") {
+      throw new HttpProblem(
+        409,
+        "cannot-delete-reconciled",
+        "Cannot delete reconciled transaction",
+        `Transaction ${id} is reconciled. Unreconcile it first, then delete.`,
+        { transaction_id: id, status: current.status },
       );
-      return full!;
+    }
+    await tx
+      .update(transactions)
+      .set({ deletedAt: new Date() })
+      .where(eq(transactions.id, id));
+    await tx.insert(transactionEvents).values({
+      id: newId(),
+      workspaceId,
+      transactionId: id,
+      eventType: "deleted",
+      actorId: opts.userId ?? null,
+      payload: {
+        reason: opts.reason ?? "soft_delete",
+        prior_status: current.status,
+      },
     });
+  });
+}
+
+/**
+ * Restore a soft-deleted transaction: clear `deleted_at`. Returns the
+ * refreshed row. 404 if the row isn't found or wasn't deleted.
+ */
+export async function restoreTransaction(
+  workspaceId: string,
+  id: string,
+  expectedVersion: number,
+  opts: { userId?: string } = {},
+): Promise<TransactionRow> {
+  return await db.transaction(async (tx) => {
+    const rows = await tx
+      .select()
+      .from(transactions)
+      .where(
+        and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
+      );
+    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
+    const current = rows[0]!;
+    if (Number(current.version) !== expectedVersion) {
+      const { VersionMismatchProblem } = await import("../http/problem.js");
+      throw new VersionMismatchProblem(Number(current.version), expectedVersion);
+    }
+    if (!current.deletedAt) throw new NotFoundProblem("Transaction", id);
+    await tx
+      .update(transactions)
+      .set({ deletedAt: null })
+      .where(eq(transactions.id, id));
+    await tx.insert(transactionEvents).values({
+      id: newId(),
+      workspaceId,
+      transactionId: id,
+      eventType: "restored",
+      actorId: opts.userId ?? null,
+      payload: {},
+    });
+    const full = await loadTransactionFull(
+      tx as unknown as typeof db,
+      workspaceId,
+      id,
+    );
+    return full!;
   });
 }
 
@@ -1467,6 +1456,10 @@ export async function listPostings(
 
   const conditions: ReturnType<typeof sql>[] = [];
   conditions.push(sql`p.workspace_id = ${workspaceId}::uuid`);
+  // Never leak postings of soft-deleted transactions (e.g. deduped rows). #171
+  conditions.push(
+    sql`EXISTS (SELECT 1 FROM transactions t WHERE t.id = p.transaction_id AND t.deleted_at IS NULL)`,
+  );
   if (query.transaction_id) conditions.push(sql`p.transaction_id = ${query.transaction_id}::uuid`);
   if (query.account_id) conditions.push(sql`p.account_id = ${query.account_id}::uuid`);
   if (query.from || query.to) {

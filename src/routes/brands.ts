@@ -601,7 +601,7 @@ brandsRouter.get(
       `);
       const currency = ((wsRow.rows[0] as any)?.base_currency as string) ?? "USD";
 
-      // 4. Per-merchant stats (excluding voided)
+      // 4. Per-merchant stats (money-counting rows only: posted/reconciled, not deleted)
       const perMerchantStats = new Map<
         string,
         { txnCount: number; lifetime: number; currentMonth: number; lastDate: string | null }
@@ -632,7 +632,7 @@ brandsRouter.get(
               WHERE workspace_id = ${workspaceId}::uuid
                 AND brand_id = ${brandId}
             )
-            AND t.status <> 'voided'
+            AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
           GROUP BY t.merchant_id
         `);
         for (const r of statsResult.rows as any[]) {

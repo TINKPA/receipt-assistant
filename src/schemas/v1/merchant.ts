@@ -91,7 +91,7 @@ export const MerchantTransactionRow = z
     id: Uuid,
     occurred_on: z.string(),
     payee: z.string().nullable(),
-    status: z.enum(["draft", "posted", "voided", "reconciled", "error"]),
+    status: z.enum(["draft", "posted", "reconciled", "error"]),
     total_minor: z.number().int(),
     currency: z.string(),
     document_id: Uuid.nullable(),

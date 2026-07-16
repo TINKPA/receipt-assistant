@@ -17,7 +17,7 @@
  *     own enrichment loop.
  *
  * Layer-3 shielding (matches `src/projection/layer3.ts`):
- *   - HARD fields (status, voided_by_id, trip_id, narration, identity,
+ *   - HARD fields (status, deleted_at, trip_id, narration, identity,
  *     version) are NEVER in the UPDATE column list — extraction can't
  *     even mention them.
  *   - SOFT fields (occurred_on, occurred_at, payee) use a CASE WHEN

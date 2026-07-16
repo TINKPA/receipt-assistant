@@ -44,11 +44,11 @@
  * matching the SQL column is the useful contract.
  */
 export const HARD_LAYER3_TX_FIELDS = [
-  // User state changes via explicit endpoints (POST /void, POST
-  // /reconcile, the future un-reconcile path). Never written by
-  // extraction.
+  // User state changes via explicit endpoints (POST /reconcile, the
+  // un-reconcile path, and soft delete/restore). Never written by
+  // extraction — re-extract must not resurrect a deleted row.
   "status",
-  "voided_by_id",
+  "deleted_at",
   // User-assigned grouping. No ingest path writes this.
   "trip_id",
   // User-supplied note. Ingest leaves NULL; any value is user input.
