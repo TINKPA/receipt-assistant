@@ -666,6 +666,12 @@
           "kind": {
             "type": "string"
           },
+          "mime_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "source_meta": {
             "type": [
               "object",
@@ -8330,7 +8336,7 @@
     },
     "/v1/documents/{id}/rendered": {
       "get": {
-        "summary": "Decoded + sanitized HTML body of a receipt_email document, for the frontend 'Original email' fold. Served with a strict CSP; render inside a sandboxed iframe.",
+        "summary": "Sanitized HTML rendering of a document for the frontend's 'Original receipt / email' fold: a decoded receipt_email (.eml) body or a sanitized raw text/html document (#137). Served with a strict CSP; render inside a sandboxed iframe.",
         "tags": [
           "documents"
         ],
@@ -8348,7 +8354,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Sanitized email HTML",
+            "description": "Sanitized HTML (email body or text/html document)",
             "content": {
               "text/html": {
                 "schema": {
@@ -8358,7 +8364,7 @@
             }
           },
           "404": {
-            "description": "Not found / no file",
+            "description": "Not found / no file / empty render",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8368,7 +8374,7 @@
             }
           },
           "422": {
-            "description": "Document is not an email (kind != receipt_email)",
+            "description": "Document has no HTML rendering (neither receipt_email nor text/html); code document-not-renderable",
             "content": {
               "application/problem+json": {
                 "schema": {

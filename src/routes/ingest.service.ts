@@ -431,6 +431,14 @@ function guessDocumentKind(
     return "receipt_image";
   }
   if (mt === "message/rfc822" || ext === ".eml") return "receipt_email";
+  if (mt === "text/html" || ext === ".html" || ext === ".htm") {
+    // Portal invoices saved as HTML (Tekmetric and other shop-management
+    // systems) and some web purchase confirmations. Display is gated on
+    // mime_type (the viewer renders text/html through /rendered), so this
+    // kind only drives the list glyph — receipt_pdf reads best for an
+    // invoice-style page. #137.
+    return "receipt_pdf";
+  }
   if (mt === "application/pdf" || ext === ".pdf") {
     // We can't tell receipt-vs-statement without reading it; the agent
     // classifies authoritatively. Default to receipt_pdf (more common).

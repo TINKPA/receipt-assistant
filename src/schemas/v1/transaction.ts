@@ -66,6 +66,12 @@ export const TransactionDocumentRef = z
   .object({
     id: Uuid,
     kind: z.string(),
+    /** Raw content type of the stored document. Drives the detail
+     *  viewer's render path independently of `kind` — e.g. a
+     *  `text/html` portal invoice renders through /rendered even though
+     *  its `kind` is receipt_pdf. Present on the single-tx detail read;
+     *  null on the list view. #137. */
+    mime_type: z.string().nullish(),
     /** Channel provenance for email-sourced docs (sender/subject/
      *  received_at). Present on the single-tx detail read; omitted on
      *  the list view. #122. */

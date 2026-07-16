@@ -293,23 +293,39 @@ const EMAIL_SANITIZE: sanitizeHtml.IOptions = {
 };
 
 /**
- * Decode + sanitize the HTML body of a receipt_email document.
- * Returns null when the document is missing/soft-deleted or its `.eml`
- * file is unreadable (→ 404). Throws 422 for non-email documents.
+ * Decode + sanitize an HTML rendering of a document for the detail
+ * page's "Original receipt / email" fold. Two renderable sources (#137):
+ *   - `.eml` email (`kind = receipt_email`) → RFC822-decode, take the
+ *     HTML (or text-as-HTML) body.
+ *   - raw `text/html` file (`mime_type = text/html`) → sanitize the file
+ *     bytes directly; there is no envelope to decode.
+ * Both pass through the same `EMAIL_SANITIZE` allowlist (drops <script>,
+ * event handlers, etc.), so together with the route's strict CSP and the
+ * frontend's sandboxed iframe the untrusted markup has three independent
+ * containment layers.
+ * Returns null when the document is missing/soft-deleted or its file is
+ * unreadable (→ 404). Throws 422 for a document that is neither source.
  */
-export async function renderEmailDocument(
+export async function renderDocumentHtml(
   workspaceId: string,
   id: string,
 ): Promise<string | null> {
   const doc = await getDocumentById(workspaceId, id);
   if (!doc) return null;
-  if (doc.kind !== "receipt_email") {
+  const isEmail = doc.kind === "receipt_email";
+  // Normalize the stored mime: strip the charset param and lowercase, so
+  // `text/html; charset=utf-8` and case variants still route here. Accept
+  // application/xhtml+xml too — otherwise an HTML-by-extension doc with a
+  // near-miss mime would fall to the non-sandboxed /content viewer. #137.
+  const baseMime = (doc.mime_type ?? "").split(";")[0]!.trim().toLowerCase();
+  const isHtml = baseMime === "text/html" || baseMime === "application/xhtml+xml";
+  if (!isEmail && !isHtml) {
     throw new HttpProblem(
       422,
-      "document-not-email",
-      "Not an email document",
-      `Document ${id} has kind=${doc.kind}; /rendered only serves receipt_email documents.`,
-      { document_id: id, kind: doc.kind },
+      "document-not-renderable",
+      "Document has no HTML rendering",
+      `Document ${id} (kind=${doc.kind}, mime_type=${doc.mime_type ?? "null"}) is not a renderable HTML source; /rendered serves receipt_email (.eml) or text/html documents.`,
+      { document_id: id, kind: doc.kind, mime_type: doc.mime_type },
     );
   }
   if (!doc.file_path) return null;
@@ -320,12 +336,17 @@ export async function renderEmailDocument(
     return null;
   }
   const raw = await readFile(absPath);
-  const parsed = await simpleParser(raw);
-  const body =
-    typeof parsed.html === "string" && parsed.html.length > 0
-      ? parsed.html
-      : parsed.textAsHtml ?? `<pre>${escapeHtml(parsed.text ?? "")}</pre>`;
-  return sanitizeHtml(body, EMAIL_SANITIZE);
+  if (isEmail) {
+    const parsed = await simpleParser(raw);
+    const body =
+      typeof parsed.html === "string" && parsed.html.length > 0
+        ? parsed.html
+        : parsed.textAsHtml ?? `<pre>${escapeHtml(parsed.text ?? "")}</pre>`;
+    return sanitizeHtml(body, EMAIL_SANITIZE);
+  }
+  // Raw text/html file (portal invoice, saved confirmation): the bytes
+  // are the HTML document — sanitize them as-is.
+  return sanitizeHtml(raw.toString("utf8"), EMAIL_SANITIZE);
 }
 
 export async function linkDocumentToTransaction(params: {
