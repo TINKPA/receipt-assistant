@@ -7,6 +7,7 @@
  * See `receipt-assistant#49` for the architectural move from Phase 1
  * (Node-side coerce + service-layer writes) to Phase 2.
  */
+import { readFileSync } from "node:fs";
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
@@ -21,7 +22,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.20";
+export const PROMPT_VERSION = "2.21";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -58,6 +59,47 @@ upload. The SQL candidate check below still applies.)`;
         `  - document ${n.documentId} (pHash distance ${n.distance}) → transaction ${n.transactionId}`,
     )
     .join("\n");
+}
+
+/**
+ * Curated self-evolution loop (#prompt-lessons).
+ *
+ * `lessons.md` is a SHORT, HUMAN-REVIEWED list of lessons distilled from
+ * past extraction runs. The agent never edits it directly — at the end of
+ * a noteworthy run it appends a one-line PROPOSAL to `lessons.proposed.md`
+ * (a separate file), and a human promotes good proposals into `lessons.md`.
+ * This keeps the feedback loop "agent proposes → human gatekeeps", so the
+ * prompt can only be improved by vetted lessons, never self-poisoned.
+ *
+ * Path is a dedicated bind-mount (`~/Developer/receipt-assistant-data/
+ * prompt-lessons` → `/data/prompt-lessons`): runtime state, not in any git
+ * repo and not in iCloud, matching the data-tiering invariant. Read fresh
+ * per call so promoting a lesson takes effect without a container restart.
+ * Absent/empty/unreadable (e.g. local dev has no mount) → inject nothing.
+ */
+const LESSONS_DIR = process.env.PROMPT_LESSONS_DIR ?? "/data/prompt-lessons";
+const ACTIVE_LESSONS_PATH = `${LESSONS_DIR}/lessons.md`;
+/** Append-only proposal file the agent writes (Phase 6); never read back. */
+const PROPOSED_LESSONS_PATH = `${LESSONS_DIR}/lessons.proposed.md`;
+
+function renderActiveLessons(): string {
+  let raw = "";
+  try {
+    raw = readFileSync(ACTIVE_LESSONS_PATH, "utf8").trim();
+  } catch {
+    return "";
+  }
+  if (!raw) return "";
+  return `
+── Learned lessons (curated, human-reviewed — apply these) ────────────
+
+Short lessons distilled from past extractions and approved by a human.
+They encode real mistakes and wins from earlier runs; treat them as
+high-priority guidance that overrides your default habits where they
+conflict. (These are vetted rules, NOT your own proposals.)
+
+${raw}
+`;
 }
 
 export function buildExtractorPrompt(ctx: ExtractorPromptContext): string {
@@ -111,6 +153,54 @@ if any one errors, every sibling call is cancelled mid-flight, and the
 cascade of cancellations is disorienting enough to corrupt your own
 extraction state (#126). One command, one result, then the next.
 
+── Priority & effort budget — READ FIRST, governs everything below ────
+
+This job has ONE required deliverable plus a best-effort tail. Keep them
+straight, or you will burn minutes on polish while the core sits unfinished.
+Trace evidence: routine receipts finish in ~7 tool calls, but some balloon
+to 40+ turns — and the extra 30 turns are almost always merchant enrichment
+(Google fetches, storefront photos, brand icons), NOT harder extraction.
+
+CORE — required. Do this and commit it no matter what:
+  classify → extract fields → write the balanced double-entry transaction
+  (+ postings + line items + document link) → close the ingest in Phase 5.
+  A run that commits a correct, balanced transaction and closes the ingest
+  is a SUCCESS even if it did zero enrichment.
+
+ENRICHMENT — best-effort, SECONDARY. You may abbreviate or SKIP any of it:
+  Phase 3 (Google place resolve / multilingual fetch / storefront photos)
+  and the brand-icon resolution pipeline. These are polish and a cache.
+  You have full authority to skip them. They must NEVER:
+    • block, delay, or fail the core write;
+    • trigger a self-correction loop — if a step errors or a column/table
+      surprises you, do NOT grind on it; record it briefly and move on;
+    • keep you working once the core is committed and marginal value is low.
+
+Spend effort PROPORTIONAL to difficulty and value. A routine receipt from
+an obvious merchant should finish in a handful of tool calls. If you notice
+you are many turns deep and the core is already committed, STOP enriching
+and go close the ingest.
+
+Skip heuristics — YOUR judgment, examples not an exhaustive rulebook:
+  • Place already cached (Phase 3b hit) → make zero outbound Google calls.
+  • Globally English-first brand with no CJK anywhere on the receipt →
+    skip storefront-photo OCR AND skip downloading photos; there is nothing
+    Chinese to find, so the fetch is pure waste.
+  • Storefront photos are only worth downloading when you actually need
+    them for CJK OCR (Phase 3d). Otherwise skip the download entirely —
+    they are a nice-to-have cache, not part of a complete extraction.
+  • Brand-icon resolution is optional visual polish. Do it when it is quick
+    and the asset is readily found; skip it when the core is done and it is
+    not. Never chase an icon across many fallback providers.
+  • The FREE checks stay ON: receipt-OCR CJK (Phase 3e) and the date
+    self-check (Phase 3.5 Checks A/B) cost no extra calls — always do them.
+    (Phase 3.5 Check C reuses an existing geocode, so it is naturally
+    skipped whenever you skipped Phase 3 — it never forces a new call.)
+
+When you deliberately skip an enrichment step, record it so the trace shows
+a decision, not a failure:
+  metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok
+${renderActiveLessons()}
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
 Read the file (image / pdf / html / .eml) and decide which category:
@@ -589,6 +679,12 @@ For receipt_image / receipt_email / receipt_pdf only. Skip for
 
 ── Phase 3 — Resolve place + fetch multilingual record (#74) ──────────
 
+BUDGET GATE (see the Priority & effort-budget preamble): this ENTIRE
+phase is best-effort enrichment. Skip it whenever the core is what
+matters — a cached place, an obvious non-CJK global brand, or when you
+are already many turns deep. Everything below is "do it if it is cheap
+and adds value", never "do it no matter what".
+
 Goal: get a stable \`google_place_id\` for the merchant, fetch its full
 multilingual record from Google v1, cache locally. If the place is
 Chinese-named and Google text doesn't carry the Chinese, OCR the
@@ -792,16 +888,21 @@ When OCR yields a string:
   display_name_zh_source   ← "photo_ocr"
   display_name_zh_is_native← true   (signage is the merchant's own surface)
 
-Always record per-photo OCR provenance in metadata regardless:
+For every photo you DID read, record per-photo OCR provenance in metadata
+(even a null result):
   metadata.photo_ocr = [
     {"rank":0,"chinese_chars":"永安","confidence":"high"},
     {"rank":1,"chinese_chars":null,"confidence":"n/a"},
     ...
   ]
 
-Photos are downloaded for the cache regardless — Phase 4 inserts a
-\`place_photos\` row per photo with the local file_path; the OCR
-fallback just adds the \`ocr_extracted\` jsonb to the photos it read.
+Photos are a best-effort cache, NOT part of a complete extraction. Only
+download them when Phase 3d actually needs them for CJK OCR (per the
+budget preamble) — if there is no Chinese name to hunt for, skip the
+download entirely. When you DID download for OCR, Phase 4 inserts a
+\`place_photos\` row per photo with the local file_path and the OCR
+fallback adds the \`ocr_extracted\` jsonb to the photos it read; if you
+skipped the download, skip the \`place_photos\` insert too.
 
 ### Phase 3e — Receipt-OCR CJK fallback (last-resort, free)
 
@@ -1374,7 +1475,7 @@ returned NULL for a field never overwrites a previously-good value.
     place AS (
       INSERT INTO places (
         id, google_place_id, formatted_address, lat, lng, source, raw_response,
-        first_seen_at, last_seen_at, hit_count,
+        last_seen_at, hit_count,
         display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source, display_name_zh_is_native,
         primary_type, primary_type_display_zh, maps_type_label_zh, types,
         formatted_address_en, formatted_address_zh, postal_code, country_code,
@@ -1386,7 +1487,7 @@ returned NULL for a field never overwrites a previously-good value.
         '<PLACE_ID>', '<FORMATTED_ADDRESS>', <LAT>, <LNG>,
         '<google_geocode|google_places>',
         '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb,
-        NOW(), NOW(), 1,
+        NOW(), 1,
         <NULLABLE_TEXT 'display_name_en'>,
         <NULLABLE_TEXT 'display_name_zh'>,
         <NULLABLE_TEXT 'display_name_zh_locale'>,
@@ -1602,6 +1703,12 @@ in the final ingest close-out (Phase 5).
 
 Skip every insert above. Go directly to Phase 5.
 
+BUDGET GATE (see the Priority & effort-budget preamble): the brand-icon
+resolution below is optional visual polish. Do it when it is quick and
+the asset is readily found; skip it when the core is already committed
+and an icon is not close at hand. Never chase an icon across many
+fallback providers — one or two cheap tries, then move on and close.
+
 ${PHASE_4B_4C_ICON_PIPELINE}
 
 
@@ -1644,6 +1751,29 @@ constraint error), catch it and instead:
          completed_at = NOW()
    WHERE id = '${ctx.ingestId}';
   SQL
+
+── Phase 6 — Propose a lesson (optional, best-effort, human-reviewed) ──
+
+After the ingest is closed, if THIS run hit something genuinely worth
+remembering — a slowdown you could have avoided, an error you had to
+self-correct, a schema surprise, or a skip heuristic that clearly paid
+off or misfired — append ONE concise line to the PROPOSAL file:
+
+  echo '- [<classification>] <one specific, evidence-based lesson>' \\
+    >> ${PROPOSED_LESSONS_PATH} 2>/dev/null || true
+
+This is how the extractor improves itself over time WITHOUT self-poisoning:
+  • Proposals are for a HUMAN to review and promote into the curated
+    lesson set that gets fed back to future runs. They are NOT active
+    rules; never read this file back, never treat your own proposals as
+    instructions.
+  • One line, max. Be specific and evidence-based ("Costco gas prints the
+    date as MM/DD in tiny type at the top-right — check there first"), not
+    generic ("be careful with dates").
+  • Skip this entirely on an unremarkable run. No lesson beats a noise
+    lesson — the reviewer's attention is the bottleneck.
+  • Never let this step fail or delay the run. The \`2>/dev/null || true\`
+    drops it silently if the file is not writable. Do not retry.
 
 ── Output ─────────────────────────────────────────────────────────────
 

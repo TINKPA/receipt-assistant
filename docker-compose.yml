@@ -123,4 +123,15 @@ services:
       # outside iCloud. On a fresh machine:
       #   mkdir -p ~/Developer/receipt-assistant-data/product-assets
       - ${HOME}/Developer/receipt-assistant-data/product-assets:/data/product-assets
+      # Curated self-evolution loop (prompt-lessons). Two files:
+      #   lessons.md          — human-reviewed active lessons, READ into the
+      #                         extractor prompt by buildExtractorPrompt().
+      #   lessons.proposed.md — append-only agent PROPOSALS (one line/run),
+      #                         reviewed by a human who promotes good ones
+      #                         into lessons.md. The agent never reads this.
+      # SIBLING dir, same rationale as claude / brand-assets: runtime state,
+      # outside git and outside iCloud. On a fresh machine:
+      #   mkdir -p ~/Developer/receipt-assistant-data/prompt-lessons
+      #   touch    ~/Developer/receipt-assistant-data/prompt-lessons/lessons.md
+      - ${HOME}/Developer/receipt-assistant-data/prompt-lessons:/data/prompt-lessons
     restart: unless-stopped
