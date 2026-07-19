@@ -25,6 +25,14 @@ Goal: ensure every brand_id you emitted has a row in the global
 discoverable) an official domain. The downstream Phase 4b uses the
 domain to query logo.dev; without it that tier is skipped.
 
+BUDGET GATE (see the extractor's Priority & effort-budget preamble):
+brand discovery is best-effort enrichment, not core. It is ONE cheap
+registry SELECT, and for a brand that is ALREADY KNOWN it ends right
+there — do not reason further, do not WebSearch, do not re-UPSERT, just
+move on. Only a genuinely unseen brand (no row at all, or a row with a
+NULL domain that is NOT marked 'discovery_failed') is worth any
+discovery work. When unsure, prefer skipping over spending turns.
+
 Steps (run once per unique merchant brand_id in this document):
 
   1. Cache check — read the registry first:
