@@ -44,7 +44,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         curl \
         postgresql-client \
+        poppler-utils \
+        ghostscript \
     && rm -rf /var/lib/apt/lists/*
+
+# poppler-utils (pdftoppm/pdftotext) is the extractor's PDF path: it
+# rasterizes a receipt PDF to PNG in ~1s so the agent reads pixels instead
+# of hand-decoding PDF streams (which cost ~400s on an AAA form-PDF before
+# this was installed). Debian's ImageMagick also ships a policy.xml that
+# blocks the PDF coder; relax it as a defensive fallback for any
+# convert-based path (no-op if ImageMagick isn't present). Receipts are the
+# user's own trusted files, so allowing the PDF coder is acceptable here.
+RUN for f in /etc/ImageMagick-*/policy.xml; do \
+        if [ -f "$f" ]; then \
+            sed -i 's#rights="none" pattern="PDF"#rights="read|write" pattern="PDF"#' "$f"; \
+        fi; \
+    done
 
 # Claude Code CLI — invoked by src/claude.ts as a subprocess.
 RUN npm install -g @anthropic-ai/claude-code

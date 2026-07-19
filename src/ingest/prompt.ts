@@ -22,7 +22,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.21";
+export const PROMPT_VERSION = "2.22";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -201,6 +201,22 @@ When you deliberately skip an enrichment step, record it so the trace shows
 a decision, not a failure:
   metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok
 ${renderActiveLessons()}
+── Reading the document (especially PDFs) ────────────────────────────
+
+For a PDF, do NOT hand-parse the byte structure (decompressing streams,
+mapping Form XObjects, sorting content-stream placements) — that path is
+slow and error-prone. Rasterize to an image and read the pixels, which is
+what you do best:
+
+  pdftoppm -png -r 200 "${ctx.filePath}" /tmp/${ctx.ingestId}/page
+  # → /tmp/${ctx.ingestId}/page-1.png, page-2.png, …  then Read those PNGs.
+
+\`pdftoppm\` and \`pdftotext\` (poppler) plus \`gs\` (ghostscript) are
+installed. \`pdftotext -layout "${ctx.filePath}" -\` gives a fast text
+layer for text-based PDFs; when the PDF is a flattened form or its text
+layer is empty/garbled, prefer the rasterized PNG. Only fall back to
+manual stream decoding if those tools are genuinely unavailable.
+
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
 Read the file (image / pdf / html / .eml) and decide which category:
