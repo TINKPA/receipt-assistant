@@ -8,6 +8,7 @@
  * (Node-side coerce + service-layer writes) to Phase 2.
  */
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
@@ -22,7 +23,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.22";
+export const PROMPT_VERSION = "2.23";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -64,32 +65,48 @@ upload. The SQL candidate check below still applies.)`;
 /**
  * Curated self-evolution loop (#prompt-lessons).
  *
- * `lessons.md` is a SHORT, HUMAN-REVIEWED list of lessons distilled from
- * past extraction runs. The agent never edits it directly — at the end of
- * a noteworthy run it appends a one-line PROPOSAL to `lessons.proposed.md`
- * (a separate file), and a human promotes good proposals into `lessons.md`.
- * This keeps the feedback loop "agent proposes → human gatekeeps", so the
- * prompt can only be improved by vetted lessons, never self-poisoned.
+ * Two files, two homes, by design:
+ *   • `lessons.md` — the curated, human-reviewed lesson set. VERSION-
+ *     CONTROLLED: it lives next to this module (`src/ingest/lessons.md`,
+ *     baked into the image at `dist/ingest/lessons.md`) and ships with the
+ *     prompt. It is small, non-sensitive, non-PII, and hand-curated —
+ *     irreplaceable knowledge that belongs in git with a review trail, so
+ *     the data-tiering "keep out of git" rule (which guards sensitive /
+ *     PII / regenerable state) does not apply. Read fresh per call; lines
+ *     starting with `#` are comments and are NOT injected.
+ *   • `lessons.proposed.md` — the agent's raw per-run PROPOSALS (Phase 6).
+ *     RUNTIME-ONLY on the mini (`/data/prompt-lessons/`, a bind-mount):
+ *     ephemeral, unvetted agent output, appended to and never read back.
  *
- * Path is a dedicated bind-mount (`~/Developer/receipt-assistant-data/
- * prompt-lessons` → `/data/prompt-lessons`): runtime state, not in any git
- * repo and not in iCloud, matching the data-tiering invariant. Read fresh
- * per call so promoting a lesson takes effect without a container restart.
- * Absent/empty/unreadable (e.g. local dev has no mount) → inject nothing.
+ * Flow: the agent appends a proposal → a human (via the agent-evolver
+ * skill) promotes good ones into `lessons.md` as a normal repo change +
+ * deploy. "agent proposes → human gatekeeps", so the prompt improves only
+ * via vetted lessons, never self-poisons. Missing/empty/unreadable →
+ * inject nothing (local dev without the file is fine).
  */
-const LESSONS_DIR = process.env.PROMPT_LESSONS_DIR ?? "/data/prompt-lessons";
-const ACTIVE_LESSONS_PATH = `${LESSONS_DIR}/lessons.md`;
-/** Append-only proposal file the agent writes (Phase 6); never read back. */
-const PROPOSED_LESSONS_PATH = `${LESSONS_DIR}/lessons.proposed.md`;
+const ACTIVE_LESSONS_PATH =
+  process.env.PROMPT_LESSONS_FILE ??
+  fileURLToPath(new URL("./lessons.md", import.meta.url));
+/** Append-only proposal file the agent writes (Phase 6); never read back.
+ *  Runtime-only bind-mount on the mini. */
+const PROPOSED_LESSONS_PATH =
+  process.env.PROMPT_LESSONS_PROPOSED ??
+  "/data/prompt-lessons/lessons.proposed.md";
 
 function renderActiveLessons(): string {
   let raw = "";
   try {
-    raw = readFileSync(ACTIVE_LESSONS_PATH, "utf8").trim();
+    raw = readFileSync(ACTIVE_LESSONS_PATH, "utf8");
   } catch {
     return "";
   }
-  if (!raw) return "";
+  // Drop comment lines (start with '#') and blanks; keep only lesson lines.
+  const body = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n")
+    .trim();
+  if (!body) return "";
   return `
 ── Learned lessons (curated, human-reviewed — apply these) ────────────
 
@@ -98,7 +115,7 @@ They encode real mistakes and wins from earlier runs; treat them as
 high-priority guidance that overrides your default habits where they
 conflict. (These are vetted rules, NOT your own proposals.)
 
-${raw}
+${body}
 `;
 }
 

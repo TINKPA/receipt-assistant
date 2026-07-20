@@ -69,6 +69,12 @@ WORKDIR /app
 # Copy compiled output and production node_modules from the builder stage.
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
+# Curated lessons file (self-evolution loop) ships WITH the prompt: it is
+# version-controlled source, read at runtime by buildExtractorPrompt via a
+# path relative to the compiled module. tsc does not copy .md, so place it
+# next to dist/ingest/prompt.js explicitly. lessons.proposed.md (the agent's
+# raw proposals) is NOT here — it stays a runtime bind-mount on the mini.
+COPY --from=builder /app/src/ingest/lessons.md ./dist/ingest/lessons.md
 # Drizzle migrations (SQL files + journal) ship with the image — the
 # migrate runner resolves `<app>/drizzle/` at boot to apply any pending
 # schema changes. Committing these into the image is deliberate: it means
