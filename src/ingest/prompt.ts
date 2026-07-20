@@ -23,7 +23,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.23";
+export const PROMPT_VERSION = "2.24";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -270,6 +270,10 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   (CNY vs JPY).
   category_hint : one of
                   groceries | dining | retail | cafe | transport | other
+                  (vehicle repair / maintenance / parts / fuel / parking →
+                  transport — the same "car spending" axis as the
+                  "Transportation" merchant category; never "other" for a
+                  vehicle expense.)
   items         : REQUIRED structured line-item array (#81). Each
                   item is one object with the exact shape below;
                   the array MUST be non-empty for receipt_image /
@@ -690,17 +694,35 @@ the most attention-sensitive new ask in the prompt; keep it terse.
                    This is the per-transaction 7-class taxonomy used by
                    the frontend Dashboard — NOT the same axis as
                    \`category_hint\` above (groceries/dining/retail/…).
-                   It is OK for the same brand to land in different
-                   categories on different receipts (Costco warehouse
-                   → Shopping; Costco gas → Transportation).
+                   For a genuinely multi-purpose merchant it is OK to
+                   land in different categories on different receipts
+                   (Costco warehouse → Shopping; Costco gas →
+                   Transportation). But a SINGLE-purpose merchant (an auto
+                   shop, a pharmacy) must stay in its ONE category on every
+                   receipt. If you have resolved this merchant before, keep
+                   the category you gave it last time unless the receipt
+                   clearly shows a different KIND of spend.
                    Mapping crib:
                      dining/cafe/groceries/bakery   → "Food & Drinks"
                      retail/department/apparel     → "Shopping"
                      gas/transit/parking/rideshare → "Transportation"
+                     auto repair/service/parts/tires/smog/oil/towing → "Transportation"
                      pharmacy/medical/dental       → "Health"
                      shipping/subscriptions/utilities/rent/laundry → "Services"
                      concerts/movies/streaming     → "Entertainment"
                      hotel/flight/cruise           → "Travel"
+
+                   ── category is the KIND of spend, NOT the item_class ──
+                   This category (= the expense account = the Dashboard
+                   icon) answers "what kind of purchase is this whole
+                   payment?" It is chosen from the MERCHANT / what was
+                   bought, and is INDEPENDENT of the per-line item_class.
+                   An auto shop is "Transportation" (money spent on your
+                   car) EVEN THOUGH every labor line inside is
+                   item_class='service' and the parts are
+                   'consumable'/'durable'. Do NOT let "the lines are
+                   services" pull the whole transaction into "Services" —
+                   that is the #1 mistake on auto-repair receipts.
 
 The merchant block goes into the transaction's \`metadata.merchant\` JSON
 key (see the Phase 4 template).
@@ -1285,6 +1307,11 @@ seven canonical accounts:
 
   Food & Drinks · Transportation · Shopping · Travel ·
   Entertainment · Health · Services
+
+This is the KIND of spend (an auto shop → "Transportation"), NOT the
+item_class of the lines (which stay 'service'/'consumable'/'durable').
+Never let the lines being services push the whole transaction to
+"Services".
 
 \`merchant.category\` is REQUIRED — Phase 2.5 is not optional and you
 must not skip it. If a merchant genuinely doesn't fit the other six
