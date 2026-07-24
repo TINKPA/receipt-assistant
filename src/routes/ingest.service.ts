@@ -16,13 +16,23 @@
  */
 import { and, eq, desc, sql } from "drizzle-orm";
 import * as path from "path";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import { db } from "../db/client.js";
 import { batches, ingests } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
-import { NotFoundProblem } from "../http/problem.js";
+import {
+  NotFoundProblem,
+  ValidationProblem,
+  IngestNotRetryableProblem,
+  IngestFileMissingProblem,
+} from "../http/problem.js";
 import { enqueue, maybeCompleteBatch } from "../ingest/worker.js";
-import { uploadDocumentBytes, getUploadDir, extForMime } from "./documents.service.js";
+import {
+  uploadDocumentBytes,
+  getUploadDir,
+  extForMime,
+  resolveUploadPath,
+} from "./documents.service.js";
 import {
   clampLimit,
   decodeCursor,
@@ -32,6 +42,22 @@ import {
 
 // ── Row shapes (API layer) ────────────────────────────────────────────
 
+export type IngestStatus =
+  | "queued"
+  | "processing"
+  | "done"
+  | "error"
+  | "unsupported"
+  | "dedup"
+  | "near_dup";
+
+export type IngestCategory =
+  | "ok"
+  | "in_progress"
+  | "transient_actionable"
+  | "input_problem"
+  | "informational";
+
 export interface IngestRow {
   id: string;
   workspace_id: string;
@@ -39,7 +65,7 @@ export interface IngestRow {
   filename: string;
   mime_type: string | null;
   file_path: string;
-  status: "queued" | "processing" | "done" | "error" | "unsupported" | "dedup" | "near_dup";
+  status: IngestStatus;
   classification: string | null;
   produced: {
     receipt_ids: string[];
@@ -47,8 +73,107 @@ export interface IngestRow {
     document_ids: string[];
   } | null;
   error: string | null;
+  // #158 derived fields.
+  category: IngestCategory;
+  retryable: boolean;
+  dedup_of: string | null;
   created_at: string;
   completed_at: string | null;
+}
+
+// The set surfaced by `GET /v1/ingests/problems` when no explicit status
+// filter is given: everything that didn't reach `done` and isn't still in
+// flight. Ordered most-actionable first for readability.
+export const PROBLEM_INGEST_STATUSES: IngestStatus[] = [
+  "error",
+  "unsupported",
+  "dedup",
+  "near_dup",
+];
+
+const ALL_INGEST_STATUSES: readonly IngestStatus[] = [
+  "queued",
+  "processing",
+  "done",
+  "error",
+  "unsupported",
+  "dedup",
+  "near_dup",
+];
+
+// An `error` string matching this pattern is a transient/infrastructure
+// fault (expired auth, timeout, rate-limit, upstream 5xx) — re-running the
+// same bytes is likely to succeed once the outage clears. Anything else
+// (missing date, illegible, "no total") is treated as an input problem
+// where a blind retry won't help. Matches the 401 auth-expiry class that
+// motivated #158.
+const TRANSIENT_ERROR_RE =
+  /\b(401|403|429|500|502|503|504)\b|invalid authentication|unauthor|forbidden|timed?[ -]?out|timeout|rate.?limit|overloaded|econnreset|econnrefused|etimedout|network|socket hang up|fetch failed|temporarily|try again/i;
+
+/**
+ * Derive the reason bucket + affordance hints for one ingest (#158). Pure
+ * function of (status, error, produced) so both the list and problems
+ * endpoints stay consistent.
+ */
+export function categorizeIngest(
+  status: IngestStatus,
+  error: string | null,
+  produced: IngestRow["produced"],
+): { category: IngestCategory; retryable: boolean; dedup_of: string | null } {
+  switch (status) {
+    case "done":
+      return { category: "ok", retryable: false, dedup_of: null };
+    case "queued":
+    case "processing":
+      return { category: "in_progress", retryable: false, dedup_of: null };
+    case "dedup":
+    case "near_dup":
+      return {
+        category: "informational",
+        retryable: false,
+        dedup_of: produced?.transaction_ids?.[0] ?? null,
+      };
+    case "unsupported":
+      return { category: "input_problem", retryable: false, dedup_of: null };
+    case "error": {
+      const transient = TRANSIENT_ERROR_RE.test(error ?? "");
+      return {
+        category: transient ? "transient_actionable" : "input_problem",
+        retryable: transient,
+        dedup_of: null,
+      };
+    }
+  }
+}
+
+/**
+ * Parse the `status` query param — a single token or comma-separated set
+ * (#158). Returns null when absent (caller applies its own default).
+ * Throws NotFoundProblem-shaped ValidationProblem on unknown tokens.
+ */
+export function parseStatusFilter(raw: string | undefined): IngestStatus[] | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  const tokens = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const out: IngestStatus[] = [];
+  for (const t of tokens) {
+    if (!(ALL_INGEST_STATUSES as readonly string[]).includes(t)) {
+      throw new ValidationProblem(
+        [
+          {
+            path: "status",
+            code: "invalid_enum_value",
+            message: `Unknown ingest status '${t}'. Allowed: ${ALL_INGEST_STATUSES.join(", ")}.`,
+          },
+        ],
+        `Unknown ingest status '${t}'`,
+      );
+    }
+    if (!out.includes(t as IngestStatus)) out.push(t as IngestStatus);
+  }
+  return out.length > 0 ? out : null;
 }
 
 export interface BatchCounts {
@@ -89,6 +214,12 @@ function toIso(v: Date | string | null | undefined): string | null {
 
 function mapIngestRow(r: typeof ingests.$inferSelect): IngestRow {
   const produced = (r.produced ?? null) as IngestRow["produced"];
+  const status = r.status as IngestStatus;
+  const { category, retryable, dedup_of } = categorizeIngest(
+    status,
+    r.error,
+    produced,
+  );
   return {
     id: r.id,
     workspace_id: r.workspaceId,
@@ -96,10 +227,13 @@ function mapIngestRow(r: typeof ingests.$inferSelect): IngestRow {
     filename: r.filename,
     mime_type: r.mimeType,
     file_path: r.filePath,
-    status: r.status as IngestRow["status"],
+    status,
     classification: r.classification,
     produced,
     error: r.error,
+    category,
+    retryable,
+    dedup_of,
     created_at: toIso(r.createdAt)!,
     completed_at: toIso(r.completedAt),
   };
@@ -565,7 +699,7 @@ export async function listIngests(params: {
   cursor?: string;
   limit?: number;
   batchId?: string;
-  status?: string;
+  statuses?: IngestStatus[];
 }): Promise<{ items: IngestRow[]; next_cursor: string | null }> {
   const limit = clampLimit(params.limit ?? DEFAULT_PAGE_LIMIT);
   const cur = decodeCursor<IngestListCursor>(params.cursor);
@@ -574,8 +708,13 @@ export async function listIngests(params: {
   ];
   if (params.batchId)
     whereParts.push(sql`batch_id = ${params.batchId}::uuid`);
-  if (params.status)
-    whereParts.push(sql`status = ${params.status}::ingest_status`);
+  if (params.statuses && params.statuses.length > 0) {
+    const list = sql.join(
+      params.statuses.map((s) => sql`${s}::ingest_status`),
+      sql`, `,
+    );
+    whereParts.push(sql`status IN (${list})`);
+  }
   if (cur) {
     whereParts.push(
       sql`(created_at, id) < (${cur.created_at}::timestamptz, ${cur.id}::uuid)`,
@@ -616,4 +755,69 @@ export async function listIngests(params: {
     });
   }
   return { items, next_cursor };
+}
+
+// ── Retry (#158) ──────────────────────────────────────────────────────
+
+/**
+ * Re-run a failed/unsupported ingest against its original stored bytes.
+ *
+ * Rather than surgically re-opening the (already terminal) batch, we route
+ * the stored bytes back through `createBatchFromFiles` — the normal upload
+ * pipeline. That reuses the full batch → worker → auto-reconcile lifecycle
+ * and, crucially, the L1 dedup "genuine restore" branch (#124): because the
+ * errored ingest produced no live transaction, `findLiveTransactionForDocument`
+ * returns null and nothing is in flight, so the byte-known input is enqueued
+ * for a real re-extract instead of being suppressed as a duplicate.
+ *
+ * The original errored ingest row is left intact as the historical record
+ * of the failure; the returned `ingest` is the freshly-created one the
+ * caller should poll.
+ *
+ * Guards: only `error` / `unsupported` are retryable. `done` already
+ * succeeded; `queued`/`processing` are still in flight; `dedup`/`near_dup`
+ * are duplicates whose canonical transaction is reachable via `dedup_of`.
+ */
+export async function retryIngest(
+  workspaceId: string,
+  id: string,
+): Promise<{
+  retried_ingest_id: string;
+  batch_id: string;
+  ingest: IngestRow;
+  poll: string;
+}> {
+  const original = await getIngest(workspaceId, id); // throws NotFound
+  if (original.status !== "error" && original.status !== "unsupported") {
+    throw new IngestNotRetryableProblem(id, original.status);
+  }
+
+  const abs = resolveUploadPath(original.file_path);
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(abs);
+  } catch {
+    throw new IngestFileMissingProblem(id, original.file_path);
+  }
+
+  const { batch, items } = await createBatchFromFiles({
+    workspaceId,
+    files: [
+      {
+        originalName: original.filename,
+        mimeType: original.mime_type,
+        bytes,
+      },
+    ],
+    autoReconcile: true,
+  });
+
+  const newIngestId = items[0]!.ingestId;
+  const ingest = await getIngest(workspaceId, newIngestId);
+  return {
+    retried_ingest_id: id,
+    batch_id: batch.id,
+    ingest,
+    poll: `/v1/batches/${batch.id}`,
+  };
 }

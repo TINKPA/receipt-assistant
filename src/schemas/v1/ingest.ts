@@ -36,6 +36,25 @@ export const IngestClassification = z
   ])
   .openapi("IngestClassification");
 
+// Derived reason bucket (#158) so a client can pick the right affordance
+// without string-parsing `error`:
+//   ok                  → reached `done`, produced a transaction.
+//   in_progress         → still `queued` / `processing`.
+//   transient_actionable→ `error` from auth/timeout/rate-limit/upstream 5xx;
+//                          retrying the same bytes is likely to succeed.
+//   input_problem       → `unsupported`, or an `error` that looks like a
+//                          bad/unreadable input; user should replace/correct.
+//   informational       → `dedup` / `near_dup`; not an error. See `dedup_of`.
+export const IngestCategory = z
+  .enum([
+    "ok",
+    "in_progress",
+    "transient_actionable",
+    "input_problem",
+    "informational",
+  ])
+  .openapi("IngestCategory");
+
 // ── produced provenance ───────────────────────────────────────────────
 
 export const IngestProduced = z
@@ -60,6 +79,13 @@ export const Ingest = z
     classification: IngestClassification.nullable(),
     produced: IngestProduced.nullable(),
     error: z.string().nullable(),
+    // #158 — derived reason bucket + affordance hints. `category` and
+    // `retryable` are computed from (status, error); `dedup_of` surfaces
+    // the pre-existing transaction for a `dedup`/`near_dup` row so the
+    // client can deep-link "already in your ledger → view it".
+    category: IngestCategory,
+    retryable: z.boolean(),
+    dedup_of: Uuid.nullable(),
     created_at: IsoDateTime,
     completed_at: IsoDateTime.nullable(),
   })
@@ -154,5 +180,50 @@ export const ListIngestsQuery = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
   batch_id: Uuid.optional(),
-  status: IngestStatus.optional(),
+  // Single status OR a comma-separated set, e.g.
+  // `status=error,unsupported,dedup,near_dup` (#158). Unknown tokens are
+  // rejected 422 by the service.
+  status: z
+    .string()
+    .optional()
+    .openapi({
+      description:
+        "Filter by ingest status. Single value or comma-separated set, " +
+        "e.g. `error,unsupported,dedup,near_dup`.",
+      example: "error,unsupported",
+    }),
 });
+
+// `GET /v1/ingests/problems` — same shape minus `batch_id`. When `status`
+// is omitted the service defaults to the non-`done`, non-in-flight set
+// (`error,unsupported,dedup,near_dup`).
+export const IngestProblemsQuery = z.object({
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  status: z
+    .string()
+    .optional()
+    .openapi({
+      description:
+        "Override the default problem set. Comma-separated ingest " +
+        "statuses; defaults to `error,unsupported,dedup,near_dup`.",
+      example: "error",
+    }),
+});
+
+// ── Retry ─────────────────────────────────────────────────────────────
+
+// `POST /v1/ingests/:id/retry` re-runs the original stored bytes through
+// the normal batch pipeline. The genuine-restore branch of L1 dedup means
+// the byte-known input is NOT suppressed (the errored ingest produced no
+// live transaction). Returns the freshly-created ingest so the caller can
+// poll it; `ingest.status` is `queued` normally, or `dedup` if in the
+// meantime the same purchase was ingested another way.
+export const RetryIngestResponse = z
+  .object({
+    retried_ingest_id: Uuid,
+    batch_id: Uuid,
+    ingest: Ingest,
+    poll: z.string(),
+  })
+  .openapi("RetryIngestResponse");
