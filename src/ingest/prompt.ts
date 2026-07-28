@@ -23,7 +23,7 @@ import {
  * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
  * re-derived. See #80 / #88 for the 3-layer data model rationale.
  */
-export const PROMPT_VERSION = "2.24";
+export const PROMPT_VERSION = "2.25";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -1144,8 +1144,20 @@ Invariants you MUST honor:
   - Use a single BEGIN/COMMIT around the transaction + postings inserts
     so the deferred balance trigger fires at COMMIT on matched rows.
   - Money is ALWAYS integer minor units. Never insert floats.
-  - amount_base_minor can be set equal to amount_minor when currency is
-    already the workspace base currency (USD for this workspace).
+  - amount_base_minor: always write it equal to amount_minor, and NEVER
+    write fx_rate at all — leave that column out of your INSERT so it
+    stays NULL. When the receipt is already in the workspace base
+    currency (USD here) that is the final, correct answer. When it is
+    NOT (a CNY / JPY / EUR receipt), your value is a placeholder that
+    only exists to satisfy the deferred balance trigger: the worker
+    re-derives both columns straight after your run using the published
+    FX rate for the receipt's own date (#184, src/fx/normalize.ts).
+    \`fx_rate IS NULL\` is precisely the marker it looks for, so a
+    guessed rate from you would suppress the real conversion and leave
+    1 CNY counted as 1 USD in every report. Do not guess a rate, do not
+    convert the total yourself, and do not "helpfully" write USD into
+    the currency column — record the currency actually printed on the
+    receipt.
   - Generate UUIDs via gen_random_uuid() inside the SQL.
   - All rows take workspace_id = WORKSPACE_ID.
   - The items[] JSON is embedded via PostgreSQL dollar-quoting
