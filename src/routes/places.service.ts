@@ -23,7 +23,7 @@ import {
   type ProjectedPlaceFields,
   type RawResponseV1,
 } from "../projection/derive.js";
-import { PROMPT_VERSION } from "../ingest/prompt.js";
+import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
 import { buildInfo } from "../generated/build-info.js";
 import { NoRawResponseProblem } from "../http/problem.js";
 import { placeSnapshots } from "../schema/place_snapshots.js";

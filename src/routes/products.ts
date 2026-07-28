@@ -25,7 +25,7 @@ import {
   derivationEvents,
 } from "../schema/index.js";
 import { buildInfo } from "../generated/build-info.js";
-import { PROMPT_VERSION } from "../ingest/prompt.js";
+import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   Product,

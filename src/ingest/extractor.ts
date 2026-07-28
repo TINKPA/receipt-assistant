@@ -83,6 +83,14 @@ function runClaude(
       "--session-id",
       sessionId,
     ];
+    // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
+    // mini today) means the CLI picks its own default, and the prompt
+    // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
+    // Passing a hard-coded "sonnet" here would silently downgrade the
+    // model that has actually been running.
+    if (process.env.CLAUDE_MODEL) {
+      args.push("--model", process.env.CLAUDE_MODEL);
+    }
     const child = spawn("claude", args, {
       env: buildClaudeEnv(),
       stdio: ["ignore", "pipe", "pipe"],

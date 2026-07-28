@@ -10,7 +10,7 @@ Postgres (managed via Drizzle migrations in `drizzle/`). The receipt-as-flat-row
 |---|---|
 | `documents` | Uploaded receipt images / PDFs. Content-deduped per workspace by `sha256`. Soft-delete column `deleted_at`. |
 | `document_links` | Many-to-many between `documents` and `transactions`. |
-| `transactions` | Ledger header. `status ∈ {draft, posted, voided, reconciled, error}`; `voided_by_id` points to the mirror reversal row. |
+| `transactions` | Ledger header. Writable `status ∈ {draft, posted, reconciled, error}` — voids were removed in #170/#173 (`voided_by_id` dropped in `drizzle/0033`; the `voided` value survives in the `txn_status` PG enum only as a vestigial leftover, and nothing writes it). Soft delete is `deleted_at`. |
 | `postings` | The individual debit/credit lines under a transaction. Sum-to-zero is enforced by a deferred check trigger. |
 | `places` | Geocoded merchant location, FK from `transactions.place_id`. |
 | `transaction_events` | Append-only audit log. |
@@ -221,8 +221,8 @@ Distinct from `transactions.metadata.extraction.model` (#88) because OCR text an
 
 ```ts
 HARD_LAYER3_TX_FIELDS = [
-  "status",            // explicit user actions (void/reconcile)
-  "voided_by_id",
+  "status",            // explicit user actions (reconcile/un-reconcile)
+  "deleted_at",        // soft delete/restore — never resurrected by extraction
   "trip_id",           // user-assigned grouping
   "narration",         // user notes
   "id",                // immutable identity
@@ -280,7 +280,7 @@ POST /v1/documents/{id}/re-extract    # re-OCR + UPDATE linked transaction
 
 ### Layer-3 shielding (the safety contract)
 
-**HARD Layer 3** (`HARD_LAYER3_TX_FIELDS` in `src/projection/layer3.ts`): `status`, `voided_by_id`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. The prompt's UPDATE doesn't mention these columns at all (omission = perfect shielding). `version` is the lone exception — re-extract always bumps it via `version + 1` to advance optimistic-concurrency.
+**HARD Layer 3** (`HARD_LAYER3_TX_FIELDS` in `src/projection/layer3.ts`): `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. The prompt's UPDATE doesn't mention these columns at all (omission = perfect shielding). `version` is the lone exception — re-extract always bumps it via `version + 1` to advance optimistic-concurrency.
 
 **SOFT Layer 3** (`SOFT_LAYER3_TX_FIELDS`): `payee`, `occurred_on`, `occurred_at`. The agent generates new values but the SQL wraps them in CASE expressions:
 
@@ -314,7 +314,7 @@ The `session_id` field in the response is the pre-allocated UUID passed to `clau
 
 ### Idempotency, sort of
 
-Re-running re-extract on the same document with the same `REEXTRACT_PROMPT_VERSION` and model should produce no Layer-2 diff in the *transaction* (the agent should produce the same payee/date). It will always produce a `metadata.extraction` diff (the `ran_at` timestamp moves) and may produce an `ocr_text` diff (vision OCR is not 100% deterministic — punctuation, line-break differences). The `derivation_events` row is written every time regardless, so the audit trail tracks every re-run.
+Re-running re-extract on the same document with the same `PROMPT_VERSION` and model should produce no Layer-2 diff in the *transaction* (the agent should produce the same payee/date). It will always produce a `metadata.extraction` diff (the `ran_at` timestamp moves) and may produce an `ocr_text` diff (vision OCR is not 100% deterministic — punctuation, line-break differences). The `derivation_events` row is written every time regardless, so the audit trail tracks every re-run.
 
 ## Known Pitfalls
 
@@ -333,11 +333,14 @@ Re-running re-extract on the same document with the same `REEXTRACT_PROMPT_VERSI
    or a 9? Given the date context…") which improves ambiguous OCR.
 
    **Current solution**: Single-call agent pipeline
-   (`src/claude.ts::processReceipt`). One `claude -p` invocation reads
-   the image, reasons in plain text, and writes the extracted fields
-   to Postgres via a `psql` tool call — **no JSON-schema coercion
-   anywhere in the flow**. A placeholder receipt row is seeded at
-   upload time and `UPDATE`d by the agent.
+   (`src/ingest/prompt.ts::buildExtractorPrompt` →
+   `src/ingest/extractor.ts::defaultClaudeExtractor`). One `claude -p`
+   invocation reads the image, reasons in plain text, and writes the
+   whole v1 ledger transaction to Postgres via `psql` tool calls —
+   **no JSON-schema coercion anywhere in the flow**. The pre-v1
+   `src/claude.ts::processReceipt` that used to own this was deleted
+   in #164; `src/claude.ts` now only exports `runClaude` /
+   `detectPsqlCommand` for `src/insights/ask.ts`.
 
    An earlier two-phase variant (Phase 1: image → plain-text OCR;
    Phase 2: separate `claude -p` call structuring the text into JSON
@@ -386,7 +389,7 @@ When you change a schema or add a new endpoint:
 4. Run `npm run openapi:generate` to regenerate `openapi/openapi.json`.
 5. Commit the schema, route registration, handler, and regenerated spec **in the same commit**. A stale `openapi.json` misleads client codegen and breaks PR diffs.
 
-**Never inline a new `z.object()` directly in `server.ts`.** Schemas defined inline don't appear in the OpenAPI spec, so frontend / macOS / future clients can't see them. The `src/schemas/` + registry layout exists so a single source describes every endpoint.
+**Never inline a new `z.object()` directly in `server.ts`.** Schemas defined inline don't appear in the OpenAPI spec, so the frontend and any future client can't see them. The `src/schemas/` + registry layout exists so a single source describes every endpoint.
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
 
