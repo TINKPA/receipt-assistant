@@ -95,7 +95,28 @@ export function agentHygiene(opts: {
   scratchDir: string;
   /** Container-absolute path of the file under extraction. */
   filePath: string;
+  /** Which path is rendering this. The effort-budget prose names the run's
+   *  own phases, and the two paths do not share them — re-extract has no
+   *  Phase 5 to close an ingest in, and its Phase 3 is a brand refresh, not
+   *  a Google place resolve. Telling a re-extract agent to "close the ingest
+   *  in Phase 5" points it at a step that does not exist in its own prompt. */
+  path: "ingest" | "re-extract";
 }): string {
+  const core =
+    opts.path === "ingest"
+      ? `classify → extract fields → write the balanced double-entry transaction
+  (+ postings + line items + document link) → close the ingest in Phase 5.
+  A run that commits a correct, balanced transaction and closes the ingest
+  is a SUCCESS even if it did zero enrichment.`
+      : `re-read the source → UPDATE the existing transaction's fields in place
+  → replace its line items (retiring the previous run) → stamp
+  metadata.extraction. A run that commits a correct in-place update is a
+  SUCCESS even if it did zero enrichment.`;
+  const enrichment =
+    opts.path === "ingest"
+      ? `Phase 3 (Google place resolve / multilingual fetch / storefront photos)
+  and the brand-icon resolution pipeline.`
+      : `the brand refresh and the brand-icon resolution pipeline.`;
   return `Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
 concurrently in this container and /tmp is shared: a generic name like
 /tmp/receipt_rot.jpg WILL be overwritten by a sibling agent mid-run,
@@ -127,14 +148,10 @@ to 40+ turns — and the extra 30 turns are almost always merchant enrichment
 (Google fetches, storefront photos, brand icons), NOT harder extraction.
 
 CORE — required. Do this and commit it no matter what:
-  classify → extract fields → write the balanced double-entry transaction
-  (+ postings + line items + document link) → close the ingest in Phase 5.
-  A run that commits a correct, balanced transaction and closes the ingest
-  is a SUCCESS even if it did zero enrichment.
+  ${core}
 
 ENRICHMENT — best-effort, SECONDARY. You may abbreviate or SKIP any of it:
-  Phase 3 (Google place resolve / multilingual fetch / storefront photos)
-  and the brand-icon resolution pipeline. These are polish and a cache.
+  ${enrichment} These are polish and a cache.
   You have full authority to skip them. They must NEVER:
     • block, delay, or fail the core write;
     • trigger a self-correction loop — if a step errors or a column/table
@@ -167,14 +184,32 @@ a decision, not a failure:
   metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok`;
 }
 
+/** Today, in the agent's own terms. Computed per render, never baked in —
+ *  see `dateSelfCheck()`. */
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+function currentYear(): number {
+  return new Date().getUTCFullYear();
+}
+
 /**
  * Phase 3.5 Checks A + B — the two evidence-proven date self-checks.
+ *
+ * A FUNCTION, not a const, and that is load-bearing. This block tells the
+ * agent what "today" is so it can sanity-check an extracted year, and a
+ * hardcoded date here is worse than none: it silently teaches the agent the
+ * wrong present. A `const` would freeze the date at module load, which on a
+ * container that runs for weeks drifts just as badly. Date accuracy is the
+ * known weak spot (#27) and this check is the mechanism meant to catch it,
+ * so it evaluates on every render.
  *
  * Check C (payee cross-check via Google) is NOT here: it depends on a
  * Phase 3 geocode that only the ingest path performs, so it stays in
  * `prompt.ts`.
  */
-export const DATE_SELF_CHECK = `── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
+export function dateSelfCheck(): string {
+  return `── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
 
 Round 1 + Round 2 (40 receipts total) showed that **failures cluster
 on two axes**: (a) date OCR errors (wrong year, day/month digit swaps)
@@ -188,14 +223,18 @@ evidence-driven**: only the two checks that provably help.
 Before committing your YYYY-MM-DD:
 
   1. What year did you extract? Say it out loud: "I extracted year YYYY."
-  2. Today's date (from \`date\` command if needed) is 2026-04-20.
+  2. Today's date is ${todayISO()}, and the current year is ${currentYear()}.
   3. Is your extracted year more than 12 months before today? Receipts
      are almost always from the current or previous calendar year.
-  4. If your year is 2023 or earlier AND today is 2026: **LOOK AGAIN**
+  4. If your extracted year is ${currentYear() - 2} or earlier: **LOOK AGAIN**
      at the year digit on the receipt. It is statistically extremely
      unlikely that a receipt processed today is 2+ years old.
-     Common misread: "2025" rendered as "2023" on faint thermal paper;
-     the middle digit is usually '2' with the last digit 5 vs 3.
+     Common misread: "${currentYear()}" rendered as "${currentYear() - 2}" on
+     faint thermal paper; the middle digit is usually '2' and it is the last
+     digit that is misread.
+     This is a PROMPT, not a veto — genuine old receipts exist (a backfill of
+     a 2021 purchase is legitimate). Look again, then keep what the paper
+     actually says.
 
 ### Check B — Multi-candidate date enumeration (catches day-digit swaps)
 
@@ -224,6 +263,7 @@ Emit your date-candidate list in metadata:
 
   "date_candidates": ["09/30/2025", "12/31/2025"],
   "chosen_date_reason": "top of receipt adjacent to transaction time"`;
+}
 
 /** The mandatory `metadata.ocr_audit` provenance key. */
 export const OCR_AUDIT_REQUIREMENT = `### REQUIRED metadata.ocr_audit shape
