@@ -17,7 +17,7 @@ import {
   EXTRACTION_MODEL,
   NO_JSON_SCHEMA_RULE,
   PSQL_DISCIPLINE,
-  DATE_SELF_CHECK,
+  dateSelfCheck,
   OCR_AUDIT_REQUIREMENT,
   agentHygiene,
   renderActiveLessons,
@@ -114,7 +114,7 @@ Optional: if you want to discover schema details, \`\\d\` works:
   psql "\$DATABASE_URL" -c "\\d transactions"
   psql "\$DATABASE_URL" -c "SELECT id, name, type FROM accounts WHERE workspace_id = '${ctx.workspaceId}' ORDER BY type, name"
 
-${agentHygiene({ scratchDir, filePath: ctx.filePath })}
+${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest" })}
 ${renderActiveLessons()}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
 
@@ -532,7 +532,7 @@ Also record provenance in metadata:
 This phase is FREE — it uses OCR you've already done. Always run
 it before giving up on the Chinese name.
 
-${DATE_SELF_CHECK}
+${dateSelfCheck()}
 
 ### Check C — Payee cross-check via Google (KEEP — evidence-proven)
 

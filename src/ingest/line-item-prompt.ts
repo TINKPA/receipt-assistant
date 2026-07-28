@@ -396,7 +396,9 @@ Two different failures, two different answers. Do not confuse them.
   illegible thermal print, an image that is only a total:
     emit exactly ONE row —
       line_type='other', item_class='other', confidence='low',
-      raw_name='TOTAL ONLY', line_total_minor=<TOTAL_MINOR>,
+      raw_name='TOTAL ONLY',
+      line_total_minor = the receipt's printed grand total, in minor
+                         units (cents), as you read it off the paper,
       parent_line_no=NULL, product_key=NULL,
       tags=['no-item-section'].
 

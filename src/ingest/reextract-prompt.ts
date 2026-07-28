@@ -46,7 +46,7 @@ import {
   EXTRACTION_MODEL,
   NO_JSON_SCHEMA_RULE,
   PSQL_DISCIPLINE,
-  DATE_SELF_CHECK,
+  dateSelfCheck,
   OCR_AUDIT_REQUIREMENT,
   agentHygiene,
   renderActiveLessons,
@@ -143,7 +143,7 @@ Context variables for SQL (use as-is):
 
 ${PSQL_DISCIPLINE}
 
-${agentHygiene({ scratchDir, filePath: ctx.filePath })}
+${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "re-extract" })}
 ${renderActiveLessons()}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
 ${renderDecodedSource(ctx.ocrText)}
@@ -176,7 +176,7 @@ ${LINE_ITEM_WORKED_EXAMPLES}
 
 ${ALLOCATION_LOGIC}
 
-${DATE_SELF_CHECK}
+${dateSelfCheck()}
 
 ${OCR_AUDIT_REQUIREMENT}
 
