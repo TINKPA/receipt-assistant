@@ -62,6 +62,7 @@ import {
 } from "./line-item-prompt.js";
 import {
   ITEMS_JSON_EXPR,
+  itemsCte,
   brandFkGuard,
   productsUpsert,
   transactionItemsInsert,
@@ -156,15 +157,19 @@ live there, so you do not extract them at all.
 
 **Brand FK guard (#101).** Items may carry product_brand_id, which is
 FK into \`brands\`. The products UPSERT below would fail if the brand
-row doesn't exist. Run this defensively BEFORE the main block:
+row doesn't exist, so it runs defensively as the FIRST statement of the
+block below — its own statement, never a sibling CTE (\`WITH\`
+sub-statements cannot see each other's effects on target tables and RI
+checks are AFTER-ROW). Delete it when no item carries a
+product_brand_id.
 
-${brandFkGuard()}
+Run exactly ONE psql INVOCATION for the whole write. Substitute your
+extracted values for the placeholders; the CASE statements consult
+\`metadata.user_edited\` so a user override survives this re-extract.
 
-Run exactly ONE psql block. Substitute your extracted values for the
-placeholders; the CASE statements consult \`metadata.user_edited\` so a
-user override survives this re-extract.
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
+${brandFkGuard({ bare: true })}
 
-  psql "\$DATABASE_URL" <<'SQL'
   BEGIN;
 
   UPDATE transactions SET
@@ -238,6 +243,7 @@ user override survives this re-extract.
     FROM transaction_items
     WHERE transaction_id = '${ctx.transactionId}'
   ),
+${itemsCte()},
 ${productsUpsert({ workspaceId: ctx.workspaceId, merchantIdExpr })}
 ${transactionItemsInsert({
   workspaceId: ctx.workspaceId,

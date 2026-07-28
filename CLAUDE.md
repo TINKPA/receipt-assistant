@@ -515,31 +515,43 @@ the auth pool, and harness poll timeouts will fire while queued.
 
 ### Manual Verification Flow
 
-No verify script. Three curl calls are the contract:
+No verify script. Three curl calls are the contract. The pre-v1
+`POST /receipt` → `GET /jobs/:id` → `GET /receipt/:id` recipe that used
+to live here is **gone** — `src/app.ts` mounts only `/v1/*`, so those
+three paths 404. Point at the **mini** (production); `localhost` is the
+dev box and lands in the wrong DB.
 
 ```bash
+BASE=http://100.84.82.96:3000
+
 # 1. Upload
-JOB=$(curl -sS -X POST http://localhost:3000/receipt \
-  -F "image=@$HOME/Desktop/RECEIPT/IMG.jpeg" | jq -r .jobId)
+BATCH=$(curl -sS -X POST "$BASE/v1/ingest/batch" \
+  -F "file=@/path/to/receipt.jpeg" | jq -r .batchId)
 
-# 2. Poll until status=done
-while :; do
-  s=$(curl -sS http://localhost:3000/jobs/$JOB | jq -r .status)
-  [[ "$s" == "done" || "$s" == "error" ]] && break
-  sleep 2
-done
-RECEIPT=$(curl -sS http://localhost:3000/jobs/$JOB | jq -r .receiptId)
+# 2. Poll until the batch reaches a terminal state
+until [[ "$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r .status)" \
+         =~ ^(extracted|reconciled|failed)$ ]]; do sleep 3; done
+curl -sS "$BASE/v1/batches/$BATCH" | jq '.items[] | {id,status,error,produced}'
 
-# 3. Inspect the receipt record (the data of record — merchant/date/
-#    total/tip/items are all here)
-curl -sS http://localhost:3000/receipt/$RECEIPT | jq .
+# 3. Inspect the transaction (the data of record — payee/date/total/
+#    postings/items are all here)
+TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_id')
+curl -sS "$BASE/v1/transactions/$TX" | jq .
 ```
 
 For the Langfuse trace, query the API directly (see
 "Query Langfuse" above). Never trust a wrapper script's display —
-go to `/receipt/:id` for ground truth. (Earlier `verify-receipt.sh`
-printed all-None while the DB had correct data; deleted to avoid
-that trap.)
+go to `/v1/transactions/:id` for ground truth. (Earlier
+`verify-receipt.sh` printed all-None while the DB had correct data;
+deleted to avoid that trap.)
+
+Re-extract is a single synchronous call — it bypasses
+`MAX_CLAUDE_CONCURRENCY`, so run these strictly one at a time:
+
+```bash
+curl -sS --max-time 1000 -X POST "$BASE/v1/documents/$DOC/re-extract" | jq .
+# PASS: changed_keys contains "metadata_extraction".
+```
 
 ### Why API over UI
 

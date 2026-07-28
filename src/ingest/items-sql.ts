@@ -21,6 +21,12 @@
  *   • extraction-run number — `1` vs. `(SELECT run FROM next_run)`
  *   • the version constant — now shared (`prompt-contract.ts`)
  *
+ * #181 added `itemsCte()`: the `<ITEMS_JSON_ARRAY>` placeholder and the
+ * 26-column type list now appear ONCE per statement instead of once per
+ * fragment. `productsUpsert` and `transactionItemsInsert` read the
+ * resulting `item` CTE and must not be spliced into a statement that
+ * lacks it.
+ *
  * Plain template literals, never `String.raw` — see `prompt-contract.ts`.
  */
 import { PROMPT_VERSION } from "./prompt-contract.js";
@@ -54,15 +60,33 @@ function indentBlock(text: string, pad: string): string {
 }
 
 /**
- * `jsonb_to_recordset(<items>) AS item(<26 columns>)`.
+ * The `raw` + `item` leading CTEs (#181).
  *
- * @param pad leading whitespace for the continuation lines, so the
- *            fragment lines up wherever it is spliced in.
+ * Before #181 every fragment that needed the line items pasted the
+ * whole `<ITEMS_JSON_ARRAY>` placeholder AND the 26-column
+ * `jsonb_to_recordset` type list of its own — four array copies and two
+ * type lists in the ingest write, three and two on re-extract. The array
+ * is the agent's OUTPUT, so each duplicate is retyped in full.
+ *
+ * CTEs are per-STATEMENT in PostgreSQL, so this dedups within one
+ * statement only: the brand FK guard stays a separate statement (RI
+ * checks are AFTER-ROW and `WITH` sub-statements cannot see each
+ * other's effects on target tables) and keeps its own one-column
+ * recordset.
+ *
+ * Place these FIRST in the `WITH` list; everything downstream reads
+ * `item`.
  */
-export function itemsRecordset(pad = ""): string {
-  return `jsonb_to_recordset(${ITEMS_JSON_EXPR}) AS item(
-${indentBlock(ITEM_RECORD_COLUMNS, `${pad}  `)}
-${pad})`;
+export function itemsCte(): string {
+  return `    -- #181: the items[] array enters this statement EXACTLY ONCE, here.
+    -- Every CTE below reads \`item\` — do NOT paste the array again.
+    raw AS (SELECT ${ITEMS_JSON_EXPR} AS j),
+    item AS (
+      SELECT i.*
+        FROM raw, jsonb_to_recordset(raw.j) AS i(
+${indentBlock(ITEM_RECORD_COLUMNS, "          ")}
+        )
+    )`;
 }
 
 /**
@@ -72,21 +96,31 @@ ${pad})`;
  *
  * Its own statement, never a sibling CTE: `WITH` sub-statements cannot
  * see each other's effects on target tables and RI checks are AFTER-ROW.
+ *
+ * `bare: true` drops the `psql … <<'SQL'` wrapper so the caller can
+ * batch it into a larger heredoc (#181 Turn B). It keeps its own
+ * one-column recordset either way — CTEs are per-statement, so it
+ * cannot read `itemsCte()`'s `item`.
  */
-export function brandFkGuard(): string {
-  return `  psql "\$DATABASE_URL" <<'SQL'
-    INSERT INTO brands (brand_id, name)
-    SELECT DISTINCT product_brand_id, product_brand_id
-      FROM jsonb_to_recordset(${ITEMS_JSON_EXPR})
-        AS item(product_brand_id text)
-     WHERE product_brand_id IS NOT NULL
-    ON CONFLICT (brand_id) DO NOTHING;
+export function brandFkGuard(opts: { bare?: boolean } = {}): string {
+  const stmt = `INSERT INTO brands (brand_id, name)
+SELECT DISTINCT product_brand_id, product_brand_id
+  FROM jsonb_to_recordset(${ITEMS_JSON_EXPR})
+    AS item(product_brand_id text)
+ WHERE product_brand_id IS NOT NULL
+ON CONFLICT (brand_id) DO NOTHING;`;
+  if (opts.bare) return indentBlock(stmt, "  ");
+  return `  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
+${indentBlock(stmt, "    ")}
   SQL`;
 }
 
 /**
  * The `p_upsert` CTE — #84 Phase 1 products SSOT upsert, keyed by
  * (workspace_id, merchant_id, product_key).
+ *
+ * Requires `itemsCte()` earlier in the same `WITH` list — it reads
+ * `item`, it does not paste the array itself (#181).
  *
  * Returned WITHOUT a trailing comma so the call site can place it
  * anywhere in a `WITH` list.
@@ -107,21 +141,29 @@ export function productsUpsert(opts: {
     -- product_key=NULL and skip this step entirely (filtered by the
     -- WHERE clause). NULLS NOT DISTINCT in the unique index makes
     -- merchant_id=NULL participate.
+    -- DISTINCT ON (#181): two lines on one receipt may legitimately
+    -- share a product_key (the same dish ordered twice). Feeding both
+    -- to ON CONFLICT DO UPDATE raises PG 21000 "command cannot affect
+    -- row a second time" and rolls back the whole write. This dedups
+    -- the CATALOG upsert source only — transaction_items below still
+    -- gets one row per printed line.
     p_upsert AS (
       INSERT INTO products (
         workspace_id, merchant_id, product_key, canonical_name,
         item_class, brand_id, model, color, size, variant, sku,
         manufacturer
       )
-      SELECT '${opts.workspaceId}',
+      SELECT DISTINCT ON (item.product_key, COALESCE(item.product_merchant_exclusive, false))
+             '${opts.workspaceId}',
              CASE WHEN item.product_merchant_exclusive THEN ${opts.merchantIdExpr} ELSE NULL END,
              item.product_key,
              COALESCE(item.normalized_name, item.raw_name),
              item.item_class, item.product_brand_id,
              item.product_model, item.product_color, item.product_size,
              item.product_variant, item.product_sku, item.product_manufacturer
-      FROM ${itemsRecordset("      ")}
+      FROM item
       WHERE COALESCE(item.line_type, 'product') = 'product' AND item.product_key IS NOT NULL
+      ORDER BY item.product_key, COALESCE(item.product_merchant_exclusive, false), item.line_no
       ON CONFLICT (workspace_id, merchant_id, product_key) DO UPDATE
         SET updated_at = NOW(),
             canonical_name = COALESCE(EXCLUDED.canonical_name, products.canonical_name),
@@ -134,6 +176,9 @@ export function productsUpsert(opts: {
 /**
  * The `transaction_items` INSERT — #81 Phase 2 + #84 relational line
  * items with the `product_id` link and the per-line allocation columns.
+ *
+ * Requires `itemsCte()` earlier in the same `WITH` list — it selects
+ * `FROM item` rather than re-pasting the array (#181).
  *
  * Returns a bare `INSERT … SELECT … FROM …` (no trailing semicolon, no
  * CTE wrapper) so the ingest path can wrap it as `ti AS ( … )` and the
@@ -154,7 +199,7 @@ export function transactionItemsInsert(opts: {
   /** RETURNING column list, when the caller wraps this in a CTE. */
   returning?: string;
 }): string {
-  const from = opts.fromPrefix ? `${opts.fromPrefix}\n        ` : "";
+  const from = opts.fromPrefix ? `${opts.fromPrefix} ` : "";
   const returning = opts.returning ? `\n      RETURNING ${opts.returning}` : "";
   return `      INSERT INTO transaction_items (
         id, workspace_id, transaction_id, line_no, parent_line_no,
@@ -179,7 +224,7 @@ export function transactionItemsInsert(opts: {
                 LIMIT 1),
              item.tax_minor, item.tip_share_minor, item.discount_share_minor,
              ${opts.runExpr}, '${PROMPT_VERSION}'
-      FROM ${from}${itemsRecordset("        ")}${returning}`;
+      FROM ${from}item${returning}`;
 }
 
 /**

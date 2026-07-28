@@ -365,3 +365,23 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
     console.error("[langfuse] Ingestion failed:", (err as Error).message);
   }
 }
+
+// ── Fire-and-forget wrapper ──────────────────────────────────────────
+
+/**
+ * Kick off Langfuse ingestion for a finished `claude -p` run without
+ * blocking the caller. `ingestSession` itself swallows errors, so
+ * Langfuse downtime never fails a batch or a re-extract.
+ *
+ * Lives here rather than in `worker.ts` because the re-extract path
+ * (`routes/documents.service.ts`) needs it too, and `worker.ts` already
+ * imports from that module — putting it there would close an import
+ * cycle. Before #181 only the ingest worker called it, so every
+ * re-extract ran completely untraced and the #181 token measurement
+ * would have been blind on exactly the path the campaign uses.
+ */
+export function trackLangfuse(sessionId: string, tags: string[]): void {
+  ingestSession(getSessionJsonlPath(sessionId), tags).catch((err) => {
+    console.error("[langfuse] ingestion failed:", err);
+  });
+}

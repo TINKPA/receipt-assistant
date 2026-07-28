@@ -32,7 +32,7 @@ import {
   LINE_ITEM_WORKED_EXAMPLES,
 } from "./line-item-prompt.js";
 import {
-  ITEMS_JSON_EXPR,
+  itemsCte,
   brandFkGuard,
   productsUpsert,
   transactionItemsInsert,
@@ -120,7 +120,9 @@ ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
 
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
-Read the file (image / pdf / html / .eml) and decide which category:
+Follow the document-reading rules above FIRST — for a PDF that means
+the text file, never the PDF itself (the Read tool rasterizes PDFs into
+images). Then decide which category:
 
   receipt_image   photo/scan of a physical receipt
   receipt_email   .eml / .html purchase confirmation (Amazon, Uber, …)
@@ -307,18 +309,18 @@ Any non-OK status / HTTP error → skip. Phase 3 is best-effort.
 ### Phase 3b — Local-first cache check
 
 Before hitting any v1 endpoint, check whether we already have this
-place cached:
+place cached. Do NOT spend a psql call of your own here: this lookup
+is result set ② of the ONE consolidated read (**Turn A**, Phase 4.0
+below). Run Turn A now — you have the \`<PLACE_ID>\` from 3a, which is
+all it was waiting for — and read its answer.
 
-  PID='<google_place_id from 3a>'
-  EXISTING=\$(psql "\$DATABASE_URL" -tA -c "SELECT id FROM places WHERE google_place_id = '\$PID'")
-
-If EXISTING is non-empty (the place is cached):
-  - Use the cached row id as your tx.place_id in Phase 4.
-  - Bump \`last_seen_at\`/\`hit_count\` via the upsert in Phase 4 — that
-    statement handles both insert-new and increment-existing.
+If Turn A's ② returned a row (the place is cached):
   - SKIP Phase 3c entirely. No outbound Google calls.
+  - You do NOT need the returned id in hand: the \`place\` CTE inside
+    Turn B upserts on \`google_place_id\` and feeds \`tx.place_id\`
+    inline, so it handles insert-new and increment-existing alike.
 
-Only when EXISTING is empty do you proceed to 3c.
+Only when Turn A's ② returned no row do you proceed to 3c.
 
 ### Phase 3c — Dual-language v1 fetch + photos
 
@@ -624,6 +626,77 @@ Invariants you MUST honor:
     titles ("World's", 12" pan) from breaking the write. Never revert it
     to a single-quoted \`'...'::jsonb\` literal.
 
+### 4.0 The write-phase turn plan — READ THIS BEFORE ANY WRITE
+
+The entire ledger write is **THREE psql invocations**, not eight and
+not twenty:
+
+  Turn A — ONE read invocation, four result sets. Everything the write
+           branches on.
+  Turn B — ONE write invocation. The whole ledger write.
+  Turn C — Phase 5, close the ingest row.
+
+Batch statements inside each invocation with a heredoc (see the psql
+discipline near the top). Every extra invocation re-sends this whole
+conversation, and that round-trip cost — not the extraction itself —
+is what makes a run expensive.
+
+**Turn A.** Run it ONCE, after you have (a) your extracted fields,
+(b) the Phase 2.5 merchant block, and (c) the Phase 3a geocode result
+if you are doing Phase 3 at all. Phase 3a is a \`curl\`, not a psql
+call, so doing it before Turn A costs you nothing and lets the place
+lookup ride along. Include only the result sets that apply; keep them
+in this order so you can read the output positionally:
+
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
+  -- (1) brand registry: Phase 2.6 cache check AND the Phase 4b icon
+  --     pre-check, in one row per brand.
+  SELECT b.brand_id, b.name, b.domain, b.user_chose_at,
+         b.preferred_asset_id,
+         b.metadata->>'icon_resolution' AS icon_resolution,
+         (SELECT count(*) FROM brand_assets a
+           WHERE a.brand_id = b.brand_id AND a.retired_at IS NULL) AS live_count
+    FROM brands b
+   WHERE b.brand_id IN ('<merchant brand-id>' /* , '<product brand-ids>' */);
+
+  -- (2) place cache: Phase 3b. OMIT this query when Phase 3a produced
+  --     no place id (or you skipped Phase 3).
+  SELECT id FROM places WHERE google_place_id = '<PLACE_ID>';
+
+  -- (3) Message-ID dedup: receipt_email ONLY. OMIT otherwise.
+  SELECT id FROM documents
+   WHERE workspace_id = '${ctx.workspaceId}'
+     AND message_id = '<MESSAGE_ID>'
+     AND id <> '${ctx.documentId}'
+   LIMIT 1;
+
+  -- (4) near-duplicate candidates: Phase 4a.0. Use YOUR extracted
+  --     values; the ±3-day window covers settlement-date drift.
+  SELECT t.id, t.payee, t.occurred_on,
+         t.metadata->>'order_number'  AS order_number,
+         t.metadata->>'payment_id'    AS payment_id,
+         t.metadata->>'approval_code' AS approval_code,
+         t.metadata->>'payment'       AS payment
+    FROM transactions t
+    JOIN postings p ON p.transaction_id = t.id AND p.amount_minor > 0
+   WHERE t.workspace_id = '${ctx.workspaceId}'
+     AND t.status IN ('posted','reconciled')
+     AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3
+   GROUP BY t.id
+  HAVING SUM(p.amount_minor) = <TOTAL_MINOR>
+   LIMIT 5;
+  SQL
+
+psql prints the result sets in order. Read them once, then branch:
+  (3) non-empty → duplicate email; skip the write entirely and go to
+      Turn C with status='done' (see 4a step 1).
+  (4) → walk the near-dup decision tree in 4a.0.
+  (2) → Phase 3b/3c.
+  (1) → Phase 2.6 discovery and the Phase 4b/4c icon cases.
+
+Do NOT re-run any of these queries later in the run. If a result
+surprises you, re-read the output you already have.
+
 ### 4a. receipt_image / receipt_email / receipt_pdf
 
 **Email-only pre/post steps (receipt_email). #122.**
@@ -643,42 +716,42 @@ document" phase above before reading it.)
 
 1. **Dedup pre-check — skip the WHOLE ingest if this email was already
    ingested.** A re-forwarded copy has different bytes (so the sha256
-   dedup misses it) but the same Message-ID. Run:
+   dedup misses it) but the same Message-ID. This is result set (3) of
+   **Turn A** — do not issue a separate psql call for it.
 
-     psql "\$DATABASE_URL" -tAc "SELECT id FROM documents WHERE workspace_id = '${ctx.workspaceId}' AND message_id = '<MESSAGE_ID>' AND id <> '${ctx.documentId}' LIMIT 1"
-
-   If it returns a row, do **NOT** write a transaction — go straight to
-   Phase 5 and close the ingest as \`done\` with
+   If Turn A's (3) returned a row, do **NOT** write a transaction — go
+   straight to Phase 5 (Turn C) and close the ingest as \`done\` with
    \`produced.transaction_ids = []\` and \`error = 'duplicate Message-ID'\`.
    (The \`(workspace_id, message_id)\` unique index is the hard backstop;
    this pre-check is the graceful path.)
 
-2. **After the transaction commits**, stamp the document so future
-   dedup and the frontend "Original email" fold work:
+2. **Stamping the document** with \`message_id\` / \`source_meta\` is NOT
+   a separate call either — it is folded into Turn B's
+   \`UPDATE documents\` statement, which runs after the transaction
+   INSERT inside the same transaction. The values to put there:
 
-     psql "\$DATABASE_URL" <<'SQL'
-       UPDATE documents
-          SET message_id  = '<MESSAGE_ID>',
-              source_meta = jsonb_build_object(
-                'channel', 'eml',
-                'sender', '<FROM>',
-                'subject', '<SUBJECT>',
-                'received_at', '<RFC822 Date as ISO-8601>',
-                'message_id', '<MESSAGE_ID>')
-        WHERE id = '${ctx.documentId}';
-     SQL
+       message_id  = '<MESSAGE_ID>',
+       source_meta = jsonb_build_object(
+         'channel', 'eml',
+         'sender', '<FROM>',
+         'subject', '<SUBJECT>',
+         'received_at', '<RFC822 Date as ISO-8601>',
+         'message_id', '<MESSAGE_ID>')
 
-**Pre-step — brand FK guard.** Phase 2.6 ensured the merchant's
-brand_id is in \`brands\`. Items may also carry \`product_brand_id\`
+**Brand rows are FK parents — they are the first statements of Turn
+B.** \`merchants.brand_id\` and \`products.brand_id\` are both FK into
+\`brands\`, so both must exist before the \`m\` and \`p_upsert\` CTEs
+run. Items may carry a \`product_brand_id\` distinct from the merchant's
 (e.g. Apple-branded products at Best Buy → product brand = "apple",
-merchant brand = "best-buy"). \`products.brand_id\` is FK into
-\`brands\`, so before the BEGIN below, run one defensive UPSERT for
-every distinct product_brand_id present in items[]:
+merchant brand = "best-buy").
 
-${brandFkGuard()}
+Each is its OWN statement inside Turn B's heredoc, never a sibling
+CTE: \`WITH\` sub-statements cannot see each other's effects on target
+tables, and RI checks are AFTER-ROW, so a brands row created in a
+sibling CTE is not reliably visible to the FK check.
 
-This is a stub row (domain NULL); we don't run Phase 2.6 discovery
-for product brand_ids in v1. Phase 4b will skip them at the
+The product-brand rows are stubs (domain NULL); we don't run Phase 2.6
+discovery for product brand_ids in v1. Phase 4b will skip them at the
 discovery_failed check, so they cost nothing extra at ingest. They
 become eligible for discovery + icon acquisition if a future ingest
 sees the same brand as a merchant.
@@ -698,12 +771,10 @@ the extracted fields below always decide, never this list by itself):
 
 ${renderPhashNeighbors(ctx.phashNeighbors)}
 
-Candidate query — run it with YOUR extracted values (±3-day window
-covers settlement-date drift):
+Candidate list — this is result set (4) of **Turn A**, already run with
+YOUR extracted values. Do not re-query it here.
 
-  psql "\$DATABASE_URL" -c "SELECT t.id, t.payee, t.occurred_on, t.metadata->>'order_number' AS order_number, t.metadata->>'payment_id' AS payment_id, t.metadata->>'approval_code' AS approval_code, t.metadata->>'payment' AS payment FROM transactions t JOIN postings p ON p.transaction_id = t.id AND p.amount_minor > 0 WHERE t.workspace_id = '${ctx.workspaceId}' AND t.status IN ('posted','reconciled') AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3 GROUP BY t.id HAVING SUM(p.amount_minor) = <TOTAL_MINOR> LIMIT 5"
-
-Union the result with any pHash-neighbor transactions above, then walk
+Union that result with any pHash-neighbor transactions above, then walk
 this tree (tiebreaker strength: order/receipt number > payment auth
 code / card last-4 > time-of-day > items list):
 
@@ -713,7 +784,7 @@ code / card last-4 > time-of-day > items list):
    same items) AND same merchant → this purchase is already in the
    ledger. Do NOT insert a transaction. Instead ATTACH:
 
-     psql "\$DATABASE_URL" <<'SQL'
+     psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
      BEGIN;
      INSERT INTO document_links (document_id, transaction_id)
      VALUES ('${ctx.documentId}', '<EXISTING_TX_ID>')
@@ -729,11 +800,23 @@ code / card last-4 > time-of-day > items list):
               )
             )
       WHERE id = '<EXISTING_TX_ID>';
+     -- receipt_email only: Turn B never runs on this branch, so stamp
+     -- the document here or dedup breaks for the next forwarded copy.
+     UPDATE documents
+        SET message_id  = '<MESSAGE_ID>',
+            source_meta = jsonb_build_object(
+              'channel', 'eml',
+              'sender', '<FROM>',
+              'subject', '<SUBJECT>',
+              'received_at', '<RFC822 Date as ISO-8601>',
+              'message_id', '<MESSAGE_ID>'),
+            updated_at  = NOW()
+      WHERE id = '${ctx.documentId}';
      COMMIT;
      SQL
 
-   Still run the email post-step (message_id / source_meta stamp) if
-   classification is receipt_email. Then close the ingest in Phase 5
+   That heredoc is the whole write for this branch — one invocation.
+   Then close the ingest in Phase 5 (Turn C)
    with **status='near_dup'** and
    \`produced.transaction_ids = ['<EXISTING_TX_ID>']\`. Skip Phases
    2.6/3/4b/4c entirely — the existing transaction already carries
@@ -770,13 +853,48 @@ and never leave the category blank.
 
 Mirror side is Credit Card (default).
 
-Template (substitute your extracted values for the placeholders; the
-subqueries resolve account ids inline so you do NOT need to SELECT
-them first):
+Template — **this whole heredoc is Turn B: ONE Bash tool call.**
+Substitute your extracted values for the placeholders; the subqueries
+resolve account ids inline so you do NOT need to SELECT them first.
+Statements marked OPTIONAL get deleted when they don't apply to this
+receipt. Everything that stays goes in this single invocation — do not
+split it back into one psql call per statement.
 
-  psql "\$DATABASE_URL" <<'SQL'
+\`<TX>\` below means the expression
+
+  (SELECT id FROM transactions WHERE source_ingest_id = '${ctx.ingestId}' AND workspace_id = '${ctx.workspaceId}')
+
+— the row the \`tx\` CTE inserts in step (3). Later statements resolve
+the new transaction that way, so nothing here needs its uuid echoed
+back to you in a separate turn.
+
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
   BEGIN;
+
+  -- (1) FK parent — the merchant's brand. Its OWN statement: a sibling
+  --     CTE cannot reliably satisfy merchants.brand_id's AFTER-ROW RI
+  --     check. Use the canonical_name + domain you settled in Phase 2.6
+  --     (domain NULL is fine). When Phase 2.6 found no usable domain,
+  --     add  metadata = jsonb_build_object('icon_resolution','discovery_failed')
+  --     to the DO UPDATE list so Phase 4b skips the brand cheaply.
+  INSERT INTO brands (brand_id, name, domain)
+  VALUES ('<brand-id>', '<CANONICAL_NAME>', <'<domain>' | NULL>)
+  ON CONFLICT (brand_id) DO UPDATE
+    SET name       = EXCLUDED.name,
+        domain     = COALESCE(brands.domain, EXCLUDED.domain),
+        updated_at = NOW();
+
+  -- (2) OPTIONAL FK parents — every distinct product_brand_id in
+  --     items[]. Stub rows (domain NULL). Delete when no item carries
+  --     a product_brand_id.
+${brandFkGuard({ bare: true })}
+
+  -- (3) The ledger write itself: merchant, transaction, both postings,
+  --     the document link, the product catalog and the line items —
+  --     ONE statement, so the deferred balance trigger sees a matched
+  --     set of postings.
   WITH
+${itemsCte()},
     expense AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'expense' AND name = '<EXPENSE_NAME>' LIMIT 1),
     credit  AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'liability' AND name = 'Credit Card' LIMIT 1),
     m AS (
@@ -815,8 +933,10 @@ them first):
           ),
           -- items[] is REQUIRED for receipt_image / receipt_email /
           -- receipt_pdf per #81. Statement_pdf omits this key. Each
-          -- object follows the schema in Phase 2.
-          'items', ${ITEMS_JSON_EXPR}
+          -- object follows the schema in Phase 2. This reads the SAME
+          -- array you already pasted into the \`raw\` CTE above — copy
+          -- it from there, do not retype it differently.
+          'items', (SELECT j FROM raw)
           -- add tax/tip/raw_text here if useful, as extra JSONB keys
         ),
         '${ctx.userId}'
@@ -857,112 +977,164 @@ ${transactionItemsInsert({
 })}
     )
   SELECT tx.id AS tx_id FROM tx;
-  COMMIT;
-  SQL
 
-After the main block commits, run the products aggregate recomputation
-for every product touched by this ingest. The agent runs this so
-the stats reflect THE LIVE set of transaction_items immediately —
-this is the recompute-not-increment rule from #84. \`from_dt\` is
-optional; use the workspace base currency snapshot already on
-\`postings.amount_base_minor\` for total_spent_minor:
+  -- (4) Force the DEFERRABLE balance triggers to fire HERE, where psql
+  --     can point at a line number, instead of at COMMIT where it
+  --     cannot. If postings don't sum to zero you find out now.
+  SET CONSTRAINTS ALL IMMEDIATE;
 
-  psql "\$DATABASE_URL" <<'SQL'
+  -- (5) OPTIONAL — owned_items for the durable lines you judged worth
+  --     tracking (see 4a-bis for the judgment). ONE set-based
+  --     statement: list those line_no values in the ARRAY. Delete this
+  --     statement entirely when no line qualifies.
+  INSERT INTO owned_items (workspace_id, product_id, transaction_item_id, instance_index, acquired_on)
+  SELECT '${ctx.workspaceId}', ti.product_id, ti.id, gs.idx, '<YYYY-MM-DD>'::date
+  FROM transaction_items ti
+  CROSS JOIN LATERAL generate_series(1, COALESCE(ti.quantity, 1)::int) gs(idx)
+  WHERE ti.transaction_id = <TX>
+    AND ti.retired_at IS NULL
+    AND ti.line_no = ANY(ARRAY[<durable line_nos, comma-separated>]::int[])
+    AND ti.item_class = 'durable'
+    AND ti.product_id IS NOT NULL
+  ON CONFLICT (transaction_item_id, instance_index) DO NOTHING;
+
+  -- (6) Stamp the document: ties the file back to this ingest AND
+  --     stores the OCR text, so \`documents.ocr_text\` is populated by
+  --     BOTH the ingest and the re-extract path (it used to be
+  --     re-extract only, which made every "what did the agent actually
+  --     read?" question unanswerable for ingest-only documents).
+  --     message_id / source_meta are the receipt_email post-step from
+  --     4a step 2 — drop those two assignments for non-email uploads.
+  UPDATE documents
+     SET source_ingest_id  = '${ctx.ingestId}',
+         ocr_text          = '<RAW_TEXT, single-quote-escaped>',
+         ocr_model_version = '${EXTRACTION_MODEL}',
+         message_id        = '<MESSAGE_ID>',
+         source_meta       = jsonb_build_object(
+                               'channel', 'eml',
+                               'sender', '<FROM>',
+                               'subject', '<SUBJECT>',
+                               'received_at', '<RFC822 Date as ISO-8601>',
+                               'message_id', '<MESSAGE_ID>'),
+         updated_at        = NOW()
+   WHERE id = '${ctx.documentId}';
+
+  -- (7) products aggregate recomputation, for every product this
+  --     ingest touched. Recompute, never increment (#84) — the stats
+  --     then reflect the LIVE set of transaction_items immediately.
+  --     total_spent_minor uses the workspace base-currency snapshot
+  --     already on postings.amount_base_minor.
 ${productAggregateRecompute({ workspaceId: ctx.workspaceId, touchedPredicate: `t.source_ingest_id = '${ctx.ingestId}'` })}
-  SQL
 
-If you have a geocode result, run this AFTER the main transaction
-(use the tx_id printed above).
+  COMMIT;
 
-The INSERT is a full multilingual upsert (#74). For uncached places
-include every column you extracted in Phase 3c/3d. For cached places
-the ON CONFLICT clause keeps existing per-language data and the
-\`custom_name\` user override (renamed from \`custom_name_zh\` in #79); only \`last_seen_at\` and \`hit_count\`
-bump. \`COALESCE(EXCLUDED.x, places.x)\` ensures a NEW fetch that
-returned NULL for a field never overwrites a previously-good value.
+  -- (8) AFTER COMMIT, still inside this one invocation: the party
+  --     graph (see 4a-ter for which parties to record). Additive —
+  --     it must never be able to roll back the transaction itself,
+  --     which is why it sits after COMMIT rather than inside it.
+  INSERT INTO transaction_parties
+    (workspace_id, transaction_id, transaction_item_id, role, display_name, brand_id)
+  VALUES
+    ('${ctx.workspaceId}', <TX>, NULL, 'channel', '<as printed>', '<brand_id-or-NULL>')
+    -- , line-level example:
+    -- ('${ctx.workspaceId}', <TX>,
+    --   (SELECT id FROM transaction_items WHERE transaction_id=<TX> AND line_no=<N> AND retired_at IS NULL),
+    --   'maker', 'Anker', 'anker')
+  ON CONFLICT ON CONSTRAINT transaction_parties_identity_uq DO NOTHING;
 
-  psql "\$DATABASE_URL" <<'SQL'
-  WITH
-    place AS (
-      INSERT INTO places (
-        id, google_place_id, formatted_address, lat, lng, source, raw_response,
-        last_seen_at, hit_count,
-        display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source, display_name_zh_is_native,
-        primary_type, primary_type_display_zh, maps_type_label_zh, types,
-        formatted_address_en, formatted_address_zh, postal_code, country_code,
-        business_status, business_hours, time_zone,
-        rating, user_rating_count,
-        national_phone_number, website_uri, google_maps_uri
-      ) VALUES (
-        gen_random_uuid(),
-        '<PLACE_ID>', '<FORMATTED_ADDRESS>', <LAT>, <LNG>,
-        '<google_geocode|google_places>',
-        '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb,
-        NOW(), 1,
-        <NULLABLE_TEXT 'display_name_en'>,
-        <NULLABLE_TEXT 'display_name_zh'>,
-        <NULLABLE_TEXT 'display_name_zh_locale'>,
-        <NULLABLE_TEXT 'display_name_zh_source'>,           -- 'google_text' | 'photo_ocr' | 'receipt_ocr' | NULL
-        <NULLABLE_BOOL 'display_name_zh_is_native'>,        -- true unless brand is a global English-first name w/ Google gloss
-        <NULLABLE_TEXT 'primary_type'>,
-        <NULLABLE_TEXT 'primary_type_display_zh'>,
-        <NULLABLE_TEXT 'maps_type_label_zh'>,
-        <NULLABLE_TEXT_ARRAY 'types[]'>,                     -- e.g. ARRAY['store','food']::text[] or NULL
-        <NULLABLE_TEXT 'formatted_address_en'>,
-        <NULLABLE_TEXT 'formatted_address_zh'>,
-        <NULLABLE_TEXT 'postal_code'>,
-        <NULLABLE_TEXT 'country_code'>,
-        <NULLABLE_TEXT 'business_status'>,
-        <NULLABLE_JSONB 'business_hours'>,
-        <NULLABLE_TEXT 'time_zone'>,
-        <NULLABLE_NUMERIC 'rating'>,
-        <NULLABLE_INT 'user_rating_count'>,
-        <NULLABLE_TEXT 'national_phone_number'>,
-        <NULLABLE_TEXT 'website_uri'>,
-        <NULLABLE_TEXT 'google_maps_uri'>
-      )
-      ON CONFLICT (google_place_id) DO UPDATE
-        SET last_seen_at = NOW(),
-            hit_count = places.hit_count + 1,
-            raw_response = EXCLUDED.raw_response,
-            display_name_en          = COALESCE(EXCLUDED.display_name_en,          places.display_name_en),
-            display_name_zh          = COALESCE(EXCLUDED.display_name_zh,          places.display_name_zh),
-            display_name_zh_locale   = COALESCE(EXCLUDED.display_name_zh_locale,   places.display_name_zh_locale),
-            display_name_zh_source   = COALESCE(EXCLUDED.display_name_zh_source,   places.display_name_zh_source),
-            display_name_zh_is_native = COALESCE(EXCLUDED.display_name_zh_is_native, places.display_name_zh_is_native),
-            primary_type             = COALESCE(EXCLUDED.primary_type,             places.primary_type),
-            primary_type_display_zh  = COALESCE(EXCLUDED.primary_type_display_zh,  places.primary_type_display_zh),
-            maps_type_label_zh       = COALESCE(EXCLUDED.maps_type_label_zh,       places.maps_type_label_zh),
-            types                    = COALESCE(EXCLUDED.types,                    places.types),
-            formatted_address_en     = COALESCE(EXCLUDED.formatted_address_en,     places.formatted_address_en),
-            formatted_address_zh     = COALESCE(EXCLUDED.formatted_address_zh,     places.formatted_address_zh),
-            postal_code              = COALESCE(EXCLUDED.postal_code,              places.postal_code),
-            country_code             = COALESCE(EXCLUDED.country_code,             places.country_code),
-            business_status          = COALESCE(EXCLUDED.business_status,          places.business_status),
-            business_hours           = COALESCE(EXCLUDED.business_hours,           places.business_hours),
-            time_zone                = COALESCE(EXCLUDED.time_zone,                places.time_zone),
-            rating                   = COALESCE(EXCLUDED.rating,                   places.rating),
-            user_rating_count        = COALESCE(EXCLUDED.user_rating_count,        places.user_rating_count),
-            national_phone_number    = COALESCE(EXCLUDED.national_phone_number,    places.national_phone_number),
-            website_uri              = COALESCE(EXCLUDED.website_uri,              places.website_uri),
-            google_maps_uri          = COALESCE(EXCLUDED.google_maps_uri,          places.google_maps_uri)
-            -- Note: custom_name is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches. (Renamed from custom_name_zh in #79.)
-      RETURNING id
-    ),
-    -- #90 Phase 3: append-only history of every Google/Yelp fetch.
-    -- One row per ingest that touched this place; \`places.raw_response\`
-    -- is the latest pointer, \`place_snapshots\` is the full audit
-    -- trail that #91 refresh will diff against.  Use the SAME
-    -- \`<RAW_JSON_STRING_WITH_BOTH_LANGS>\` body you passed into the
-    -- \`places\` upsert above and the SAME \`<google_geocode|google_places>\`
-    -- source string.
-    snapshot AS (
-      INSERT INTO place_snapshots (place_id, source, raw_response, fetched_by_sha)
-      SELECT id, '<google_geocode|google_places>', '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb, '${buildInfo.gitShortSha}'
-        FROM place
-    )
-  UPDATE transactions SET place_id = (SELECT id FROM place), updated_at = NOW()
-   WHERE id = '<TX_ID>' AND workspace_id = '${ctx.workspaceId}';
+  -- (9) OPTIONAL, Phase 3 only — the place cache. Also after COMMIT,
+  --     and for the same reason: Phase 3 is best-effort enrichment and
+  --     a malformed Google blob must never take the ledger write down
+  --     with it. Full multilingual upsert (#74): for uncached places
+  --     include every column you extracted in Phase 3c/3d; for cached
+  --     places the ON CONFLICT clause keeps existing per-language data
+  --     and the \`custom_name\` user override (renamed from
+  --     \`custom_name_zh\` in #79) and only bumps \`last_seen_at\` /
+  --     \`hit_count\`. COALESCE(EXCLUDED.x, places.x) ensures a NEW
+  --     fetch that returned NULL for a field never overwrites a
+  --     previously-good value. Delete (9)-(11) when you have no
+  --     geocode result.
+  INSERT INTO places (
+    id, google_place_id, formatted_address, lat, lng, source, raw_response,
+    last_seen_at, hit_count,
+    display_name_en, display_name_zh, display_name_zh_locale, display_name_zh_source, display_name_zh_is_native,
+    primary_type, primary_type_display_zh, maps_type_label_zh, types,
+    formatted_address_en, formatted_address_zh, postal_code, country_code,
+    business_status, business_hours, time_zone,
+    rating, user_rating_count,
+    national_phone_number, website_uri, google_maps_uri
+  ) VALUES (
+    gen_random_uuid(),
+    '<PLACE_ID>', '<FORMATTED_ADDRESS>', <LAT>, <LNG>,
+    '<google_geocode|google_places>',
+    '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb,
+    NOW(), 1,
+    <NULLABLE_TEXT 'display_name_en'>,
+    <NULLABLE_TEXT 'display_name_zh'>,
+    <NULLABLE_TEXT 'display_name_zh_locale'>,
+    <NULLABLE_TEXT 'display_name_zh_source'>,           -- 'google_text' | 'photo_ocr' | 'receipt_ocr' | NULL
+    <NULLABLE_BOOL 'display_name_zh_is_native'>,        -- true unless brand is a global English-first name w/ Google gloss
+    <NULLABLE_TEXT 'primary_type'>,
+    <NULLABLE_TEXT 'primary_type_display_zh'>,
+    <NULLABLE_TEXT 'maps_type_label_zh'>,
+    <NULLABLE_TEXT_ARRAY 'types[]'>,                     -- e.g. ARRAY['store','food']::text[] or NULL
+    <NULLABLE_TEXT 'formatted_address_en'>,
+    <NULLABLE_TEXT 'formatted_address_zh'>,
+    <NULLABLE_TEXT 'postal_code'>,
+    <NULLABLE_TEXT 'country_code'>,
+    <NULLABLE_TEXT 'business_status'>,
+    <NULLABLE_JSONB 'business_hours'>,
+    <NULLABLE_TEXT 'time_zone'>,
+    <NULLABLE_NUMERIC 'rating'>,
+    <NULLABLE_INT 'user_rating_count'>,
+    <NULLABLE_TEXT 'national_phone_number'>,
+    <NULLABLE_TEXT 'website_uri'>,
+    <NULLABLE_TEXT 'google_maps_uri'>
+  )
+  ON CONFLICT (google_place_id) DO UPDATE
+    SET last_seen_at = NOW(),
+        hit_count = places.hit_count + 1,
+        raw_response = EXCLUDED.raw_response,
+        display_name_en          = COALESCE(EXCLUDED.display_name_en,          places.display_name_en),
+        display_name_zh          = COALESCE(EXCLUDED.display_name_zh,          places.display_name_zh),
+        display_name_zh_locale   = COALESCE(EXCLUDED.display_name_zh_locale,   places.display_name_zh_locale),
+        display_name_zh_source   = COALESCE(EXCLUDED.display_name_zh_source,   places.display_name_zh_source),
+        display_name_zh_is_native = COALESCE(EXCLUDED.display_name_zh_is_native, places.display_name_zh_is_native),
+        primary_type             = COALESCE(EXCLUDED.primary_type,             places.primary_type),
+        primary_type_display_zh  = COALESCE(EXCLUDED.primary_type_display_zh,  places.primary_type_display_zh),
+        maps_type_label_zh       = COALESCE(EXCLUDED.maps_type_label_zh,       places.maps_type_label_zh),
+        types                    = COALESCE(EXCLUDED.types,                    places.types),
+        formatted_address_en     = COALESCE(EXCLUDED.formatted_address_en,     places.formatted_address_en),
+        formatted_address_zh     = COALESCE(EXCLUDED.formatted_address_zh,     places.formatted_address_zh),
+        postal_code              = COALESCE(EXCLUDED.postal_code,              places.postal_code),
+        country_code             = COALESCE(EXCLUDED.country_code,             places.country_code),
+        business_status          = COALESCE(EXCLUDED.business_status,          places.business_status),
+        business_hours           = COALESCE(EXCLUDED.business_hours,           places.business_hours),
+        time_zone                = COALESCE(EXCLUDED.time_zone,                places.time_zone),
+        rating                   = COALESCE(EXCLUDED.rating,                   places.rating),
+        user_rating_count        = COALESCE(EXCLUDED.user_rating_count,        places.user_rating_count),
+        national_phone_number    = COALESCE(EXCLUDED.national_phone_number,    places.national_phone_number),
+        website_uri              = COALESCE(EXCLUDED.website_uri,              places.website_uri),
+        google_maps_uri          = COALESCE(EXCLUDED.google_maps_uri,          places.google_maps_uri);
+        -- Note: custom_name is INTENTIONALLY OMITTED — user overrides never get overwritten by re-fetches. (Renamed from custom_name_zh in #79.)
+
+  -- (10) OPTIONAL, Phase 3 only — #90 Phase 3: append-only history of
+  --      every Google/Yelp fetch. One row per ingest that touched this
+  --      place; \`places.raw_response\` is the latest pointer,
+  --      \`place_snapshots\` is the full audit trail that #91 refresh
+  --      will diff against. Use the SAME
+  --      \`<RAW_JSON_STRING_WITH_BOTH_LANGS>\` body you passed into the
+  --      \`places\` upsert above and the SAME
+  --      \`<google_geocode|google_places>\` source string.
+  INSERT INTO place_snapshots (place_id, source, raw_response, fetched_by_sha)
+  SELECT id, '<google_geocode|google_places>', '<RAW_JSON_STRING_WITH_BOTH_LANGS>'::jsonb, '${buildInfo.gitShortSha}'
+    FROM places WHERE google_place_id = '<PLACE_ID>';
+
+  -- (11) OPTIONAL, Phase 3 only — attach the place to the transaction.
+  UPDATE transactions
+     SET place_id = (SELECT id FROM places WHERE google_place_id = '<PLACE_ID>'),
+         updated_at = NOW()
+   WHERE id = <TX> AND workspace_id = '${ctx.workspaceId}';
   SQL
 
 If you downloaded photos in Phase 3c, insert one \`place_photos\` row
@@ -996,21 +1168,6 @@ record \`file_path\` accordingly:
     "
   done
 
-Also stamp the document row — it ties the file back to this ingest AND
-stores the OCR text, so \`documents.ocr_text\` is populated by BOTH the
-ingest and the re-extract path (it used to be re-extract only, which
-made every "what did the agent actually read?" question unanswerable
-for ingest-only documents):
-
-  psql "\$DATABASE_URL" <<'SQL'
-    UPDATE documents
-       SET source_ingest_id  = '${ctx.ingestId}',
-           ocr_text          = '<RAW_TEXT, single-quote-escaped>',
-           ocr_model_version = '${EXTRACTION_MODEL}',
-           updated_at        = NOW()
-     WHERE id = '${ctx.documentId}';
-  SQL
-
 ### 4a-bis. owned_items judgment (#84 Phase 2)
 
 For each line where you set \`item_class='durable'\` AND assigned a
@@ -1028,24 +1185,14 @@ Leave \`serial_number\`, \`location\`, \`warranty_until\`, \`condition\`,
 \`notes\` blank — the user fills those in. \`acquired_on\` defaults to
 the transaction's \`occurred_on\`.
 
-Query back the just-inserted transaction_items.id for each durable
-line you want to track, then INSERT into owned_items:
-
-  psql "\$DATABASE_URL" <<'SQL'
-  INSERT INTO owned_items (workspace_id, product_id, transaction_item_id, instance_index, acquired_on)
-  SELECT '${ctx.workspaceId}', ti.product_id, ti.id, gs.idx, '<occurred_on>'::date
-  FROM transaction_items ti
-  CROSS JOIN LATERAL generate_series(1, COALESCE(ti.quantity, 1)::int) gs(idx)
-  WHERE ti.transaction_id = '<TX_ID>'
-    AND ti.line_no = <LINE_NO>            -- one statement per durable line
-    AND ti.item_class = 'durable'
-    AND ti.product_id IS NOT NULL
-  ON CONFLICT (transaction_item_id, instance_index) DO NOTHING;
-  SQL
-
-The ON CONFLICT clause makes the insert safe to re-run. Skip this
-step entirely for non-durable items, for durables you judge not
-worth tracking, and for product-less lines.
+The INSERT is statement (5) of Turn B — you do NOT run it here and you
+do NOT need to query the transaction_items ids back first. Decide which
+durable lines qualify, then put THOSE line_no values into the
+\`ARRAY[...]\` in Turn B (5). It is ONE set-based statement for the
+whole receipt, not one per line. The ON CONFLICT clause makes it safe
+to re-run. Delete Turn B (5) entirely when nothing qualifies — which
+is the common case: non-durable items, durables you judge not worth
+tracking, and product-less lines all fall out.
 
 ### 4a-ter. transaction_parties — the party graph (#149 P4)
 
@@ -1091,25 +1238,15 @@ party is unambiguously a known brand — then upsert a brands row first
 parent brand is obvious, e.g. AnkerDirect → anker, set parent_id).
 Otherwise leave brand_id NULL — a text-only row is still useful.
 
-Insert after 4a's items exist (line-level rows reference
-transaction_items by line):
-
-  psql "\$DATABASE_URL" <<'SQL'
-  INSERT INTO transaction_parties
-    (workspace_id, transaction_id, transaction_item_id, role, display_name, brand_id)
-  VALUES
-    ('${ctx.workspaceId}', '<TX_ID>', NULL, 'channel', '<as printed>', '<brand_id-or-NULL>')
-    -- , line-level example:
-    -- ('${ctx.workspaceId}', '<TX_ID>',
-    --   (SELECT id FROM transaction_items WHERE transaction_id='<TX_ID>' AND line_no=<N>),
-    --   'maker', 'Anker', 'anker')
-  ON CONFLICT ON CONSTRAINT transaction_parties_identity_uq DO NOTHING;
-  SQL
+The INSERT is statement (8) of Turn B — you do NOT run it here. Fill in
+one VALUES row per (role, party) you decided on above; line-level rows
+resolve their \`transaction_item_id\` by line_no from the items Turn B
+just wrote, in the same invocation.
 
 Don't fabricate parties; a plain single-merchant receipt legitimately
-produces just the one channel row. This step is additive — never let
-a parties failure roll back the transaction itself (run it in its own
-statement after COMMIT).
+produces just the one channel row. This step is additive — never let a
+parties failure roll back the transaction itself, which is exactly why
+Turn B places it after COMMIT rather than inside the block.
 
 ### 4b. statement_pdf
 
@@ -1134,11 +1271,11 @@ fallback providers — one or two cheap tries, then move on and close.
 ${PHASE_4B_4C_ICON_PIPELINE}
 
 
-── Phase 5 — Close the ingest row ─────────────────────────────────────
+── Phase 5 — Close the ingest row (Turn C) ────────────────────────────
 
-Regardless of classification, end with:
+Regardless of classification, end with ONE invocation:
 
-  psql "\$DATABASE_URL" <<SQL
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<SQL
   UPDATE ingests
      SET status = '<done|unsupported|near_dup>',
          classification = '<classification>',
@@ -1165,7 +1302,7 @@ already be committed — the worker verifies the link exists and forces
 If any INSERT above fails (foreign key violation, balance trigger,
 constraint error), catch it and instead:
 
-  psql "\$DATABASE_URL" <<SQL
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<SQL
   UPDATE ingests
      SET status = 'error',
          error = '<one-line message, escape quotes>',
@@ -1209,8 +1346,10 @@ the database is your output.
 
 ── Rules ──────────────────────────────────────────────────────────────
 
-- Every \`psql\` invocation is a separate Bash tool call. Plan them in
-  order; don't try to pipeline from one to the next via stdin chaining.
+- Every \`psql\` INVOCATION is a separate Bash tool call, so BATCH your
+  statements into as few invocations as possible — the write phase is
+  Turn A / Turn B / Turn C and nothing else (Phase 4.0). Don't try to
+  pipeline from one invocation to the next via stdin chaining.
 - NEVER insert a transaction without exactly matching balanced
   postings in the SAME BEGIN/COMMIT block. The deferred constraint
   trigger will reject at COMMIT and roll back the whole block.

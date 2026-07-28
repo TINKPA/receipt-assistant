@@ -30,6 +30,7 @@ import {
   EXTRACTION_MODEL,
 } from "../ingest/prompt-contract.js";
 import { buildInfo } from "../generated/build-info.js";
+import { trackLangfuse } from "../langfuse.js";
 
 export type DocumentKindValue =
   | "receipt_image"
@@ -820,6 +821,13 @@ export async function reExtractDocument(
     transactionId,
     userId,
   });
+
+  // 3b) Ship the session transcript to Langfuse (#181). Fire-and-forget
+  //     — `trackLangfuse` never throws and never blocks the response.
+  //     Without this, re-extract produced ZERO traces (every trace on
+  //     the box came from ingest), so there was no way to measure token
+  //     burn or turn count on the path the re-extract campaign uses.
+  trackLangfuse(sessionId, [documentId, transactionId, "re-extract"]);
 
   // 4) Snapshot AFTER. Agent has now UPDATEd transactions + documents.
   const afterSnapshot = await snapshotReExtractFields(transactionId, doc.id);

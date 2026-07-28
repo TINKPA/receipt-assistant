@@ -43,8 +43,12 @@ discovery work. When unsure, prefer skipping over spending turns.
 
 Steps (run once per unique merchant brand_id in this document):
 
-  1. Cache check — read the registry first:
-       psql "\$DATABASE_URL" -c "SELECT brand_id, name, domain, metadata->>'icon_resolution' AS icon_resolution FROM brands WHERE brand_id = '<bid>';"
+  1. Cache check — read the registry first. ONE read covers both this
+     step and the Phase 4b icon pre-check further down; do not query
+     \`brands\` twice. (Ingest path: this IS result set (1) of Turn A —
+     you already have it, do not run it again here.)
+
+       psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" -c "SELECT b.brand_id, b.name, b.domain, b.user_chose_at, b.preferred_asset_id, b.metadata->>'icon_resolution' AS icon_resolution, (SELECT count(*) FROM brand_assets a WHERE a.brand_id = b.brand_id AND a.retired_at IS NULL) AS live_count FROM brands b WHERE b.brand_id = '<bid>';"
 
      - Row exists with non-null domain → done. Move on.
      - Row exists with null domain AND metadata.icon_resolution =
@@ -71,8 +75,12 @@ Steps (run once per unique merchant brand_id in this document):
        mainland chain. Geo from receipt printed address helps
        disambiguate.
 
-  3. UPSERT:
-       psql "\$DATABASE_URL" <<'SQL'
+  3. UPSERT. (Ingest path: do NOT run this as its own call — it is
+     statement (1) of Turn B, where it also serves as the FK parent for
+     \`merchants.brand_id\`. Carry the name/domain you just discovered
+     into that statement.)
+
+       psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
          INSERT INTO brands (brand_id, name, domain)
          VALUES ('<bid>', '<canonical_name>', '<domain or NULL>')
          ON CONFLICT (brand_id) DO UPDATE
@@ -111,9 +119,11 @@ winner — that's Phase 4c. The goal here is mechanical retention:
 saved to disk, recorded in \`brand_assets\`". Tier is provenance, not
 priority.
 
-Cache pre-check (token saver — read before fetching anything):
-
-  psql "\$DATABASE_URL" -c "SELECT b.preferred_asset_id, b.user_chose_at, b.domain, b.metadata->>'icon_resolution' AS icon_resolution, (SELECT count(*) FROM brand_assets WHERE brand_id = '<bid>' AND retired_at IS NULL) AS live_count FROM brands b WHERE brand_id = '<bid>';"
+Cache pre-check (token saver — read before fetching anything). You
+ALREADY have this row: Phase 2.6 step 1's registry read returns
+\`preferred_asset_id\`, \`user_chose_at\`, \`domain\`, \`icon_resolution\`
+and \`live_count\` for exactly this purpose. Re-read that output — do
+NOT issue another \`brands\` SELECT here.
 
   Case A — preferred_asset_id IS NOT NULL:
     Already resolved. Skip Phase 4b AND 4c for this brand. Move on.
@@ -280,20 +290,24 @@ source URL, or filename. Score axes:
   - Quality: dimensions (bigger is better for raster), padding
     (over-cropped is bad), transparency present, color accuracy.
 
-Step 3: write the judgment back per candidate:
+Steps 3-5 are ONE psql invocation. Batch every per-candidate UPDATE
+plus the winner-pick into a single heredoc; do not spend a Bash call
+per candidate.
 
-  psql "\$DATABASE_URL" <<SQL
+Step 3: write the judgment back per candidate — one UPDATE per
+candidate, all inside that one heredoc:
+
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<SQL
     UPDATE brand_assets
        SET agent_relevance    = <0..100>,
            agent_notes        = '<one-line judgment>',
            extraction_version = extraction_version + 1
            <, retired_at = NOW() if letter-fallback or otherwise unusable>
      WHERE id = '<candidate_id>';
-  SQL
 
-Step 4: pick the winner (Layer-3-safe):
+Step 4: pick the winner (Layer-3-safe) — next statement in the SAME
+heredoc:
 
-  psql "\$DATABASE_URL" <<SQL
     UPDATE brands
        SET preferred_asset_id = (
              SELECT id FROM brand_assets
@@ -306,16 +320,16 @@ Step 4: pick the winner (Layer-3-safe):
            updated_at = NOW()
      WHERE brand_id = '<bid>'
        AND user_chose_at IS NULL;
-  SQL
+  SQL   -- close the heredoc only after Step 4 OR Step 5, not both
 
 The \`user_chose_at IS NULL\` clause is the Layer-3 lock — if the
 user has manually picked an icon via PATCH /v1/brands/:id, never
 overwrite it.
 
 Step 5: if no candidate scored ≥ 30, the agent rejected every
-candidate. Record that:
+candidate. Record that INSTEAD of Step 4's winner-pick — same heredoc,
+same invocation:
 
-  psql "\$DATABASE_URL" <<SQL
     UPDATE brands
        SET preferred_asset_id = NULL,
            metadata = metadata || jsonb_build_object(
