@@ -1,11 +1,12 @@
 /**
  * `GET /v1/items` — line-item listing for admin / aggregation.
  *
- * Lives at the top level (not nested under `/v1/transactions/:id/items`)
- * because the use case is "show me every durable I bought in 2026",
- * not "show me what's on this one receipt". Use the transaction
- * endpoint (`GET /v1/transactions/:id`) for the latter — items are
- * already embedded in that response.
+ * Lives at the top level because the use case is "show me every durable
+ * I bought in 2026", not "show me what's on this one receipt". Use the
+ * transaction endpoint (`GET /v1/transactions/:id`) for the latter —
+ * items are already embedded in that response. There is deliberately no
+ * `GET /v1/transactions/:id/items` to duplicate it; the nested path
+ * carries only the manual-backfill `POST` (#183, in `transactions.ts`).
  *
  * Filters mirror the index in migration 0015:
  *   (workspace_id, item_class, created_at DESC) — fast for "give me
@@ -117,6 +118,10 @@ itemsRouter.get(
         food_kind: r.food_kind ?? null,
         tags: Array.isArray(r.tags) ? r.tags : null,
         confidence: r.confidence,
+        // #183 — creation pathway ('extraction' | 'manual'); a real
+        // column, so aggregation views can exclude manual backfill
+        // without string-matching metadata.
+        source: r.source ?? "extraction",
         // Extras only on the listing endpoint — handy for admin
         // aggregation views without round-tripping to /transactions/:id.
         id: r.id,

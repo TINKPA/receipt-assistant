@@ -17,6 +17,7 @@ import {
   transactions,
   transactionItems,
   postings,
+  products,
   accounts,
   documents,
   documentLinks,
@@ -72,6 +73,7 @@ import type {
   CreateTransactionRequest,
   UpdateTransactionRequest,
   NewPosting,
+  NewTransactionItem,
   UpdatePostingRequest,
   ListTransactionsQuery,
   ListPostingsQuery,
@@ -87,6 +89,7 @@ import {
 type CreateReq = z.infer<typeof CreateTransactionRequest>;
 type UpdateReq = z.infer<typeof UpdateTransactionRequest>;
 type NewPostingT = z.infer<typeof NewPosting>;
+type NewTransactionItemInput = z.infer<typeof NewTransactionItem>;
 type UpdatePostingReq = z.infer<typeof UpdatePostingRequest>;
 type ListTxQuery = z.infer<typeof ListTransactionsQuery>;
 type ListPostingQuery = z.infer<typeof ListPostingsQuery>;
@@ -141,6 +144,9 @@ export interface TransactionItemRow {
   discount_share_minor: number | null;
   /** #84 — generated column: line_total + tax + tip - discount. */
   effective_total_minor: number;
+  /** #183 — creation pathway: 'extraction' (ingest agent, and every
+   *  pre-#183 / `metadata.items` fallback row) vs 'manual'. */
+  source: string;
 }
 
 export interface TransactionRow {
@@ -333,6 +339,9 @@ function mapTransactionItem(row: any): TransactionItemRow {
           (Number(tipShare) || 0) -
           (Number(discShare) || 0)
         : Number(effective),
+    // #183 — absent on `metadata.items` fallback rows, which predate
+    // the manual path entirely and are therefore extraction-derived.
+    source: row.source ?? "extraction",
   };
 }
 
@@ -614,6 +623,225 @@ export async function createTransaction(
       return full;
     });
   });
+}
+
+// ── Line items (manual backfill, #183 Phase 2) ─────────────────────────
+
+/**
+ * Append manually-entered line items to an existing transaction.
+ *
+ * Exists because ingest was the only writer of `transaction_items`, so
+ * a purchase with no receipt to OCR could reach the ledger but never
+ * the product catalog or Things (#183). A sibling endpoint rather than
+ * an `items[]` field on `POST /v1/transactions` keeps `createTransaction`
+ * single-purpose.
+ *
+ * Ledger-neutral by construction: it writes no postings and does not
+ * touch the head row, so the deferred balance triggers see nothing and
+ * `transactions.version` is unchanged (hence no If-Match — there is no
+ * payload to clobber). Callers who want the postings to agree with the
+ * lines they just typed reconcile that themselves.
+ *
+ * Provenance, all three orthogonal:
+ *   - `source = 'manual'`      — the pathway (#183 Phase 3)
+ *   - `extraction_version`     — left NULL, "no prompt produced this"
+ *   - `extraction_run`         — joins the transaction's current LIVE
+ *     run so the new lines read back next to the existing ones (every
+ *     read path filters `retired_at IS NULL`, not on the run number).
+ */
+export async function addTransactionItems(
+  workspaceId: string,
+  userId: string,
+  txId: string,
+  items: NewTransactionItemInput[],
+): Promise<{
+  transaction_id: string;
+  extraction_run: number;
+  items: TransactionItemRow[];
+}> {
+  const txRows = await db
+    .select({ id: transactions.id, deletedAt: transactions.deletedAt })
+    .from(transactions)
+    .where(
+      and(eq(transactions.id, txId), eq(transactions.workspaceId, workspaceId)),
+    );
+  if (txRows.length === 0) throw new NotFoundProblem("Transaction", txId);
+  if (txRows[0]!.deletedAt !== null) {
+    throw new HttpProblem(
+      409,
+      "transaction-deleted",
+      "Transaction is soft-deleted",
+      `Transaction ${txId} has deleted_at set; restore it before adding line items.`,
+    );
+  }
+
+  // `transaction_items.currency` is NOT NULL and the head row carries no
+  // currency — the postings do. One distinct posting currency is the
+  // unambiguous answer; a mixed-currency transaction must say which.
+  const currencyRows = await db
+    .select({ currency: postings.currency })
+    .from(postings)
+    .where(eq(postings.transactionId, txId));
+  const txCurrencies = Array.from(new Set(currencyRows.map((r) => r.currency)));
+  const defaultCurrency = txCurrencies.length === 1 ? txCurrencies[0]! : null;
+
+  // Current live run + highest live line_no, in one round trip. Both
+  // default for a transaction that has no items yet.
+  const stateRes = await db.execute(sql`
+    SELECT COALESCE(MAX(extraction_run), 1) AS run,
+           COALESCE(MAX(line_no), 0)        AS max_line_no
+      FROM transaction_items
+     WHERE transaction_id = ${txId}::uuid
+       AND workspace_id = ${workspaceId}::uuid
+       AND retired_at IS NULL`);
+  const run = Number((stateRes.rows[0] as any)?.run ?? 1);
+  let nextLineNo = Number((stateRes.rows[0] as any)?.max_line_no ?? 0) + 1;
+
+  // Validate catalog links up front — one round trip, precise 422.
+  const productIds = Array.from(
+    new Set(
+      items
+        .map((i) => i.product_id)
+        .filter((p): p is string => typeof p === "string"),
+    ),
+  );
+  if (productIds.length > 0) {
+    const found = await db
+      .select({ id: products.id })
+      .from(products)
+      .where(
+        and(
+          inArray(products.id, productIds),
+          eq(products.workspaceId, workspaceId),
+        ),
+      );
+    const known = new Set(found.map((p) => p.id));
+    const missing = productIds.filter((p) => !known.has(p));
+    if (missing.length > 0) {
+      throw new ValidationProblem(
+        missing.map((m) => ({
+          path: "items.product_id",
+          code: "not_found",
+          message: `Product ${m} not in workspace`,
+        })),
+        "One or more items reference unknown products",
+      );
+    }
+  }
+
+  const inserts = items.map((item, idx) => {
+    const currency = item.currency ?? defaultCurrency;
+    if (!currency) {
+      throw new ValidationProblem(
+        [
+          {
+            path: `items.${idx}.currency`,
+            code: "required",
+            message:
+              txCurrencies.length === 0
+                ? "Transaction has no postings to inherit a currency from; supply currency explicitly."
+                : `Transaction postings span ${txCurrencies.join(", ")}; supply currency explicitly.`,
+          },
+        ],
+        "Cannot infer the line item's currency",
+      );
+    }
+    const lineNo = item.line_no ?? nextLineNo++;
+    return {
+      id: newId(),
+      workspaceId,
+      transactionId: txId,
+      lineNo,
+      parentLineNo: item.parent_line_no ?? null,
+      rawName: item.raw_name,
+      normalizedName: item.normalized_name ?? null,
+      productVariant: item.product_variant ?? null,
+      quantity: item.quantity === undefined || item.quantity === null
+        ? null
+        : String(item.quantity),
+      unit: item.unit ?? null,
+      unitPriceMinor: item.unit_price_minor ?? null,
+      lineTotalMinor: item.line_total_minor,
+      currency,
+      itemClass: item.item_class,
+      durabilityTier: item.durability_tier ?? null,
+      foodKind: item.food_kind ?? null,
+      tags: item.tags ?? null,
+      confidence: item.confidence ?? "high",
+      lineType: item.line_type ?? "product",
+      productId: item.product_id ?? null,
+      taxMinor: item.tax_minor ?? null,
+      tipShareMinor: item.tip_share_minor ?? null,
+      discountShareMinor: item.discount_share_minor ?? null,
+      extractionRun: run,
+      // NOT the string 'manual' — see the column comment. NULL means
+      // "no prompt produced this row"; the pathway is `source`.
+      extractionVersion: null,
+      source: "manual",
+      metadata: item.metadata ?? {},
+    };
+  });
+
+  // Reject a collision inside the request itself before the DB sees it —
+  // the unique index would report only the first offender.
+  const seen = new Set<number>();
+  for (const ins of inserts) {
+    if (seen.has(ins.lineNo)) {
+      throw new ValidationProblem(
+        [
+          {
+            path: "items.line_no",
+            code: "duplicate",
+            message: `line_no ${ins.lineNo} appears twice in this request`,
+          },
+        ],
+        "Duplicate line_no in request",
+      );
+    }
+    seen.add(ins.lineNo);
+  }
+
+  let inserted;
+  try {
+    inserted = await db.insert(transactionItems).values(inserts).returning();
+  } catch (err) {
+    // 23505 on transaction_items_line_no_run_uq — an explicit line_no
+    // already exists in the live run. This makes an explicit line_no a
+    // safe retry key: the second attempt 409s instead of duplicating.
+    if (pgCode(err) === "23505") {
+      throw new HttpProblem(
+        409,
+        "line-no-conflict",
+        "Line number already used",
+        `One or more line_no values already exist on transaction ${txId} in extraction_run ${run}. Omit line_no to append, or pick unused numbers.`,
+      );
+    }
+    throw err;
+  }
+
+  await db.insert(transactionEvents).values({
+    id: newId(),
+    workspaceId,
+    transactionId: txId,
+    eventType: "items_added",
+    actorId: userId,
+    payload: {
+      source: "manual",
+      extraction_run: run,
+      line_nos: inserts.map((i) => i.lineNo),
+      count: inserts.length,
+    },
+  });
+
+  const byLine = new Map(inserted.map((r: any) => [Number(r.lineNo), r]));
+  return {
+    transaction_id: txId,
+    extraction_run: run,
+    items: inserts
+      .map((i) => byLine.get(i.lineNo))
+      .filter((r): r is any => r !== undefined)
+      .map(mapTransactionItem),
+  };
 }
 
 // ── Get ────────────────────────────────────────────────────────────────

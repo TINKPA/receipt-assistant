@@ -4,8 +4,13 @@
  * The catalog is the canonical "what is this thing" registry; ingest
  * writes rows here via `ON CONFLICT (workspace_id, merchant_id,
  * product_key) DO UPDATE` and re-points `transaction_items.product_id`
- * at the surviving row. This router only exposes read + user-truth
- * edits. The merge endpoint and admin recompute land in #84 Phase 3.
+ * at the surviving row.
+ *
+ * Ingest is no longer the only writer: `POST /` (#183 Phase 1) creates
+ * a catalog row by hand for purchases with no receipt to OCR, keyed
+ * idempotently on the same unique index the ingest upsert uses. The
+ * two pathways are told apart by the `source` column, not by a
+ * `metadata.source` string convention.
  */
 import express, { Router, type Request, type Response, type NextFunction } from "express";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
@@ -23,6 +28,7 @@ import {
   transactionItems,
   ownedItems,
   derivationEvents,
+  merchants,
 } from "../schema/index.js";
 import { buildInfo } from "../generated/build-info.js";
 import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
@@ -31,6 +37,7 @@ import {
   Product,
   ProductAsset,
   UploadProductAssetForm,
+  CreateProductRequest,
   UpdateProductRequest,
   ListProductsQuery,
   MergeProductRequest,
@@ -141,6 +148,7 @@ function rowToProductDto(row: any) {
       (row.preferredAssetId ?? row.preferred_asset_id)
         ? `/v1/products/${row.id}/image`
         : null,
+    source: row.source ?? "extraction",
     metadata: row.metadata ?? {},
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
@@ -247,6 +255,135 @@ productsRouter.get(
 
       emitNextLink(req, res, nextCursor);
       res.json({ items, next_cursor: nextCursor });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+// ── POST /v1/products ──────────────────────────────────────────────────
+//
+// Manual catalog entry (#183 Phase 1). Until this existed the catalog
+// was write-only-by-ingest, so a purchase with no receipt could never
+// reach the product catalog — and `owned_items.product_id` being NOT
+// NULL made Things transitively unreachable too.
+//
+// Idempotent on `products_workspace_merchant_key_uq`
+// (workspace_id, merchant_id, product_key — NULLS NOT DISTINCT, so
+// portable products with merchant_id=NULL participate): a repeat create
+// with the same product_key returns the existing row 200 instead of
+// 409, because manual entry is inherently retry-prone. The existing row
+// is returned UNCHANGED — a retry must never silently overwrite fields
+// the user edited through PATCH in between.
+
+productsRouter.post(
+  "/",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const body = parseOrThrow(CreateProductRequest, req.body);
+      const merchantId = body.merchant_id ?? null;
+
+      if (merchantId !== null) {
+        const merchantRows = await db
+          .select({ id: merchants.id })
+          .from(merchants)
+          .where(
+            and(
+              eq(merchants.id, merchantId),
+              eq(merchants.workspaceId, req.ctx.workspaceId),
+            ),
+          );
+        if (merchantRows.length === 0) {
+          throw new ValidationProblem([
+            {
+              path: "merchant_id",
+              code: "not_found",
+              message: `Merchant ${merchantId} not in workspace`,
+            },
+          ]);
+        }
+      }
+
+      // Return the pre-existing row before attempting an insert. Doing
+      // the lookup first (rather than relying on ON CONFLICT alone) is
+      // what lets 200-vs-201 distinguish "already there" from "created".
+      const existing = await db.execute(sql`
+        SELECT * FROM products
+         WHERE workspace_id = ${req.ctx.workspaceId}::uuid
+           AND product_key = ${body.product_key}
+           AND merchant_id IS NOT DISTINCT FROM ${merchantId}::uuid
+         LIMIT 1`);
+      if (existing.rows.length > 0) {
+        res.status(200).json(rowToProductDto(existing.rows[0] as any));
+        return;
+      }
+
+      // `products.brand_id` is an FK into the global `brands` registry,
+      // and there is no POST /v1/brands. The ingest path already
+      // self-heals with the same defensive upsert (see
+      // `items-sql.ts::brandFkGuard`) — requiring the brand to pre-exist
+      // here would make manual entry strictly harder than OCR, which is
+      // the complaint #183 opens with.
+      const created = await db.transaction(async (tx) => {
+        if (body.brand_id) {
+          await tx.execute(sql`
+            INSERT INTO brands (brand_id, name)
+            VALUES (${body.brand_id}, ${body.brand_id})
+            ON CONFLICT (brand_id) DO NOTHING`);
+        }
+        const inserted = await tx
+          .insert(products)
+          .values({
+            workspaceId: req.ctx.workspaceId,
+            productKey: body.product_key,
+            canonicalName: body.canonical_name,
+            merchantId,
+            brandId: body.brand_id ?? null,
+            itemClass: body.item_class,
+            model: body.model ?? null,
+            color: body.color ?? null,
+            size: body.size ?? null,
+            variant: body.variant ?? null,
+            sku: body.sku ?? null,
+            manufacturer: body.manufacturer ?? null,
+            notes: body.notes ?? null,
+            source: "manual",
+            metadata: body.metadata ?? {},
+          })
+          .onConflictDoNothing({
+            target: [
+              products.workspaceId,
+              products.merchantId,
+              products.productKey,
+            ],
+          })
+          .returning();
+        return inserted[0] ?? null;
+      });
+
+      if (created === null) {
+        // Lost a race with a concurrent create of the same key — the
+        // idempotent outcome is still "here is the row".
+        const raced = await db.execute(sql`
+          SELECT * FROM products
+           WHERE workspace_id = ${req.ctx.workspaceId}::uuid
+             AND product_key = ${body.product_key}
+             AND merchant_id IS NOT DISTINCT FROM ${merchantId}::uuid
+           LIMIT 1`);
+        if (raced.rows.length === 0) {
+          throw new HttpProblem(
+            409,
+            "create-conflict",
+            "Product create conflicted",
+            `Insert of product_key=${body.product_key} was rejected by the unique index but the conflicting row could not be read back.`,
+          );
+        }
+        res.status(200).json(rowToProductDto(raced.rows[0] as any));
+        return;
+      }
+
+      res.setHeader("Location", `/v1/products/${created.id}`);
+      res.status(201).json(rowToProductDto(created));
     } catch (err) {
       next(err);
     }
@@ -932,6 +1069,7 @@ export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Product", Product);
   registry.register("ProductAsset", ProductAsset);
   registry.register("UploadProductAssetForm", UploadProductAssetForm);
+  registry.register("CreateProductRequest", CreateProductRequest);
   registry.register("UpdateProductRequest", UpdateProductRequest);
   registry.register("MergeProductRequest", MergeProductRequest);
   registry.register("MergeProductResponse", MergeProductResponse);
@@ -950,6 +1088,54 @@ export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
       200: {
         description: "OK",
         content: { "application/json": { schema: paginated(Product) } },
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/products",
+    summary: "Create a catalog product manually",
+    description:
+      "Manual catalog entry for a purchase with no receipt to OCR (#183). The catalog was " +
+      "previously written only by the ingest agent, which made `POST /v1/owned-items` " +
+      "(`product_id` NOT NULL) unreachable for anything not scanned.\n\n" +
+      "**Idempotent on `(workspace_id, merchant_id, product_key)`** (the existing unique index, " +
+      "NULLS NOT DISTINCT so portable products with `merchant_id=null` participate). A repeat " +
+      "create with the same `product_key` returns **200** with the existing row rather than 409 — " +
+      "manual entry is retry-prone. The existing row is returned **unmodified**: a retry never " +
+      "overwrites edits made through PATCH in the meantime. A genuinely new row returns **201** " +
+      "with a `Location` header.\n\n" +
+      "**Provenance.** Rows created here carry `source='manual'` (a real column, #183 Phase 3) — " +
+      "filter on it rather than string-matching `metadata.source`. The ingest upsert never " +
+      "rewrites `source`, so a manually-entered product that OCR later confirms stays `manual`: " +
+      "the column records origin, not last touch.\n\n" +
+      "**`brand_id` self-heals.** It is an FK into the global `brands` registry and there is no " +
+      "`POST /v1/brands`; an unknown id is registered with `name = brand_id`, exactly as the " +
+      "ingest path's brand FK guard already does.\n\n" +
+      "Aggregate stats (`purchase_count`, `total_spent_minor`, `first_purchased_on`, " +
+      "`last_purchased_on`) are not accepted — they are recomputed from the live " +
+      "`transaction_items` set. Link items, then call `POST /v1/products/{id}/recompute`.",
+    tags: ["products"],
+    request: {
+      body: {
+        required: true,
+        content: { "application/json": { schema: CreateProductRequest } },
+      },
+    },
+    responses: {
+      200: {
+        description:
+          "Idempotent hit — a product with this (merchant, product_key) already existed; returned unchanged",
+        content: { "application/json": { schema: Product } },
+      },
+      201: {
+        description: "Created",
+        content: { "application/json": { schema: Product } },
+      },
+      422: {
+        description: "Validation failed (bad item_class, unknown merchant_id)",
+        content: problemContent,
       },
     },
   });

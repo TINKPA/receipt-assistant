@@ -23,6 +23,9 @@ import {
   UnreconcileTransactionRequest,
   UpdatePostingRequest,
   NewPosting,
+  NewTransactionItem,
+  AddTransactionItemsRequest,
+  AddTransactionItemsResponse,
   ListTransactionsQuery,
   BulkRequest,
   Transaction as TransactionSchema,
@@ -56,6 +59,7 @@ import {
   dismissNearDupFlag,
   reconcileTransaction,
   unreconcileTransaction,
+  addTransactionItems,
   addPosting,
   updatePosting,
   deletePosting,
@@ -396,6 +400,34 @@ transactionsRouter.post(
   },
 );
 
+// ── POST /v1/transactions/:id/items ────────────────────────────────────
+//
+// Manual line-item backfill (#183 Phase 2). Deliberately NOT If-Match
+// guarded: items are append-only, ledger-neutral (no postings written,
+// head row untouched, `version` unchanged), so there is no payload to
+// clobber — same reasoning as /near-dup-review. Supply an explicit
+// `line_no` when you need a safe retry key; a repeat then 409s instead
+// of duplicating the line.
+
+transactionsRouter.post(
+  "/:id/items",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { id } = parseOrThrow(IdParam, req.params);
+      const body = parseOrThrow(AddTransactionItemsRequest, req.body);
+      const result = await addTransactionItems(
+        req.ctx.workspaceId,
+        req.ctx.userId,
+        id,
+        body.items,
+      );
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 // ── PATCH /v1/transactions/:tid/postings/:pid ──────────────────────────
 
 transactionsRouter.patch(
@@ -479,6 +511,9 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);
   registry.register("Posting", PostingSchema);
   registry.register("TransactionItem", TransactionItem);
+  registry.register("NewTransactionItem", NewTransactionItem);
+  registry.register("AddTransactionItemsRequest", AddTransactionItemsRequest);
+  registry.register("AddTransactionItemsResponse", AddTransactionItemsResponse);
   registry.register("BulkResponse", BulkResponse);
 
   const problemContent = {
@@ -708,6 +743,59 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: PostingSchema } },
       },
       422: { description: "Imbalance", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/transactions/{id}/items",
+    summary: "Add manually-entered line items to a transaction",
+    description:
+      "Manual backfill for a purchase with no receipt to OCR (#183). Before this endpoint, " +
+      "`transaction_items` had exactly one writer — the ingest agent — so a transaction created " +
+      "via `POST /v1/transactions` could never gain line items, a product-catalog link, or a " +
+      "Things entry.\n\n" +
+      "**Provenance.** Rows created here are stamped `source='manual'` and left with a NULL " +
+      "`extraction_version` (\"no prompt produced this row\"). Both are real columns — read them " +
+      "instead of string-matching `metadata.source`, and do NOT write a `'manual'` sentinel into " +
+      "`extraction_version`.\n\n" +
+      "**Not ledger-mutating.** No postings are written and the head row is untouched, so " +
+      "`version` does not change and no `If-Match` is required. It is the caller's job to keep " +
+      "the postings consistent with the lines they type — the sum of `effective_total_minor` is " +
+      "NOT reconciled against the postings.\n\n" +
+      "`effective_total_minor` (`line_total + tax + tip - discount`) is a generated column and is " +
+      "echoed back computed by the database, never accepted from the client.\n\n" +
+      "Lines join the transaction's current live `extraction_run` so they read back alongside " +
+      "existing items. Omit `line_no` to append after the highest live line; supply it to make " +
+      "the call safely retryable (a repeat 409s rather than duplicating).",
+    tags: ["transactions"],
+    request: {
+      params: z.object({ id: Uuid }),
+      body: {
+        content: {
+          "application/json": { schema: AddTransactionItemsRequest },
+        },
+      },
+    },
+    responses: {
+      201: {
+        description: "Items created",
+        content: {
+          "application/json": { schema: AddTransactionItemsResponse },
+        },
+      },
+      404: { description: "Transaction not found", content: problemContent },
+      409: {
+        description:
+          "line_no already used in the live extraction run, or the transaction is soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description:
+          "Validation failed — unknown product_id, duplicate line_no in the request, or an " +
+          "un-inferrable currency (transaction has no postings, or they span several currencies)",
+        content: problemContent,
+      },
     },
   });
 

@@ -94,6 +94,17 @@ export const products = pgTable(
       withTimezone: true,
     }),
 
+    /** #183 Phase 3 — creation pathway, first-write-wins provenance.
+     *  `'extraction'` (default; every pre-#183 row and every row the
+     *  ingest upsert creates) vs `'manual'` (`POST /v1/products`).
+     *  Free text, no CHECK — same hard-coding budget as the fields
+     *  above. The ingest upsert's `DO UPDATE` never touches this
+     *  column, so a manually-entered product that OCR later confirms
+     *  keeps `source='manual'`: it records where the row came from,
+     *  not who touched it last. Read this instead of
+     *  `metadata->>'source'`. */
+    source: text("source").notNull().default("extraction"),
+
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

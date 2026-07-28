@@ -97,11 +97,63 @@ export const Product = z
      *  `/v1/products/:id/image` (the resolved-image endpoint). */
     image_url: z.string().nullable(),
 
+    /** #183 — creation pathway. `extraction` = written by the ingest
+     *  agent's catalog upsert (also every row predating #183);
+     *  `manual` = created through `POST /v1/products`. Free text so
+     *  future pathways need no migration. Filter on this column
+     *  instead of string-matching `metadata.source`. */
+    source: z.string().default("extraction"),
+
     metadata: Metadata,
     created_at: IsoDateTime,
     updated_at: IsoDateTime,
   })
   .openapi("Product");
+
+/**
+ * `POST /v1/products` body (#183 Phase 1) — manual catalog entry for a
+ * purchase that has no receipt to OCR.
+ *
+ * Idempotent on the existing `(workspace_id, merchant_id, product_key)`
+ * unique index (NULLS NOT DISTINCT, so `merchant_id=null` participates):
+ * a repeat create with the same key returns the existing row 200 rather
+ * than 409, because manual entry is inherently retry-prone. The existing
+ * row is returned UNTOUCHED — a retry never silently overwrites fields
+ * the user has since edited through PATCH.
+ *
+ * Aggregate stats (`purchase_count`, `total_spent_minor`,
+ * `first_purchased_on`, `last_purchased_on`) are deliberately absent:
+ * they are recomputed from the live `transaction_items` set, never set
+ * by a client. Link line items to the product, then call
+ * `POST /v1/products/:id/recompute`.
+ */
+export const CreateProductRequest = z
+  .object({
+    /** Kebab-case canonical key, unique under (workspace, merchant). */
+    product_key: z.string().min(1),
+    canonical_name: z.string().min(1),
+    /** Omit / null → portable across merchants (iPhone, Coke). Set →
+     *  exclusive to that merchant (Crunchwrap @ Taco Bell). */
+    merchant_id: Uuid.nullable().optional(),
+    /** Manufacturer brand id (kebab-case), NOT the seller's. FK into
+     *  `brands`; an unknown id is auto-registered with `name=brand_id`,
+     *  mirroring what the ingest path already does — otherwise manual
+     *  entry would be strictly harder than OCR, which is the whole
+     *  point of #183. */
+    brand_id: z.string().min(1).nullable().optional(),
+    item_class: ProductItemClass,
+
+    model: z.string().nullable().optional(),
+    color: z.string().nullable().optional(),
+    size: z.string().nullable().optional(),
+    variant: z.string().nullable().optional(),
+    sku: z.string().nullable().optional(),
+    manufacturer: z.string().nullable().optional(),
+
+    notes: z.string().nullable().optional(),
+    metadata: Metadata.optional(),
+  })
+  .openapi("CreateProductRequest");
 
 export const UpdateProductRequest = z
   .object({
