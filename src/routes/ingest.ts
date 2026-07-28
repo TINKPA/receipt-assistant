@@ -27,8 +27,10 @@ import {
   CreateBatchForm,
   CreateBatchResponse,
   Ingest,
+  IngestProblemsQuery,
   ListBatchesQuery,
   ListIngestsQuery,
+  RetryIngestResponse,
 } from "../schemas/v1/ingest.js";
 import {
   createBatchFromFiles,
@@ -36,6 +38,9 @@ import {
   getIngest,
   listBatches,
   listIngests,
+  parseStatusFilter,
+  retryIngest,
+  PROBLEM_INGEST_STATUSES,
 } from "./ingest.service.js";
 import { keepalive, sendEvent, setSseHeaders } from "../http/sse.js";
 import { on as busOn } from "../events/bus.js";
@@ -266,7 +271,27 @@ ingestsRouter.get(
       cursor: q.cursor,
       limit: q.limit,
       batchId: q.batch_id,
-      status: q.status,
+      statuses: parseStatusFilter(q.status) ?? undefined,
+    });
+    emitNextLink(req, res, out.next_cursor);
+    res.json(out);
+  }),
+);
+
+// Problem inbox (#158): every upload that didn't reach `done` and isn't
+// still in flight, enriched with `category` / `retryable` / `dedup_of` so a
+// client can render "retry" vs "view duplicate" vs "explain" without
+// string-parsing `error`. Registered BEFORE `/:id` so `problems` isn't
+// captured as an id param.
+ingestsRouter.get(
+  "/problems",
+  asyncHandler(async (req, res) => {
+    const q = parseOrThrow(IngestProblemsQuery, req.query);
+    const out = await listIngests({
+      workspaceId: req.ctx.workspaceId,
+      cursor: q.cursor,
+      limit: q.limit,
+      statuses: parseStatusFilter(q.status) ?? PROBLEM_INGEST_STATUSES,
     });
     emitNextLink(req, res, out.next_cursor);
     res.json(out);
@@ -282,6 +307,18 @@ ingestsRouter.get(
   }),
 );
 
+// Retry a failed/unsupported ingest against its original stored bytes
+// (#158). Returns the freshly-created ingest to poll.
+ingestsRouter.post(
+  "/:id/retry",
+  asyncHandler(async (req, res) => {
+    const { id } = parseOrThrow(IdParam, req.params);
+    const out = await retryIngest(req.ctx.workspaceId, id);
+    res.setHeader("Location", out.poll);
+    res.status(202).json(out);
+  }),
+);
+
 // ── OpenAPI registration ──────────────────────────────────────────────
 
 export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
@@ -290,6 +327,7 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Ingest", Ingest);
   registry.register("CreateBatchForm", CreateBatchForm);
   registry.register("CreateBatchResponse", CreateBatchResponse);
+  registry.register("RetryIngestResponse", RetryIngestResponse);
 
   const problemContent = {
     "application/problem+json": { schema: ProblemDetails },
@@ -402,6 +440,31 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
 
   registry.registerPath({
     method: "get",
+    path: "/v1/ingests/problems",
+    summary:
+      "List uploads needing attention (#158) — every ingest that didn't " +
+      "reach `done` and isn't still in flight (default: " +
+      "error, unsupported, dedup, near_dup). Each row carries `category`, " +
+      "`retryable`, and `dedup_of` so a client can choose the right " +
+      "affordance without string-parsing `error`.",
+    tags: ["ingest"],
+    request: { query: IngestProblemsQuery },
+    responses: {
+      200: {
+        description: "Paginated problem ingests",
+        content: {
+          "application/json": { schema: paginated(Ingest) },
+        },
+      },
+      422: {
+        description: "Unknown status token in filter",
+        content: problemContent,
+      },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
     path: "/v1/ingests/{id}",
     summary: "Get one ingest with produced reverse-lookup",
     tags: ["ingest"],
@@ -412,6 +475,34 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: Ingest } },
       },
       404: { description: "Ingest not found", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/ingests/{id}/retry",
+    summary:
+      "Retry a failed/unsupported ingest (#158). Re-runs the original " +
+      "stored bytes through the batch pipeline (genuine-restore dedup " +
+      "branch — not suppressed). Returns 202 with the freshly-created " +
+      "ingest to poll. Only `error`/`unsupported` are retryable.",
+    tags: ["ingest"],
+    request: { params: z.object({ id: Uuid }) },
+    responses: {
+      202: {
+        description: "Retry enqueued — poll the returned ingest / batch",
+        headers: { Location: { schema: { type: "string" } } },
+        content: { "application/json": { schema: RetryIngestResponse } },
+      },
+      404: { description: "Ingest not found", content: problemContent },
+      409: {
+        description: "Ingest is not in a retryable state",
+        content: problemContent,
+      },
+      422: {
+        description: "Stored source bytes missing",
+        content: problemContent,
+      },
     },
   });
 }

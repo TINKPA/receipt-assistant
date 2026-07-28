@@ -3267,6 +3267,16 @@
           }
         }
       },
+      "IngestCategory": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "in_progress",
+          "transient_actionable",
+          "input_problem",
+          "informational"
+        ]
+      },
       "Ingest": {
         "type": "object",
         "properties": {
@@ -3315,6 +3325,20 @@
               "null"
             ]
           },
+          "category": {
+            "$ref": "#/components/schemas/IngestCategory"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "dedup_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -3338,6 +3362,9 @@
           "classification",
           "produced",
           "error",
+          "category",
+          "retryable",
+          "dedup_of",
           "created_at",
           "completed_at"
         ]
@@ -3533,6 +3560,33 @@
           "batchId",
           "status",
           "items",
+          "poll"
+        ]
+      },
+      "RetryIngestResponse": {
+        "type": "object",
+        "properties": {
+          "retried_ingest_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "batch_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "ingest": {
+            "$ref": "#/components/schemas/Ingest"
+          },
+          "poll": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "retried_ingest_id",
+          "batch_id",
+          "ingest",
           "poll"
         ]
       },
@@ -8788,7 +8842,9 @@
           },
           {
             "schema": {
-              "$ref": "#/components/schemas/IngestStatus"
+              "type": "string",
+              "description": "Filter by ingest status. Single value or comma-separated set, e.g. `error,unsupported,dedup,near_dup`.",
+              "example": "error,unsupported"
             },
             "required": false,
             "name": "status",
@@ -8827,6 +8883,84 @@
         }
       }
     },
+    "/v1/ingests/problems": {
+      "get": {
+        "summary": "List uploads needing attention (#158) — every ingest that didn't reach `done` and isn't still in flight (default: error, unsupported, dedup, near_dup). Each row carries `category`, `retryable`, and `dedup_of` so a client can choose the right affordance without string-parsing `error`.",
+        "tags": [
+          "ingest"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "required": false,
+            "name": "cursor",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            },
+            "required": false,
+            "name": "limit",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "description": "Override the default problem set. Comma-separated ingest statuses; defaults to `error,unsupported,dedup,near_dup`.",
+              "example": "error"
+            },
+            "required": false,
+            "name": "status",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated problem ingests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Ingest"
+                      }
+                    },
+                    "next_cursor": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "items",
+                    "next_cursor"
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown status token in filter",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/ingests/{id}": {
       "get": {
         "summary": "Get one ingest with produced reverse-lookup",
@@ -8858,6 +8992,75 @@
           },
           "404": {
             "description": "Ingest not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/ingests/{id}/retry": {
+      "post": {
+        "summary": "Retry a failed/unsupported ingest (#158). Re-runs the original stored bytes through the batch pipeline (genuine-restore dedup branch — not suppressed). Returns 202 with the freshly-created ingest to poll. Only `error`/`unsupported` are retryable.",
+        "tags": [
+          "ingest"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Retry enqueued — poll the returned ingest / batch",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryIngestResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Ingest not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Ingest is not in a retryable state",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Stored source bytes missing",
             "content": {
               "application/problem+json": {
                 "schema": {

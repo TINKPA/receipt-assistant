@@ -191,6 +191,43 @@ export class GooglePlacesUpstreamProblem extends HttpProblem {
   }
 }
 
+/**
+ * Returned by `POST /v1/ingests/:id/retry` when the ingest is in a
+ * state that cannot be re-run. Only `error` / `unsupported` ingests are
+ * retryable — `done` already succeeded, `queued`/`processing` are still
+ * in flight, and `dedup`/`near_dup` are duplicates whose canonical
+ * transaction is reachable via `dedup_of` (retrying would re-suppress).
+ */
+export class IngestNotRetryableProblem extends HttpProblem {
+  constructor(ingestId: string, status: string) {
+    super(
+      409,
+      "ingest-not-retryable",
+      "Ingest is not retryable",
+      `Ingest ${ingestId} has status='${status}'. Only 'error' and 'unsupported' ingests can be retried.`,
+      { ingest_id: ingestId, status },
+    );
+  }
+}
+
+/**
+ * Returned by `POST /v1/ingests/:id/retry` when the stored bytes for the
+ * ingest can no longer be read from disk (evicted, or the uploads volume
+ * was reset). Retry re-runs the original bytes, so a missing file is a
+ * hard stop — the caller must re-upload the source document.
+ */
+export class IngestFileMissingProblem extends HttpProblem {
+  constructor(ingestId: string, filePath: string) {
+    super(
+      422,
+      "ingest-file-missing",
+      "Ingest source file missing",
+      `Ingest ${ingestId} references stored bytes at '${filePath}' that could not be read. Re-upload the document instead.`,
+      { ingest_id: ingestId, file_path: filePath },
+    );
+  }
+}
+
 export class DocumentHasLinksProblem extends HttpProblem {
   constructor(documentId: string, linkCount: number) {
     super(
