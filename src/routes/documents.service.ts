@@ -706,7 +706,169 @@ export async function cascadeDeleteDocument(params: {
   return { ...report, hardDeletedFilePath: pendingFileUnlink };
 }
 
+// ── Source text for re-extract (#167) ──────────────────────────────────
+
+/**
+ * Tags whose CONTENT is never receipt data — dropped wholesale rather
+ * than reduced to their text.
+ */
+const TEXT_EXTRACT_DROP = [
+  "script",
+  "style",
+  "head",
+  "noscript",
+  "title",
+  "textarea",
+];
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  ndash: "–",
+  mdash: "—",
+  hellip: "…",
+  rsquo: "’",
+  lsquo: "‘",
+  rdquo: "”",
+  ldquo: "“",
+};
+
+function decodeEntities(s: string): string {
+  return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body: string) => {
+    if (body.startsWith("#x") || body.startsWith("#X")) {
+      const cp = Number.parseInt(body.slice(2), 16);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : whole;
+    }
+    if (body.startsWith("#")) {
+      const cp = Number.parseInt(body.slice(1), 10);
+      return Number.isFinite(cp) ? String.fromCodePoint(cp) : whole;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
+  });
+}
+
+/**
+ * Linearize HTML into receipt-shaped plain text.
+ *
+ * Table structure is load-bearing, not cosmetic: Square and Toast lay
+ * their item lists out as `<table>`, so a naive tag-strip collapses
+ * "Uni  $12.00" into a column of orphaned words and the agent loses the
+ * name↔price pairing. Cells are joined on ONE line; rows and block
+ * elements each start a new one.
+ *
+ * Built on `sanitize-html` (already a dependency) rather than adding
+ * `html-to-text`: sanitize-html does the genuinely hard part — parsing
+ * malformed real-world email markup and dropping `<script>` / `<style>`
+ * bodies and comments — so the pass below only ever sees well-formed,
+ * attribute-free tags.
+ */
+export function htmlToPlainText(html: string): string {
+  const safe = sanitizeHtml(html, {
+    allowedTags: [
+      "p", "div", "br", "table", "thead", "tbody", "tfoot", "tr", "td",
+      "th", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "span",
+      "strong", "b", "em", "i", "u", "small", "big", "a", "hr", "section",
+      "article", "header", "footer", "center", "font", "blockquote", "pre",
+    ],
+    allowedAttributes: {},
+    nonTextTags: TEXT_EXTRACT_DROP,
+  });
+
+  const linearized = safe
+    // Cell boundary → a soft separator, so a "name / qty / price" row
+    // survives as one readable line.
+    .replace(/<\/(td|th)>/gi, "\t")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<hr\s*\/?>/gi, "\n")
+    .replace(
+      /<\/(p|div|tr|li|h[1-6]|section|article|header|footer|center|blockquote|pre|table)>/gi,
+      "\n",
+    )
+    .replace(/<[^>]*>/g, "");
+
+  return decodeEntities(linearized)
+    .split("\n")
+    // Collapse runs of spaces (but not the cell tabs) first, then turn
+    // each tab into a visible two-space gutter.
+    .map((line) =>
+      line
+        // NBSP written as an escape: a literal U+00A0 here is invisible
+        // in the source and the next editor would delete it by accident.
+        .replace(/\u00a0/g, " ")
+        .replace(/[^\S\t]+/g, " ")
+        .replace(/\t+/g, "  ")
+        .trim(),
+    )
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Best-effort plain text for the source file behind a document, used to
+ * seed re-extract (#167).
+ *
+ * `parsed.text` alone is NOT sufficient, measured on real fixtures:
+ * Square's Sushi Nozomi `.eml` carries a short `text/plain` stub with no
+ * line items at all, and Toast's Elysee `.eml` has no `text/plain` part.
+ * Both carry the full itemization — including the #162 two-level
+ * modifier structure — only in `text/html`, so the HTML branch is the
+ * one that matters and the longer of the two wins.
+ *
+ * Returns null for images and PDFs: those the agent reads itself, and a
+ * bad text stand-in would be worse than none.
+ */
+async function extractSourceText(
+  doc: { kind: DocumentKindValue | null; mimeType: string | null },
+  absPath: string,
+): Promise<string | null> {
+  const baseMime = (doc.mimeType ?? "").split(";")[0]!.trim().toLowerCase();
+  const isHtml =
+    baseMime === "text/html" || baseMime === "application/xhtml+xml";
+
+  if (doc.kind === "receipt_email") {
+    const parsed = await simpleParser(await readFile(absPath));
+    const fromHtml =
+      typeof parsed.html === "string" && parsed.html.length > 0
+        ? htmlToPlainText(parsed.html)
+        : "";
+    const fromText = (parsed.text ?? "").trim();
+    const body = fromHtml.length >= fromText.length ? fromHtml : fromText;
+    const headers = [
+      parsed.from?.text ? `From: ${parsed.from.text}` : null,
+      parsed.subject ? `Subject: ${parsed.subject}` : null,
+      parsed.date ? `Date (envelope): ${parsed.date.toISOString()}` : null,
+    ].filter((l): l is string => l !== null);
+    const joined = [headers.join("\n"), body].filter(Boolean).join("\n\n");
+    return joined.length > 0 ? joined : null;
+  }
+
+  if (isHtml) {
+    const text = htmlToPlainText((await readFile(absPath)).toString("utf8"));
+    return text.length > 0 ? text : null;
+  }
+
+  return null;
+}
+
 // ── Re-extract (Phase 4c of #80 / #91) ─────────────────────────────────
+
+/**
+ * What the run actually did (#167).
+ *
+ * The old signal — "did `re_extracted_at` advance?" — was structurally
+ * blind: that column only moves as a side effect of the agent's own psql
+ * block, so a run that wrote NOTHING was indistinguishable from a
+ * successful one, and the frontend rendered "No changes — the agent
+ * produced the same output." That string is exactly what made #167
+ * invisible for weeks. Key future batch tooling on `outcome`, never on a
+ * timestamp.
+ */
+export type ReExtractOutcome = "written" | "no_change" | "agent_error";
 
 export interface ReExtractDocumentResult {
   document_id: string;
@@ -719,6 +881,10 @@ export interface ReExtractDocumentResult {
   /** Re-extract is observability-first; carry the session id so the
    *  operator can pull the Langfuse trace without a join. */
   session_id: string;
+  /** `written` when the agent's psql block moved something, `no_change`
+   *  when it demonstrably wrote nothing. `agent_error` is part of the
+   *  vocabulary but never reaches a 200 — it surfaces as a 422. */
+  outcome: ReExtractOutcome;
 }
 
 /**
@@ -746,7 +912,7 @@ export async function reExtractDocument(
   workspaceId: string,
   userId: string,
   documentId: string,
-  options: { reExtractor?: ReExtractor } = {},
+  options: { reExtractor?: ReExtractor; transactionId?: string } = {},
 ): Promise<ReExtractDocumentResult | null> {
   const reExtractor = options.reExtractor ?? defaultClaudeReExtractor;
 
@@ -755,6 +921,8 @@ export async function reExtractDocument(
     .select({
       id: documents.id,
       workspaceId: documents.workspaceId,
+      kind: documents.kind,
+      mimeType: documents.mimeType,
       filePath: documents.filePath,
       ocrText: documents.ocrText,
       deletedAt: documents.deletedAt,
@@ -779,6 +947,25 @@ export async function reExtractDocument(
     );
   }
 
+  // 1b) Preflight the file BEFORE spending a 15-minute `claude -p` round
+  //     trip (#167). 95 of 1600 live `file_path` values did not resolve;
+  //     every one of them used to burn a full agent run and come back as
+  //     a misleading `200 {}` with empty `changed_keys`, which reads as
+  //     "the agent produced the same output" rather than "there was no
+  //     file". Same `stat` guard `renderDocumentHtml` already uses.
+  const absPath = resolveUploadPath(doc.filePath);
+  try {
+    await stat(absPath);
+  } catch {
+    throw new HttpProblem(
+      422,
+      "document-file-missing",
+      "Source file is missing on disk",
+      `Document ${documentId} points at ${doc.filePath}, which does not resolve to a readable file. Re-extract has nothing to read; restore the file before retrying.`,
+      { document_id: documentId, file_path: doc.filePath },
+    );
+  }
+
   const linkRows = await db
     .select({ transactionId: documentLinks.transactionId })
     .from(documentLinks)
@@ -792,35 +979,87 @@ export async function reExtractDocument(
       { document_id: documentId },
     );
   }
-  if (linkRows.length > 1) {
+  let transactionId: string;
+  if (linkRows.length === 1) {
+    transactionId = linkRows[0]!.transactionId;
+  } else if (
+    options.transactionId &&
+    linkRows.some((r) => r.transactionId === options.transactionId)
+  ) {
+    // Multi-link documents are no longer a dead end (#167): the caller
+    // names which transaction to re-derive via `?transaction_id=`.
+    transactionId = options.transactionId;
+  } else {
     throw new HttpProblem(
       422,
       "document-multiple-transactions",
       "Document linked to multiple transactions",
-      "Re-extract refuses when a document links to more than one transaction; pick a tx and use a per-tx flow.",
+      "Re-extract operates per-transaction and will not pick for you; pass ?transaction_id=<uuid> naming one of the linked transactions.",
       {
         document_id: documentId,
         transaction_ids: linkRows.map((r) => r.transactionId),
       },
     );
   }
-  const transactionId = linkRows[0]!.transactionId;
 
   // 2) Snapshot BEFORE — projection-domain tx fields only. Layer-3
   //    fields are excluded from the diff because re-extract can't
   //    change them anyway; including them would clutter `changed_keys`.
   const beforeSnapshot = await snapshotReExtractFields(transactionId, doc.id);
 
+  // 2b) Give an email / HTML document a TEXT source (#167). The agent
+  //     can open an image or a PDF itself, but an `.eml` body is
+  //     MIME-encoded and its itemization usually lives only in the
+  //     `text/html` part. Inlining the decoded text into the prompt is
+  //     what makes re-extract produce anything at all on these.
+  //     Deliberately NOT written to `documents.ocr_text` first: the
+  //     agent has no `SELECT ocr_text` instruction, and its own psql
+  //     block overwrites that column at the end of the run anyway.
+  let sourceText: string | null = null;
+  try {
+    sourceText = await extractSourceText(doc, absPath);
+  } catch (err) {
+    console.warn(
+      `[re-extract] doc=${documentId} source-text extraction failed: ${(err as Error).message}`,
+    );
+  }
+
   // 3) Spawn the agent. Errors here bubble to the route handler;
   //    nothing has been written yet so the DB state is untouched.
   const { sessionId, stdout } = await reExtractor({
     // The agent needs a container-absolute path it can open (#128).
-    filePath: resolveUploadPath(doc.filePath),
+    filePath: absPath,
     workspaceId,
     documentId,
     transactionId,
     userId,
+    ocrText: sourceText,
   });
+
+  // 3c) The prompt's own contract: on an unreadable source the agent
+  //     writes NOTHING and prints `ERROR <reason>`. Honour it before
+  //     inserting a `derivation_events` row — that row asserts a
+  //     derivation ran, and writing one for a run that refused is a
+  //     false audit record.
+  const lastLine =
+    stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .pop() ?? "";
+  if (/^ERROR\b/.test(lastLine)) {
+    throw new HttpProblem(
+      422,
+      "re-extract-agent-error",
+      "The extraction agent could not read this document",
+      lastLine.replace(/^ERROR\s*/, "") || "Agent reported an error.",
+      {
+        document_id: documentId,
+        transaction_id: transactionId,
+        session_id: sessionId,
+      },
+    );
+  }
 
   // 3b) Ship the session transcript to Langfuse (#181). Fire-and-forget
   //     — `trackLangfuse` never throws and never blocks the response.
@@ -875,6 +1114,14 @@ export async function reExtractDocument(
       afterSnapshot.ocr_text,
     ),
     session_id: sessionId,
+    // The agent's metadata UPDATE always rewrites `extraction.ran_at`
+    // with NOW(), so `metadata_extraction` is present whenever the psql
+    // block ran at all. An EMPTY `changed_keys` therefore means the
+    // agent wrote nothing — a no-op, not a confirmation that the output
+    // was identical. Production corroborates: 118 of 122
+    // `derivation_events` contain the key; the 4 empties are exactly the
+    // #167 no-ops.
+    outcome: changedKeys.length > 0 ? "written" : "no_change",
   };
 }
 

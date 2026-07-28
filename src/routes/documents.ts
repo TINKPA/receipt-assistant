@@ -84,6 +84,10 @@ function asyncHandler<T>(
 }
 
 const IdOnlyParams = z.object({ id: Uuid });
+
+/** Query for `POST /:id/re-extract` — names which linked transaction to
+ *  re-derive when the document links to more than one (#167). */
+const ReExtractQuery = z.object({ transaction_id: Uuid.optional() });
 const LinkParams = z.object({ id: Uuid, txn_id: Uuid });
 
 // ── POST /v1/documents ─────────────────────────────────────────────────
@@ -342,10 +346,18 @@ documentsRouter.post(
   "/:id/re-extract",
   asyncHandler(async (req, res) => {
     const { id } = parseOrThrow(IdOnlyParams, req.params);
+    // `?transaction_id=` disambiguates a document linked to more than one
+    // transaction (#167) — without it those documents were a permanent
+    // 422 and could never be re-derived at all.
+    const { transaction_id } = parseOrThrow(
+      ReExtractQuery,
+      req.query as Record<string, unknown>,
+    );
     const out = await reExtractDocument(
       req.ctx.workspaceId,
       req.ctx.userId,
       id,
+      { transactionId: transaction_id },
     );
     if (!out) throw new NotFoundProblem("Document", id);
     res.json(out);
@@ -577,9 +589,23 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       "identity columns) never touched; SOFT fields (occurred_on, " +
       "occurred_at, payee) protected by `metadata.user_edited.<field>` " +
       "CASE expressions, so user PATCH overrides survive. " +
-      "Returns 422 if the document has zero or >1 linked transactions.",
+      "For `.eml` / `text/html` documents the body is MIME-decoded and " +
+      "linearized server-side and inlined into the prompt (#167) — the " +
+      "agent does not decode it itself. The response's `outcome` field " +
+      "is the completion signal; do NOT infer success from " +
+      "`re_extracted_at` advancing.",
     tags: ["documents"],
-    request: { params: z.object({ id: Uuid }) },
+    request: {
+      params: z.object({ id: Uuid }),
+      query: z.object({
+        transaction_id: Uuid.optional().openapi({
+          description:
+            "Which linked transaction to re-derive. Required only when " +
+            "the document links to more than one transaction; without it " +
+            "such a document 422s with `document-multiple-transactions`.",
+        }),
+      }),
+    },
     responses: {
       200: {
         description: "Re-extract committed",
@@ -591,7 +617,13 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       },
       422: {
         description:
-          "Document not linked to exactly one transaction, or has no file_path",
+          "`document-no-file-path` (row has no file_path), " +
+          "`document-file-missing` (file_path does not resolve on disk — " +
+          "checked BEFORE spawning the agent), `document-no-transaction` " +
+          "(zero linked transactions), `document-multiple-transactions` " +
+          "(more than one and no `?transaction_id=`), or " +
+          "`re-extract-agent-error` (the agent printed `ERROR <reason>` " +
+          "and wrote nothing; `detail` carries its reason).",
         content: problemContent,
       },
     },
