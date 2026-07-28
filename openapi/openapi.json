@@ -4655,6 +4655,15 @@
             "type": "string",
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "written",
+              "no_change",
+              "agent_error"
+            ],
+            "description": "What the run actually did (#167). `written` = the agent's psql block moved something. `no_change` = it demonstrably wrote NOTHING (the metadata UPDATE always rewrites `extraction.ran_at`, so empty `changed_keys` means no write happened, NOT that the output was identical). `agent_error` is part of the vocabulary but never appears on a 200 — the agent's `ERROR` line surfaces as a 422 `re-extract-agent-error`. Batch tooling MUST key on this field, never on whether `re_extracted_at` advanced."
           }
         },
         "required": [
@@ -4663,7 +4672,8 @@
           "derivation_event_id",
           "changed_keys",
           "ocr_text_changed",
-          "session_id"
+          "session_id",
+          "outcome"
         ]
       },
       "UpdatePlaceRequest": {
@@ -8557,7 +8567,7 @@
     "/v1/documents/{id}/re-extract": {
       "post": {
         "summary": "Re-OCR the receipt and UPDATE the linked transaction in place.",
-        "description": "Phase 4c of the 3-layer rollout (#80 / #91). Spawns `claude -p` with a narrow re-extract prompt; the agent reads the cached image bytes and refreshes `transactions.{payee, occurred_on, occurred_at, metadata.extraction}` plus `documents.{ocr_text, ocr_model_version}`. **Out of scope**: postings, place_id, merchant_id, document_links — those have their own paths. **Layer-3 shielded**: HARD fields (status, narration, trip_id, identity columns) never touched; SOFT fields (occurred_on, occurred_at, payee) protected by `metadata.user_edited.<field>` CASE expressions, so user PATCH overrides survive. Returns 422 if the document has zero or >1 linked transactions.",
+        "description": "Phase 4c of the 3-layer rollout (#80 / #91). Spawns `claude -p` with a narrow re-extract prompt; the agent reads the cached image bytes and refreshes `transactions.{payee, occurred_on, occurred_at, metadata.extraction}` plus `documents.{ocr_text, ocr_model_version}`. **Out of scope**: postings, place_id, merchant_id, document_links — those have their own paths. **Layer-3 shielded**: HARD fields (status, narration, trip_id, identity columns) never touched; SOFT fields (occurred_on, occurred_at, payee) protected by `metadata.user_edited.<field>` CASE expressions, so user PATCH overrides survive. For `.eml` / `text/html` documents the body is MIME-decoded and linearized server-side and inlined into the prompt (#167) — the agent does not decode it itself. The response's `outcome` field is the completion signal; do NOT infer success from `re_extracted_at` advancing.",
         "tags": [
           "documents"
         ],
@@ -8571,6 +8581,17 @@
             "required": true,
             "name": "id",
             "in": "path"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "Which linked transaction to re-derive. Required only when the document links to more than one transaction; without it such a document 422s with `document-multiple-transactions`.",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": false,
+            "name": "transaction_id",
+            "in": "query"
           }
         ],
         "responses": {
@@ -8595,7 +8616,7 @@
             }
           },
           "422": {
-            "description": "Document not linked to exactly one transaction, or has no file_path",
+            "description": "`document-no-file-path` (row has no file_path), `document-file-missing` (file_path does not resolve on disk — checked BEFORE spawning the agent), `document-no-transaction` (zero linked transactions), `document-multiple-transactions` (more than one and no `?transaction_id=`), or `re-extract-agent-error` (the agent printed `ERROR <reason>` and wrote nothing; `detail` carries its reason).",
             "content": {
               "application/problem+json": {
                 "schema": {

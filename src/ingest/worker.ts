@@ -48,7 +48,7 @@ async function pickExtractor(absPath: string) {
   if (process.env.EXTRACTOR_STUB_ALLOWED !== "1") return defaultClaudeExtractor;
   return (await isStubFile(absPath)) ? stubFileExtractor : defaultClaudeExtractor;
 }
-import { ingestSession, getSessionJsonlPath } from "../langfuse.js";
+import { trackLangfuse } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -618,20 +618,6 @@ export async function maybeCompleteBatch(
   workspaceId: string,
 ): Promise<void> {
   await onBatchChildTerminated(batchId, workspaceId);
-}
-
-// ── Langfuse trace ingestion (fire-and-forget) ───────────────────────
-
-/**
- * Kick off Langfuse ingestion for a finished extraction without blocking
- * the worker. `ingestSession` itself swallows errors, so Langfuse
- * downtime never fails a batch.
- */
-function trackLangfuse(sessionId: string, tags: string[]): void {
-  ingestSession(getSessionJsonlPath(sessionId), tags).catch((err) => {
-    // eslint-disable-next-line no-console
-    console.error("[ingest worker] langfuse ingestion failed:", err);
-  });
 }
 
 // ── Auto-reconcile hook (#32 Phase 2a) ───────────────────────────────

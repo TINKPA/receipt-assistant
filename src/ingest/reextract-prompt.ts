@@ -62,6 +62,7 @@ import {
 } from "./line-item-prompt.js";
 import {
   ITEMS_JSON_EXPR,
+  itemsCte,
   brandFkGuard,
   productsUpsert,
   transactionItemsInsert,
@@ -80,6 +81,42 @@ export interface ReExtractPromptContext {
   transactionId: string;
   /** Owner user id, recorded in the `transaction_events` row. */
   userId: string;
+  /** Pre-decoded plain text of the source (#167), inlined below. Set for
+   *  `.eml` and raw-HTML documents, NULL for images and PDFs. */
+  ocrText?: string | null;
+}
+
+/**
+ * The decoded-source block (#167).
+ *
+ * Inlined into the prompt rather than pre-written to `documents.ocr_text`:
+ * the agent has no `SELECT ocr_text` instruction, and its own psql block
+ * overwrites that column at the end of the run anyway, so pre-populating
+ * it would be a write the agent never reads and then destroys.
+ */
+function renderDecodedSource(ocrText: string | null | undefined): string {
+  if (!ocrText || ocrText.trim().length === 0) return "";
+  return `
+── Decoded source text (already extracted for you) ────────────────────
+
+This document is an email / HTML file, so its body has ALREADY been
+MIME-decoded and linearized for you. Read it here; you do NOT need to
+decode the file yourself. Item tables are linearized one row per line,
+so a name and its price sit on the SAME line.
+
+Treat this as the receipt text. Open the original file only if this
+text is obviously truncated or contradicts itself — and if you do,
+follow the document-reading rules above.
+
+The \`Date (envelope)\` header, when present, is when the EMAIL was sent.
+It is NOT automatically \`occurred_on\`: use the transaction date printed
+in the body, and fall back to the envelope date only when the body
+prints none.
+
+<<<DECODED_SOURCE
+${ocrText.trim()}
+DECODED_SOURCE
+`;
 }
 
 export function buildReExtractPrompt(ctx: ReExtractPromptContext): string {
@@ -109,11 +146,12 @@ ${PSQL_DISCIPLINE}
 ${agentHygiene({ scratchDir, filePath: ctx.filePath })}
 ${renderActiveLessons()}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
-
+${renderDecodedSource(ctx.ocrText)}
 ── Phase 1 — Extract ──────────────────────────────────────────────────
 
 Read the file at the path above (same image / pdf / .eml the original
-ingest read). ${NO_JSON_SCHEMA_RULE}
+ingest read) — or, when a decoded source block is present above, read
+that instead. ${NO_JSON_SCHEMA_RULE}
 
 Pull these fields. Use NULL when the field is not visible — never
 guess, never fall back to today's date.
@@ -156,15 +194,19 @@ live there, so you do not extract them at all.
 
 **Brand FK guard (#101).** Items may carry product_brand_id, which is
 FK into \`brands\`. The products UPSERT below would fail if the brand
-row doesn't exist. Run this defensively BEFORE the main block:
+row doesn't exist, so it runs defensively as the FIRST statement of the
+block below — its own statement, never a sibling CTE (\`WITH\`
+sub-statements cannot see each other's effects on target tables and RI
+checks are AFTER-ROW). Delete it when no item carries a
+product_brand_id.
 
-${brandFkGuard()}
+Run exactly ONE psql INVOCATION for the whole write. Substitute your
+extracted values for the placeholders; the CASE statements consult
+\`metadata.user_edited\` so a user override survives this re-extract.
 
-Run exactly ONE psql block. Substitute your extracted values for the
-placeholders; the CASE statements consult \`metadata.user_edited\` so a
-user override survives this re-extract.
+  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
+${brandFkGuard({ bare: true })}
 
-  psql "\$DATABASE_URL" <<'SQL'
   BEGIN;
 
   UPDATE transactions SET
@@ -238,6 +280,7 @@ user override survives this re-extract.
     FROM transaction_items
     WHERE transaction_id = '${ctx.transactionId}'
   ),
+${itemsCte()},
 ${productsUpsert({ workspaceId: ctx.workspaceId, merchantIdExpr })}
 ${transactionItemsInsert({
   workspaceId: ctx.workspaceId,
@@ -320,6 +363,11 @@ corrupted), do NOT write anything to the database. Print:
 
   ERROR <one-line reason>
 
-and exit. The service will mark the document accordingly.
+and exit. This line is a CONTRACT, not a log message: the service reads
+the last non-empty line of your stdout, and a leading \`ERROR\` makes it
+skip the audit record and return 422 with your reason as the detail the
+user sees. So make the reason specific and user-facing ("scan is a blank
+page", "PDF has no text layer and rasterizes to noise"), keep it to one
+line, and never print it after a successful write.
 `;
 }

@@ -161,6 +161,11 @@ export interface ReExtractorInput {
   transactionId: string;
   /** Owner user id, recorded in `transaction_events`. */
   userId: string;
+  /** Pre-decoded plain text of the source, for documents the agent
+   *  cannot usefully open on its own — `.eml` bodies (MIME-encoded, with
+   *  the itemization usually only in the `text/html` part) and raw HTML
+   *  files (#167). NULL for images and PDFs, which the agent reads. */
+  ocrText?: string | null;
 }
 
 export interface ReExtractorResult {
@@ -184,6 +189,7 @@ export const defaultClaudeReExtractor: ReExtractor = async (input) => {
     documentId: input.documentId,
     transactionId: input.transactionId,
     userId: input.userId,
+    ocrText: input.ocrText ?? null,
   };
   const prompt = buildReExtractPrompt(ctx);
   console.log(

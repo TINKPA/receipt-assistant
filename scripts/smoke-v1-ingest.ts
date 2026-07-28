@@ -19,6 +19,9 @@
  *
  * Run:   npx tsx scripts/smoke-v1-ingest.ts
  * Args:  --files=<glob>           Override file selection (unquoted glob)
+ *        --fixtures=<dir>         Directory holding the receipt corpus
+ *                                 (or set RECEIPT_FIXTURE_DIR). Required
+ *                                 unless --files is given.
  *        --base=<url>             API base URL (default http://localhost:3000)
  *        --concurrency=<n>        Parallel workers (default 3)
  *        --limit=<n>              Cap processed count (default 15)
@@ -47,11 +50,24 @@ function parseArgs(argv: string[]): Args {
   const concurrency = Number(args.concurrency ?? "3");
   const limit = Number(args.limit ?? "15");
 
-  const files = args.files
-    ? expandGlob(args.files)
-    : DEFAULT_SELECTION.map((f) =>
-        path.resolve("/Users/danieltang/Desktop/RECEIPT", f),
-      );
+  // The fixture directory is NOT hard-coded: `~/Desktop/RECEIPT` used to
+  // be baked in here and exists on neither machine, so a bare run silently
+  // processed zero files (#181 cleanup). Point it with --fixtures=<dir> or
+  // RECEIPT_FIXTURE_DIR; --files=<glob> still overrides everything.
+  const fixtureDir = args.fixtures ?? process.env.RECEIPT_FIXTURE_DIR;
+  let files: string[];
+  if (args.files) {
+    files = expandGlob(args.files);
+  } else if (fixtureDir) {
+    files = DEFAULT_SELECTION.map((f) => path.resolve(fixtureDir, f)).filter(
+      (f) => fs.existsSync(f),
+    );
+  } else {
+    throw new Error(
+      "No fixtures given. Pass --files=<glob>, or --fixtures=<dir> / " +
+        "RECEIPT_FIXTURE_DIR=<dir> pointing at the receipt corpus.",
+    );
+  }
 
   return { files: files.slice(0, limit), base, concurrency, limit };
 }

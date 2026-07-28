@@ -66,6 +66,17 @@ export const ReExtractDocumentResponse = z
     changed_keys: z.array(z.string()),
     ocr_text_changed: z.boolean(),
     session_id: Uuid,
+    outcome: z.enum(["written", "no_change", "agent_error"]).openapi({
+      description:
+        "What the run actually did (#167). `written` = the agent's psql " +
+        "block moved something. `no_change` = it demonstrably wrote " +
+        "NOTHING (the metadata UPDATE always rewrites `extraction.ran_at`, " +
+        "so empty `changed_keys` means no write happened, NOT that the " +
+        "output was identical). `agent_error` is part of the vocabulary " +
+        "but never appears on a 200 — the agent's `ERROR` line surfaces " +
+        "as a 422 `re-extract-agent-error`. Batch tooling MUST key on " +
+        "this field, never on whether `re_extracted_at` advanced.",
+    }),
   })
   .openapi("ReExtractDocumentResponse");
 

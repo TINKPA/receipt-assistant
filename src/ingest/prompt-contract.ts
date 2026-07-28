@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
  * pure liability, and nothing reads or compares either value. The path
  * is distinguished by `metadata.extraction.source ∈ {'ingest','re-extract'}`.
  */
-export const PROMPT_VERSION = "3.0";
+export const PROMPT_VERSION = "3.1";
 
 /**
  * The model identifier stamped into `transactions.metadata.extraction.model`
@@ -51,15 +51,32 @@ export const EXTRACTION_MODEL = process.env.CLAUDE_MODEL ?? "cli-default";
 export const NO_JSON_SCHEMA_RULE = `Reason in plain text first. Chain-of-thought measurably improves OCR.
 Do NOT use \`--json-schema\`-style structured output.`;
 
-/** The psql connection + heredoc form. Both prompts write via psql and
- *  both need the multi-statement heredoc shape. */
+/**
+ * The psql connection + heredoc form + the BATCHING rule (#181).
+ *
+ * The batching rule is the turn-count half of #181. Nothing in either
+ * prompt ever forbade multiple *statements* per invocation, but nothing
+ * asked for it either, and the per-section structure produced ~8 core
+ * write turns. Each extra round trip re-sends the whole conversation,
+ * so turns multiply input tokens super-linearly.
+ */
 export const PSQL_DISCIPLINE = `DB connection: \`psql "\$DATABASE_URL"\` — the env var is set. Use it for
-every SQL call. If you want a multi-statement block, use a heredoc:
-  psql "\$DATABASE_URL" <<'SQL'
-    BEGIN;
-    ...
-    COMMIT;
-  SQL`;
+every SQL call.
+
+- One psql INVOCATION per Bash tool call, and BATCH your statements
+  into that one invocation with a heredoc. Do NOT issue one psql call
+  per statement — each round trip re-sends the whole conversation.
+    psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
+      BEGIN;
+      ...
+      COMMIT;
+    SQL
+  Always use the QUOTED heredoc marker <<'SQL' so the shell does not
+  mangle \$items\$ dollar-quoting. Always pass -v ON_ERROR_STOP=1 —
+  without it, a failed statement inside BEGIN turns COMMIT into a
+  silent ROLLBACK and psql still exits 0.
+- Still SEQUENTIAL: one Bash tool call at a time, never a parallel
+  tool-call block.`;
 
 /**
  * Scratch-file discipline (#143) + sequential tool discipline (#126) +
