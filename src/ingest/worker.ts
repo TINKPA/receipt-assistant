@@ -26,6 +26,7 @@ import {
   workspaces,
 } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
+import { normalizeFxSafely } from "../fx/normalize.js";
 import {
   defaultClaudeExtractor,
   type ExtractorResult,
@@ -519,6 +520,15 @@ async function runOne(item: QueueItem): Promise<void> {
     await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
+
+  // #184 — the agent writes the receipt's own numbers and nothing else;
+  // converting a foreign-currency posting into the workspace base
+  // currency is our job, at the receipt's date. Runs after the #125/#133
+  // guards have settled `produced.transaction_ids`, and before job.done
+  // so the SSE consumer never sees a pre-conversion total. Never throws:
+  // an unconvertible posting keeps fx_rate NULL for the backfill pass
+  // rather than failing an otherwise good extraction.
+  await normalizeFxSafely(terminal.produced.transaction_ids, workspaceId);
 
   busEmit("job.done", {
     batchId,
