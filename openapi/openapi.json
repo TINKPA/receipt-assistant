@@ -1095,6 +1095,10 @@
           },
           "effective_total_minor": {
             "type": "integer"
+          },
+          "source": {
+            "type": "string",
+            "default": "extraction"
           }
         },
         "required": [
@@ -1241,6 +1245,192 @@
           "documents",
           "place",
           "merchant",
+          "items"
+        ]
+      },
+      "NewTransactionItem": {
+        "type": "object",
+        "properties": {
+          "line_no": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          },
+          "parent_line_no": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "raw_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "normalized_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_variant": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quantity": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit_price_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "line_total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$",
+            "example": "USD"
+          },
+          "item_class": {
+            "type": "string",
+            "enum": [
+              "durable",
+              "consumable",
+              "food_drink",
+              "service",
+              "other"
+            ]
+          },
+          "durability_tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "luxury",
+              "standard"
+            ]
+          },
+          "food_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "restaurant_dish",
+              "grocery_food",
+              "beverage"
+            ]
+          },
+          "tags": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "line_type": {
+            "type": "string"
+          },
+          "product_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "tax_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tip_share_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "discount_share_minor": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          }
+        },
+        "required": [
+          "raw_name",
+          "line_total_minor",
+          "item_class"
+        ]
+      },
+      "AddTransactionItemsRequest": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NewTransactionItem"
+            },
+            "minItems": 1,
+            "maxItems": 200
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "AddTransactionItemsResponse": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "extraction_run": {
+            "type": "integer"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransactionItem"
+            }
+          }
+        },
+        "required": [
+          "transaction_id",
+          "extraction_run",
           "items"
         ]
       },
@@ -1438,6 +1628,10 @@
               "null"
             ]
           },
+          "source": {
+            "type": "string",
+            "default": "extraction"
+          },
           "metadata": {
             "type": "object",
             "additionalProperties": {},
@@ -1616,6 +1810,97 @@
             "format": "binary"
           }
         }
+      },
+      "CreateProductRequest": {
+        "type": "object",
+        "properties": {
+          "product_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "canonical_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "merchant_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "brand_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "item_class": {
+            "type": "string",
+            "enum": [
+              "durable",
+              "consumable",
+              "food_drink",
+              "service",
+              "other"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "variant": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sku": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "manufacturer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {},
+            "default": {},
+            "description": "User-defined JSON object; not schema-validated."
+          }
+        },
+        "required": [
+          "product_key",
+          "canonical_name",
+          "item_class"
+        ]
       },
       "UpdateProductRequest": {
         "type": "object",
@@ -6095,6 +6380,78 @@
         }
       }
     },
+    "/v1/transactions/{id}/items": {
+      "post": {
+        "summary": "Add manually-entered line items to a transaction",
+        "description": "Manual backfill for a purchase with no receipt to OCR (#183). Before this endpoint, `transaction_items` had exactly one writer — the ingest agent — so a transaction created via `POST /v1/transactions` could never gain line items, a product-catalog link, or a Things entry.\n\n**Provenance.** Rows created here are stamped `source='manual'` and left with a NULL `extraction_version` (\"no prompt produced this row\"). Both are real columns — read them instead of string-matching `metadata.source`, and do NOT write a `'manual'` sentinel into `extraction_version`.\n\n**Not ledger-mutating.** No postings are written and the head row is untouched, so `version` does not change and no `If-Match` is required. It is the caller's job to keep the postings consistent with the lines they type — the sum of `effective_total_minor` is NOT reconciled against the postings.\n\n`effective_total_minor` (`line_total + tax + tip - discount`) is a generated column and is echoed back computed by the database, never accepted from the client.\n\nLines join the transaction's current live `extraction_run` so they read back alongside existing items. Omit `line_no` to append after the highest live line; supply it to make the call safely retryable (a repeat 409s rather than duplicating).",
+        "tags": [
+          "transactions"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddTransactionItemsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Items created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddTransactionItemsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Transaction not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "line_no already used in the live extraction run, or the transaction is soft-deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed — unknown product_id, duplicate line_no in the request, or an un-inferrable currency (transaction has no postings, or they span several currencies)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/transactions/{tid}/postings/{pid}": {
       "patch": {
         "summary": "Update a posting",
@@ -6426,6 +6783,55 @@
                     "items",
                     "next_cursor"
                   ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a catalog product manually",
+        "description": "Manual catalog entry for a purchase with no receipt to OCR (#183). The catalog was previously written only by the ingest agent, which made `POST /v1/owned-items` (`product_id` NOT NULL) unreachable for anything not scanned.\n\n**Idempotent on `(workspace_id, merchant_id, product_key)`** (the existing unique index, NULLS NOT DISTINCT so portable products with `merchant_id=null` participate). A repeat create with the same `product_key` returns **200** with the existing row rather than 409 — manual entry is retry-prone. The existing row is returned **unmodified**: a retry never overwrites edits made through PATCH in the meantime. A genuinely new row returns **201** with a `Location` header.\n\n**Provenance.** Rows created here carry `source='manual'` (a real column, #183 Phase 3) — filter on it rather than string-matching `metadata.source`. The ingest upsert never rewrites `source`, so a manually-entered product that OCR later confirms stays `manual`: the column records origin, not last touch.\n\n**`brand_id` self-heals.** It is an FK into the global `brands` registry and there is no `POST /v1/brands`; an unknown id is registered with `name = brand_id`, exactly as the ingest path's brand FK guard already does.\n\nAggregate stats (`purchase_count`, `total_spent_minor`, `first_purchased_on`, `last_purchased_on`) are not accepted — they are recomputed from the live `transaction_items` set. Link items, then call `POST /v1/products/{id}/recompute`.",
+        "tags": [
+          "products"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProductRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent hit — a product with this (merchant, product_key) already existed; returned unchanged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Product"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Product"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed (bad item_class, unknown merchant_id)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }

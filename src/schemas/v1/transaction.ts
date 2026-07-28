@@ -144,8 +144,97 @@ export const TransactionItem = z
     /** #84 — generated column on `transaction_items`:
      *  `line_total + tax + tip - discount`. */
     effective_total_minor: z.number().int(),
+    /** #183 — creation pathway. `extraction` = produced by the ingest
+     *  agent (also every row predating #183 and every `metadata.items`
+     *  fallback row); `manual` = typed by a human via
+     *  `POST /v1/transactions/:id/items`. Free text so future pathways
+     *  need no migration. Filter on this column instead of
+     *  string-matching `metadata.source`. */
+    source: z.string().default("extraction"),
   })
   .openapi("TransactionItem");
+
+/**
+ * `POST /v1/transactions/{id}/items` element (#183 Phase 2) — one
+ * manually-entered line on a transaction that has no receipt.
+ *
+ * Deliberately a sibling endpoint rather than an `items[]` field on
+ * `POST /v1/transactions`: it keeps `createTransaction` single-purpose
+ * and gives re-extract a natural counterpart.
+ *
+ * Server-owned fields are absent by construction:
+ *   - `effective_total_minor` is a generated column
+ *     (`line_total + tax + tip - discount`) and is echoed back, never
+ *     accepted.
+ *   - `extraction_version` is left NULL — these rows are not
+ *     extraction-derived. The `'manual'` sentinel string that the
+ *     hand-written SQL workaround used is explicitly NOT written.
+ *   - `source` is stamped `'manual'` server-side.
+ *   - `extraction_run` joins the transaction's current live run so the
+ *     new lines read back alongside the existing ones.
+ */
+export const NewTransactionItem = z
+  .object({
+    /** 1-based. Omit to append after the highest live line on the
+     *  transaction; supply it to slot a line at a known position.
+     *  A duplicate (line_no, live run) is a 409, which makes an
+     *  explicit line_no a safe retry key. */
+    line_no: z.number().int().positive().optional(),
+    parent_line_no: z.number().int().positive().nullable().optional(),
+    raw_name: z.string().min(1),
+    normalized_name: z.string().nullable().optional(),
+    product_variant: z.string().nullable().optional(),
+    quantity: z.number().nullable().optional(),
+    unit: z.string().nullable().optional(),
+    unit_price_minor: z.number().int().nullable().optional(),
+    /** Signed minor units; negative for a line-level discount. */
+    line_total_minor: z.number().int(),
+    /** Omit to inherit the transaction's posting currency. Required
+     *  only when the transaction's postings disagree on currency. */
+    currency: CurrencyCode.optional(),
+    item_class: z.enum([
+      "durable",
+      "consumable",
+      "food_drink",
+      "service",
+      "other",
+    ]),
+    durability_tier: z.enum(["luxury", "standard"]).nullable().optional(),
+    food_kind: z
+      .enum(["restaurant_dish", "grocery_food", "beverage"])
+      .nullable()
+      .optional(),
+    tags: z.array(z.string()).nullable().optional(),
+    /** Defaults to `high` — a human typed this line. */
+    confidence: z.enum(["high", "medium", "low"]).optional(),
+    line_type: z.string().optional(),
+    /** Catalog linkage. Create the product first with
+     *  `POST /v1/products`, then pass its id here. */
+    product_id: Uuid.nullable().optional(),
+    tax_minor: z.number().int().nullable().optional(),
+    tip_share_minor: z.number().int().nullable().optional(),
+    discount_share_minor: z.number().int().nullable().optional(),
+    metadata: Metadata.optional(),
+  })
+  .openapi("NewTransactionItem");
+
+export const AddTransactionItemsRequest = z
+  .object({
+    items: z.array(NewTransactionItem).min(1).max(200),
+  })
+  .openapi("AddTransactionItemsRequest");
+
+export const AddTransactionItemsResponse = z
+  .object({
+    transaction_id: Uuid,
+    /** The run the new lines joined — the transaction's current live
+     *  `extraction_run`, or 1 when it had no items at all. */
+    extraction_run: z.number().int(),
+    /** Only the rows created by this call, read back from the DB so
+     *  `effective_total_minor` is the server-computed value. */
+    items: z.array(TransactionItem),
+  })
+  .openapi("AddTransactionItemsResponse");
 
 export type TransactionItemShape = z.infer<typeof TransactionItem>;
 

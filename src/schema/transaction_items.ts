@@ -95,8 +95,26 @@ export const transactionItems = pgTable(
     retiredAt: timestamp("retired_at", { withTimezone: true }),
     /** Prompt version stamp (text). #105/#106 used this column;
      *  retained as semantic audit ("which prompt produced this row")
-     *  alongside the numeric `extractionRun` counter (#84). */
-    extractionVersion: text("extraction_version").notNull(),
+     *  alongside the numeric `extractionRun` counter (#84).
+     *
+     *  NULLABLE since #183: NULL means "no extraction produced this
+     *  row" (manual backfill via `POST /v1/transactions/:id/items`).
+     *  Do NOT write a `'manual'` sentinel string here — the column
+     *  answers "WHICH prompt", and there is no prompt. "WHAT pathway"
+     *  is `source` below. */
+    extractionVersion: text("extraction_version"),
+    /** #183 Phase 3 — creation pathway, first-write-wins provenance.
+     *  `'extraction'` (default, every pre-#183 row and every row the
+     *  ingest agent writes) vs `'manual'` (typed by a human through
+     *  the API). Free text, no CHECK — same hard-coding budget as
+     *  `lineType`: the recommended set is documented, novel pathways
+     *  (`'import'`, `'statement'`) can be added without a migration.
+     *
+     *  Complementary to `extractionVersion`, not redundant with it:
+     *  a future extraction-derived row could carry a NULL version, and
+     *  a manually-created row could later be re-derived. Read this
+     *  column for "who created it", never `metadata->>'source'`. */
+    source: text("source").notNull().default("extraction"),
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
