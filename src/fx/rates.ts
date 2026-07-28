@@ -28,7 +28,27 @@ function fxApiBase(): string {
   return process.env.FX_API_BASE ?? "https://api.frankfurter.dev/v1";
 }
 const FX_SOURCE = "frankfurter/ecb";
-const FETCH_TIMEOUT_MS = 8000;
+const FETCH_TIMEOUT_MS = 15_000;
+
+/**
+ * The upstream is a free public service and it is measurably flaky under
+ * a burst: a backfill of ~30 rows saw a Cloudflare 522 and a run of
+ * timeouts even though a single cold request from the same container
+ * completes in ~120ms. So: retry, and pace consecutive upstream calls.
+ *
+ * Both matter for the same reason — a rate that fails to resolve leaves
+ * a posting counted at 1:1, which is the exact bug this module exists to
+ * prevent. Being slow is free; being wrong is not.
+ */
+const FETCH_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = [400, 1500];
+const MIN_GAP_BETWEEN_FETCHES_MS = 150;
+
+let lastFetchAt = 0;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 /**
  * How far back the offline fallback will reach for a cached rate when the
@@ -114,12 +134,17 @@ async function readNearestCache(
   };
 }
 
-async function fetchUpstream(
-  base: string,
+async function fetchOnce(
+  url: string,
   quote: string,
   onDate: string,
 ): Promise<ResolvedRate> {
-  const url = `${fxApiBase()}/${onDate}?base=${base}&symbols=${quote}`;
+  const gap = Date.now() - lastFetchAt;
+  if (gap < MIN_GAP_BETWEEN_FETCHES_MS) {
+    await sleep(MIN_GAP_BETWEEN_FETCHES_MS - gap);
+  }
+  lastFetchAt = Date.now();
+
   const res = await fetch(url, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
@@ -132,13 +157,34 @@ async function fetchUpstream(
   };
   const rate = body.rates?.[quote];
   if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
-    throw new Error(`FX source ${url} returned no usable ${base}→${quote} rate`);
+    throw new Error(`FX source ${url} returned no usable rate for ${quote}`);
   }
-  return {
-    rate,
-    asOfActual: body.date ?? onDate,
-    source: FX_SOURCE,
-  };
+  return { rate, asOfActual: body.date ?? onDate, source: FX_SOURCE };
+}
+
+async function fetchUpstream(
+  base: string,
+  quote: string,
+  onDate: string,
+): Promise<ResolvedRate> {
+  const url = `${fxApiBase()}/${onDate}?base=${base}&symbols=${quote}`;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await fetchOnce(url, quote, onDate);
+    } catch (err) {
+      lastErr = err;
+      const backoff = RETRY_BACKOFF_MS[attempt];
+      if (backoff === undefined) break;
+      console.warn(
+        `[fx] ${base}→${quote} @ ${onDate} attempt ${attempt + 1} failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); ` +
+          `retrying in ${backoff}ms`,
+      );
+      await sleep(backoff);
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 /**
