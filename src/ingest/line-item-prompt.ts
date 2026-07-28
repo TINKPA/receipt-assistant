@@ -216,7 +216,32 @@ line_type='tax'. Keep the printed NAME in raw_name / normalized_name.
 NEVER collapse them into the top-level tax_minor / discount_minor
 numbers only — that loses the name. parent_line_no is NULL on these
 rows. They are the audit baseline against the per-line allocations
-further below.`;
+further below.
+
+NAME PRESERVATION — the printed name is the only copy.
+
+  raw_name is the row EXACTLY as printed, verbatim: brand prefixes,
+  regulatory prefixes, store codes, CJK, punctuation, spacing.
+
+  normalized_name may expand an abbreviation or add an English gloss,
+  but it MUST still identify the SAME specific thing:
+    "KS PPR TWLS 12CT"     -> "Paper Towels"           OK (brand stripped)
+    "CRV / REDEMPTION FEE" -> "CRV Redemption Fee"     OK (expanded)
+    "CRV / REDEMPTION FEE" -> "Sales Fee"              WRONG (generalized)
+    "Tax(7.75%)"           -> "Sales Tax"              OK
+  Replacing a SPECIFIC printed name with a generic category word
+  destroys information that exists nowhere else — the UI renders this
+  string and never re-reads the image. When you cannot decode an
+  abbreviation, set normalized_name = NULL. NULL is honest; a plausible
+  generic label is a silent lie. This applies to tax / tip / discount /
+  fee / surcharge rows exactly as it applies to products.
+
+Two absolute rules on line_type:
+  * NEVER force a row into a label that misdescribes it. 'surcharge' is
+    not 'fee'; 'service_fee' is not 'tax'.
+  * NEVER DROP a printed row because you could not label it. 'other'
+    always exists. A dropped row is money that vanishes; a row labelled
+    'other' is money that stays auditable.`;
 
 /** The #162 two-level modifier rule, including BOTH the ADDITIVE and
  *  the INCLUSIVE branch. An agent given only the INCLUSIVE branch has
@@ -254,6 +279,35 @@ a PRICE?
     all-in price AND also emit priced children — that double-counts and
     breaks Σ line_total = subtotal.
 
+    GUARD — INCLUSIVE fires ONLY when this line HAS priced children.
+    "Σ priced add-ons" means exactly this: the sum of
+    line_total_minor over the child rows YOU ARE EMITTING with
+    parent_line_no = this line's line_no. Nothing else on the receipt
+    counts toward it. When that sum is ZERO — the line has no children,
+    or its children are printed at \$0.00 — then base = displayed, and
+    you MUST leave the parent's line_total EXACTLY as printed.
+      NEVER reduce or zero a printed price unless you are emitting
+      priced child rows that add back up to it. A price you removed
+      with nothing re-adding it is money DELETED from the receipt, not
+      money re-shaped, and it is strictly worse than double-counting
+      because nothing downstream can detect it.
+      Per-line cross-check, run it on every line you reduced:
+        (reduced parent base) + sum(that line's children's line_total)
+          == the price printed on that line
+      If that does not hold, your reduction was wrong. Put the printed
+      price back and re-derive the children.
+
+    ADDITIVE is the DEFAULT. Assume the printed price stands unless the
+    receipt gives you positive evidence that one all-in price already
+    contains its add-ons.
+
+    INVARIANT, stated in BOTH directions:
+      parent base + sum(its child add-ons) = the price actually charged
+      for that item — no MORE (never leave the parent at the all-in
+      price AND also emit priced children: that double-counts) and no
+      LESS (never zero or shrink a parent without children re-adding
+      the difference: that deletes money).
+
   ZERO-COST option → it is an ATTRIBUTE.
     Do NOT emit a separate line. Fold it into the PARENT item's
     product_variant string ("Less Sugar", "No Ice", "Spice Level 2",
@@ -269,7 +323,59 @@ receipts bundle "Milk Tea +Boba" at one blended price with no
 breakout), you cannot invent a split: keep the add-on name in the
 parent's product_variant and add a "variant-price-unresolved" tag on
 the parent so the limitation is auditable. Prefer a priced child line
-whenever the source shows any separable price.`;
+whenever the source shows any separable price.
+
+── Fixed-price PACKAGE / prix-fixe / AYCE / combo charges ─────────────
+
+A DIFFERENT shape from the modifier case above, and the one most often
+mangled. Some receipts charge ONE fixed package price and then list
+everything the package covers at \$0.00 each: all-you-can-eat, hot-pot
+"chang xuan" / "fang ti" selections, prix-fixe and tasting menus,
+banquet sets, "combo" meals, bundled service plans. Signals: a line
+whose price is large relative to the receipt and whose name contains
+AYCE / All You Can Eat / Package / Set / Course / Combo / Prix Fixe /
+per-person pricing, followed by a run of items printed at \$0.00 or with
+no price column at all.
+
+  1. THE PACKAGE CHARGE IS ITS OWN TOP-LEVEL PRODUCT LINE.
+     line_type='product', parent_line_no=NULL,
+     line_total_minor = the printed package price,
+     raw_name = the package line exactly as printed,
+     normalized_name = a clean gloss ("All-You-Can-Eat Package"),
+     product_merchant_exclusive=true, quantity = the guest / cover
+     count when printed.
+     NEVER fold the package price onto one of the items it covers. A
+     \$349.93 charge sitting on a "Green Bamboo Shoot" line is wrong
+     three times over: the package disappears as a purchasable thing,
+     a \$0 side dish acquires a \$349.93 price history, and no human
+     reading the ledger can reconstruct what was bought.
+
+  2. THE \$0.00 COVERED ITEMS ARE CHILDREN OF THE PACKAGE LINE.
+     parent_line_no = the package line's line_no,
+     line_total_minor = 0 (the printed price — do not impute one),
+     item_class / food_kind inherited from the parent.
+     They are the MANIFEST of what the package delivered. Keep every
+     one, keep them at zero, and keep duplicates as separate rows when
+     the receipt prints the same item more than once. Do NOT fold them
+     into the package's product_variant — product_variant is for
+     zero-cost CUSTOMIZATIONS of one item, not a list of distinct
+     dishes.
+
+  3. ANYTHING PRICED OUTSIDE THE PACKAGE KEEPS ITS PRINTED PRICE as its
+     own TOP-LEVEL line: soup bases and pot charges, a-la-carte dishes,
+     drinks, table / cover charges, sauce-bar fees. A soup base printed
+     at \$90.98 is NOT "included in" the package merely because the
+     package charge is larger. This is the INCLUSIVE GUARD restated: it
+     has no priced children, so it gets no reduction. Do not zero it.
+
+  4. TIE CHECK, before you write:
+       sum(top-level line_type='product' lines)
+         = package charge + everything priced outside the package
+         = the printed SUBTOTAL
+     The \$0.00 children contribute nothing by construction, so they
+     cannot break this sum. If it misses the subtotal you either
+     transplanted the package price onto a covered item or zeroed
+     something printed. Fix the shape; do not paper over it.`;
 
 /**
  * The arithmetic invariant + the TOTAL-ONLY fallback.
@@ -282,36 +388,79 @@ whenever the source shows any separable price.`;
  *
  * PR #165/#166 extends this export with the occlusion-bridge rule.
  */
-export const LINE_ITEM_COVERAGE_AND_BRIDGE = `── Coverage + arithmetic invariant ───────────────────────────────────
+export const LINE_ITEM_COVERAGE_AND_BRIDGE = `── Coverage: never silently lose money to a region you cannot read ────
 
-  Σ line_total_minor across rows with line_type IN ('product','other')
-  SHOULD approximate the receipt's printed SUBTOTAL (within \$0.01
-  rounding). 'other' counts toward coverage because the TOTAL-ONLY row
-  below stands in for product lines the source would not let you read.
+Two different failures, two different answers. Do not confuse them.
 
-  The remaining rows — tax / tip / discount / shipping / surcharge /
-  service_fee / gift_card — carry the rest (discount rows are
-  negative), so Σ of ALL rows ≈ the printed GRAND TOTAL.
+  NOTHING is itemizable — a total-only receipt, no item section, fully
+  illegible thermal print, an image that is only a total:
+    emit exactly ONE row —
+      line_type='other', item_class='other', confidence='low',
+      raw_name='TOTAL ONLY', line_total_minor=<TOTAL_MINOR>,
+      parent_line_no=NULL, product_key=NULL,
+      tags=['no-item-section'].
 
-  If the coverage sum is off by more than \$0.50, drop confidence to
-  "low" on the items that look most suspect.
+  SOME lines are readable but part of the item block is BLOCKED — a
+  hand or thumb over the paper, a fold, a glare or flash band, a tear,
+  a staple, a crop that cuts lines off — and the printed subtotal is
+  materially larger than what you can actually read (gap > \$0.50):
+    keep EVERY readable line at its printed price, AND emit ONE BRIDGE
+    ROW carrying the difference —
 
-  Self-check before COMMIT:
-    Σ tax rows      ≈ the printed tax
-    Σ discount rows ≈ the printed discount (negative)
-    Σ product effective_total ≈ the transaction total
+      line_type         'other'
+      item_class        'other'
+      parent_line_no    NULL
+      product_key       NULL
+      raw_name          a literal description of what blocked the read:
+                        "ITEMS OBSCURED BY HAND (unreadable)"
+                        "LINES CUT OFF BY CROP"
+                        "FOLD OBSCURES ~3 LINES"
+                        "GLARE BAND OVER ITEM BLOCK"
+      normalized_name   NULL
+      line_total_minor  printed subtotal - sum(readable product lines)
+      confidence        'low'
+      tags              ['occluded','unreadable'] (or ['cropped'],
+                        ['glare'], ['torn'] — describe the cause)
+      quantity / unit / unit_price_minor   NULL
 
-If you cannot itemize at all (total-only receipt, unreadable item
-section, illegible thermal print) emit exactly ONE item with
+    The bridge row makes the gap EXPLICIT and auditable instead of
+    silently missing, and it is what lets the receipt still tie.
+      Do NOT invent plausible item names to fill the gap.
+      Do NOT inflate a readable line to absorb it.
+      Do NOT discard the readable lines and fall back to TOTAL ONLY —
+        the readable lines are real data and must survive.
+      Emit at most ONE bridge row per receipt.
 
-  line_type='other', item_class='other', confidence='low',
-  raw_name='TOTAL ONLY', line_total_minor=<TOTAL_MINOR>,
-  parent_line_no=NULL, product_key=NULL,
-  tags=['no-item-section']
+  BRIDGE ONLY FOR SOURCE PROBLEMS. A gap you created yourself — by
+  zeroing a parent, by folding a package charge onto a covered dish, by
+  dropping a row you could not label — is a BUG to fix, not a gap to
+  bridge. Before emitting a bridge row, re-read the two-level rule, the
+  INCLUSIVE guard, and the package rule, and confirm the missing money
+  is genuinely unreadable ink on the source. A bridge row on a legible
+  receipt is a cover-up.
 
-— one label for "money the source would not let me itemize" keeps
-every downstream product-scoped sum a two-value check instead of an
-open-ended one.`;
+── Reconciliation self-check — run this BEFORE you write ──────────────
+
+  A = sum(line_total_minor) over rows with line_type IN ('product','other')
+      (bridge and total-only rows count in A: they stand in for product
+       lines the source would not let you read)
+  A  ~= the printed SUBTOTAL
+  sum(tax rows)      ~= the printed tax
+  sum(tip rows)      ~= the printed tip
+  sum(discount rows) ~= the printed discount (negative)
+  A + tax + tip + discount + shipping/surcharge/service_fee/gift_card
+                     ~= the printed GRAND TOTAL
+
+  Off by > \$0.50 with NO bridge row -> you lost or mis-shaped a line.
+    Go find it. Usual culprits in order: a parent you zeroed, a package
+    charge you transplanted, a printed row you dropped for want of a
+    line_type.
+  Off by > \$0.50 WITH a bridge row -> recompute the bridge amount from
+    the printed subtotal.
+  Within \$0.50 but over 1 cent -> keep it, set confidence='low' on the
+    lines you least trust, and record
+    transactions.metadata.allocation_audit = {kind, expected, got, delta}.
+  Never block the write on a residual; log it.`;
 
 /** Phase 2.7 — per-line tax / tip / discount allocation (#84). The
  *  re-extract SQL writes `tax_minor` / `tip_share_minor` /
@@ -454,6 +603,63 @@ $7.49 so base + add-ons re-sum to the $9.49 actually charged:
     // keep them in product_variant + "variant-price-unresolved" instead.
   ]
 
+Fixed-price PACKAGE with $0.00 covered items (#165) — hot pot, AYCE
+"chang xuan" selections. Contrast this against the INCLUSIVE example
+directly above: there, the parent was REDUCED because it had priced
+children. Here the children are all $0.00, so the GUARD says the
+package charge stays EXACTLY as printed. Two top-level product lines
+(a soup-base/pot charge priced outside the package, and the package
+itself), every covered dish a $0.00 child of the package:
+  items = [
+    {"line_no":1, "raw_name":"Small Pots", "normalized_name":"Small Pots",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "line_total_minor":9098, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"restaurant_dish", "line_type":"product",
+     "product_key":"hot-pot-small-pots", "product_merchant_exclusive":true,
+     "confidence":"high"},
+    {"line_no":2, "raw_name":"AYCE Package (7 guests)",
+     "normalized_name":"All-You-Can-Eat Package", "parent_line_no":null,
+     "quantity":7, "unit":"ea", "line_total_minor":34993, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "line_type":"product", "product_key":"ayce-package",
+     "product_merchant_exclusive":true, "confidence":"high"},
+    {"line_no":3, "raw_name":"绿竹笋 Green Bamboo Shoot",
+     "normalized_name":"Green Bamboo Shoot", "parent_line_no":2,
+     "quantity":1, "unit":"ea", "line_total_minor":0, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "line_type":"product", "confidence":"high"},
+    {"line_no":4, "raw_name":"安格斯肥牛 Angus Beef",
+     "normalized_name":"Angus Beef", "parent_line_no":2,
+     "quantity":1, "unit":"ea", "line_total_minor":0, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "line_type":"product", "confidence":"high"},
+    {"line_no":5, "raw_name":"安格斯肥牛 Angus Beef",
+     "normalized_name":"Angus Beef", "parent_line_no":2,
+     "quantity":1, "unit":"ea", "line_total_minor":0, "currency":"USD",
+     "item_class":"food_drink", "food_kind":"restaurant_dish",
+     "line_type":"product", "confidence":"high"},
+    // … one $0.00 child per printed selection, duplicates kept as
+    // separate rows exactly as the receipt printed them …
+    {"line_no":20, "raw_name":"Promotion", "normalized_name":"Promotion",
+     "parent_line_no":null, "line_total_minor":-7000, "currency":"USD",
+     "item_class":"other", "line_type":"discount", "tags":["promo"],
+     "confidence":"high"},
+    {"line_no":21, "raw_name":"Tax(7.75%)", "normalized_name":"Sales Tax",
+     "parent_line_no":null, "line_total_minor":2875, "currency":"USD",
+     "item_class":"other", "line_type":"tax", "confidence":"high"}
+    // Arithmetic: top-level product lines 9098 + 34993 = 44091 = the
+    // printed SUBTOTAL. 44091 - 7000 + 2875 = 39966 = the printed
+    // GRAND TOTAL. The $0.00 children add nothing, by construction.
+    //
+    // BOTH of these shapes are WRONG and both have shipped before:
+    //   (a) transplanting the 34993 package price onto line 3, the
+    //       covered "Green Bamboo Shoot" — the package vanishes as a
+    //       purchasable thing and a side dish gets a $349.93 history;
+    //   (b) zeroing the 9098 "Small Pots" line as "included in the
+    //       package" — it has NO priced children, so the INCLUSIVE
+    //       guard forbids reducing it. That is $90.98 deleted.
+  ]
+
 Costco gas (single line):
   items = [
     {"line_no":1, "raw_name":"GAS REG", "normalized_name":"Regular Gas",
@@ -462,7 +668,64 @@ Costco gas (single line):
      "item_class":"consumable", "tags":["fuel"], "confidence":"high"}
   ]
 
-AYCE sushi dinner ($46.20):
+Occluded item block — the BRIDGE row (#166). A hand covers part of the
+item list on a grocery receipt; five lines are readable and sum to
+$63.17, but the printed subtotal is $156.09. Keep the readable lines,
+carry the $92.92 gap on ONE explicit bridge row, and preserve the
+printed fee names:
+  items = [
+    {"line_no":1, "raw_name":"SPINACH", "normalized_name":"Spinach",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "line_total_minor":1899, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"grocery_food", "line_type":"product",
+     "product_key":"spinach", "confidence":"high"},
+    {"line_no":2, "raw_name":"TOFU FIRM", "normalized_name":"Firm Tofu",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "line_total_minor":1499, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"grocery_food", "line_type":"product",
+     "product_key":"firm-tofu", "confidence":"high"},
+    {"line_no":3, "raw_name":"PORK BELLY", "normalized_name":"Pork Belly",
+     "parent_line_no":null, "quantity":1, "unit":"lb",
+     "line_total_minor":1299, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"grocery_food", "line_type":"product",
+     "product_key":"pork-belly", "confidence":"high"},
+    {"line_no":4, "raw_name":"KIMCHI 1KG", "normalized_name":"Kimchi 1kg",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "line_total_minor":999, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"grocery_food", "line_type":"product",
+     "product_key":"kimchi-1kg", "confidence":"high"},
+    {"line_no":5, "raw_name":"GREEN ONION", "normalized_name":"Green Onion",
+     "parent_line_no":null, "quantity":1, "unit":"ea",
+     "line_total_minor":621, "currency":"USD", "item_class":"food_drink",
+     "food_kind":"grocery_food", "line_type":"product",
+     "product_key":"green-onion", "confidence":"high"},
+    {"line_no":6, "raw_name":"ITEMS OBSCURED BY HAND (unreadable)",
+     "normalized_name":null, "parent_line_no":null, "quantity":null,
+     "unit":null, "unit_price_minor":null, "line_total_minor":9292,
+     "currency":"USD", "item_class":"other", "line_type":"other",
+     "product_key":null, "tags":["occluded","unreadable"],
+     "confidence":"low"},
+    {"line_no":7, "raw_name":"SALES TAX", "normalized_name":"Sales Tax",
+     "parent_line_no":null, "line_total_minor":360, "currency":"USD",
+     "item_class":"other", "line_type":"tax", "confidence":"high"},
+    {"line_no":8, "raw_name":"CRV / REDEMPTION FEE",
+     "normalized_name":"CRV Redemption Fee", "parent_line_no":null,
+     "line_total_minor":10, "currency":"USD", "item_class":"other",
+     "line_type":"surcharge", "confidence":"high"}
+    // Arithmetic: 6317 (readable products) + 9292 (bridge) = 15609 =
+    // the printed SUBTOTAL. 15609 + 360 + 10 = 15979 = the printed
+    // GRAND TOTAL.
+    // Do NOT collapse 'surcharge' to 'fee', and do NOT generalize
+    // "CRV Redemption Fee" to "Sales Fee" — that specific printed name
+    // exists nowhere else once the image is filed away.
+    // Do NOT invent five more plausible grocery names to fill the
+    // $92.92, and do NOT throw the readable lines away for a TOTAL
+    // ONLY row.
+  ]
+
+AYCE sushi dinner — flat per-cover pricing, NOT a package ($46.20).
+Nothing here is printed at $0.00, so there is no package line and no
+$0.00 manifest; this is just two ordinary priced lines:
   items = [
     {"line_no":1, "raw_name":"AYCE Lunch", "normalized_name":"All-You-Can-Eat Lunch",
      "quantity":2, "unit":"ea", "unit_price_minor":2199,
