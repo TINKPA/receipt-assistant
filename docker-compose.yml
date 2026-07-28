@@ -11,6 +11,8 @@
 #
 # Requires Docker Compose v2.20+ for `include:` support.
 
+name: receipt-assistant
+
 include:
   - path: langfuse/docker-compose.yml
 

@@ -1,6 +1,17 @@
 # Sandbox stack for frontend-test-runner.
 #
-#   docker compose -p receipts-test -f docker-compose.test.yml up -d --build
+#   docker compose -f docker-compose.test.yml up -d --build
+#
+# The `name:` below pins the compose project. Do NOT remove it. Without it,
+# Compose derives the project name from the directory — which is the same
+# directory the production compose file lives in — and because both files
+# declare the SAME service names (`receipts-postgres`, `receipt-assistant`),
+# Compose concludes the running PRODUCTION containers are stale instances of
+# this file's services and destroys them. That happened on 2026-07-28: a
+# `docker compose -f docker-compose.test.yml up -d` without `-p` removed the
+# prod app and DB containers and took the backend down for ~3 minutes. Data
+# survived only because postgres is on a bind mount, not a named volume.
+# `name:` makes the `-p` flag unnecessary and the mistake impossible.
 #
 # Side-by-side with the production stack — different ports, different
 # postgres volume, different uploads dir, different container names.
@@ -23,6 +34,8 @@
 #
 # Reset script: scripts/sandbox-reset.sh — TRUNCATEs all test tables and
 # nukes test-uploads/, fast (~1s) versus a full down/up cycle.
+
+name: receipts-test
 
 services:
   receipts-postgres:
