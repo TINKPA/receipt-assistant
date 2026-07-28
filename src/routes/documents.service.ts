@@ -26,9 +26,9 @@ import {
   type ReExtractor,
 } from "../ingest/extractor.js";
 import {
-  REEXTRACT_PROMPT_VERSION,
-  REEXTRACT_MODEL,
-} from "../ingest/reextract-prompt.js";
+  PROMPT_VERSION,
+  EXTRACTION_MODEL,
+} from "../ingest/prompt-contract.js";
 import { buildInfo } from "../generated/build-info.js";
 
 export type DocumentKindValue =
@@ -840,9 +840,9 @@ export async function reExtractDocument(
       workspaceId,
       entityType: "document",
       entityId: documentId,
-      promptVersion: REEXTRACT_PROMPT_VERSION,
+      promptVersion: PROMPT_VERSION,
       promptGitSha: buildInfo.gitSha,
-      model: REEXTRACT_MODEL,
+      model: EXTRACTION_MODEL,
       ranAt: new Date(),
       before: beforeSnapshot as unknown as Record<string, unknown>,
       after: afterSnapshot as unknown as Record<string, unknown>,

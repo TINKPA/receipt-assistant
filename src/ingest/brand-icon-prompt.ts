@@ -7,6 +7,14 @@
  * full instructions in its prompt window. Don't reference these phases
  * by source-file path from the prompt; the agent will go looking for
  * `src/ingest/prompt.ts` and waste turns when it can't find it.
+ *
+ * PLAIN template literals, never `String.raw` (#164). These strings used
+ * to be `String.raw`, which passes escape sequences through verbatim —
+ * so the agent's window literally read `psql "\$DATABASE_URL"` and
+ * ``\`brands\``` with the backslashes still attached. When editing,
+ * remember that a plain literal DOES consume `\n` and a trailing `\`
+ * before a newline: shell line-continuations and literal `\n` format
+ * strings must be written doubled (`\\`, `\\n`).
  */
 
 /**
@@ -18,7 +26,7 @@
  * Skip silently to `metadata.icon_resolution='discovery_failed'` when
  * no domain can be found.
  */
-export const PHASE_2_6_BRAND_DISCOVERY = String.raw`── Phase 2.6 — Brand discovery & registry upsert (#101) ───────────────
+export const PHASE_2_6_BRAND_DISCOVERY = `── Phase 2.6 — Brand discovery & registry upsert (#101) ───────────────
 
 Goal: ensure every brand_id you emitted has a row in the global
 \`brands\` registry, with a canonical English name and (when
@@ -91,10 +99,11 @@ Already-cached brands cost only one SELECT. Most receipts hit cache.`;
  * loop and the cache pre-check naturally flows from 4b's classification
  * into 4c's input set.
  */
-export const PHASE_4B_4C_ICON_PIPELINE = String.raw`── Phase 4b — Mechanical icon acquisition (#101) ──────────────────────
+export const PHASE_4B_4C_ICON_PIPELINE = `── Phase 4b — Mechanical icon acquisition (#101) ──────────────────────
 
 For each unique merchant brand_id this run touched. Skip for
-\`unsupported\` and statement-row aggregates with no merchant.
+\`unsupported\` and statement-row aggregates with no merchant (ingest
+only — those classifications do not exist on the re-extract path).
 
 This phase saves every icon candidate it finds. It does NOT pick a
 winner — that's Phase 4c. The goal here is mechanical retention:
@@ -167,7 +176,7 @@ via separate Bash tool calls if you want.
 
     Skip this tier entirely if LOGODEV_SECRET_KEY is unset.
 
-    curl -sS -H "Authorization: Bearer \$LOGODEV_SECRET_KEY" \
+    curl -sS -H "Authorization: Bearer \$LOGODEV_SECRET_KEY" \\
       "https://api.logo.dev/search?q=<urlencoded canonical_name>" | jq -c '.'
 
     Iterate matches with plausible name/domain (cap 3). For each:
@@ -182,7 +191,7 @@ via separate Bash tool calls if you want.
     Compute the slug: lowercase, drop non-alphanumeric. E.g.
     "Best Buy" → "bestbuy".
 
-    curl -sS -o /tmp/si.svg -w '%{http_code} %{content_type}\n' \
+    curl -sS -o /tmp/si.svg -w '%{http_code} %{content_type}\\n' \\
       "https://cdn.simpleicons.org/<slug>"
 
     Only save if HTTP 200 AND content_type starts with "image/svg".
@@ -206,7 +215,7 @@ via separate Bash tool calls if you want.
     com.chagee.us.application on Android — the US-region variant). You
     can also reach the page from a WebSearch "<brand> google play".
 
-    curl -sSL "https://play.google.com/store/apps/details?id=<bundleId>&hl=en_US" \
+    curl -sSL "https://play.google.com/store/apps/details?id=<bundleId>&hl=en_US" \\
       -A "Mozilla/5.0" -o /tmp/gp.html
 
     The icon URL is exposed two ways — pick either:

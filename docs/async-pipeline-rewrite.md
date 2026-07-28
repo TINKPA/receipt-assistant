@@ -1,5 +1,9 @@
 # Async Pipeline Rewrite — Study & Reference Notes
 
+> ⚠️ **HISTORICAL — do not use as a code map.** This is a dated record of the April 2026 rewrite, kept for its A/B evidence and its bug post-mortems. The code it describes is gone: the pre-v1 `receipts` / `receipt_items` tables were replaced by the v1 double-entry ledger (#49), and `src/claude.ts::processReceipt` / `askClaude` / `getSessionJsonlPath` were **deleted in #164**. Every `processReceipt(...)` snippet below names a function that no longer exists. Today's extraction path is `src/ingest/prompt.ts::buildExtractorPrompt` → `src/ingest/extractor.ts::defaultClaudeExtractor` → the agent's own `psql` writes; `getSessionJsonlPath` lives in `src/langfuse.ts`.
+>
+> The one thing here that is still a live **invariant** is the `--json-schema` finding — never reintroduce it. See `CLAUDE.md` → Known Pitfalls.
+>
 > **Context**: Receipt Assistant backend, April 2026. This document captures the design decisions, experiments, bugs, and lessons from collapsing a 3-call Claude CLI pipeline into a single-call agent pipeline with async UX.
 >
 > **Related**: GitHub issue TINKPA/receipt-assistant#6

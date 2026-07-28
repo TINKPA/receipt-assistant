@@ -7,23 +7,37 @@
  * See `receipt-assistant#49` for the architectural move from Phase 1
  * (Node-side coerce + service-layer writes) to Phase 2.
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
   PHASE_4B_4C_ICON_PIPELINE,
 } from "./brand-icon-prompt.js";
-
-/**
- * Manual prompt-version stamp written into `transactions.metadata.extraction`
- * for every ingest. Bump on meaningful prompt changes only — typo fixes
- * and whitespace edits do not warrant a new version. The string becomes
- * the gate for `POST /v1/documents/:id/re-extract` (#91): rows whose
- * `extraction.prompt_version` ≠ `PROMPT_VERSION` are eligible to be
- * re-derived. See #80 / #88 for the 3-layer data model rationale.
- */
-export const PROMPT_VERSION = "2.25";
+import {
+  PROMPT_VERSION,
+  EXTRACTION_MODEL,
+  NO_JSON_SCHEMA_RULE,
+  PSQL_DISCIPLINE,
+  DATE_SELF_CHECK,
+  OCR_AUDIT_REQUIREMENT,
+  agentHygiene,
+  renderActiveLessons,
+} from "./prompt-contract.js";
+import { phase0DocumentRead } from "./document-read-prompt.js";
+import {
+  ITEM_SCHEMA,
+  LINE_TYPE_VOCAB_AND_NAMES,
+  LINE_ITEM_TWO_LEVEL_RULE,
+  LINE_ITEM_COVERAGE_AND_BRIDGE,
+  ALLOCATION_LOGIC,
+  LINE_ITEM_WORKED_EXAMPLES,
+} from "./line-item-prompt.js";
+import {
+  ITEMS_JSON_EXPR,
+  brandFkGuard,
+  productsUpsert,
+  transactionItemsInsert,
+  productAggregateRecompute,
+} from "./items-sql.js";
 
 export interface ExtractorPromptContext {
   /** Absolute path inside the container where the file was staged. */
@@ -63,63 +77,21 @@ upload. The SQL candidate check below still applies.)`;
 }
 
 /**
- * Curated self-evolution loop (#prompt-lessons).
+ * Append-only proposal file the agent writes (Phase 6); never read back.
+ * Runtime-only bind-mount on the mini (`/data/prompt-lessons/`):
+ * ephemeral, unvetted agent output, appended to and never read back.
  *
- * Two files, two homes, by design:
- *   • `lessons.md` — the curated, human-reviewed lesson set. VERSION-
- *     CONTROLLED: it lives next to this module (`src/ingest/lessons.md`,
- *     baked into the image at `dist/ingest/lessons.md`) and ships with the
- *     prompt. It is small, non-sensitive, non-PII, and hand-curated —
- *     irreplaceable knowledge that belongs in git with a review trail, so
- *     the data-tiering "keep out of git" rule (which guards sensitive /
- *     PII / regenerable state) does not apply. Read fresh per call; lines
- *     starting with `#` are comments and are NOT injected.
- *   • `lessons.proposed.md` — the agent's raw per-run PROPOSALS (Phase 6).
- *     RUNTIME-ONLY on the mini (`/data/prompt-lessons/`, a bind-mount):
- *     ephemeral, unvetted agent output, appended to and never read back.
- *
- * Flow: the agent appends a proposal → a human (via the agent-evolver
- * skill) promotes good ones into `lessons.md` as a normal repo change +
- * deploy. "agent proposes → human gatekeeps", so the prompt improves only
- * via vetted lessons, never self-poisons. Missing/empty/unreadable →
- * inject nothing (local dev without the file is fine).
+ * Its counterpart — the curated, human-reviewed `lessons.md` that gets
+ * injected INTO the prompt — lives with `renderActiveLessons()` in
+ * `prompt-contract.ts`, because both prompts inject it. Only the ingest
+ * prompt runs Phase 6, so the proposal path stays here.
  */
-const ACTIVE_LESSONS_PATH =
-  process.env.PROMPT_LESSONS_FILE ??
-  fileURLToPath(new URL("./lessons.md", import.meta.url));
-/** Append-only proposal file the agent writes (Phase 6); never read back.
- *  Runtime-only bind-mount on the mini. */
 const PROPOSED_LESSONS_PATH =
   process.env.PROMPT_LESSONS_PROPOSED ??
   "/data/prompt-lessons/lessons.proposed.md";
 
-function renderActiveLessons(): string {
-  let raw = "";
-  try {
-    raw = readFileSync(ACTIVE_LESSONS_PATH, "utf8");
-  } catch {
-    return "";
-  }
-  // Drop comment lines (start with '#') and blanks; keep only lesson lines.
-  const body = raw
-    .split("\n")
-    .filter((line) => !line.trimStart().startsWith("#"))
-    .join("\n")
-    .trim();
-  if (!body) return "";
-  return `
-── Learned lessons (curated, human-reviewed — apply these) ────────────
-
-Short lessons distilled from past extractions and approved by a human.
-They encode real mistakes and wins from earlier runs; treat them as
-high-priority guidance that overrides your default habits where they
-conflict. (These are vetted rules, NOT your own proposals.)
-
-${body}
-`;
-}
-
 export function buildExtractorPrompt(ctx: ExtractorPromptContext): string {
+  const scratchDir = `/tmp/${ctx.ingestId}`;
   return `You are a v1 double-entry ledger extractor. You will classify a
 financial document, extract its fields, optionally geocode the merchant,
 and **write the result directly into Postgres** via the psql Bash tool.
@@ -136,103 +108,15 @@ Context variables for SQL:
   DOCUMENT_ID   = '${ctx.documentId}'
   USER_ID       = '${ctx.userId}'
 
-DB connection: \`psql "\$DATABASE_URL"\` — the env var is set. Use it for
-every SQL call. If you want a multi-statement block, use a heredoc:
-  psql "\$DATABASE_URL" <<'SQL'
-    BEGIN;
-    ...
-    COMMIT;
-  SQL
+${PSQL_DISCIPLINE}
 
 Optional: if you want to discover schema details, \`\\d\` works:
   psql "\$DATABASE_URL" -c "\\d transactions"
   psql "\$DATABASE_URL" -c "SELECT id, name, type FROM accounts WHERE workspace_id = '${ctx.workspaceId}' ORDER BY type, name"
 
-Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
-concurrently in this container and /tmp is shared: a generic name like
-/tmp/receipt_rot.jpg WILL be overwritten by a sibling agent mid-run,
-and you will silently read someone else's receipt (#143 — this
-happened: an agent extracted the neighbor's Trader Joe's receipt under
-a Kelly's Coffee ingest and rationalized the mismatch as a stale EXIF
-preview). Rules:
-  - First command before any image work:
-      mkdir -p /tmp/${ctx.ingestId}
-    and create EVERY scratch file inside that directory.
-  - If a crop/rotation ever shows a DIFFERENT merchant than your first
-    read of the original upload, do NOT rationalize it (no "stale
-    preview" theories). Re-read the ORIGINAL file at
-    ${ctx.filePath} and trust only what it shows.
-
-Tool discipline — SEQUENTIAL Bash calls only. Issue Bash tool calls one
-at a time and wait for each result before deciding the next command.
-NEVER batch multiple Bash invocations into one parallel tool-call block:
-if any one errors, every sibling call is cancelled mid-flight, and the
-cascade of cancellations is disorienting enough to corrupt your own
-extraction state (#126). One command, one result, then the next.
-
-── Priority & effort budget — READ FIRST, governs everything below ────
-
-This job has ONE required deliverable plus a best-effort tail. Keep them
-straight, or you will burn minutes on polish while the core sits unfinished.
-Trace evidence: routine receipts finish in ~7 tool calls, but some balloon
-to 40+ turns — and the extra 30 turns are almost always merchant enrichment
-(Google fetches, storefront photos, brand icons), NOT harder extraction.
-
-CORE — required. Do this and commit it no matter what:
-  classify → extract fields → write the balanced double-entry transaction
-  (+ postings + line items + document link) → close the ingest in Phase 5.
-  A run that commits a correct, balanced transaction and closes the ingest
-  is a SUCCESS even if it did zero enrichment.
-
-ENRICHMENT — best-effort, SECONDARY. You may abbreviate or SKIP any of it:
-  Phase 3 (Google place resolve / multilingual fetch / storefront photos)
-  and the brand-icon resolution pipeline. These are polish and a cache.
-  You have full authority to skip them. They must NEVER:
-    • block, delay, or fail the core write;
-    • trigger a self-correction loop — if a step errors or a column/table
-      surprises you, do NOT grind on it; record it briefly and move on;
-    • keep you working once the core is committed and marginal value is low.
-
-Spend effort PROPORTIONAL to difficulty and value. A routine receipt from
-an obvious merchant should finish in a handful of tool calls. If you notice
-you are many turns deep and the core is already committed, STOP enriching
-and go close the ingest.
-
-Skip heuristics — YOUR judgment, examples not an exhaustive rulebook:
-  • Place already cached (Phase 3b hit) → make zero outbound Google calls.
-  • Globally English-first brand with no CJK anywhere on the receipt →
-    skip storefront-photo OCR AND skip downloading photos; there is nothing
-    Chinese to find, so the fetch is pure waste.
-  • Storefront photos are only worth downloading when you actually need
-    them for CJK OCR (Phase 3d). Otherwise skip the download entirely —
-    they are a nice-to-have cache, not part of a complete extraction.
-  • Brand-icon resolution is optional visual polish. Do it when it is quick
-    and the asset is readily found; skip it when the core is done and it is
-    not. Never chase an icon across many fallback providers.
-  • The FREE checks stay ON: receipt-OCR CJK (Phase 3e) and the date
-    self-check (Phase 3.5 Checks A/B) cost no extra calls — always do them.
-    (Phase 3.5 Check C reuses an existing geocode, so it is naturally
-    skipped whenever you skipped Phase 3 — it never forces a new call.)
-
-When you deliberately skip an enrichment step, record it so the trace shows
-a decision, not a failure:
-  metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok
+${agentHygiene({ scratchDir, filePath: ctx.filePath })}
 ${renderActiveLessons()}
-── Reading the document (especially PDFs) ────────────────────────────
-
-For a PDF, do NOT hand-parse the byte structure (decompressing streams,
-mapping Form XObjects, sorting content-stream placements) — that path is
-slow and error-prone. Rasterize to an image and read the pixels, which is
-what you do best:
-
-  pdftoppm -png -r 200 "${ctx.filePath}" /tmp/${ctx.ingestId}/page
-  # → /tmp/${ctx.ingestId}/page-1.png, page-2.png, …  then Read those PNGs.
-
-\`pdftoppm\` and \`pdftotext\` (poppler) plus \`gs\` (ghostscript) are
-installed. \`pdftotext -layout "${ctx.filePath}" -\` gives a fast text
-layer for text-based PDFs; when the PDF is a flattened form or its text
-layer is empty/garbled, prefer the rasterized PNG. Only fall back to
-manual stream decoding if those tools are genuinely unavailable.
+${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
 
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
@@ -244,8 +128,7 @@ Read the file (image / pdf / html / .eml) and decide which category:
   statement_pdf   credit-card or bank statement with many line items
   unsupported     anything else (W-2, menu, junk, illegible, non-financial)
 
-Reason in plain text first. Chain-of-thought measurably improves OCR.
-Do NOT use \`--json-schema\`-style structured output.
+${NO_JSON_SCHEMA_RULE}
 
 ── Phase 2 — Extract ──────────────────────────────────────────────────
 
@@ -255,6 +138,8 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
   occurred_on   : date in YYYY-MM-DD form (read from the document —
                   NEVER fall back to today's date). If year is missing,
                   infer from nearby context (statement period etc.).
+  occurred_at   : timestamp YYYY-MM-DD HH:MM:SS+TZ if a time is
+                  printed; NULL otherwise
   total_minor   : the receipt's FINAL "Grand Total" — the amount actually
                   charged — in the currency's minor unit (integer cents for
                   USD, whole units for JPY). Include handwritten tips.
@@ -280,386 +165,23 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   receipt_email / receipt_pdf. Statement PDFs
                   continue to skip items (each statement row IS a
                   transaction, no sub-itemization possible).
-  raw_text      : optional full transcription (helps debugging)
+  raw_text      : full transcription (written to \`documents.ocr_text\`)
 
-── items[] shape (per line on the receipt) ───────────────────────────
+${ITEM_SCHEMA}
 
-Each \`item\` object has these fields:
+${LINE_TYPE_VOCAB_AND_NAMES}
 
-  line_no            int      1-based, preserves the order printed
-                              on the receipt
-  parent_line_no     int|null  #162 CANONICAL TWO-LEVEL RULE. When this
-                              line is a PAID modifier / add-on / topping /
-                              size-upgrade that belongs to another item,
-                              set this to that owning item's line_no. NULL
-                              for top-level items and for tax/tip/discount
-                              audit rows. See the "Two-level line-items"
-                              block below — this is how a "+$3.00 Fish
-                              Cutlet" add-on attaches to its parent dish
-                              instead of floating as a peer line.
-  raw_name           text     the line as printed, verbatim (don't
-                              normalize — preserve abbreviations,
-                              brand prefixes, codes)
-  normalized_name    text|null brand-stripped human-readable form
-                              (e.g. "KS PPR TWLS 12CT" → "Paper
-                              Towels"). NULL when the raw name is
-                              already clean or impossible to clean.
-                              #162: this is the CLEAN ITEM NAME ONLY —
-                              never append a relational suffix like
-                              "(curry modifier)" / "(curry topping)".
-                              A modifier's name is just "Fish Cutlet",
-                              and parent_line_no carries the relationship.
-  quantity           num|null  2, 0.5, 1 default if unprinted
-  unit               text|null "ct", "lb", "kg", "oz", "ea", "ml",
-                              or NULL when not printed
-  unit_price_minor   int|null  minor units (cents for USD), NULL when
-                              not printed (single line items often omit)
-  line_total_minor   int       REQUIRED. Minor units. Signed —
-                              negative for line-level discounts /
-                              coupons / store-applied promos
-  currency           text      ISO 4217, same as the transaction
-  item_class         enum      one of:
-                                 durable      — expected life ≥ 1 year
-                                                (electronics, furniture,
-                                                appliances, clothing,
-                                                kitchenware, tools)
-                                 consumable   — used up in weeks/months
-                                                (cleaning supplies,
-                                                toiletries, batteries,
-                                                fuel, OTC meds, paper
-                                                products, light bulbs)
-                                 food_drink   — anything edible/potable
-                                 service      — non-physical (massage,
-                                                haircut, delivery fee,
-                                                itemized service charge)
-                                 other        — refunds, gift cards,
-                                                tax appearing as its
-                                                own line. Rare; if you
-                                                use this often, the
-                                                receipt is probably
-                                                ambiguous — flag in tags.
-  durability_tier    enum|null only when item_class='durable':
-                                 luxury   — line total > \$200 OR brand
-                                            is luxury-list (Apple
-                                            high-end, LV, Hermès, …)
-                                 standard — otherwise
-                                NULL for non-durable items.
-  food_kind          enum|null only when item_class='food_drink':
-                                 restaurant_dish — dining/cafe merchant
-                                 grocery_food    — market for home cook
-                                 beverage        — drinks bought as
-                                                   drinks (latte, water,
-                                                   beer). Alcohol →
-                                                   add "alcohol" tag.
-                                NULL for non-food items.
-  tags               text[]|null freeform low-trust signals:
-                                ["alcohol","cold","organic","sale",
-                                 "imported","handwritten","unclear"]
-  confidence         enum      one of:
-                                 high   — line crisp, totals tie
-                                 medium — readable but ambiguous
-                                 low    — thermal-paper smudge,
-                                          ink fade, partial occlusion
+${LINE_ITEM_COVERAGE_AND_BRIDGE}
 
-  ── Phase 1 of #84: products SSOT + allocation fields ──
+${LINE_ITEM_TWO_LEVEL_RULE}
 
-  line_type          text       prompt-recommended values:
-                                 product  — the default, an actual line
-                                 tax      — printed tax aggregate row
-                                 tip      — printed tip aggregate row
-                                 discount — store discount aggregate row
-                                 shipping | surcharge | service_fee |
-                                 gift_card | …
-                                Invent a snake_case label when none fit.
-                                tax/tip/discount rows MUST appear if
-                                printed — they're the audit baseline
-                                against the per-line allocations below.
-
-  product_key        text|null  kebab-case canonical key. REQUIRED for
-                                line_type='product'; NULL for tax/tip/
-                                discount rows. Format: ^[a-z0-9-]+\$.
-                                Same product → same key forever.
-                                Variants get distinct keys:
-                                  iphone-15-pro-natural-titanium-256
-                                  iphone-15-pro-blue-titanium-256
-                                  kirkland-paper-towels-12ct
-                                  starbucks-grande-latte
-                                  costco-gas-regular   (NOT just "gas")
-                                Don't include the merchant id in the key
-                                — merchant scoping lives on a separate
-                                column.
-
-  product_brand_id   text|null  the manufacturer brand, NOT the seller.
-                                "apple" for iPhone, "kirkland" for KS
-                                products, "starbucks" for in-store
-                                espresso. Mirror the merchant block's
-                                brand_id rules.
-
-  product_merchant_exclusive bool|null
-                                true  → this product only exists at
-                                        this merchant (Crunchwrap @
-                                        Taco Bell, AYCE @ Sichuan Spicy
-                                        Bay, in-store private label).
-                                        Phase 4 binds product.merchant_id
-                                        to this receipt's merchant.
-                                false → portable / cross-merchant
-                                        (iPhone, Coke, brand-name goods).
-                                        product.merchant_id stays NULL
-                                        and the row shares across stores.
-
-  product_model      text|null   "M3 13\\" 256GB", "iPad Pro 11\\""
-  product_color      text|null   "Natural Titanium", "Black", "Red"
-  product_size       text|null   "L", "12 ct", "750 ml"
-  product_variant    text|null   #162 CANONICAL: a single human-readable
-                                string of THIS line's ZERO-COST
-                                customizations — free options that change
-                                the item but add no price (少糖 / 半糖 /
-                                去冰 / "Less Sugar" / "Ice Blended" /
-                                "no cilantro" / a free spice level).
-                                Join multiple with ", ". NEVER put a PAID
-                                add-on here (those become their own priced
-                                child line via parent_line_no). Also used
-                                as the catalog product's free-text variant
-                                (flavor, fit, finish). NULL when the line
-                                has no free customizations.
-  product_sku        text|null   when printed on the receipt
-  product_manufacturer text|null when the brand and the manufacturer
-                                differ ("kirkland" brand made by
-                                "georgia-pacific" manufacturer); leave
-                                NULL when they match.
-
-  tax_minor          int|null    per-line tax share allocated from the
-                                printed tax aggregate. See Phase 2.7
-                                allocation logic. NULL on tax/tip/
-                                discount rows themselves and on lines
-                                you decide are non-taxable.
-  tip_share_minor    int|null    per-line tip share from printed tip.
-  discount_share_minor int|null  per-line discount share. Signed
-                                positive (always reduces). NULL when
-                                no discount applies.
-
-Arithmetic invariant — Σ line_total_minor across all items SHOULD
-approximate the receipt's printed subtotal (within \$0.01 rounding;
-tax/tip/discount lines are themselves items or excluded — see
-Examples). When the sum is off by more than \$0.50, drop confidence
-to "low" on the items that look most suspect.
-
-If you cannot itemize at all (total-only receipt, unreadable item
-section, illegible thermal print) emit ONE item with
-item_class='other', confidence='low', raw_name='TOTAL ONLY',
-line_total_minor=<TOTAL_MINOR>, and a tags entry explaining why
-("unreadable", "no-item-section").
-
-── Two-level line-items — the ONE rule for modifiers (#162) ───────────
-
-Restaurant / cafe / boba receipts print a dish or drink followed by
-its modifiers (toppings, add-ons, size upgrades, sugar/ice levels,
-spice levels). Decide each modifier's fate by ONE test — does it have
-a PRICE?
-
-  PRICED add-on  → it is a LINE.
-    Emit it as its OWN item object with a real line_total_minor, and
-    set parent_line_no = the owning dish/drink's line_no. Give it a
-    clean normalized_name ("Fish Cutlet", "Large Rice", "Soybean
-    Mousse") — NO "(curry modifier)" / "(topping)" relational suffix;
-    parent_line_no already encodes the relationship.
-    Keep item_class/food_kind consistent with the parent (a paid
-    topping on a dish is still food_drink / restaurant_dish).
-
-    ADDITIVE vs INCLUSIVE pricing — get the parent's line_total right:
-    • ADDITIVE (e.g. CoCo): the dish shows a base price and each paid
-      modifier is printed with its own price ADDED on top. Keep the
-      parent at its base; the children carry their own prices; they
-      sum naturally.
-    • INCLUSIVE (common on Snackpass / boba / combo receipts): the
-      item shows ONE all-in customized price and the modifier prices
-      are COMPONENTS of it, not charged on top. To split without
-      double-counting, REDUCE the parent's line_total to the base =
-      (displayed price − Σ priced add-ons); the children then re-add
-      up to the displayed price.
-    INVARIANT either way: parent base + Σ its child add-ons = the price
-    actually charged for that item. NEVER leave the parent at the
-    all-in price AND also emit priced children — that double-counts and
-    breaks Σ line_total = subtotal.
-
-  ZERO-COST option → it is an ATTRIBUTE.
-    Do NOT emit a separate line. Fold it into the PARENT item's
-    product_variant string ("Less Sugar", "No Ice", "Spice Level 2",
-    "no cilantro"). Multiple free options join with ", ".
-
-Never do the reverse: never bury a priced add-on inside a
-product_variant string (it would vanish from the ledger totals), and
-never spawn a peer line for a free customization (it would double the
-item count and break Σ line_total).
-
-If a modifier's price is genuinely not itemized on the source (some
-receipts bundle "Milk Tea +Boba" at one blended price with no
-breakout), you cannot invent a split: keep the add-on name in the
-parent's product_variant and add a "variant-price-unresolved" tag on
-the parent so the limitation is auditable. Prefer a priced child line
-whenever the source shows any separable price.
-
-── Worked examples ───────────────────────────────────────────────────
-
-Two-level dish with paid modifiers (#162) — real CoCo Ichibanya order:
-two plain dishes, then a "Fried Chicken Curry" $14.64 base with three
-separately-PRICED modifiers (Large Rice $1.00, Level 4 spice $0.80,
-Fish Cutlet $3.00). Every modifier here is priced, so every one is its
-own child line (none go to product_variant); if any had been free
-("Less Sauce", "No Onion") it would instead ride on line 3's
-product_variant string:
-  items = [
-    {"line_no":1, "raw_name":"Naan Bread", "normalized_name":"Naan Bread",
-     "parent_line_no":null, "quantity":1, "unit":"ea",
-     "unit_price_minor":250, "line_total_minor":250, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"restaurant_dish",
-     "confidence":"high"},
-    {"line_no":2, "raw_name":"Garlic Naan", "normalized_name":"Garlic Naan",
-     "parent_line_no":null, "quantity":1, "unit":"ea",
-     "unit_price_minor":300, "line_total_minor":300, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"restaurant_dish",
-     "confidence":"high"},
-    {"line_no":3, "raw_name":"Fried Chicken Curry",
-     "normalized_name":"Fried Chicken Curry", "parent_line_no":null,
-     "quantity":1, "unit":"ea", "unit_price_minor":1464,
-     "line_total_minor":1464, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"restaurant_dish", "confidence":"high"},
-    {"line_no":4, "raw_name":"Large Rice", "normalized_name":"Large Rice",
-     "parent_line_no":3, "quantity":1, "unit":"ea",
-     "unit_price_minor":100, "line_total_minor":100, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"restaurant_dish",
-     "confidence":"high"},
-    {"line_no":5, "raw_name":"Level 4", "normalized_name":"Spice Level 4",
-     "parent_line_no":3, "quantity":1, "unit":"ea",
-     "unit_price_minor":80, "line_total_minor":80, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"restaurant_dish",
-     "confidence":"high"},
-    {"line_no":6, "raw_name":"Fish Cutlet", "normalized_name":"Fish Cutlet",
-     "parent_line_no":3, "quantity":1, "unit":"ea",
-     "unit_price_minor":300, "line_total_minor":300, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"restaurant_dish",
-     "confidence":"high"}
-    // + a tax line ($1.93) with line_type='tax'. Σ product lines = $24.94
-    // subtotal. Modifiers are children of line 3, NOT peers named
-    // "Fish Cutlet (curry topping)", NOT folded into product_variant.
-  ]
-
-Boba drink, free customizations only (#162)
-(3CAT "Brown Sugar Milk Tea" $5.50, Less Sugar + Ice Blended, both free):
-  items = [
-    {"line_no":1, "raw_name":"Brown Sugar Milk Tea",
-     "normalized_name":"Brown Sugar Milk Tea", "parent_line_no":null,
-     "product_variant":"Less Sugar, Ice Blended",
-     "quantity":1, "unit":"ea", "unit_price_minor":550,
-     "line_total_minor":550, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"beverage", "confidence":"high"}
-  ]
-  If that same drink instead showed "+Soybean Mousse $0.75" printed
-  with a price, Soybean Mousse becomes line_no 2 with parent_line_no=1
-  and line_total_minor=75. If the price is NOT itemized, keep
-  "+Soybean Mousse" in product_variant and tag line 1
-  "variant-price-unresolved".
-
-Boba drink, INCLUSIVE paid add-ons (#162)
-(3CAT "Avomango Sweet Dew" shown at ONE all-in $9.49; its +Soybean
-Mousse ($1.25) and +Agar Boba ($0.75) are COMPONENTS of that $9.49,
-and Less Sugar / Ice Blended are free). Reduce the parent to base
-$7.49 so base + add-ons re-sum to the $9.49 actually charged:
-  items = [
-    {"line_no":1, "raw_name":"Avomango Sweet Dew",
-     "normalized_name":"Avomango Sweet Dew", "parent_line_no":null,
-     "product_variant":"Less Sugar, Ice Blended",
-     "quantity":1, "unit":"ea", "unit_price_minor":749,
-     "line_total_minor":749, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"beverage", "confidence":"high"},
-    {"line_no":2, "raw_name":"Soybean Mousse",
-     "normalized_name":"Soybean Mousse", "parent_line_no":1,
-     "quantity":1, "unit":"ea", "unit_price_minor":125,
-     "line_total_minor":125, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"beverage", "confidence":"high"},
-    {"line_no":3, "raw_name":"Agar Boba", "normalized_name":"Agar Boba",
-     "parent_line_no":1, "quantity":1, "unit":"ea",
-     "unit_price_minor":75, "line_total_minor":75, "currency":"USD",
-     "item_class":"food_drink", "food_kind":"beverage", "confidence":"high"}
-    // base 749 + 125 + 75 = 949 = the price charged for the drink.
-    // Do NOT emit the parent at 949 AND these children — that is 1074,
-    // double-counting $1.25+$0.75. If the add-on prices were NOT shown,
-    // keep them in product_variant + "variant-price-unresolved" instead.
-  ]
-
-Costco gas (single line):
-  items = [
-    {"line_no":1, "raw_name":"GAS REG", "normalized_name":"Regular Gas",
-     "quantity":12.345, "unit":"gal", "unit_price_minor":419,
-     "line_total_minor":5176, "currency":"USD",
-     "item_class":"consumable", "tags":["fuel"], "confidence":"high"}
-  ]
-
-AYCE sushi dinner ($46.20):
-  items = [
-    {"line_no":1, "raw_name":"AYCE Lunch", "normalized_name":"All-You-Can-Eat Lunch",
-     "quantity":2, "unit":"ea", "unit_price_minor":2199,
-     "line_total_minor":4398, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"restaurant_dish", "confidence":"high"},
-    {"line_no":2, "raw_name":"Hot Tea", "normalized_name":"Hot Tea",
-     "quantity":2, "unit":"ea", "unit_price_minor":150,
-     "line_total_minor":300, "currency":"USD", "item_class":"food_drink",
-     "food_kind":"beverage", "confidence":"high"}
-  ]
-
-Best Buy laptop ($1,599):
-  items = [
-    {"line_no":1, "raw_name":"MBA M3 13 256GB", "normalized_name":"MacBook Air M3 13\" 256GB",
-     "quantity":1, "unit":"ea", "unit_price_minor":159900,
-     "line_total_minor":159900, "currency":"USD",
-     "item_class":"durable", "durability_tier":"luxury",
-     "tags":["electronics","apple"], "confidence":"high"}
-  ]
+${LINE_ITEM_WORKED_EXAMPLES}
 
 For statement_pdf, pull rows: { date, payee, amount_minor }.
 
 For unsupported, record a short reason.
 
-── Phase 2.7 — Per-line tax / tip / discount allocation (#84) ─────────
-
-Receipts print aggregate tax / tip / discount; users want "what did
-this specific line cost me, all-in." Allocate per-line at ingest.
-Recommended logic (apply real arithmetic; do NOT hard-code rates):
-
-Tax allocation:
-  1. Look for per-line taxability markers ("T", "T1/T2", asterisks
-     next to specific lines, "Taxable" labels).
-  2. If markers present: \`tax_minor\` for each taxable line =
-     ROUND(printed-tax-total × line_total_minor / Σ taxable lines).
-     Non-taxable lines → tax_minor = NULL.
-  3. If no markers: treat all line_type='product' rows as equally
-     taxable and allocate proportionally.
-  4. Make Σ tax_minor exactly match the printed tax (absorb the
-     rounding remainder on the largest line).
-
-Tip allocation (dining receipts):
-  Split the printed tip total proportionally across product lines
-  by \`line_total_minor\`. Tips are for the whole meal.
-
-Discount allocation:
-  Receipt names the target ("20% off Item X") → put it all on that
-  line. Whole-order ("\$5 off subtotal") → split proportionally.
-  BOGO / "buy 2 get 1 free" / promo edge cases → use judgment;
-  record the reasoning in transactions.metadata.allocation_audit.
-
-Always emit the printed tax / tip / discount rows themselves as
-items with line_type ∈ ('tax','tip','discount') and product_key=NULL.
-Their tax_minor / tip_share_minor / discount_share_minor stay NULL
-— a tax line is not itself taxed.
-
-Final self-check before COMMIT:
-  Σ effective_total_minor (line_type='product') ≈ transactions.total
-  Σ tax_minor      ≈ items where line_type='tax'
-  Σ tip_share_minor ≈ items where line_type='tip'
-  Σ discount_share_minor ≈ items where line_type='discount'
-Discrepancies > 1¢ → record in transactions.metadata.allocation_audit
-(structured object: \`{kind, expected, got, delta}\`). Don't block
-ingest — just log.
+${ALLOCATION_LOGIC}
 
 ── Phase 2.5 — Merchant canonicalization (#64) ────────────────────────
 
@@ -1008,56 +530,7 @@ Also record provenance in metadata:
 This phase is FREE — it uses OCR you've already done. Always run
 it before giving up on the Chinese name.
 
-── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
-
-Round 1 + Round 2 (40 receipts total) showed that **failures cluster
-on two axes**: (a) date OCR errors (wrong year, day/month digit swaps)
-and (b) payee OCR errors when a merchant name is ambiguous. Generic
-"re-read the receipt" verification is net-zero — it adds prompt length
-without improving digit accuracy. So this phase is **narrow and
-evidence-driven**: only the two checks that provably help.
-
-### Check A — Year sanity (30-second check, catches #27 regression)
-
-Before committing your YYYY-MM-DD:
-
-  1. What year did you extract? Say it out loud: "I extracted year YYYY."
-  2. Today's date (from \`date\` command if needed) is 2026-04-20.
-  3. Is your extracted year more than 12 months before today? Receipts
-     are almost always from the current or previous calendar year.
-  4. If your year is 2023 or earlier AND today is 2026: **LOOK AGAIN**
-     at the year digit on the receipt. It is statistically extremely
-     unlikely that a receipt processed today is 2+ years old.
-     Common misread: "2025" rendered as "2023" on faint thermal paper;
-     the middle digit is usually '2' with the last digit 5 vs 3.
-
-### Check B — Multi-candidate date enumeration (catches day-digit swaps)
-
-Receipts often have multiple date-like strings: header print date,
-transaction date, auth code timestamp, rewards expiry. They're NOT
-all the same date.
-
-Before picking ONE \`occurred_on\`:
-
-  1. List every date-like string you can see on the receipt. Examples:
-       - "09/30/2025 14:22:07" (top, likely transaction time)
-       - "Valid through 12/31/2025" (bottom coupon)
-       - "Auth code 092525" (middle, could be date-embedded)
-  2. Identify which is the transaction date. It's usually:
-       - Near the top (header), OR
-       - Adjacent to total/payment line, OR
-       - Labeled "Date:" / "Trans Date:" / "Sale Date:"
-  3. If only ONE date appears, use it. If multiple, pick by label
-     proximity to total/tender.
-  4. For the chosen date, verify DAY digits specifically — in US
-     MM/DD/YYYY format, day digits can be transposed (30↔03, 28↔82).
-     Day must be 1–31; month must be 1–12. If either violates, the
-     digits are swapped.
-
-Emit your date-candidate list in metadata:
-
-  "date_candidates": ["09/30/2025", "12/31/2025"],
-  "chosen_date_reason": "top of receipt adjacent to transaction time"
+${DATE_SELF_CHECK}
 
 ### Check C — Payee cross-check via Google (KEEP — evidence-proven)
 
@@ -1082,23 +555,7 @@ Compare Google's \`name\` with your OCR'd payee:
     Wall Supermarket"): prefer the receipt's printed English/full
     form; record Google's in metadata.ocr_audit.note as context.
 
-### REQUIRED metadata.ocr_audit shape
-
-You MUST populate this key on every receipt ingest (not optional):
-
-  "ocr_audit": {
-    "ocr_raw_payee": "<what you read from the receipt header>",
-    "google_name": "<what Google returned, or null if no geocode>",
-    "correction_applied": true | false,
-    "date_candidates": [ "...", "..." ],
-    "chosen_date_reason": "...",
-    "year_sanity_ok": true | false,
-    "note": "optional freeform observation (e.g., thermal-paper faded, bilingual name, etc.)"
-  }
-
-An ingest without this key is considered incomplete. Emit it even
-when no corrections were needed (correction_applied=false,
-note="clean extraction").
+${OCR_AUDIT_REQUIREMENT}
 
 ### REQUIRED metadata.extraction shape (provenance stamp — #88 / #80)
 
@@ -1110,7 +567,7 @@ prompt/model under which extraction actually ran:
   "extraction": {
     "prompt_version": "${PROMPT_VERSION}",     // bumped manually on meaningful prompt edits
     "prompt_git_sha": "${buildInfo.gitSha}",    // build-time git rev
-    "model":          "${process.env.CLAUDE_MODEL ?? "sonnet"}",
+    "model":          "${EXTRACTION_MODEL}",
     "ran_at":         NOW()                                                    // wall-clock at COMMIT
   }
 
@@ -1129,7 +586,7 @@ v1 schema primer (workspace_id is required on every row):
                      liability: Credit Card
                      asset: Cash, Checking, Savings
   transactions    — one per receipt (or one per statement row)
-                   status IN (draft|posted|voided|reconciled|error)
+                   status IN (draft|posted|reconciled|error)
                    set status='posted' for completed receipts.
   postings        — ≥2 per transaction; SUM(amount_minor) PER currency
                    MUST EQUAL 0. Debit expense = positive; credit
@@ -1181,20 +638,8 @@ exact bracket-free form in BOTH the dedup pre-check query AND when you store
 querying the other silently breaks dedup → duplicate transactions. One form,
 everywhere.
 
-**Decoding the body.** The \`.eml\` body is MIME-encoded (quoted-printable
-or base64, sometimes with non-UTF-8 bytes). Do NOT try to read a raw
-base64 blob, and do NOT improvise your own decoder. Run exactly this
-tested one-liner (stdlib only — handles QP, base64, and charset quirks;
-note \`message_from_binary_file\` + \`policy=email.policy.default\`, both
-required):
-
-  python3 -c "import email,email.policy,sys; m=email.message_from_binary_file(open(sys.argv[1],'rb'),policy=email.policy.default); p=m.get_body(preferencelist=('html','plain')); print(p.get_content() if p else '(no text body found)')" "${ctx.filePath}" > /tmp/email-body.txt
-
-then Read \`/tmp/email-body.txt\`. If (and only if) that command fails,
-fall back to reading the raw \`.eml\` directly — quoted-printable parts
-are human-readable as-is (ignore \`=3D\` and soft \`=\\n\` line-breaks).
-Try ONE approach at a time; never fire multiple decode attempts in
-parallel (see Tool discipline above).
+(Decode the body with the tested MIME one-liner from the "Reading the
+document" phase above before reading it.)
 
 1. **Dedup pre-check — skip the WHOLE ingest if this email was already
    ingested.** A re-forwarded copy has different bytes (so the sha256
@@ -1230,14 +675,7 @@ merchant brand = "best-buy"). \`products.brand_id\` is FK into
 \`brands\`, so before the BEGIN below, run one defensive UPSERT for
 every distinct product_brand_id present in items[]:
 
-  psql "\$DATABASE_URL" <<'SQL'
-    INSERT INTO brands (brand_id, name)
-    SELECT DISTINCT product_brand_id, product_brand_id
-      FROM jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb)
-        AS item(product_brand_id text)
-     WHERE product_brand_id IS NOT NULL
-    ON CONFLICT (brand_id) DO NOTHING;
-  SQL
+${brandFkGuard()}
 
 This is a stub row (domain NULL); we don't run Phase 2.6 discovery
 for product brand_ids in v1. Phase 4b will skip them at the
@@ -1350,10 +788,12 @@ them first):
     ),
     tx AS (
       INSERT INTO transactions (
-        id, workspace_id, occurred_on, payee, status,
+        id, workspace_id, occurred_on, occurred_at, payee, status,
         source_ingest_id, merchant_id, metadata, created_by
       ) VALUES (
-        gen_random_uuid(), '${ctx.workspaceId}', '<YYYY-MM-DD>', '<PAYEE>', 'posted',
+        gen_random_uuid(), '${ctx.workspaceId}', '<YYYY-MM-DD>',
+        <'<YYYY-MM-DD HH:MM:SS+TZ>'::timestamptz | NULL>,
+        '<PAYEE>', 'posted',
         '${ctx.ingestId}',
         (SELECT id FROM m),
         jsonb_build_object(
@@ -1369,13 +809,14 @@ them first):
           'extraction', jsonb_build_object(
             'prompt_version', '${PROMPT_VERSION}',
             'prompt_git_sha', '${buildInfo.gitSha}',
-            'model',          '${process.env.CLAUDE_MODEL ?? "sonnet"}',
-            'ran_at',         NOW()
+            'model',          '${EXTRACTION_MODEL}',
+            'ran_at',         NOW(),
+            'source',         'ingest'
           ),
           -- items[] is REQUIRED for receipt_image / receipt_email /
-          -- receipt_pdf per #81 / PROMPT_VERSION 2.6. Statement_pdf
-          -- omits this key. Each object follows the schema in Phase 2.
-          'items', $items$<ITEMS_JSON_ARRAY>$items$::jsonb
+          -- receipt_pdf per #81. Statement_pdf omits this key. Each
+          -- object follows the schema in Phase 2.
+          'items', ${ITEMS_JSON_EXPR}
           -- add tax/tip/raw_text here if useful, as extra JSONB keys
         ),
         '${ctx.userId}'
@@ -1400,91 +841,20 @@ them first):
       ON CONFLICT DO NOTHING
       RETURNING transaction_id
     ),
-    -- #84 Phase 1: products SSOT upsert. The agent emits a
-    -- product_key per item; this CTE upserts the catalog row keyed by
-    -- (workspace_id, merchant_id, product_key) and returns its id.
-    -- merchant_id is NULL when product_merchant_exclusive=false (the
-    -- product is portable across stores) and the receipt's
-    -- merchant_id when true (in-store private label / dish).
-    -- Non-product lines (line_type ∈ tax/tip/discount/shipping/…) get
-    -- product_key=NULL and skip this step entirely (filtered by the
-    -- WHERE clause). NULLS NOT DISTINCT in the unique index makes
-    -- merchant_id=NULL participate.
-    p_upsert AS (
-      INSERT INTO products (
-        workspace_id, merchant_id, product_key, canonical_name,
-        item_class, brand_id, model, color, size, variant, sku,
-        manufacturer
-      )
-      SELECT '${ctx.workspaceId}',
-             CASE WHEN item.product_merchant_exclusive THEN (SELECT id FROM m) ELSE NULL END,
-             item.product_key,
-             COALESCE(item.normalized_name, item.raw_name),
-             item.item_class, item.product_brand_id,
-             item.product_model, item.product_color, item.product_size,
-             item.product_variant, item.product_sku, item.product_manufacturer
-      FROM jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb) AS item(
-        line_no int, parent_line_no int, raw_name text, normalized_name text,
-        quantity numeric, unit text,
-        unit_price_minor bigint, line_total_minor bigint, currency text,
-        item_class text, durability_tier text, food_kind text,
-        tags text[], confidence text,
-        line_type text, product_key text, product_brand_id text,
-        product_merchant_exclusive boolean, product_model text,
-        product_color text, product_size text, product_variant text,
-        product_sku text, product_manufacturer text,
-        tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
-      )
-      WHERE COALESCE(item.line_type, 'product') = 'product' AND item.product_key IS NOT NULL
-      ON CONFLICT (workspace_id, merchant_id, product_key) DO UPDATE
-        SET updated_at = NOW(),
-            canonical_name = COALESCE(EXCLUDED.canonical_name, products.canonical_name),
-            brand_id       = COALESCE(EXCLUDED.brand_id,       products.brand_id),
-            item_class     = COALESCE(EXCLUDED.item_class,     products.item_class)
-      RETURNING id, product_key, merchant_id
-    ),
+${productsUpsert({ workspaceId: ctx.workspaceId, merchantIdExpr: "(SELECT id FROM m)" })},
     -- #81 Phase 2 + #84: relational line-items with product_id link
     -- and per-line allocation columns. Re-extract on the same tx
     -- bumps extraction_run and soft-deletes the prior run; this
     -- ingest path always writes the first run (run=1, retired_at=NULL).
     ti AS (
-      INSERT INTO transaction_items (
-        id, workspace_id, transaction_id, line_no, parent_line_no,
-        raw_name, normalized_name, product_variant, quantity, unit,
-        unit_price_minor, line_total_minor, currency,
-        item_class, durability_tier, food_kind, tags, confidence,
-        line_type, product_id, tax_minor, tip_share_minor,
-        discount_share_minor, extraction_run, extraction_version
-      )
-      SELECT gen_random_uuid(), '${ctx.workspaceId}', tx.id, item.line_no,
-             item.parent_line_no,
-             item.raw_name, item.normalized_name, item.product_variant,
-             item.quantity, item.unit,
-             item.unit_price_minor, item.line_total_minor, item.currency,
-             item.item_class, item.durability_tier, item.food_kind,
-             item.tags, item.confidence,
-             COALESCE(item.line_type, 'product'),
-             (SELECT pu.id FROM p_upsert pu
-                WHERE pu.product_key = item.product_key
-                  AND pu.merchant_id IS NOT DISTINCT FROM
-                      (CASE WHEN item.product_merchant_exclusive THEN (SELECT id FROM m) ELSE NULL END)
-                LIMIT 1),
-             item.tax_minor, item.tip_share_minor, item.discount_share_minor,
-             1, '${PROMPT_VERSION}'
-      FROM tx,
-        jsonb_to_recordset($items$<ITEMS_JSON_ARRAY>$items$::jsonb) AS item(
-          line_no int, parent_line_no int, raw_name text, normalized_name text,
-          quantity numeric, unit text,
-          unit_price_minor bigint, line_total_minor bigint, currency text,
-          item_class text, durability_tier text, food_kind text,
-          tags text[], confidence text,
-          line_type text, product_key text, product_brand_id text,
-          product_merchant_exclusive boolean, product_model text,
-          product_color text, product_size text, product_variant text,
-          product_sku text, product_manufacturer text,
-          tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
-        )
-      RETURNING id, product_id
+${transactionItemsInsert({
+  workspaceId: ctx.workspaceId,
+  txIdExpr: "tx.id",
+  runExpr: "1",
+  merchantIdExpr: "(SELECT id FROM m)",
+  fromPrefix: "tx,",
+  returning: "id, product_id",
+})}
     )
   SELECT tx.id AS tx_id FROM tx;
   COMMIT;
@@ -1498,38 +868,7 @@ optional; use the workspace base currency snapshot already on
 \`postings.amount_base_minor\` for total_spent_minor:
 
   psql "\$DATABASE_URL" <<'SQL'
-  WITH touched AS (
-    -- Only the products THIS ingest touched — recomputing the whole
-    -- workspace every ingest is O(N) per receipt → O(N²) over a backfill.
-    SELECT DISTINCT ti.product_id
-    FROM transaction_items ti
-    JOIN transactions t ON t.id = ti.transaction_id
-    WHERE t.source_ingest_id = '${ctx.ingestId}'
-      AND ti.product_id IS NOT NULL
-  ),
-  stats AS (
-    SELECT ti.product_id,
-           MIN(t.occurred_on)          AS first_on,
-           MAX(t.occurred_on)          AS last_on,
-           COUNT(DISTINCT ti.transaction_id) AS purchases,
-           SUM(ti.effective_total_minor)    AS total_minor
-    FROM transaction_items ti
-    JOIN transactions t ON t.id = ti.transaction_id
-    WHERE ti.workspace_id = '${ctx.workspaceId}'
-      AND ti.product_id IN (SELECT product_id FROM touched)
-      AND ti.retired_at IS NULL
-      AND ti.line_type = 'product'
-    GROUP BY ti.product_id
-  )
-  UPDATE products p SET
-    first_purchased_on = stats.first_on,
-    last_purchased_on  = stats.last_on,
-    purchase_count     = stats.purchases,
-    total_spent_minor  = stats.total_minor,
-    updated_at         = NOW()
-  FROM stats
-  WHERE p.id = stats.product_id
-    AND p.workspace_id = '${ctx.workspaceId}';
+${productAggregateRecompute({ workspaceId: ctx.workspaceId, touchedPredicate: `t.source_ingest_id = '${ctx.ingestId}'` })}
   SQL
 
 If you have a geocode result, run this AFTER the main transaction
@@ -1657,9 +996,20 @@ record \`file_path\` accordingly:
     "
   done
 
-Also stamp the document row (ties it back to this ingest):
+Also stamp the document row — it ties the file back to this ingest AND
+stores the OCR text, so \`documents.ocr_text\` is populated by BOTH the
+ingest and the re-extract path (it used to be re-extract only, which
+made every "what did the agent actually read?" question unanswerable
+for ingest-only documents):
 
-  psql "\$DATABASE_URL" -c "UPDATE documents SET source_ingest_id = '${ctx.ingestId}' WHERE id = '${ctx.documentId}';"
+  psql "\$DATABASE_URL" <<'SQL'
+    UPDATE documents
+       SET source_ingest_id  = '${ctx.ingestId}',
+           ocr_text          = '<RAW_TEXT, single-quote-escaped>',
+           ocr_model_version = '${EXTRACTION_MODEL}',
+           updated_at        = NOW()
+     WHERE id = '${ctx.documentId}';
+  SQL
 
 ### 4a-bis. owned_items judgment (#84 Phase 2)
 

@@ -23,7 +23,9 @@ An open-source, AI-native receipt parsing backend that extracts structured data 
 
 ### Single-call agent pipeline
 
-`--json-schema` mode constrains Claude's output format and **degrades OCR accuracy** (4/10 dates wrong vs 0/10 with plain text), because it skips chain-of-thought reasoning. The current flow (`src/claude.ts::processReceipt`) is a **single `claude -p` invocation** that reads the image, reasons about ambiguous characters in plain text, and writes the extracted fields directly to Postgres via a `psql` tool call — no JSON-schema coercion anywhere. A placeholder receipt row is seeded at upload time and `UPDATE`d by the agent. Full A/B rationale and the prior two-phase variant (kept around for anyone benchmarking a return) live in [`CLAUDE.md`](CLAUDE.md#known-pitfalls).
+`--json-schema` mode constrains Claude's output format and **degrades OCR accuracy** (4/10 dates wrong vs 0/10 with plain text), because it skips chain-of-thought reasoning. The current flow (`src/ingest/prompt.ts::buildExtractorPrompt`, spawned by `src/ingest/extractor.ts`) is a **single `claude -p` invocation** that reads the image, reasons about ambiguous characters in plain text, and writes the whole balanced transaction directly to Postgres via `psql` tool calls — no JSON-schema coercion anywhere. Node never parses fields; it seeds the `ingests` row and waits for the agent to close it. Full A/B rationale and the prior two-phase variant (kept around for anyone benchmarking a return) live in [`CLAUDE.md`](CLAUDE.md#known-pitfalls).
+
+The rules the agent is given are **not** duplicated per prompt: `src/ingest/prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts` and `items-sql.ts` hold the single copy that both the ingest prompt and `reextract-prompt.ts` interpolate (#164).
 
 ### Quality & Business Flags
 
@@ -147,7 +149,7 @@ The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1)
 
 ### OpenAPI contract (for client codegen)
 
-Frontend, macOS, and any future client generate typed bindings from `openapi/openapi.json` instead of hand-writing `fetch` / `URLSession` calls.
+The frontend, and any future client, generates typed bindings from `openapi/openapi.json` instead of hand-writing `fetch` calls.
 
 | File / command | Purpose |
 |---------------|---------|

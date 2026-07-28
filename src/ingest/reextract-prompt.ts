@@ -4,8 +4,12 @@
  *
  * Scope decision (Phase 4c of #80 / #91 MVP):
  *   - Re-extract = re-OCR the receipt against the **current** prompt
- *     and model. Refines payee, occurred_on, occurred_at, currency,
- *     total_minor on the existing transaction; refreshes `documents.ocr_text`.
+ *     and model. Refines payee, occurred_on, occurred_at and the
+ *     `items[]` line-item set on the existing transaction; refreshes
+ *     `documents.ocr_text`. It deliberately does NOT extract a
+ *     transaction total or currency — `transactions` has no such
+ *     columns (they live on `postings`, which are out of scope), so
+ *     asking for them was pure dead work.
  *   - It does NOT touch postings — re-running extraction could change
  *     category/amount and risk the double-entry sum-to-zero invariant.
  *     If category drift matters, edit postings explicitly via the
@@ -24,31 +28,45 @@
  *     reading `metadata.user_edited.<field>` so a user override survives
  *     re-extract verbatim.
  *
- * The prompt itself stays short because the heavy lifting (classify,
- * postings, place resolution) is gone. ~70 lines of prose vs.
- * `src/ingest/prompt.ts`'s ~800.
+ * The extraction CONTRACT — item schema, line_type vocabulary,
+ * two-level modifier rule, coverage invariant, allocation logic,
+ * worked examples, date self-check, psql/agent hygiene, and every
+ * items-related SQL fragment — is NOT restated here. It is imported
+ * from the shared modules (#164) that `prompt.ts` interpolates too,
+ * because the two hand-maintained copies had already drifted apart in
+ * ways that measurably degraded re-extract output.
  */
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
   PHASE_4B_4C_ICON_PIPELINE,
 } from "./brand-icon-prompt.js";
-
-/**
- * Bumped on meaningful re-extract prompt edits. Separate from
- * `PROMPT_VERSION` in `src/ingest/prompt.ts` because the two prompts
- * can drift independently — re-extract has a narrower job. Stamped
- * into `transactions.metadata.extraction.prompt_version` on every run
- * (overwriting the prior value), and into `derivation_events.prompt_version`.
- */
-export const REEXTRACT_PROMPT_VERSION = "1.8";
-
-/**
- * The model identifier we stamp into `documents.ocr_model_version`.
- * Matches the `--model` flag we pass to `claude -p`; kept in sync
- * with the env var fallback in `extractor.ts`.
- */
-export const REEXTRACT_MODEL = process.env.CLAUDE_MODEL || "sonnet";
+import {
+  PROMPT_VERSION,
+  EXTRACTION_MODEL,
+  NO_JSON_SCHEMA_RULE,
+  PSQL_DISCIPLINE,
+  DATE_SELF_CHECK,
+  OCR_AUDIT_REQUIREMENT,
+  agentHygiene,
+  renderActiveLessons,
+} from "./prompt-contract.js";
+import { phase0DocumentRead } from "./document-read-prompt.js";
+import {
+  ITEM_SCHEMA,
+  LINE_TYPE_VOCAB_AND_NAMES,
+  LINE_ITEM_TWO_LEVEL_RULE,
+  LINE_ITEM_COVERAGE_AND_BRIDGE,
+  ALLOCATION_LOGIC,
+  LINE_ITEM_WORKED_EXAMPLES,
+} from "./line-item-prompt.js";
+import {
+  ITEMS_JSON_EXPR,
+  brandFkGuard,
+  productsUpsert,
+  transactionItemsInsert,
+  productAggregateRecompute,
+} from "./items-sql.js";
 
 export interface ReExtractPromptContext {
   /** Absolute path inside the container where the original upload lives. */
@@ -65,6 +83,8 @@ export interface ReExtractPromptContext {
 }
 
 export function buildReExtractPrompt(ctx: ReExtractPromptContext): string {
+  const scratchDir = `/tmp/reextract-${ctx.transactionId}`;
+  const merchantIdExpr = `(SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')`;
   return `You are re-running extraction on a previously-ingested receipt.
 The transaction row already exists; your job is to refresh the
 receipt-readable fields against the current prompt/model. You will
@@ -80,17 +100,20 @@ Context variables for SQL (use as-is):
   WORKSPACE_ID  = '${ctx.workspaceId}'
   DOCUMENT_ID   = '${ctx.documentId}'
   USER_ID       = '${ctx.userId}'
-  PROMPT_VERSION   = '${REEXTRACT_PROMPT_VERSION}'
+  PROMPT_VERSION   = '${PROMPT_VERSION}'
   PROMPT_GIT_SHA   = '${buildInfo.gitSha}'
-  MODEL            = '${REEXTRACT_MODEL}'
+  MODEL            = '${EXTRACTION_MODEL}'
 
-DB connection: \`psql "\$DATABASE_URL"\` — the env var is set.
+${PSQL_DISCIPLINE}
+
+${agentHygiene({ scratchDir, filePath: ctx.filePath })}
+${renderActiveLessons()}
+${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
 
 ── Phase 1 — Extract ──────────────────────────────────────────────────
 
 Read the file at the path above (same image / pdf / .eml the original
-ingest read). Reason in plain text first — chain-of-thought measurably
-improves OCR. Do NOT use \`--json-schema\`-style structured output.
+ingest read). ${NO_JSON_SCHEMA_RULE}
 
 Pull these fields. Use NULL when the field is not visible — never
 guess, never fall back to today's date.
@@ -99,106 +122,25 @@ guess, never fall back to today's date.
   occurred_on   : date in YYYY-MM-DD form (read from the document)
   occurred_at   : timestamp YYYY-MM-DD HH:MM:SS+TZ if a time is
                   printed; NULL otherwise
-  total_minor   : FINAL amount in the currency's minor unit (integer
-                  cents for USD, whole units for JPY). Include
-                  handwritten tips if visible.
-  currency      : ISO 4217 (USD, CNY, EUR, JPY, …)
   raw_text      : full transcription (for \`documents.ocr_text\`)
-  items         : REQUIRED structured line-item array per #81 / REEXTRACT_PROMPT_VERSION 1.1.
-                  Each item is one object with these fields:
-                    line_no            int (1-based, preserves order)
-                    parent_line_no     int|null #162 — when this line is a
-                                       PAID modifier/add-on/topping/size-
-                                       upgrade of another item, set to that
-                                       owning item's line_no; NULL for top-
-                                       level items and tax/tip/discount rows.
-                    raw_name           text (verbatim line)
-                    normalized_name    text|null (brand-stripped) — #162:
-                                       CLEAN ITEM NAME ONLY, never append a
-                                       relational suffix like "(curry
-                                       modifier)"/"(topping)".
-                    product_variant    text|null #162 — one string of THIS
-                                       line's ZERO-COST customizations
-                                       (少糖/去冰/"Less Sugar"/"no cilantro"/
-                                       free spice level), joined by ", ".
-                                       NEVER a paid add-on (that is its own
-                                       priced child line). NULL when none.
-                    quantity           num|null
-                    unit               text|null ("ct","lb","ea",…)
-                    unit_price_minor   int|null (minor units)
-                    line_total_minor   int REQUIRED (signed; negative for discounts)
-                    currency           ISO 4217 (same as transaction)
-                    item_class         enum:
-                                         durable    — life ≥ 1 year
-                                         consumable — used in weeks/months (fuel, paper, batteries)
-                                         food_drink — edible/potable
-                                         service    — non-physical (massage, delivery fee)
-                                         other      — refunds, gift cards, rare
-                    durability_tier    enum|null (only if durable): luxury|standard
-                                       (luxury when single-line total > \$200 OR known
-                                        luxury brand: Apple high-end, LV, Hermès, …)
-                    food_kind          enum|null (only if food_drink):
-                                         restaurant_dish|grocery_food|beverage
-                    tags               text[]|null (freeform: alcohol, cold, organic,
-                                                   sale, imported, handwritten, unclear)
-                    confidence         enum: high|medium|low
-                    line_type          enum: product|tax|tip|discount|
-                                       shipping|fee (default 'product'). #162:
-                                       ALWAYS emit the printed tax / tip /
-                                       discount / fee rows THEMSELVES as named
-                                       items with the matching line_type and
-                                       product_key=NULL — e.g. a "Snackpass
-                                       Credit" −\$5.00 row is line_type=
-                                       'discount' (tags=['promo']); a "Taxes &
-                                       Fees" \$0.51 row is line_type='tax'. Keep
-                                       the printed NAME in raw_name /
-                                       normalized_name. NEVER collapse them into
-                                       the top-level tax_minor/discount_minor
-                                       numbers only — that loses the name.
-                                       parent_line_no NULL for these rows.
+  items         : REQUIRED structured line-item array (#81). Each item
+                  is one object with the exact shape below.
 
-                  Σ line_total_minor across line_type='product' items SHOULD
-                  approximate the receipt's subtotal (within \$0.01); the tax /
-                  tip / discount / fee rows carry the rest (discount rows are
-                  negative), so Σ of ALL rows ≈ the final total. If the product
-                  sum is off by >\$0.50, drop confidence='low' on suspect items.
-                  Self-check before COMMIT: Σ tax rows ≈ printed tax, Σ discount
-                  rows ≈ printed discount, Σ product effective ≈ transaction total.
+${ITEM_SCHEMA}
 
-                  If you cannot itemize at all (total-only receipt, illegible
-                  thermal print), emit ONE item with item_class='other',
-                  confidence='low', raw_name='TOTAL ONLY',
-                  line_total_minor=<TOTAL_MINOR>, tags=['no-item-section'].
+${LINE_TYPE_VOCAB_AND_NAMES}
 
-                  #162 TWO-LEVEL RULE (modifiers). One test: does the
-                  modifier have a PRICE?
-                    PRICED add-on → its OWN item object with a real
-                      line_total_minor and parent_line_no = the owning
-                      dish/drink's line_no. Clean normalized_name (e.g.
-                      "Fish Cutlet", "Large Rice"), NO "(curry modifier)"
-                      suffix. Keep item_class/food_kind like the parent.
-                    ZERO-COST option → NOT a line; fold into the parent's
-                      product_variant string ("Less Sugar, No Ice").
-                  Never bury a priced add-on in product_variant (it would
-                  vanish from totals); never spawn a peer line for a free
-                  option. If a paid add-on's price is not itemized on the
-                  source, keep its name in the parent's product_variant and
-                  add a 'variant-price-unresolved' tag on the parent.
-                  ADDITIVE vs INCLUSIVE: if the item shows ONE all-in price
-                  that already CONTAINS its add-ons (Snackpass / boba /
-                  combo), REDUCE the parent's line_total to base =
-                  (displayed − Σ priced add-ons) so base + children re-sum
-                  to the charged price. INVARIANT: parent base + Σ children
-                  = price charged; never keep the parent at the all-in price
-                  AND emit priced children (double-counts, breaks Σ=subtotal).
-                  E.g. 3CAT "Avomango Sweet Dew" all-in $9.49 incl. +Soybean
-                  Mousse $1.25 + +Agar Boba $0.75 → parent base $7.49 + two
-                  child lines ($1.25, $0.75), free "Less Sugar, Ice Blended"
-                  in product_variant.
-                  Example: CoCo "Fried Chicken Curry" (line 1, $9.00,
-                  product_variant="Less Sauce") with +Large Rice $1.00,
-                  +Spice Level 4 $0.80, +Fish Cutlet $3.00 → three extra
-                  items, each parent_line_no=1, clean names, own prices.
+${LINE_ITEM_COVERAGE_AND_BRIDGE}
+
+${LINE_ITEM_TWO_LEVEL_RULE}
+
+${LINE_ITEM_WORKED_EXAMPLES}
+
+${ALLOCATION_LOGIC}
+
+${DATE_SELF_CHECK}
+
+${OCR_AUDIT_REQUIREMENT}
 
 Place resolution and merchant canonicalization are OUT OF SCOPE for
 re-extract — those have their own endpoints (\`POST /v1/places/:id/refresh\`
@@ -207,22 +149,16 @@ and the merchant enrichment loop). Do NOT touch \`place_id\`,
 
 Postings (the double-entry debit/credit rows under the transaction) are
 also OUT OF SCOPE — re-extract does not rewrite them. Do NOT touch
-\`postings\` or \`document_links\`.
+\`postings\` or \`document_links\`. The transaction's total and currency
+live there, so you do not extract them at all.
 
 ── Phase 2 — Write ────────────────────────────────────────────────────
 
 **Brand FK guard (#101).** Items may carry product_brand_id, which is
-FK into \`brands\`. Re-extract products UPSERT below would fail if the
-brand row doesn't exist. Run this defensively BEFORE the main block:
+FK into \`brands\`. The products UPSERT below would fail if the brand
+row doesn't exist. Run this defensively BEFORE the main block:
 
-  psql "\$DATABASE_URL" <<'SQL'
-    INSERT INTO brands (brand_id, name)
-    SELECT DISTINCT product_brand_id, product_brand_id
-      FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb)
-        AS item(product_brand_id text)
-     WHERE product_brand_id IS NOT NULL
-    ON CONFLICT (brand_id) DO NOTHING;
-  SQL
+${brandFkGuard()}
 
 Run exactly ONE psql block. Substitute your extracted values for the
 placeholders; the CASE statements consult \`metadata.user_edited\` so a
@@ -244,35 +180,49 @@ user override survives this re-extract.
       WHEN (metadata->'user_edited'->>'payee')::boolean IS TRUE THEN payee
       ELSE '<PAYEE>'
     END,
-    metadata = jsonb_set(
-      jsonb_set(
-        jsonb_set(
-          COALESCE(metadata, '{}'::jsonb),
-          '{extraction}',
-          jsonb_build_object(
-            'prompt_version', '${REEXTRACT_PROMPT_VERSION}',
-            'prompt_git_sha', '${buildInfo.gitSha}',
-            'model',          '${REEXTRACT_MODEL}',
-            'ran_at',         NOW()::text,
-            'source',         're-extract'
-          )
-        ),
-        '{items}',
-        '<ITEMS_JSON_ARRAY>'::jsonb
+    -- Top-level jsonb merge. The extraction_history term MUST be
+    -- evaluated from the OLD metadata (it is, inside UPDATE ... SET),
+    -- so it captures the stamp this run is about to overwrite.
+    metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+      -- Never destroy the previous provenance stamp: push the CURRENT
+      -- extraction object onto extraction_history, keeping the newest 5.
+      'extraction_history', (
+        SELECT COALESCE(jsonb_agg(h.elem ORDER BY h.ord), '[]'::jsonb)
+          FROM (
+            SELECT elem, ord
+              FROM jsonb_array_elements(
+                     COALESCE(metadata->'extraction_history', '[]'::jsonb)
+                     || CASE WHEN metadata->'extraction' IS NOT NULL
+                             THEN jsonb_build_array(metadata->'extraction')
+                             ELSE '[]'::jsonb END
+                   ) WITH ORDINALITY AS t(elem, ord)
+             ORDER BY ord DESC
+             LIMIT 5
+          ) h
       ),
-      '{re_extracted_at}',
-      to_jsonb(NOW()::text)
+      'extraction', jsonb_build_object(
+        'prompt_version', '${PROMPT_VERSION}',
+        'prompt_git_sha', '${buildInfo.gitSha}',
+        'model',          '${EXTRACTION_MODEL}',
+        'ran_at',         NOW()::text,
+        'source',         're-extract'
+      ),
+      'items', ${ITEMS_JSON_EXPR},
+      'ocr_audit', $audit$<OCR_AUDIT_JSON>$audit$::jsonb,
+      're_extracted_at', to_jsonb(NOW()::text)
     ),
     version = version + 1
-  WHERE id = '${ctx.transactionId}' AND workspace_id = '${ctx.workspaceId}';
+  WHERE id = '${ctx.transactionId}'
+    AND workspace_id = '${ctx.workspaceId}'
+    AND deleted_at IS NULL;
 
   UPDATE documents SET
     ocr_text          = '<RAW_TEXT, single-quote-escaped>',
-    ocr_model_version = '${REEXTRACT_MODEL}',
+    ocr_model_version = '${EXTRACTION_MODEL}',
     updated_at        = NOW()
   WHERE id = '${ctx.documentId}' AND workspace_id = '${ctx.workspaceId}';
 
-  -- #84 Phase 1: re-extract is now versioned (extraction_run counter
+  -- #84 Phase 1: re-extract is versioned (extraction_run counter
   -- bumps; old run rows soft-deleted via retired_at). Live aggregates
   -- read WHERE retired_at IS NULL, so old purchases drop out and new
   -- ones count immediately — purchase_count stays correct, no drift.
@@ -283,114 +233,26 @@ user override survives this re-extract.
     AND retired_at IS NULL;
 
   -- Insert the freshly extracted rows under run = MAX(prev)+1.
-  -- Capture the run number in a temp var via WITH ... SELECT, then
-  -- INSERT. The agent computes this run number inline below.
   WITH next_run AS (
     SELECT COALESCE(MAX(extraction_run), 0) + 1 AS run
     FROM transaction_items
     WHERE transaction_id = '${ctx.transactionId}'
   ),
-  p_upsert AS (
-    INSERT INTO products (
-      workspace_id, merchant_id, product_key, canonical_name,
-      item_class, brand_id, model, color, size, variant, sku,
-      manufacturer
-    )
-    SELECT '${ctx.workspaceId}',
-           CASE WHEN item.product_merchant_exclusive THEN
-             (SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')
-           ELSE NULL END,
-           item.product_key,
-           COALESCE(item.normalized_name, item.raw_name),
-           item.item_class, item.product_brand_id,
-           item.product_model, item.product_color, item.product_size,
-           item.product_variant, item.product_sku, item.product_manufacturer
-    FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-      line_no int, parent_line_no int, raw_name text, normalized_name text,
-      quantity numeric, unit text,
-      unit_price_minor bigint, line_total_minor bigint, currency text,
-      item_class text, durability_tier text, food_kind text,
-      tags text[], confidence text,
-      line_type text, product_key text, product_brand_id text,
-      product_merchant_exclusive boolean, product_model text,
-      product_color text, product_size text, product_variant text,
-      product_sku text, product_manufacturer text,
-      tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
-    )
-    WHERE COALESCE(item.line_type, 'product') = 'product' AND item.product_key IS NOT NULL
-    ON CONFLICT (workspace_id, merchant_id, product_key) DO UPDATE
-      SET updated_at = NOW(),
-          canonical_name = COALESCE(EXCLUDED.canonical_name, products.canonical_name),
-          brand_id       = COALESCE(EXCLUDED.brand_id,       products.brand_id),
-          item_class     = COALESCE(EXCLUDED.item_class,     products.item_class)
-    RETURNING id, product_key, merchant_id
-  )
-  INSERT INTO transaction_items (
-    id, workspace_id, transaction_id, line_no, parent_line_no,
-    raw_name, normalized_name, product_variant, quantity, unit,
-    unit_price_minor, line_total_minor, currency,
-    item_class, durability_tier, food_kind, tags, confidence,
-    line_type, product_id, tax_minor, tip_share_minor,
-    discount_share_minor, extraction_run, extraction_version
-  )
-  SELECT gen_random_uuid(), '${ctx.workspaceId}', '${ctx.transactionId}', item.line_no,
-         item.parent_line_no,
-         item.raw_name, item.normalized_name, item.product_variant,
-         item.quantity, item.unit,
-         item.unit_price_minor, item.line_total_minor, item.currency,
-         item.item_class, item.durability_tier, item.food_kind,
-         item.tags, item.confidence,
-         COALESCE(item.line_type, 'product'),
-         (SELECT pu.id FROM p_upsert pu
-            WHERE pu.product_key = item.product_key
-              AND pu.merchant_id IS NOT DISTINCT FROM
-                  (CASE WHEN item.product_merchant_exclusive THEN
-                     (SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')
-                   ELSE NULL END)
-            LIMIT 1),
-         item.tax_minor, item.tip_share_minor, item.discount_share_minor,
-         (SELECT run FROM next_run),
-         '${REEXTRACT_PROMPT_VERSION}'
-  FROM jsonb_to_recordset('<ITEMS_JSON_ARRAY>'::jsonb) AS item(
-    line_no int, parent_line_no int, raw_name text, normalized_name text,
-    quantity numeric, unit text,
-    unit_price_minor bigint, line_total_minor bigint, currency text,
-    item_class text, durability_tier text, food_kind text,
-    tags text[], confidence text,
-    line_type text, product_key text, product_brand_id text,
-    product_merchant_exclusive boolean, product_model text,
-    product_color text, product_size text, product_variant text,
-    product_sku text, product_manufacturer text,
-    tax_minor bigint, tip_share_minor bigint, discount_share_minor bigint
-  );
+${productsUpsert({ workspaceId: ctx.workspaceId, merchantIdExpr })}
+${transactionItemsInsert({
+  workspaceId: ctx.workspaceId,
+  txIdExpr: `'${ctx.transactionId}'`,
+  runExpr: "(SELECT run FROM next_run)",
+  merchantIdExpr,
+})};
 
-  -- #84: recompute aggregate stats for every product whose live
-  -- transaction_items set just changed. The WHERE clause unions
-  -- old-touched + new-touched products by reading the live set,
-  -- which now reflects the post-soft-delete state.
-  WITH stats AS (
-    SELECT ti.product_id,
-           MIN(t.occurred_on) AS first_on,
-           MAX(t.occurred_on) AS last_on,
-           COUNT(DISTINCT ti.transaction_id) AS purchases,
-           SUM(ti.effective_total_minor) AS total_minor
-    FROM transaction_items ti
-    JOIN transactions t ON t.id = ti.transaction_id
-    WHERE ti.workspace_id = '${ctx.workspaceId}'
-      AND ti.product_id IS NOT NULL
-      AND ti.retired_at IS NULL
-      AND ti.line_type = 'product'
-    GROUP BY ti.product_id
-  )
-  UPDATE products p SET
-    first_purchased_on = stats.first_on,
-    last_purchased_on  = stats.last_on,
-    purchase_count     = stats.purchases,
-    total_spent_minor  = stats.total_minor,
-    updated_at         = NOW()
-  FROM stats
-  WHERE p.id = stats.product_id
-    AND p.workspace_id = '${ctx.workspaceId}';
+  -- #84: recompute aggregate stats for every product this run touched.
+  -- Scoped by transaction, and deliberately NOT filtered on retired_at,
+  -- so a product that dropped OUT of the new run still gets recomputed.
+${productAggregateRecompute({
+  workspaceId: ctx.workspaceId,
+  touchedPredicate: `ti.transaction_id = '${ctx.transactionId}'`,
+})}
 
   INSERT INTO transaction_events (
     id, workspace_id, transaction_id, event_type, actor_id, payload
@@ -398,8 +260,8 @@ user override survives this re-extract.
     gen_random_uuid(), '${ctx.workspaceId}', '${ctx.transactionId}',
     're_extracted', '${ctx.userId}',
     jsonb_build_object(
-      'prompt_version', '${REEXTRACT_PROMPT_VERSION}',
-      'model',          '${REEXTRACT_MODEL}'
+      'prompt_version', '${PROMPT_VERSION}',
+      'model',          '${EXTRACTION_MODEL}'
     )
   );
 
@@ -409,6 +271,11 @@ user override survives this re-extract.
 IMPORTANT escaping rule: SQL single quotes inside values must be
 doubled (\`O''Brien\`). Newlines inside \`raw_text\` are fine inside a
 single-quoted SQL literal as long as no single quote is unescaped.
+The items JSON and the ocr_audit JSON are dollar-quoted instead
+(\`$items$…$items$\`, \`$audit$…$audit$\`), so drop those payloads in
+between the markers with NO surrounding single quotes and NO escaping
+— that is what keeps apostrophes in product titles ("World's", 12" pan)
+from breaking the write. Never revert them to single-quoted literals.
 
 ── Phase 3 — Refresh brand identity & icons (#101) ────────────────────
 
@@ -427,7 +294,7 @@ transaction's merchant row:
 
   psql "\$DATABASE_URL" -c "SELECT m.brand_id, m.canonical_name FROM transactions t JOIN merchants m ON m.id = t.merchant_id WHERE t.id = '${ctx.transactionId}';"
 
-If the SELECT returns NULL (voided / orphaned tx), skip Phase 3.
+If the SELECT returns NULL (soft-deleted / orphaned tx), skip Phase 3.
 
 Step 2: substitute the returned brand_id for <bid> and the
 canonical_name for <canonical_name> in the inlined phases that
@@ -446,7 +313,7 @@ no new fetch) is the next most common; full Case D (mechanical fetch
 
 After the psql block exits 0, print ONE line:
 
-  DONE re_extracted tx=${ctx.transactionId} prompt_version=${REEXTRACT_PROMPT_VERSION}
+  DONE re_extracted tx=${ctx.transactionId} prompt_version=${PROMPT_VERSION}
 
 If you cannot read the receipt at all (unsupported / illegible /
 corrupted), do NOT write anything to the database. Print:
