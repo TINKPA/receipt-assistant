@@ -40,20 +40,38 @@ export function assertArgvSafe(args: string[]): void {
   }
 }
 
+export interface RunClaudeOptions {
+  /** Flags only, never payload — the prompt goes on stdin. `-p` and
+   *  `--session-id` are supplied by this function. */
+  args?: string[];
+  timeoutMs: number;
+  /** Pre-allocated session id. The ingest path mints its own before
+   *  spawning so the Langfuse JSONL path is known while the agent is
+   *  still running (root CLAUDE.md invariant); other callers omit it and
+   *  get a fresh one back. */
+  sessionId?: string;
+}
+
 /**
- * Run `claude` CLI and return stdout + sessionId.
- * Automatically assigns a session ID for traceability.
+ * Run `claude -p` and return its stdout plus the session id used.
  *
- * The prompt is written to the child's **stdin**, never argv — argv has a
- * hard 128 KiB per-argument ceiling that the extractor prompt already
- * exceeds (see `assertArgvSafe`). Callers pass only flags in `args`.
+ * The single owner of "how this service spawns the Claude CLI" — the
+ * ingest extractor, re-extract and insights paths all come through here.
+ * It used to be copy-pasted per call site, which is how the same
+ * three-line stdin fix had to be written twice in #195.
+ *
+ * The prompt is written to the child's **stdin**, never argv: a single
+ * argv element is capped at 128 KiB (`MAX_ARG_STRLEN`) regardless of the
+ * 2 MB total `ARG_MAX`, and `buildExtractorPrompt()` alone is already
+ * ~135 KB of fixed contract text. Passing it as argv made every ingest
+ * die with an opaque `spawn E2BIG` (incident 2026-07-28, #194 —
+ * production ingestion was down until this moved to stdin). stdin has no
+ * such limit.
  */
 export function runClaude(
   prompt: string,
-  args: string[],
-  timeoutMs: number,
+  { args = [], timeoutMs, sessionId = randomUUID() }: RunClaudeOptions,
 ): Promise<{ stdout: string; sessionId: string }> {
-  const sessionId = randomUUID();
   const fullArgs = ["-p", ...args, "--session-id", sessionId];
   assertArgvSafe(fullArgs);
   return new Promise((resolve, reject) => {
@@ -75,13 +93,13 @@ export function runClaude(
 
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
+      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code !== 0) {
-        reject(new Error(stderr || stdout || `Claude CLI exited with code ${code}`));
+        reject(new Error(stderr || stdout || `claude -p exited with code ${code}`));
       } else {
         resolve({ stdout, sessionId });
       }

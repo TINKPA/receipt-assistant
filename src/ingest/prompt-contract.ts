@@ -38,7 +38,7 @@ export const PROMPT_VERSION = "3.1";
  * and `documents.ocr_model_version`.
  *
  * `claude -p` is spawned WITHOUT a `--model` flag unless `CLAUDE_MODEL`
- * is set (see `extractor.ts::runClaude`), in which case the CLI picks its
+ * is set (see `extractor.ts::runExtractorClaude`), in which case the CLI picks its
  * own default — so `"cli-default"` is the truthful stamp for an unset
  * env var. The old `"sonnet"` fallback was a lie: the container CLI has
  * been running opus while the column read `sonnet`.
