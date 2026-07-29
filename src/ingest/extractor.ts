@@ -6,9 +6,8 @@
  * produced tx_ids) is read by polling the `ingests` row the agent
  * itself updates.
  */
-import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { assertArgvSafe } from "../claude.js";
+import { runClaude } from "../claude.js";
 import { getSessionJsonlPath } from "../langfuse.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
 import {
@@ -61,82 +60,30 @@ export type Extractor = (input: ExtractorInput) => Promise<ExtractorResult>;
 
 // ── Default impl: spawn `claude -p` ───────────────────────────────────
 
-function buildClaudeEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  // These quirks poison nested CLI sessions — carry forward from Phase 1.
-  delete env.CLAUDECODE;
-  delete env.ANTHROPIC_API_KEY;
-  return env;
-}
-
 /**
- * Spawn `claude -p` with the prompt on **stdin**.
+ * Spawn `claude -p` for the two extraction prompts.
  *
- * The prompt must never be an argv element: Linux caps a single execve
- * argument at 128 KiB (`MAX_ARG_STRLEN`) regardless of the 2 MB total
- * `ARG_MAX`, and `buildExtractorPrompt()` alone is already ~135 KB of
- * fixed contract text before any variable content. Passing it as argv
- * made every ingest die with an opaque `spawn E2BIG` (incident
- * 2026-07-28 — production ingestion was down until this moved to stdin).
- * stdin has no such limit.
+ * The shared `runClaude` in `src/claude.ts` owns the mechanics — prompt
+ * on stdin (never argv, see #194), argv-size guard, env scrubbing,
+ * timeout. This wrapper adds only the flags both extraction prompts
+ * want and forwards the caller's pre-allocated session id.
  */
-function runClaude(
+async function runExtractorClaude(
   prompt: string,
   sessionId: string,
   timeoutMs: number,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "-p",
-      "--output-format",
-      "text",
-      "--dangerously-skip-permissions",
-      "--session-id",
-      sessionId,
-    ];
-    // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
-    // mini today) means the CLI picks its own default, and the prompt
-    // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
-    // Passing a hard-coded "sonnet" here would silently downgrade the
-    // model that has actually been running.
-    if (process.env.CLAUDE_MODEL) {
-      args.push("--model", process.env.CLAUDE_MODEL);
-    }
-    assertArgvSafe(args);
-    const child = spawn("claude", args, {
-      env: buildClaudeEnv(),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    // The child can exit before draining stdin (auth failure, bad flag).
-    // Swallow the resulting EPIPE so it rejects via 'close'/'error'
-    // instead of crashing the worker with an unhandled stream error.
-    child.stdin.on("error", () => {});
-    child.stdin.end(prompt);
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString();
-    });
-    child.stderr.on("data", (c: Buffer) => {
-      err += c.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(err || out || `claude -p exited ${code}`));
-      } else {
-        resolve(out);
-      }
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-  });
+  const args = ["--output-format", "text", "--dangerously-skip-permissions"];
+  // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
+  // mini today) means the CLI picks its own default, and the prompt
+  // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
+  // Passing a hard-coded "sonnet" here would silently downgrade the
+  // model that has actually been running.
+  if (process.env.CLAUDE_MODEL) {
+    args.push("--model", process.env.CLAUDE_MODEL);
+  }
+  const { stdout } = await runClaude(prompt, { args, sessionId, timeoutMs });
+  return stdout;
 }
 
 /**
@@ -162,7 +109,7 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
   console.log(
     `[claude] extract ingestId=${input.ingestId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
   );
-  const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
+  const stdout = await runExtractorClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
   return { sessionId, stdout };
 };
 
@@ -212,6 +159,6 @@ export const defaultClaudeReExtractor: ReExtractor = async (input) => {
   console.log(
     `[claude] re-extract txId=${input.transactionId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
   );
-  const stdout = await runClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
+  const stdout = await runExtractorClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
   return { sessionId, stdout };
 };

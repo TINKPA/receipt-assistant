@@ -26,10 +26,10 @@
  *        --concurrency=<n>        Parallel workers (default 3)
  *        --limit=<n>              Cap processed count (default 15)
  */
-import { spawn } from "child_process";
-import { randomUUID, createHash } from "crypto";
+import { createHash } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { runClaude } from "../src/claude.js";
 
 // ── CLI args ───────────────────────────────────────────────────────────
 
@@ -200,42 +200,12 @@ async function runClaudeOnImage(
   absImagePath: string,
   timeoutMs = 180_000,
 ): Promise<{ raw: string; parsed: Extracted | null; parseError?: string; sessionId: string }> {
-  const sessionId = randomUUID();
-  const prompt = buildPrompt(absImagePath);
-  const args = [
-    "-p",
-    prompt,
-    "--output-format",
-    "text",
-    "--dangerously-skip-permissions",
-    "--session-id",
-    sessionId,
-  ];
-
-  // Clear env quirks that break nested sessions (same as src/claude.ts).
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  delete env.ANTHROPIC_API_KEY;
-
-  const raw = await new Promise<string>((resolve, reject) => {
-    const child = spawn("claude", args, { env, stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (c: Buffer) => (out += c.toString()));
-    child.stderr.on("data", (c: Buffer) => (err += c.toString()));
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) reject(new Error(err || out || `exit ${code}`));
-      else resolve(out);
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
+  // Spawning goes through src/claude.ts so this script cannot drift from
+  // the production path — in particular the prompt travels on stdin, not
+  // argv (#194).
+  const { stdout: raw, sessionId } = await runClaude(buildPrompt(absImagePath), {
+    args: ["--output-format", "text", "--dangerously-skip-permissions"],
+    timeoutMs,
   });
 
   const fence = extractLastJsonFence(raw);

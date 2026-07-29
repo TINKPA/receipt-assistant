@@ -59,6 +59,9 @@ QUESTION: ${question}`;
     "--model",
     process.env.CLAUDE_MODEL || "sonnet",
   ];
-  const { stdout, sessionId } = await runClaude(prompt, args, 180_000);
+  const { stdout, sessionId } = await runClaude(prompt, {
+    args,
+    timeoutMs: 180_000,
+  });
   return { answer: stdout.trim(), sessionId };
 }
