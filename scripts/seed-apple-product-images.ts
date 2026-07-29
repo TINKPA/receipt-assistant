@@ -8,7 +8,8 @@
  *      row under `brand_id='apple'` in the target workspace matching
  *      the predicate.
  *   2. sha256s the source PNG, copies it to
- *      `<root>/<product_id>/manual_seed/<sha8>.png`, and INSERTs a
+ *      `<root>/<product_id>/manual_seed/<sha>.png` (the FULL digest —
+ *      the same value stored in `content_hash`), and INSERTs a
  *      `product_assets` row (tier=manual_seed) with
  *      `ON CONFLICT (product_id, content_hash) DO UPDATE last_seen_at`.
  *   3. UPDATEs `products.preferred_asset_id` + `preferred_asset_chosen_at`
@@ -162,7 +163,6 @@ async function main() {
       continue;
     }
     const sha = createHash("sha256").update(bytes).digest("hex");
-    const sha8 = sha.slice(0, 8);
 
     // Resolve product ids by predicate (workspace + apple + live).
     const matchRows = await db.execute(
@@ -186,9 +186,17 @@ async function main() {
 
     if (!DRY_RUN) {
       for (const productId of ids) {
-        const productRel = `${productId}/manual_seed/${sha8}.png`;
+        // FULL digest in the filename, not a prefix. This writes into
+        // the same tree as `POST /v1/products/:id/assets`, and dedup is
+        // keyed on UNIQUE (product_id, content_hash) over the whole
+        // sha256 — with a truncated name two genuinely different images
+        // under one product can share a path, and the `alreadyOnDisk`
+        // skip below would then never write the second one, leaving its
+        // row pointing at the FIRST image's bytes.
+        const productRel = `${productId}/manual_seed/${sha}.png`;
         const absPath = join(ASSETS_ROOT, productRel);
-        // Write the file (idempotent for identical bytes).
+        // Safe to skip the rewrite now that the name IS the full
+        // content digest: same path ⇒ same bytes.
         let alreadyOnDisk = false;
         try {
           await stat(absPath);

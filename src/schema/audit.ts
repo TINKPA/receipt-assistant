@@ -13,6 +13,7 @@ import { workspaces } from "./workspaces.js";
  * event_type examples:
  *   created | updated | posting_added | posting_updated | posting_removed
  *   voided  | reconciled | document_linked | document_unlinked
+ *   hard_deleted
  */
 export const transactionEvents = pgTable(
   "transaction_events",
@@ -21,9 +22,22 @@ export const transactionEvents = pgTable(
     workspaceId: uuid("workspace_id")
       .notNull()
       .references(() => workspaces.id, { onDelete: "cascade" }),
-    transactionId: uuid("transaction_id")
-      .notNull()
-      .references(() => transactions.id, { onDelete: "cascade" }),
+    /**
+     * Nullable, `ON DELETE SET NULL` — deliberately NOT `cascade`.
+     *
+     * A hard delete writes its own `hard_deleted` event and then drops
+     * the parent row in the SAME db transaction; under `cascade` that
+     * delete destroyed the event it had just written, along with the
+     * row's entire created/updated history — the audit log erased
+     * exactly the mutation it exists to record. With `set null` the
+     * trail survives the parent: `workspace_id`, `event_type`,
+     * `actor_id`, `occurred_at` and `payload` stay intact, and the
+     * originating id is carried inside `payload.transaction_id` so the
+     * history is still queryable after this column goes null.
+     */
+    transactionId: uuid("transaction_id").references(() => transactions.id, {
+      onDelete: "set null",
+    }),
     eventType: text("event_type").notNull(),
     actorId: uuid("actor_id").references(() => users.id, {
       onDelete: "set null",

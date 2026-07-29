@@ -24,8 +24,8 @@
  *     run leaves the DB consistent.
  */
 import "dotenv/config";
-import { spawn } from "node:child_process";
 import { sql } from "drizzle-orm";
+import { runClaude } from "../src/claude.js";
 import { db } from "../src/db/client.js";
 
 interface Args {
@@ -97,24 +97,11 @@ Inputs:
 ${lines.join("\n")}`;
 }
 
-function runClaude(prompt: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("claude", ["-p", "--model", "sonnet"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => (stdout += d.toString()));
-    proc.stderr.on("data", (d) => (stderr += d.toString()));
-    proc.on("error", reject);
-    proc.on("close", (code) => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`claude exited ${code}: ${stderr}`));
-    });
-    proc.stdin.write(prompt);
-    proc.stdin.end();
-  });
-}
+/**
+ * A whole batch of payees per call, so give it room; the sibling
+ * backfill (scripts/backfill-photo-ocr.ts) uses the same budget.
+ */
+const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function parseClassifications(
   raw: string,
@@ -211,7 +198,15 @@ async function main() {
     console.log(
       `[backfill] LLM batch ${i / args.batchSize + 1} / ${Math.ceil(uniques.length / args.batchSize)} (${slice.length} payees)`,
     );
-    const raw = await runClaude(prompt);
+    // Spawning goes through src/claude.ts so this script cannot drift from
+    // the production path — in particular the prompt travels on stdin, not
+    // argv (#194), and the child env is scrubbed of CLAUDECODE /
+    // ANTHROPIC_API_KEY. This used to be a local copy that shadowed the
+    // shared export and did none of that.
+    const { stdout: raw } = await runClaude(prompt, {
+      args: ["--model", "sonnet"],
+      timeoutMs: CLAUDE_TIMEOUT_MS,
+    });
     const parsed = parseClassifications(raw, inputs);
     for (let j = 0; j < slice.length; j++) {
       const c = parsed[j];

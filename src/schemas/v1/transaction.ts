@@ -75,6 +75,14 @@ export const TransactionDocumentRef = z
      *  received_at). Present on the single-tx detail read; omitted on
      *  the list view. #122. */
     source_meta: z.record(z.string(), z.unknown()).nullish(),
+    /** Soft-delete tombstone from `documents.deleted_at`. Non-null means
+     *  the underlying document was soft-deleted while the transaction
+     *  row survives — the client renders the deleted badge, the struck-
+     *  through total and the Restore affordance off this field. Emitted
+     *  on BOTH the detail read and the list view (unlike `mime_type` /
+     *  `source_meta`), because the Ledger list has to tombstone rows
+     *  without a per-row detail fetch. */
+    deleted_at: IsoDateTime.nullable(),
   })
   .openapi("TransactionDocumentRef");
 
