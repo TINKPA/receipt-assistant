@@ -8,6 +8,7 @@
  */
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { assertArgvSafe } from "../claude.js";
 import { getSessionJsonlPath } from "../langfuse.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
 import {
@@ -68,6 +69,17 @@ function buildClaudeEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * Spawn `claude -p` with the prompt on **stdin**.
+ *
+ * The prompt must never be an argv element: Linux caps a single execve
+ * argument at 128 KiB (`MAX_ARG_STRLEN`) regardless of the 2 MB total
+ * `ARG_MAX`, and `buildExtractorPrompt()` alone is already ~135 KB of
+ * fixed contract text before any variable content. Passing it as argv
+ * made every ingest die with an opaque `spawn E2BIG` (incident
+ * 2026-07-28 — production ingestion was down until this moved to stdin).
+ * stdin has no such limit.
+ */
 function runClaude(
   prompt: string,
   sessionId: string,
@@ -76,7 +88,6 @@ function runClaude(
   return new Promise((resolve, reject) => {
     const args = [
       "-p",
-      prompt,
       "--output-format",
       "text",
       "--dangerously-skip-permissions",
@@ -91,10 +102,16 @@ function runClaude(
     if (process.env.CLAUDE_MODEL) {
       args.push("--model", process.env.CLAUDE_MODEL);
     }
+    assertArgvSafe(args);
     const child = spawn("claude", args, {
       env: buildClaudeEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    // The child can exit before draining stdin (auth failure, bad flag).
+    // Swallow the resulting EPIPE so it rejects via 'close'/'error'
+    // instead of crashing the worker with an unhandled stream error.
+    child.stdin.on("error", () => {});
+    child.stdin.end(prompt);
     let out = "";
     let err = "";
     child.stdout.on("data", (c: Buffer) => {

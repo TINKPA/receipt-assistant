@@ -318,6 +318,43 @@ Re-running re-extract on the same document with the same `PROMPT_VERSION` and mo
 
 ## Known Pitfalls
 
+0. **Never pass a prompt (or any payload) as a `claude` CLI *argument* —
+   it must go on stdin.** Linux caps a **single** `execve` argument at
+   `MAX_ARG_STRLEN = 32 * 4096 = 131072` bytes. This is a separate limit
+   from the total `ARG_MAX`, so `getconf ARG_MAX` reports a healthy
+   2097152 while every spawn dies with the kernel's opaque
+   `spawn E2BIG` — no mention of which argument, or that a size is
+   involved.
+
+   `buildExtractorPrompt()` is **~135 KB of fixed contract text** before
+   any document-specific content (it stitches together `prompt.ts`,
+   `line-item-prompt.ts`, `prompt-contract.ts`, `items-sql.ts`, and
+   `document-read-prompt.ts`), so it sits permanently over the ceiling.
+   The prompt is expected to keep growing; stdin is what makes that safe.
+
+   Incident 2026-07-28: the prompt crossed 131072 bytes and **every
+   ingest in production failed instantly** — the first casualty was a
+   Subway `.eml`, which made it look like an oversized-email bug. It was
+   not: the ingest path passes only `filePath` into the prompt and the
+   agent opens the file itself. Any document would have failed
+   identically. Fixed in #194 by moving the prompt to `child.stdin`.
+
+   Guard rails now in place, do not remove them:
+   - `src/claude.ts::assertArgvSafe()` runs before every spawn and
+     throws a message naming the offending argument and its byte size.
+   - Both `src/claude.ts::runClaude` and
+     `src/ingest/extractor.ts::runClaude` take `prompt` as a separate
+     parameter and write it to stdin. `stdio[0]` must be `"pipe"`, and
+     the `child.stdin.on("error", …)` handler must stay — the child can
+     exit before draining stdin (auth failure, bad flag) and the
+     resulting `EPIPE` would otherwise crash the worker instead of
+     rejecting the promise.
+
+   The same exposure applies to `src/ingest/reextract-prompt.ts`, which
+   *does* inline user-sized text (`renderDecodedSource` embeds the
+   decoded `.eml`/HTML body). Because the prompt now travels on stdin,
+   no truncation cap is needed — but never move it back to argv.
+
 1. **`--json-schema` degrades OCR accuracy vs plain-text output**:
    Tested 10 receipts with Sonnet, same prompt, same model:
    - `--json-schema` mode: 4/10 dates wrong (including year errors,

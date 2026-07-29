@@ -16,18 +16,59 @@ function buildClaudeEnv(): NodeJS.ProcessEnv {
 }
 
 /**
+ * Linux caps a SINGLE `execve` argument at 32 pages, independent of the
+ * much larger total `ARG_MAX`. A prompt passed as argv silently works
+ * until it crosses this line, then every spawn dies with an opaque
+ * `spawn E2BIG`. See `assertArgvSafe` below.
+ */
+export const MAX_ARG_STRLEN = 32 * 4096;
+
+/**
+ * Turn the kernel's unactionable `spawn E2BIG` into a message that names
+ * the offending argument and its size. Prompts must go over stdin, so
+ * tripping this means someone put payload back on the command line.
+ */
+export function assertArgvSafe(args: string[]): void {
+  for (const [i, arg] of args.entries()) {
+    const bytes = Buffer.byteLength(arg, "utf8");
+    if (bytes >= MAX_ARG_STRLEN) {
+      throw new Error(
+        `claude CLI argv[${i}] is ${bytes} bytes, over the ${MAX_ARG_STRLEN}-byte ` +
+          `per-argument kernel limit (would fail as "spawn E2BIG"). ` +
+          `Large payloads must be passed on stdin, not argv. ` +
+          `Offending arg starts: ${arg.slice(0, 120)}…`,
+      );
+    }
+  }
+}
+
+/**
  * Run `claude` CLI and return stdout + sessionId.
  * Automatically assigns a session ID for traceability.
- * stdin is closed immediately to avoid "no stdin data" warnings.
+ *
+ * The prompt is written to the child's **stdin**, never argv — argv has a
+ * hard 128 KiB per-argument ceiling that the extractor prompt already
+ * exceeds (see `assertArgvSafe`). Callers pass only flags in `args`.
  */
-export function runClaude(args: string[], timeoutMs: number): Promise<{ stdout: string; sessionId: string }> {
+export function runClaude(
+  prompt: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ stdout: string; sessionId: string }> {
   const sessionId = randomUUID();
-  const fullArgs = [...args, "--session-id", sessionId];
+  const fullArgs = ["-p", ...args, "--session-id", sessionId];
+  assertArgvSafe(fullArgs);
   return new Promise((resolve, reject) => {
     const child = spawn("claude", fullArgs, {
       env: buildClaudeEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+
+    // The child may exit before draining stdin (bad flag, auth failure).
+    // Without this the EPIPE surfaces as an unhandled 'error' on the
+    // stream and crashes the process instead of rejecting the promise.
+    child.stdin.on("error", () => {});
+    child.stdin.end(prompt);
 
     let stdout = "";
     let stderr = "";
