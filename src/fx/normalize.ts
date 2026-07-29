@@ -43,7 +43,7 @@ interface PostingRow {
 }
 
 export interface NormalizeResult {
-  /** `null` when the transaction needed no conversion. */
+  /** `false` when the transaction needed no conversion — see `NOOP`. */
   changed: boolean;
   /** Per-currency rates applied, for logging / backfill reports. */
   applied: Array<{

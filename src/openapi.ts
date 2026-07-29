@@ -2,12 +2,15 @@
  * OpenAPI 3.1 document builder.
  *
  * Post-refactor state: the old single-entry `/receipt*` surface has been
- * removed. The new `/v1/*` surface (transactions, accounts, postings,
- * documents) is being built out under issues #35 and #36.
+ * removed; the `/v1/*` surface replaced it (issues #35 and #36).
  *
- * For now only meta routes (`/health`, `/openapi.json`, `/docs`) are
- * registered so the spec regeneration stays green while the new resources
- * come online. Each resource registers its own paths in later PRs.
+ * This module owns only the shared components (error / health / problem
+ * schemas, the bearer security scheme) and the two meta paths `/health`
+ * and `/version`. Every `/v1` resource registers its own paths and
+ * response schemas through the `registerXOpenApi(registry)` calls in
+ * `buildRegistry()` below, so a new endpoint is added next to its route
+ * handler rather than here. (`/openapi.json` and `/docs` are served by
+ * `src/app.ts` and are deliberately absent from the spec itself.)
  */
 import {
   OpenAPIRegistry,

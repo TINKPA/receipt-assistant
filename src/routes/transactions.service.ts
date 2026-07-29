@@ -27,6 +27,31 @@ import {
 } from "../schema/index.js";
 import { loadPlacesByIds, type PlaceRow } from "./places.service.js";
 
+import { newId } from "../http/uuid.js";
+import {
+  HttpProblem,
+  NotFoundProblem,
+  PostingsImbalanceProblem,
+  ValidationProblem,
+  VersionMismatchProblem,
+} from "../http/problem.js";
+import type {
+  CreateTransactionRequest,
+  UpdateTransactionRequest,
+  NewPosting,
+  NewTransactionItem,
+  UpdatePostingRequest,
+  ListTransactionsQuery,
+  ListPostingsQuery,
+} from "../schemas/v1/transaction.js";
+import type { z } from "zod";
+import {
+  clampLimit,
+  encodeCursor,
+  decodeCursor,
+  DEFAULT_PAGE_LIMIT,
+} from "../http/pagination.js";
+
 /** Compact merchant ref joined into transaction responses; carries
  *  `custom_name` so the frontend can apply brand-level Layer-3 renames
  *  (#79 Phase C) to Ledger rows without an N+1 fetch. */
@@ -62,29 +87,6 @@ async function loadMerchantRefsByIds(
   }
   return map;
 }
-import { newId } from "../http/uuid.js";
-import {
-  HttpProblem,
-  NotFoundProblem,
-  PostingsImbalanceProblem,
-  ValidationProblem,
-} from "../http/problem.js";
-import type {
-  CreateTransactionRequest,
-  UpdateTransactionRequest,
-  NewPosting,
-  NewTransactionItem,
-  UpdatePostingRequest,
-  ListTransactionsQuery,
-  ListPostingsQuery,
-} from "../schemas/v1/transaction.js";
-import type { z } from "zod";
-import {
-  clampLimit,
-  encodeCursor,
-  decodeCursor,
-  DEFAULT_PAGE_LIMIT,
-} from "../http/pagination.js";
 
 type CreateReq = z.infer<typeof CreateTransactionRequest>;
 type UpdateReq = z.infer<typeof UpdateTransactionRequest>;
@@ -371,20 +373,19 @@ function mapTransactionRow(
     itemRows.length > 0
       ? itemRows.map(mapTransactionItem)
       : itemsFromMetadataFallback(metadata);
+  // Both spellings of each column are accepted because this mapper is fed
+  // by drizzle selects (camelCase) and raw `db.execute` rows (snake_case).
+  const occurredAt = row.occurredAt ?? row.occurred_at;
+  const deletedAt = row.deletedAt ?? row.deleted_at;
   return {
     id: row.id,
     workspace_id: row.workspaceId ?? row.workspace_id,
     occurred_on: toIsoDate(row.occurredOn ?? row.occurred_on),
-    occurred_at: row.occurredAt ?? row.occurred_at
-      ? toIsoString(row.occurredAt ?? row.occurred_at)
-      : null,
+    occurred_at: occurredAt ? toIsoString(occurredAt) : null,
     payee: row.payee ?? null,
     narration: row.narration ?? null,
     status: row.status,
-    deleted_at:
-      row.deletedAt ?? row.deleted_at
-        ? toIsoString(row.deletedAt ?? row.deleted_at)
-        : null,
+    deleted_at: deletedAt ? toIsoString(deletedAt) : null,
     source_ingest_id: row.sourceIngestId ?? row.source_ingest_id ?? null,
     trip_id: row.tripId ?? row.trip_id ?? null,
     metadata,
@@ -904,25 +905,40 @@ export async function listTransactions(
   // — the largest leg, in base-currency minor units. Mirrors the
   // axis already used by amount_min_minor / amount_max_minor filters
   // below so a transaction's "amount" means the same thing for both.
-  const sortCol: SortColumn =
-    query.sort === "occurred_on"
-      ? "occurred_on"
-      : query.sort === "amount"
-        ? "amount"
-        : "created_at";
+  let sortCol: SortColumn;
+  switch (query.sort) {
+    case "occurred_on":
+      sortCol = "occurred_on";
+      break;
+    case "amount":
+      sortCol = "amount";
+      break;
+    default:
+      sortCol = "created_at";
+      break;
+  }
+
   const amountSubquery = sql`(SELECT COALESCE(MAX(ABS(p.amount_base_minor)), 0) FROM postings p WHERE p.transaction_id = t.id)`;
-  const sortColSql =
-    sortCol === "occurred_on"
-      ? sql`t.occurred_on`
-      : sortCol === "amount"
-        ? amountSubquery
-        : sql`t.created_at`;
-  const cursorCast =
-    sortCol === "occurred_on"
-      ? sql`::date`
-      : sortCol === "amount"
-        ? sql`::bigint`
-        : sql`::timestamptz`;
+
+  // The ORDER BY expression and the cast applied to the keyset cursor
+  // value have to describe the same column; pairing them in one switch
+  // makes it impossible to edit one and forget the other.
+  let sortColSql: ReturnType<typeof sql>;
+  let cursorCast: ReturnType<typeof sql>;
+  switch (sortCol) {
+    case "occurred_on":
+      sortColSql = sql`t.occurred_on`;
+      cursorCast = sql`::date`;
+      break;
+    case "amount":
+      sortColSql = amountSubquery;
+      cursorCast = sql`::bigint`;
+      break;
+    default:
+      sortColSql = sql`t.created_at`;
+      cursorCast = sql`::timestamptz`;
+      break;
+  }
 
   const conditions: ReturnType<typeof sql>[] = [];
   conditions.push(sql`t.workspace_id = ${workspaceId}::uuid`);
@@ -1000,8 +1016,12 @@ export async function listTransactions(
   }
 
   const ids = page.map((r) => r.id);
+  // Inlined rather than bound because it is spliced into three different
+  // ANY(...) clauses below. Safe to interpolate: `ids` are uuids read
+  // straight back out of the page rows this function just selected.
+  const idArrayLiteral = `ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`;
   const postRes = await db.execute(
-    sql`SELECT * FROM postings WHERE transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)}) ORDER BY created_at ASC`,
+    sql`SELECT * FROM postings WHERE transaction_id = ANY(${sql.raw(idArrayLiteral)}) ORDER BY created_at ASC`,
   );
   const postByTx = new Map<string, any[]>();
   for (const p of postRes.rows as any[]) {
@@ -1013,7 +1033,7 @@ export async function listTransactions(
   const docRes = await db.execute(
     sql`SELECT dl.transaction_id, d.id, d.kind
         FROM document_links dl JOIN documents d ON d.id = dl.document_id
-        WHERE dl.transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)})`,
+        WHERE dl.transaction_id = ANY(${sql.raw(idArrayLiteral)})`,
   );
   const docByTx = new Map<string, Array<{ id: string; kind: string }>>();
   for (const d of docRes.rows as any[]) {
@@ -1039,7 +1059,7 @@ export async function listTransactions(
   // #84: filter retired_at IS NULL — re-extract soft-deletes the
   // prior run; only the current run is live.
   const itemRes = await db.execute(
-    sql`SELECT * FROM transaction_items WHERE transaction_id = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`)}) AND retired_at IS NULL ORDER BY transaction_id, line_no ASC`,
+    sql`SELECT * FROM transaction_items WHERE transaction_id = ANY(${sql.raw(idArrayLiteral)}) AND retired_at IS NULL ORDER BY transaction_id, line_no ASC`,
   );
   const itemsByTx = new Map<string, any[]>();
   for (const it of itemRes.rows as any[]) {
@@ -1062,14 +1082,20 @@ export async function listTransactions(
   );
 
   const last = page[page.length - 1]!;
-  const cursorValue =
-    sortCol === "occurred_on"
-      ? toIsoDate(last.occurred_on)
-      : sortCol === "amount"
-        // sort_amount comes back as a string from node-postgres for bigint;
-        // coerce defensively in case the driver decides otherwise.
-        ? String(last.sort_amount ?? 0)
-        : toIsoString(last.created_at);
+  let cursorValue: string;
+  switch (sortCol) {
+    case "occurred_on":
+      cursorValue = toIsoDate(last.occurred_on);
+      break;
+    case "amount":
+      // sort_amount comes back as a string from node-postgres for bigint;
+      // coerce defensively in case the driver decides otherwise.
+      cursorValue = String(last.sort_amount ?? 0);
+      break;
+    default:
+      cursorValue = toIsoString(last.created_at);
+      break;
+  }
   const nextCursor = hasMore
     ? encodeCursor({ sort: sortCol, value: cursorValue, id: last.id })
     : null;
@@ -1101,7 +1127,6 @@ export async function updateTransaction(
     if (Number(current.version) !== expectedVersion) {
       // Caller is expected to have pre-checked with requireIfMatch, but
       // defence-in-depth: race between fetch and update.
-      const { VersionMismatchProblem } = await import("../http/problem.js");
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
 
@@ -1208,7 +1233,6 @@ export async function deleteTransaction(
     if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
     const current = rows[0]!;
     if (Number(current.version) !== expectedVersion) {
-      const { VersionMismatchProblem } = await import("../http/problem.js");
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
     // Reconciled rows must be unreconciled first — a deliberate gate so
@@ -1258,7 +1282,6 @@ export async function softDeleteTransaction(
     if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
     const current = rows[0]!;
     if (Number(current.version) !== expectedVersion) {
-      const { VersionMismatchProblem } = await import("../http/problem.js");
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
     if (current.deletedAt) throw new NotFoundProblem("Transaction", id);
@@ -1309,7 +1332,6 @@ export async function restoreTransaction(
     if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
     const current = rows[0]!;
     if (Number(current.version) !== expectedVersion) {
-      const { VersionMismatchProblem } = await import("../http/problem.js");
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
     if (!current.deletedAt) throw new NotFoundProblem("Transaction", id);
@@ -1353,7 +1375,6 @@ export async function reconcileTransaction(
       if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
       const current = rows[0]!;
       if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
       if (current.status !== "posted") {
@@ -1415,7 +1436,6 @@ export async function unreconcileTransaction(
       if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
       const current = rows[0]!;
       if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
       if (current.status !== "reconciled") {
@@ -1500,7 +1520,6 @@ export async function addPosting(
       if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
       const current = rows[0]!;
       if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
 
@@ -1560,7 +1579,6 @@ export async function updatePosting(
       if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
       const current = rows[0]!;
       if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
 
@@ -1626,7 +1644,6 @@ export async function deletePosting(
       if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
       const current = rows[0]!;
       if (Number(current.version) !== expectedVersion) {
-        const { VersionMismatchProblem } = await import("../http/problem.js");
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
 

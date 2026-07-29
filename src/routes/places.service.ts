@@ -29,6 +29,13 @@ import { NoRawResponseProblem } from "../http/problem.js";
 import { placeSnapshots } from "../schema/place_snapshots.js";
 import { fetchPlaceV1Dual } from "../google/places-fetch.js";
 
+/** Canonical UUID text form. Every identifier param in this module
+ *  accepts either a `places.id` UUID or Google's `ChIJ…` place id, so
+ *  each lookup branches on this test. Same literal as the `UUID_RE`
+ *  in `src/routes/merchants.ts`. */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Public-facing shape of a place. Mirrors the v1 zod Place schema —
  * any field added to one must be added to the other.
@@ -164,7 +171,7 @@ export async function loadPlacesByIds(
  * having to maintain a separate lookup path for that distinction.
  */
 export async function loadPlaceById(id: string): Promise<PlaceRow | null> {
-  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  const isUuid = UUID_RE.test(id);
   const rows = await db
     .select()
     .from(places)
@@ -356,10 +363,7 @@ export async function reDerivePlace(
   workspaceId: string,
   placeId: string,
 ): Promise<ReDeriveResult | null> {
-  const isUuid =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      placeId,
-    );
+  const isUuid = UUID_RE.test(placeId);
   const rows = await db
     .select()
     .from(places)
@@ -489,10 +493,7 @@ export async function refreshPlace(
   workspaceId: string,
   placeId: string,
 ): Promise<RefreshPlaceResult | null> {
-  const isUuid =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      placeId,
-    );
+  const isUuid = UUID_RE.test(placeId);
   const rows = await db
     .select({
       id: places.id,

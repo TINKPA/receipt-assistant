@@ -50,8 +50,21 @@ function rowToDto(row: any) {
   };
 }
 
-insightsRouter.get("/", async (req: Request, res: Response, next: NextFunction) => {
-  try {
+type AsyncHandler = (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => Promise<unknown>;
+
+function ah(fn: AsyncHandler) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    fn(req, res, next).catch(next);
+  };
+}
+
+insightsRouter.get(
+  "/",
+  ah(async (req, res) => {
     const rows = await db
       .select()
       .from(insights)
@@ -59,57 +72,43 @@ insightsRouter.get("/", async (req: Request, res: Response, next: NextFunction) 
       .orderBy(desc(insights.updatedAt))
       .limit(50);
     res.json({ items: rows.map(rowToDto) });
-  } catch (err) {
-    next(err);
-  }
-});
+  }),
+);
 
 insightsRouter.post(
   "/refresh",
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const generated = await discoverInsights(req.ctx.workspaceId);
-      res.json({ generated });
-    } catch (err) {
-      next(err);
-    }
-  },
+  ah(async (req, res) => {
+    const generated = await discoverInsights(req.ctx.workspaceId);
+    res.json({ generated });
+  }),
 );
 
 insightsRouter.post(
   "/:id/dismiss",
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const id = String(req.params.id);
-      const updated = await db
-        .update(insights)
-        .set({ dismissedAt: new Date(), updatedAt: new Date() })
-        .where(and(eq(insights.id, id), eq(insights.workspaceId, req.ctx.workspaceId)))
-        .returning();
-      if (updated.length === 0) throw new NotFoundProblem("Insight", id);
-      res.json(rowToDto(updated[0]!));
-    } catch (err) {
-      next(err);
-    }
-  },
+  ah(async (req, res) => {
+    const id = String(req.params.id);
+    const updated = await db
+      .update(insights)
+      .set({ dismissedAt: new Date(), updatedAt: new Date() })
+      .where(and(eq(insights.id, id), eq(insights.workspaceId, req.ctx.workspaceId)))
+      .returning();
+    if (updated.length === 0) throw new NotFoundProblem("Insight", id);
+    res.json(rowToDto(updated[0]!));
+  }),
 );
 
 insightsRouter.post(
   "/ask",
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const body = parseOrThrow(AskRequest, req.body);
-      const started = Date.now();
-      const { answer, sessionId } = await askLedger(req.ctx.workspaceId, body.question);
-      res.json({
-        answer,
-        session_id: sessionId,
-        elapsed_ms: Date.now() - started,
-      });
-    } catch (err) {
-      next(err);
-    }
-  },
+  ah(async (req, res) => {
+    const body = parseOrThrow(AskRequest, req.body);
+    const started = Date.now();
+    const { answer, sessionId } = await askLedger(req.ctx.workspaceId, body.question);
+    res.json({
+      answer,
+      session_id: sessionId,
+      elapsed_ms: Date.now() - started,
+    });
+  }),
 );
 
 // ── OpenAPI registration ───────────────────────────────────────────────

@@ -28,8 +28,8 @@ import {
   encodeCursor,
   decodeCursor,
   DEFAULT_PAGE_LIMIT,
+  emitNextLink,
 } from "../http/pagination.js";
-import { emitNextLink } from "../http/pagination.js";
 
 export const itemsRouter: Router = Router();
 
@@ -60,6 +60,11 @@ const ListItemsQuery = z.object({
 interface ItemsCursor {
   created_at: string;
   id: string;
+}
+
+function toIsoString(v: unknown): string {
+  if (v instanceof Date) return v.toISOString();
+  return String(v);
 }
 
 itemsRouter.get(
@@ -126,18 +131,12 @@ itemsRouter.get(
         // aggregation views without round-tripping to /transactions/:id.
         id: r.id,
         transaction_id: r.transaction_id,
-        created_at:
-          r.created_at instanceof Date
-            ? r.created_at.toISOString()
-            : String(r.created_at),
+        created_at: toIsoString(r.created_at),
       }));
 
       const nextCursor = hasMore
         ? encodeCursor({
-            created_at:
-              page[page.length - 1]!.created_at instanceof Date
-                ? page[page.length - 1]!.created_at.toISOString()
-                : String(page[page.length - 1]!.created_at),
+            created_at: toIsoString(page[page.length - 1]!.created_at),
             id: page[page.length - 1]!.id,
           })
         : null;

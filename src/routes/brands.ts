@@ -162,19 +162,17 @@ function rowToAssetDto(row: any) {
     acquired_at: toIsoString(row.acquiredAt ?? row.acquired_at),
     last_seen_at: toIsoString(row.lastSeenAt ?? row.last_seen_at),
     agent_relevance:
-      row.agentRelevance === null || row.agentRelevance === undefined
-        ? row.agent_relevance === null || row.agent_relevance === undefined
-          ? null
-          : Number(row.agent_relevance)
-        : Number(row.agentRelevance),
+      (row.agentRelevance ?? row.agent_relevance) === null ||
+      (row.agentRelevance ?? row.agent_relevance) === undefined
+        ? null
+        : Number(row.agentRelevance ?? row.agent_relevance),
     agent_notes: row.agentNotes ?? row.agent_notes ?? null,
     extraction_version: Number(row.extractionVersion ?? row.extraction_version ?? 1),
     user_rating:
-      row.userRating === null || row.userRating === undefined
-        ? row.user_rating === null || row.user_rating === undefined
-          ? null
-          : Number(row.user_rating)
-        : Number(row.userRating),
+      (row.userRating ?? row.user_rating) === null ||
+      (row.userRating ?? row.user_rating) === undefined
+        ? null
+        : Number(row.userRating ?? row.user_rating),
     user_uploaded: !!(row.userUploaded ?? row.user_uploaded ?? false),
     user_notes: row.userNotes ?? row.user_notes ?? null,
     retired_at:

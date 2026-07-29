@@ -25,7 +25,6 @@ import {
   documents as documentsTable,
   workspaces,
 } from "../schema/index.js";
-import { newId } from "../http/uuid.js";
 import { normalizeFxSafely } from "../fx/normalize.js";
 import {
   defaultClaudeExtractor,
@@ -145,48 +144,6 @@ async function markProcessing(ingestId: string, workspaceId: string): Promise<vo
   await db
     .update(ingests)
     .set({ status: "processing" })
-    .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
-}
-
-async function markDone(
-  ingestId: string,
-  workspaceId: string,
-  classification: string,
-  produced: {
-    transaction_ids: string[];
-    document_ids: string[];
-    receipt_ids?: string[];
-  },
-): Promise<void> {
-  await db
-    .update(ingests)
-    .set({
-      status: "done",
-      classification,
-      produced: {
-        receipt_ids: produced.receipt_ids ?? [],
-        transaction_ids: produced.transaction_ids,
-        document_ids: produced.document_ids,
-      },
-      completedAt: new Date(),
-    })
-    .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
-}
-
-async function markUnsupported(
-  ingestId: string,
-  workspaceId: string,
-  reason: string,
-): Promise<void> {
-  await db
-    .update(ingests)
-    .set({
-      status: "unsupported",
-      classification: "unsupported",
-      produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
-      error: reason,
-      completedAt: new Date(),
-    })
     .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
 }
 

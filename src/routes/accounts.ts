@@ -32,7 +32,6 @@ import {
 } from "../http/pagination.js";
 import {
   AccountInUseProblem,
-  HttpProblem,
   NotFoundProblem,
   ValidationProblem,
 } from "../http/problem.js";
@@ -81,6 +80,19 @@ function toIso(d: Date | string | null): string | null {
   if (d instanceof Date) return d.toISOString();
   // Postgres may already have returned a string (timestamptz text form)
   return new Date(d as string).toISOString();
+}
+
+/**
+ * Normalize a `date`-typed column to `YYYY-MM-DD`. node-postgres hands
+ * back either a `Date` (type parser active) or the raw text form; the
+ * `String(...)` tail is a runtime guard for anything the declared type
+ * doesn't cover. Same helper (and name) as `toIsoDate` in
+ * `src/routes/products.ts` and `src/routes/transactions.service.ts`.
+ */
+function toIsoDate(v: Date | string): string {
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "string") return v.slice(0, 10);
+  return String(v);
 }
 
 function rowToDto(r: AccountRow): AccountDto {
@@ -622,12 +634,7 @@ export async function getRegisterService(
   }
 
   const items = pageSlice.map((r) => {
-    const occurredOn =
-      r.occurred_on instanceof Date
-        ? r.occurred_on.toISOString().slice(0, 10)
-        : typeof r.occurred_on === "string"
-          ? r.occurred_on.slice(0, 10)
-          : String(r.occurred_on);
+    const occurredOn = toIsoDate(r.occurred_on);
     const cp = counterByTx.get(r.transaction_id) ?? [];
     const docs = docsByTx.get(r.transaction_id) ?? [];
     return {
@@ -652,14 +659,8 @@ export async function getRegisterService(
   let next_cursor: string | null = null;
   if (hasMore && pageSlice.length > 0) {
     const last = pageSlice[pageSlice.length - 1]!;
-    const lastDate =
-      last.occurred_on instanceof Date
-        ? last.occurred_on.toISOString().slice(0, 10)
-        : typeof last.occurred_on === "string"
-          ? last.occurred_on.slice(0, 10)
-          : String(last.occurred_on);
     next_cursor = encodeCursor({
-      occurred_on: lastDate,
+      occurred_on: toIsoDate(last.occurred_on),
       posting_id: last.posting_id,
     });
   }
@@ -719,8 +720,10 @@ accountsRouter.patch(
     const { id } = parseOrThrow(IdParam, req.params);
     // Validate body first so shape errors are 422 not 428.
     const patch = parseOrThrow(UpdateAccountRequest, req.body ?? {});
-    // Peek at the header-checked version explicitly so the service can
-    // pass it through (avoids a second DB read in the helper).
+    // Load the row here so `requireIfMatch` can reject a missing (428)
+    // or stale (412) If-Match before any write is attempted. The service
+    // re-reads the row under its own scope and re-checks the version, so
+    // a race between these two reads still 412s.
     const current = await fetchAccount(req.ctx.workspaceId, id);
     if (!current) throw new NotFoundProblem("Account", id);
     requireIfMatch(req, current.version);
@@ -935,6 +938,3 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
     },
   });
 }
-
-// Silence unused-import warnings in declaration-only places.
-void HttpProblem;

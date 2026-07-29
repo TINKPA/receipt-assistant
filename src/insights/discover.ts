@@ -10,11 +10,13 @@
  *  - merchant-trend  (trend): a payee visited ≥3× whose monthly visit
  *    count moved ≥40% vs the prior month.
  *  - owned-milestone (milestone): an owned item crossing a round
- *    days-held mark (1000/1500/2000/2500) within the last 30 days, or
- *    whose $/day dropped under its achievement-plan target.
+ *    days-held mark (1000/1500/2000/2500/3000) within the last 30 days,
+ *    or reaching its achievement-plan `target_days` horizon.
  *
- * Money note: spending postings are negative in the ledger; rules use
- * ABS() and compare magnitudes.
+ * Money note: the expense side of a posting carries a POSITIVE
+ * `amount_base_minor` (the card/cash side is the negative one), so the
+ * rules filter on `amount_base_minor > 0` and compare the raw values —
+ * no ABS() anywhere in this file.
  */
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";

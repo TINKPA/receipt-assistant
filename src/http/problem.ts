@@ -249,7 +249,7 @@ export function problemHandler(
   res: Response,
   _next: NextFunction,
 ): void {
-  const traceId = (req as any).traceId as string | undefined;
+  const traceId: string | undefined = req.traceId;
   const instance = req.originalUrl;
 
   if (err instanceof HttpProblem) {

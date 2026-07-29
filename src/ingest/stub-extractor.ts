@@ -61,8 +61,8 @@ interface StubInstructions {
   };
 }
 
-/** True when the file at absPath is a stub instruction file. Cheap:
- *  refuses anything over 16 KB before reading. */
+/** True when the file at absPath is a stub instruction file. Bounded:
+ *  never JSON-parses more than 16 KB. */
 export async function isStubFile(absPath: string): Promise<boolean> {
   try {
     const buf = await readFile(absPath);
@@ -126,9 +126,16 @@ export const stubFileExtractor: Extractor = async (input) => {
   }
 
   const resolveIds = (ids: string[] | undefined): string[] =>
-    (ids ?? []).map((x) =>
-      x === "$TX" ? (seededTxId ?? x) : x === "$DOC" ? input.documentId : x,
-    );
+    (ids ?? []).map((x) => {
+      switch (x) {
+        case "$TX":
+          return seededTxId ?? x;
+        case "$DOC":
+          return input.documentId;
+        default:
+          return x;
+      }
+    });
   const t = ins.terminal;
   const produced = {
     transaction_ids: resolveIds(t.transaction_ids),

@@ -14,9 +14,9 @@
  * Phase 2 will add reconcile endpoints + SSE hooks on top of the same
  * service.
  */
-import { and, eq, desc, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import * as path from "path";
-import { mkdir, writeFile, readFile } from "fs/promises";
+import { readFile } from "fs/promises";
 import { db } from "../db/client.js";
 import { batches, ingests } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
@@ -29,8 +29,6 @@ import {
 import { enqueue, maybeCompleteBatch } from "../ingest/worker.js";
 import {
   uploadDocumentBytes,
-  getUploadDir,
-  extForMime,
   resolveUploadPath,
 } from "./documents.service.js";
 import {
@@ -149,7 +147,7 @@ export function categorizeIngest(
 /**
  * Parse the `status` query param — a single token or comma-separated set
  * (#158). Returns null when absent (caller applies its own default).
- * Throws NotFoundProblem-shaped ValidationProblem on unknown tokens.
+ * Throws `ValidationProblem` (422) on unknown tokens.
  */
 export function parseStatusFilter(raw: string | undefined): IngestStatus[] | null {
   if (raw === undefined || raw.trim() === "") return null;
@@ -332,13 +330,10 @@ export async function createBatchFromFiles(params: {
   // row will be referenced by the worker when the ingest reports back
   // its produced document_ids.
   //
-  // For classification we don't know kind yet — upload as `other` and
-  // let the worker rewrite `kind` once classification completes.
-  // Actually: the documents service requires kind up-front. We use
-  // `receipt_image` as the default since it's the most common case;
-  // the worker doesn't update kind today (Phase 2 can).
-  const uploadDir = path.join(getUploadDir(), "incoming");
-  await mkdir(uploadDir, { recursive: true });
+  // The documents service requires `kind` up-front, before anything has
+  // been classified, so we seed it from filename + mime via
+  // `guessDocumentKind`. The worker does not rewrite `kind` today
+  // (Phase 2 can); the agent's classification lands on the ingest row.
 
   type SeededIngest = {
     id: string;
@@ -653,10 +648,10 @@ export async function listBatches(params: {
       mapBatchBase(
         {
           id: r.id,
-          workspaceId: (r as any).workspace_id,
+          workspaceId: r.workspace_id,
           status: r.status,
-          fileCount: (r as any).file_count,
-          autoReconcile: (r as any).auto_reconcile,
+          fileCount: r.file_count,
+          autoReconcile: r.auto_reconcile,
           createdAt: r.created_at,
           completedAt: r.completed_at,
           reconciledAt: r.reconciled_at,

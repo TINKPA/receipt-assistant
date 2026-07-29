@@ -107,10 +107,8 @@ function buildUrl(
     key: apiKey,
   });
   if (opts.marker) {
-    // `markers=` value with explicit color (orange, matches design
-    // soft-organic accent). Appended raw because URLSearchParams
-    // would re-encode `|` and `,` differently from Google's expected
-    // shape; we use `params.set` then patch.
+    // `markers=` value with explicit color (orange, matches the design's
+    // soft-organic accent).
     params.set(
       "markers",
       `color:0xe9b54a|${lat},${lng}`,

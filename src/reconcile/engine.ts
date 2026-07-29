@@ -432,26 +432,21 @@ export async function runReconcile(params: {
         duplicate_of: string;
       };
       try {
-        const removed = await softDeleteDuplicate({
+        // `softDeleteDuplicate` returns false when the duplicate row was
+        // already gone (idempotent replay). Either way the proposal is
+        // resolved the same way: leaving a stuck `proposed` row pointing
+        // at an already-deleted duplicate would be worse than an
+        // `auto_applied` row whose delete was a no-op.
+        await softDeleteDuplicate({
           workspaceId,
           userId,
           duplicateId: payload.duplicate,
           canonicalId: payload.duplicate_of,
         });
-        if (removed) {
-          await db
-            .update(reconcileProposals)
-            .set({ status: "auto_applied", resolvedAt: new Date() })
-            .where(eq(reconcileProposals.id, p.id));
-        } else {
-          // Row was already removed — mark the proposal resolved as
-          // user_applied-retroactive so we don't leave a stuck
-          // `proposed` row pointing at a deleted duplicate.
-          await db
-            .update(reconcileProposals)
-            .set({ status: "auto_applied", resolvedAt: new Date() })
-            .where(eq(reconcileProposals.id, p.id));
-        }
+        await db
+          .update(reconcileProposals)
+          .set({ status: "auto_applied", resolvedAt: new Date() })
+          .where(eq(reconcileProposals.id, p.id));
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error(
