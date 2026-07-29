@@ -53,14 +53,12 @@ RULES:
 QUESTION: ${question}`;
 
   const args = [
-    "-p",
-    prompt,
     "--output-format",
     "text",
     "--dangerously-skip-permissions",
     "--model",
     process.env.CLAUDE_MODEL || "sonnet",
   ];
-  const { stdout, sessionId } = await runClaude(args, 180_000);
+  const { stdout, sessionId } = await runClaude(prompt, args, 180_000);
   return { answer: stdout.trim(), sessionId };
 }
