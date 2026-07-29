@@ -27,9 +27,8 @@
  *   --only-id UUID  Single-row debug.
  */
 import "dotenv/config";
-import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
+import { runClaude } from "../src/claude.js";
 import { db } from "../src/db/client.js";
 
 interface Args {
@@ -146,42 +145,17 @@ Fetch each via:
 Read all three, judge, then print the single JSON object.`;
 }
 
-function runClaude(prompt: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-    delete env.ANTHROPIC_API_KEY;
-    const child = spawn(
-      "claude",
-      [
-        "-p",
-        prompt,
-        "--output-format",
-        "text",
-        "--dangerously-skip-permissions",
-        "--session-id",
-        randomUUID(),
-      ],
-      { env, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (b: Buffer) => (out += b.toString()));
-    child.stderr.on("data", (b: Buffer) => (err += b.toString()));
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) reject(new Error(err || out || `claude -p exited ${code}`));
-      else resolve(out);
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
+/**
+ * Spawning goes through src/claude.ts so this script cannot drift from
+ * the production path — in particular the prompt travels on stdin, not
+ * argv (#194).
+ */
+async function askClaude(prompt: string, timeoutMs: number): Promise<string> {
+  const { stdout } = await runClaude(prompt, {
+    args: ["--output-format", "text", "--dangerously-skip-permissions"],
+    timeoutMs,
   });
+  return stdout;
 }
 
 interface OcrResult {
@@ -235,7 +209,7 @@ async function main(): Promise<void> {
   for (const c of cands) {
     process.stdout.write(`  ${ok + miss + fail + 1}/${cands.length} ${c.display_name_en ?? c.google_place_id}: `);
     try {
-      const raw = await runClaude(buildPlacePrompt(c), TIMEOUT);
+      const raw = await askClaude(buildPlacePrompt(c), TIMEOUT);
       const parsed = parseClaudeJson(raw);
       if (!parsed) {
         fail++;
