@@ -163,7 +163,6 @@ async function main() {
     }
     const sha = createHash("sha256").update(bytes).digest("hex");
     const sha8 = sha.slice(0, 8);
-    const relPath = `__pid__/manual_seed/${sha8}.png`; // placeholder, per-product below
 
     // Resolve product ids by predicate (workspace + apple + live).
     const matchRows = await db.execute(
@@ -235,10 +234,8 @@ async function main() {
       }
     }
 
-    void relPath;
     results.push({ file, matched: ids, status, attached, refreshed, pointed });
-    const tag =
-      status === "matched" ? "✓" : status === "multi" ? "≡" : "·";
+    const tag = { matched: "✓", multi: "≡", unmatched: "·" }[status];
     console.log(
       `${tag} ${file.padEnd(26)} → ${ids.length} product(s)` +
         (DRY_RUN

@@ -54,21 +54,15 @@ interface PendingRow {
 }
 
 async function loadPending(args: Args): Promise<PendingRow[]> {
-  let q = sql`
-    SELECT id::text, google_place_id
-    FROM places
-    WHERE display_name_en IS NULL
-  `;
-  if (args.onlyId) {
-    q = sql`SELECT id::text, google_place_id FROM places WHERE id = ${args.onlyId}::uuid`;
-  } else if (args.limit) {
-    q = sql`
+  const limitClause = args.limit ? sql`LIMIT ${args.limit}` : sql``;
+  const q = args.onlyId
+    ? sql`SELECT id::text, google_place_id FROM places WHERE id = ${args.onlyId}::uuid`
+    : sql`
       SELECT id::text, google_place_id
       FROM places
       WHERE display_name_en IS NULL
-      LIMIT ${args.limit}
+      ${limitClause}
     `;
-  }
   const res = await db.execute(q);
   return res.rows as unknown as PendingRow[];
 }

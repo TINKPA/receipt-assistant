@@ -320,7 +320,10 @@ merchantsRouter.patch(
     const updates: Record<string, unknown> = {};
     if ("custom_name" in body) {
       const cn = body.custom_name ?? null;
-      updates["customName"] = cn === null ? null : cn.trim() === "" ? null : cn.trim();
+      // Blank / whitespace-only input clears the override rather than
+      // storing an empty string.
+      const trimmed = cn === null ? null : cn.trim();
+      updates["customName"] = trimmed === "" ? null : trimmed;
     }
     if (Object.keys(updates).length === 0) {
       throw new HttpProblem(

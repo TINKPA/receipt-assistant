@@ -45,8 +45,9 @@ import pg from "pg";
 
 // ── CLI ────────────────────────────────────────────────────────────────
 function argOf(name: string): string | null {
-  const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
-  return hit ? hit.slice(name.length + 3) : null;
+  const prefix = `--${name}=`;
+  const hit = process.argv.find((a) => a.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : null;
 }
 const BASE = argOf("base") ?? "http://localhost:3001";
 const PG_URL =
@@ -382,7 +383,7 @@ async function main(): Promise<void> {
   // r3 — flip + re-run reconcile → no duplicate proposals
   await runCase("r3", false, async (notes) => {
     assert(r1BatchB, "r1 must run before r3");
-    const before = await q(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
+    const before = await q<{ n: number }>(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
     await q(`UPDATE batches SET status = 'extracted' WHERE id = $1`, [r1BatchB]);
     const res = await api(`/v1/batches/${r1BatchB}/reconcile`, {
       method: "POST",
@@ -390,12 +391,12 @@ async function main(): Promise<void> {
       body: "{}",
     });
     assert(res.status === 200 || res.status === 201, `reconcile → ${res.status}`);
-    const after = await q(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
+    const after = await q<{ n: number }>(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
     assert(
-      (after[0] as any).n === (before[0] as any).n,
-      `proposals duplicated: ${(before[0] as any).n} → ${(after[0] as any).n}`,
+      after[0]!.n === before[0]!.n,
+      `proposals duplicated: ${before[0]!.n} → ${after[0]!.n}`,
     );
-    notes.push(`re-run minted 0 new proposals (${(after[0] as any).n} stable)`);
+    notes.push(`re-run minted 0 new proposals (${after[0]!.n} stable)`);
   });
 
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach

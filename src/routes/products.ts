@@ -854,7 +854,7 @@ productsRouter.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const sourceId = String(req.params.id);
-      const body = MergeProductRequest.parse(req.body);
+      const body = parseOrThrow(MergeProductRequest, req.body);
       if (sourceId === body.target_id) {
         throw new HttpProblem(
           400,

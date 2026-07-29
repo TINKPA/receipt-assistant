@@ -205,7 +205,7 @@ extracted values for the placeholders; the CASE statements consult
 \`metadata.user_edited\` so a user override survives this re-extract.
 
   psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
-${brandFkGuard({ bare: true })}
+${brandFkGuard()}
 
   BEGIN;
 

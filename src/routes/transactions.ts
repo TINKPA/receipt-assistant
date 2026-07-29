@@ -482,7 +482,7 @@ transactionsRouter.delete(
   },
 );
 
-// ── OpenAPI registration ───────────────────────────────────────────────
+// ── POST /v1/transactions/:id/near-dup-review ──────────────────────────
 
 transactionsRouter.post(
   "/:id/near-dup-review",
@@ -506,6 +506,7 @@ transactionsRouter.post(
   },
 );
 
+// ── OpenAPI registration ───────────────────────────────────────────────
 
 export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);

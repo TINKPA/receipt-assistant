@@ -97,22 +97,19 @@ ${indentBlock(ITEM_RECORD_COLUMNS, "          ")}
  * Its own statement, never a sibling CTE: `WITH` sub-statements cannot
  * see each other's effects on target tables and RI checks are AFTER-ROW.
  *
- * `bare: true` drops the `psql … <<'SQL'` wrapper so the caller can
- * batch it into a larger heredoc (#181 Turn B). It keeps its own
- * one-column recordset either way — CTEs are per-statement, so it
- * cannot read `itemsCte()`'s `item`.
+ * Returned WITHOUT a `psql … <<'SQL'` wrapper, so the caller batches it
+ * into its own larger heredoc (#181 Turn B). It keeps its own one-column
+ * recordset — CTEs are per-statement, so it cannot read `itemsCte()`'s
+ * `item`.
  */
-export function brandFkGuard(opts: { bare?: boolean } = {}): string {
+export function brandFkGuard(): string {
   const stmt = `INSERT INTO brands (brand_id, name)
 SELECT DISTINCT product_brand_id, product_brand_id
   FROM jsonb_to_recordset(${ITEMS_JSON_EXPR})
     AS item(product_brand_id text)
  WHERE product_brand_id IS NOT NULL
 ON CONFLICT (brand_id) DO NOTHING;`;
-  if (opts.bare) return indentBlock(stmt, "  ");
-  return `  psql -v ON_ERROR_STOP=1 "\$DATABASE_URL" <<'SQL'
-${indentBlock(stmt, "    ")}
-  SQL`;
+  return indentBlock(stmt, "  ");
 }
 
 /**

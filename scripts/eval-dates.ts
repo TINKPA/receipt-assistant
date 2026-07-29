@@ -21,11 +21,13 @@
  * No `--json-schema`, no DB writes, no auth headers (seed-workspace
  * middleware). Single-file; only deps are tsx + Node built-ins.
  *
- * CLI:
- *   --base <url>           API base, default http://localhost:3000
- *   --manifest <path>      Fixture manifest, default scripts/eval-dates.fixtures.json
- *   --uploads-dir <path>   SHA-named JPG root, default the iCloud project's data/uploads/uploads
- *   --limit <n>            Cap fixture count, default all
+ * CLI — `--key=value` only. The parser binds a bare `--key` to `true`, so
+ * the space form fails silently: `--limit 5` runs ONE fixture (Number(true)),
+ * and `--base http://host` makes the base URL the string "true".
+ *   --base=<url>           API base, default http://localhost:3000
+ *   --manifest=<path>      Fixture manifest, default scripts/eval-dates.fixtures.json
+ *   --uploads-dir=<path>   SHA-named JPG root, default the iCloud project's data/uploads/uploads
+ *   --limit=<n>            Cap fixture count, default all
  *   --gate                 Exit 1 if aggregate date_accuracy < 0.9 (AC#1)
  *
  * Run: `npm run eval:dates` (or `npx tsx scripts/eval-dates.ts`).
@@ -376,13 +378,24 @@ function renderMarkdown(
   for (const r of results) {
     const gtDate = r.fixture.ground_truth.date;
     const gtTotal = r.fixture.ground_truth.total_minor;
-    const dateCell = r.extracted.occurred_on
-      ? `${r.extracted.occurred_on === gtDate ? "✅" : "❌"} ${r.extracted.occurred_on}${r.extracted.occurred_on !== gtDate ? ` → ${gtDate}` : ""}`
-      : "—";
-    const totalCell =
-      r.extracted.total_minor == null || gtTotal == null
-        ? "—"
-        : `${r.extracted.total_minor === gtTotal ? "✅" : "❌"} ${(r.extracted.total_minor / 100).toFixed(2)}${r.extracted.total_minor !== gtTotal ? ` → ${(gtTotal / 100).toFixed(2)}` : ""}`;
+
+    let dateCell = "—";
+    if (r.extracted.occurred_on) {
+      dateCell =
+        r.extracted.occurred_on === gtDate
+          ? `✅ ${r.extracted.occurred_on}`
+          : `❌ ${r.extracted.occurred_on} → ${gtDate}`;
+    }
+
+    let totalCell = "—";
+    if (r.extracted.total_minor != null && gtTotal != null) {
+      const got = (r.extracted.total_minor / 100).toFixed(2);
+      totalCell =
+        r.extracted.total_minor === gtTotal
+          ? `✅ ${got}`
+          : `❌ ${got} → ${(gtTotal / 100).toFixed(2)}`;
+    }
+
     const payeeCell = r.extracted.payee
       ? `${r.scoring.payee_match ? "✅" : "❌"} ${r.extracted.payee}`
       : "—";

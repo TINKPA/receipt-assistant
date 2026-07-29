@@ -12,7 +12,7 @@ import sanitizeHtml from "sanitize-html";
 import { and, eq, sql, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { documents, documentLinks } from "../schema/documents.js";
-import { transactions, postings, transactionEvents } from "../schema/index.js";
+import { transactions, transactionEvents } from "../schema/index.js";
 import { derivationEvents } from "../schema/derivation_events.js";
 import { computePhash, isHashableImageMime } from "../images/phash.js";
 import { newId } from "../http/uuid.js";
@@ -106,10 +106,18 @@ const MIME_EXT: Record<string, string> = {
   "text/html": "html",
 };
 
+/**
+ * Normalize a stored `mime_type` to its bare type: drop any `; charset=…`
+ * parameters, trim, lowercase. Absent/empty input normalizes to `""`, so
+ * callers can compare against a literal without a null check first.
+ */
+export function baseMimeType(mime: string | null | undefined): string {
+  return (mime ?? "").split(";")[0]!.trim().toLowerCase();
+}
+
 export function extForMime(mime: string | null | undefined): string | null {
   if (!mime) return null;
-  const k = mime.toLowerCase().split(";")[0]!.trim();
-  return MIME_EXT[k] ?? null;
+  return MIME_EXT[baseMimeType(mime)] ?? null;
 }
 
 export function sha256Hex(buf: Buffer): string {
@@ -314,11 +322,10 @@ export async function renderDocumentHtml(
   const doc = await getDocumentById(workspaceId, id);
   if (!doc) return null;
   const isEmail = doc.kind === "receipt_email";
-  // Normalize the stored mime: strip the charset param and lowercase, so
-  // `text/html; charset=utf-8` and case variants still route here. Accept
-  // application/xhtml+xml too — otherwise an HTML-by-extension doc with a
-  // near-miss mime would fall to the non-sandboxed /content viewer. #137.
-  const baseMime = (doc.mime_type ?? "").split(";")[0]!.trim().toLowerCase();
+  // Accept application/xhtml+xml alongside text/html — otherwise an
+  // HTML-by-extension doc with a near-miss mime would fall through to the
+  // non-sandboxed /content viewer. #137.
+  const baseMime = baseMimeType(doc.mime_type);
   const isHtml = baseMime === "text/html" || baseMime === "application/xhtml+xml";
   if (!isEmail && !isHtml) {
     throw new HttpProblem(
@@ -549,8 +556,9 @@ interface CascadeReport {
  * Both modes refuse if any linked txn is `reconciled`: 409, no writes.
  * Caller must unreconcile first.
  *
- * Everything happens in a single DB transaction — the file unlink
- * (hard mode) runs after commit.
+ * Everything happens in a single DB transaction — the file quarantine
+ * (hard mode) runs after commit. The bytes are MOVED into `.trash/`,
+ * never unlinked; see `quarantineFile` and #72.
  */
 export async function cascadeDeleteDocument(params: {
   workspaceId: string;
@@ -826,7 +834,7 @@ async function extractSourceText(
   doc: { kind: DocumentKindValue | null; mimeType: string | null },
   absPath: string,
 ): Promise<string | null> {
-  const baseMime = (doc.mimeType ?? "").split(";")[0]!.trim().toLowerCase();
+  const baseMime = baseMimeType(doc.mimeType);
   const isHtml =
     baseMime === "text/html" || baseMime === "application/xhtml+xml";
 

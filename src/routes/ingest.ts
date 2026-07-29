@@ -18,7 +18,7 @@ import { z } from "zod";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 
 import { parseOrThrow } from "../http/validate.js";
-import { ValidationProblem, NotFoundProblem } from "../http/problem.js";
+import { ValidationProblem } from "../http/problem.js";
 import { emitNextLink } from "../http/pagination.js";
 import { IdParam, ProblemDetails, Uuid, paginated } from "../schemas/v1/common.js";
 import {

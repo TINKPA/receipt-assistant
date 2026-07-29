@@ -6,7 +6,6 @@ import {
   timestamp,
   index,
 } from "drizzle-orm/pg-core";
-import { sql } from "drizzle-orm";
 import { createdAt } from "./common.js";
 import { batchStatusEnum } from "./enums.js";
 import { workspaces } from "./workspaces.js";

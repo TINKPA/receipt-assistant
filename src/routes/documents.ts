@@ -37,7 +37,7 @@ import {
   ReExtractDocumentResponse,
 } from "../schemas/v1/document.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
-import { NotFoundProblem } from "../http/problem.js";
+import { NotFoundProblem, ValidationProblem } from "../http/problem.js";
 import { setEtag, handleIfNoneMatch } from "../http/etag.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
@@ -100,7 +100,7 @@ documentsRouter.post(
     if (!file) {
       // Explicit 422 to match the rest of the surface — missing field
       // is a validation issue, not a generic 400.
-      throw new (await import("../http/problem.js")).ValidationProblem([
+      throw new ValidationProblem([
         { path: "file", code: "required", message: "multipart field `file` is required" },
       ]);
     }
@@ -128,17 +128,24 @@ documentsRouter.post(
 
 // ── GET /v1/documents/:id ──────────────────────────────────────────────
 
+/** The four string spellings every boolean-ish query flag on this router
+ *  accepts. Shared so `include_deleted`, `hard`, and `cascade` can never
+ *  drift apart. */
+const BoolFlag = z.union([
+  z.literal("true"),
+  z.literal("1"),
+  z.literal("false"),
+  z.literal("0"),
+]);
+
 const IncludeDeletedQuery = z.object({
-  include_deleted: z
-    .union([z.literal("true"), z.literal("1"), z.literal("false"), z.literal("0")])
-    .optional(),
+  include_deleted: BoolFlag.optional(),
 });
 
 function parseIncludeDeleted(q: unknown): boolean {
   const parsed = IncludeDeletedQuery.safeParse(q);
   if (!parsed.success) return false;
-  const v = parsed.data.include_deleted;
-  return v === "true" || v === "1";
+  return flagTrue(parsed.data.include_deleted);
 }
 
 documentsRouter.get(
@@ -278,8 +285,8 @@ documentsRouter.delete(
 //   ?cascade=true&hard=true  — full purge (txns + links + doc + file)
 
 const DeleteQuery = z.object({
-  hard: z.union([z.literal("true"), z.literal("1"), z.literal("false"), z.literal("0")]).optional(),
-  cascade: z.union([z.literal("true"), z.literal("1"), z.literal("false"), z.literal("0")]).optional(),
+  hard: BoolFlag.optional(),
+  cascade: BoolFlag.optional(),
 });
 
 function flagTrue(v: string | undefined): boolean {

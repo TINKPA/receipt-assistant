@@ -887,7 +887,7 @@ back to you in a separate turn.
   -- (2) OPTIONAL FK parents — every distinct product_brand_id in
   --     items[]. Stub rows (domain NULL). Delete when no item carries
   --     a product_brand_id.
-${brandFkGuard({ bare: true })}
+${brandFkGuard()}
 
   -- (3) The ledger write itself: merchant, transaction, both postings,
   --     the document link, the product catalog and the line items —

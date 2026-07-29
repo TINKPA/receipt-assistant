@@ -34,14 +34,14 @@ import { getRate } from "../src/fx/rates.js";
 const WS = "00000000-0000-0000-0000-0000000000ff";
 const USER = "00000000-0000-0000-0000-0000000000fe";
 
-async function seed(): Promise<{ cny: string; usd: string; expense: string; card: string }> {
+async function seed(): Promise<{ expense: string; card: string }> {
   await db.execute(sql`INSERT INTO users (id, email, name) VALUES (${USER}::uuid, 'fx@test.local', 'FX Test') ON CONFLICT DO NOTHING`);
   await db.execute(sql`INSERT INTO workspaces (id, name, base_currency, owner_id) VALUES (${WS}::uuid, 'FX Test WS', 'USD', ${USER}::uuid) ON CONFLICT DO NOTHING`);
   const exp = "00000000-0000-0000-0000-00000000e001";
   const card = "00000000-0000-0000-0000-00000000e002";
   await db.execute(sql`INSERT INTO accounts (id, workspace_id, name, type, currency) VALUES (${exp}::uuid, ${WS}::uuid, 'Other', 'expense', 'USD') ON CONFLICT DO NOTHING`);
   await db.execute(sql`INSERT INTO accounts (id, workspace_id, name, type, currency) VALUES (${card}::uuid, ${WS}::uuid, 'Credit Card', 'liability', 'USD') ON CONFLICT DO NOTHING`);
-  return { cny: "", usd: "", expense: exp, card };
+  return { expense: exp, card };
 }
 
 /** Write a transaction exactly the way the buggy agent template did. */
