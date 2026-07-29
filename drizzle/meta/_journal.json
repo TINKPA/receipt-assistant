@@ -260,6 +260,13 @@
       "when": 1785247047740,
       "tag": "0036_hot_toad_men",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1785308346391,
+      "tag": "0037_faulty_marvel_boy",
+      "breakpoints": true
     }
   ]
 }

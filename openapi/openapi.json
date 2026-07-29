@@ -678,11 +678,19 @@
               "null"
             ],
             "additionalProperties": {}
+          },
+          "deleted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           }
         },
         "required": [
           "id",
-          "kind"
+          "kind",
+          "deleted_at"
         ]
       },
       "Place": {
@@ -7208,6 +7216,16 @@
           },
           "409": {
             "description": "Source already retired",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed (malformed `id`, missing or malformed `target_id`)",
             "content": {
               "application/problem+json": {
                 "schema": {

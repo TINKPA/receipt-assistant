@@ -12,6 +12,7 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
+import { parseOrThrow } from "../http/validate.js";
 import { TransactionParty, BrandPartySummary } from "../schemas/v1/party.js";
 import { Uuid } from "../schemas/v1/common.js";
 
@@ -42,7 +43,14 @@ partiesRouter.get(
   "/transactions/:id/parties",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const id = String(req.params.id);
+      // Validate before the query, not after: `${id}::uuid` hands the
+      // raw param straight to Postgres, which raises SQLSTATE 22P02 on
+      // anything non-uuid. That is neither an `HttpProblem` nor a
+      // `ZodError`, so `problemHandler` can only render it as a generic
+      // 500 — while the OpenAPI registration below already promises the
+      // caller `params: { id: Uuid }`. Same idiom as transactions.ts /
+      // postings.ts: 422 with violations.
+      const { id } = parseOrThrow(z.object({ id: Uuid }), req.params);
       const result = await db.execute(sql`
         SELECT * FROM transaction_parties
         WHERE workspace_id = ${req.ctx.workspaceId}::uuid AND transaction_id = ${id}::uuid
@@ -59,6 +67,14 @@ partiesRouter.get(
   "/brands/:brandId/party-summary",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
+      // Deliberately NOT validated as a Uuid: `brand_id` is a kebab-case
+      // slug (`MerchantBrandId` in schemas/v1/merchant.ts), the column is
+      // `text`, and it is bound as a plain parameter with no `::uuid`
+      // cast — so there is no 22P02 path to guard here, and a Uuid schema
+      // would reject every legitimate id. Matches the OpenAPI
+      // registration below (`brandId: z.string()`) and brands.ts, which
+      // reads the same param raw. An unknown slug simply yields zero
+      // counts.
       const brandId = String(req.params.brandId);
       const ws = req.ctx.workspaceId;
       const counts = await db.execute(sql`

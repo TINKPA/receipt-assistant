@@ -148,12 +148,20 @@ function cardLast4(payment: string | null): string | null {
 }
 
 export interface NearDuplicatePair {
-  /** The batch-side (newer) transaction proposed for voiding. */
+  /** The NEWER of the two transactions, proposed for voiding. Sides are
+   *  picked by `created_at`, NOT by batch membership: usually that makes
+   *  the batch row the duplicate, but a batch row ingested before the
+   *  row it matches outside the batch (a receipt filed late against a
+   *  statement already on file) is the canonical one instead. */
   duplicate_id: string;
-  /** The pre-existing transaction outside the batch. */
+  /** The OLDER of the two, kept as the survivor — usually the
+   *  pre-existing row outside the batch, with the same caveat. */
   canonical_id: string;
   score: number;
   reasons: string[];
+  /** `occurred_on` / `payee` describe `duplicate_id`; the `canonical_*`
+   *  pair describes `canonical_id`. All four follow the ids across the
+   *  swap, so none of them can be assumed to be the batch side. */
   occurred_on: string;
   canonical_occurred_on: string;
   payee: string | null;
@@ -279,15 +287,25 @@ export async function detectNearDuplicates(params: {
     const bNewer =
       new Date(String(r.b_created)).getTime() >=
       new Date(String(r.o_created)).getTime();
+    const bPayeeRaw = (r.b_payee as string | null) ?? null;
+    const oPayeeRaw = (r.o_payee as string | null) ?? null;
     pairs.push({
       duplicate_id: String(bNewer ? r.b_id : r.o_id),
       canonical_id: String(bNewer ? r.o_id : r.b_id),
       score: Math.max(0, Math.min(1, score)),
       reasons,
-      occurred_on: bDate,
-      canonical_occurred_on: oDate,
-      payee: (r.b_payee as string | null) ?? null,
-      canonical_payee: (r.o_payee as string | null) ?? null,
+      // The four descriptive fields swap on the SAME `bNewer` condition
+      // as the ids above. They are not independent labels — they exist to
+      // describe `duplicate_id` and `canonical_id`, so hard-coding the
+      // batch side as "duplicate" made every outside-is-newer proposal
+      // report the canonical row's date/payee as the duplicate's and vice
+      // versa. `total_base_minor` needs no swap: the join predicate is
+      // `o.total = b.total` and only `b.total` is selected, so the two
+      // sides share one value by construction.
+      occurred_on: bNewer ? bDate : oDate,
+      canonical_occurred_on: bNewer ? oDate : bDate,
+      payee: bNewer ? bPayeeRaw : oPayeeRaw,
+      canonical_payee: bNewer ? oPayeeRaw : bPayeeRaw,
       total_base_minor: Number(r.total),
     });
   }

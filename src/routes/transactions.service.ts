@@ -177,6 +177,10 @@ export interface TransactionRow {
     /** Channel provenance (email sender/subject/received_at). Present on
      *  the single-tx detail read; omitted on the list view. #122. */
     source_meta?: Record<string, unknown> | null;
+    /** `documents.deleted_at` tombstone. Non-null when the document was
+     *  soft-deleted. Emitted on BOTH the detail read and the list view —
+     *  the Ledger list tombstones rows without a detail fetch. */
+    deleted_at: string | null;
   }>;
   /**
    * Optional Google Places entry for this transaction's merchant
@@ -363,7 +367,18 @@ function itemsFromMetadataFallback(metadata: unknown): TransactionItemRow[] {
 function mapTransactionRow(
   row: any,
   posts: any[],
-  docs: Array<{ id: string; kind: string; mimeType?: unknown; sourceMeta?: unknown }>,
+  // Both spellings of `deleted_at` are accepted for the same reason the
+  // transaction row below accepts both: the detail loader feeds drizzle
+  // selects (camelCase) and the list loader feeds raw `db.execute` rows
+  // (snake_case).
+  docs: Array<{
+    id: string;
+    kind: string;
+    mimeType?: unknown;
+    sourceMeta?: unknown;
+    deletedAt?: unknown;
+    deleted_at?: unknown;
+  }>,
   place: PlaceRow | null = null,
   itemRows: any[] = [],
   merchant: MerchantRefRow | null = null,
@@ -393,12 +408,16 @@ function mapTransactionRow(
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
     postings: posts.map(mapPostingRow),
-    documents: docs.map((d) => ({
-      id: d.id,
-      kind: d.kind,
-      mime_type: (d.mimeType ?? null) as string | null,
-      source_meta: (d.sourceMeta ?? null) as Record<string, unknown> | null,
-    })),
+    documents: docs.map((d) => {
+      const docDeletedAt = d.deletedAt ?? d.deleted_at;
+      return {
+        id: d.id,
+        kind: d.kind,
+        mime_type: (d.mimeType ?? null) as string | null,
+        source_meta: (d.sourceMeta ?? null) as Record<string, unknown> | null,
+        deleted_at: docDeletedAt ? toIsoString(docDeletedAt) : null,
+      };
+    }),
     place,
     merchant,
     items,
@@ -431,6 +450,7 @@ async function loadTransactionFull(
       kind: documents.kind,
       mimeType: documents.mimeType,
       sourceMeta: documents.sourceMeta,
+      deletedAt: documents.deletedAt,
     })
     .from(documentLinks)
     .innerJoin(documents, eq(documents.id, documentLinks.documentId))
@@ -1030,15 +1050,21 @@ export async function listTransactions(
     postByTx.set(p.transaction_id, arr);
   }
 
+  // `deleted_at` rides along even though `mime_type` / `source_meta` are
+  // deliberately detail-only: the Ledger list tombstones soft-deleted
+  // rows inline, so it cannot afford a per-row detail fetch to learn it.
   const docRes = await db.execute(
-    sql`SELECT dl.transaction_id, d.id, d.kind
+    sql`SELECT dl.transaction_id, d.id, d.kind, d.deleted_at
         FROM document_links dl JOIN documents d ON d.id = dl.document_id
         WHERE dl.transaction_id = ANY(${sql.raw(idArrayLiteral)})`,
   );
-  const docByTx = new Map<string, Array<{ id: string; kind: string }>>();
+  const docByTx = new Map<
+    string,
+    Array<{ id: string; kind: string; deleted_at: unknown }>
+  >();
   for (const d of docRes.rows as any[]) {
     const arr = docByTx.get(d.transaction_id) ?? [];
-    arr.push({ id: d.id, kind: d.kind });
+    arr.push({ id: d.id, kind: d.kind, deleted_at: d.deleted_at });
     docByTx.set(d.transaction_id, arr);
   }
 
@@ -1252,10 +1278,21 @@ export async function deleteTransaction(
       transactionId: id,
       eventType: "hard_deleted",
       actorId: opts.userId ?? null,
-      payload: { reason: "hard_delete", prior_status: current.status },
+      // `transaction_id` is duplicated into the payload on purpose: the
+      // DELETE below nulls the `transaction_events.transaction_id`
+      // column (FK is `ON DELETE SET NULL`, see src/schema/audit.ts), so
+      // the payload copy is the only surviving pointer back to the row
+      // this event — and every earlier event for the same id — describes.
+      payload: {
+        reason: "hard_delete",
+        prior_status: current.status,
+        transaction_id: id,
+      },
     });
     // Hard-delete: postings + document_links cascade via FK. Irreversible
     // — the default DELETE path is the reversible soft delete below.
+    // `transaction_events` does NOT cascade; the audit trail outlives the
+    // row with a null `transaction_id`.
     await tx.delete(transactions).where(eq(transactions.id, id));
   });
 }

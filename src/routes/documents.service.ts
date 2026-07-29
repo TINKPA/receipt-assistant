@@ -745,15 +745,45 @@ const NAMED_ENTITIES: Record<string, string> = {
   ldquo: "“",
 };
 
+/**
+ * `String.fromCodePoint` with the guard the call sites actually need.
+ *
+ * `Number.isFinite` is the WRONG test here: `fromCodePoint` throws a
+ * RangeError for anything outside U+0000–U+10FFFF, and a finite
+ * `99999999` sails past `isFinite` straight into that throw. The failure
+ * is silent and total, not local — `decodeEntities` runs inside
+ * `htmlToPlainText`, whose only caller (`extractSourceText`) is wrapped
+ * in a try/catch that merely logs, so ONE malformed entity anywhere in a
+ * receipt email discards the ENTIRE document's source text and
+ * re-extract then runs with no body at all.
+ *
+ * The range check is the WHOLE guard — do NOT also reject surrogates
+ * (U+D800–U+DFFF). `fromCodePoint` accepts them without throwing, and
+ * Outlook/Exchange and anything built on `charCodeAt()` spell an astral
+ * character as a surrogate PAIR of entities (`&#xD83D;&#xDE00;`, or the
+ * decimal `&#55357;&#56832;`), which is routine in emoji-bearing order
+ * confirmations. Each half decodes to one code unit and the two
+ * concatenate back into a well-formed 😀; a per-entity guard cannot see
+ * the pairing, so rejecting surrogates kills both halves and leaves the
+ * raw entities in the text.
+ */
+function fromCodePointOrNull(cp: number): string | null {
+  if (!Number.isInteger(cp)) return null;
+  if (cp < 0 || cp > 0x10ffff) return null;
+  return String.fromCodePoint(cp);
+}
+
 function decodeEntities(s: string): string {
-  return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body: string) => {
+  // `#[xX]` in BOTH the regex and the prefix test: the old pattern only
+  // admitted a lowercase `x`, so `&#X41;` never even matched and the
+  // `startsWith("#X")` branch below it was dead code. HTML numeric
+  // character references are case-insensitive on the `x`.
+  return s.replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z]+);/g, (whole, body: string) => {
     if (body.startsWith("#x") || body.startsWith("#X")) {
-      const cp = Number.parseInt(body.slice(2), 16);
-      return Number.isFinite(cp) ? String.fromCodePoint(cp) : whole;
+      return fromCodePointOrNull(Number.parseInt(body.slice(2), 16)) ?? whole;
     }
     if (body.startsWith("#")) {
-      const cp = Number.parseInt(body.slice(1), 10);
-      return Number.isFinite(cp) ? String.fromCodePoint(cp) : whole;
+      return fromCodePointOrNull(Number.parseInt(body.slice(1), 10)) ?? whole;
     }
     return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
   });

@@ -15,7 +15,7 @@
 import express, { Router, type Request, type Response, type NextFunction } from "express";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
-import { sql, eq, and, isNull } from "drizzle-orm";
+import { sql, eq, and, isNull, inArray } from "drizzle-orm";
 import { createReadStream } from "fs";
 import { mkdir, stat, writeFile } from "fs/promises";
 import { join, isAbsolute, dirname } from "path";
@@ -43,7 +43,7 @@ import {
   MergeProductRequest,
   MergeProductResponse,
 } from "../schemas/v1/product.js";
-import { ProblemDetails, paginated, Uuid } from "../schemas/v1/common.js";
+import { ProblemDetails, paginated, IdParam, Uuid } from "../schemas/v1/common.js";
 import {
   HttpProblem,
   NotFoundProblem,
@@ -58,9 +58,13 @@ import {
 } from "../http/pagination.js";
 
 // Where the bind-mount lands inside the container. Bytes are written to
-// `<PRODUCT_ASSETS_ROOT>/<product_id>/<tier>/<sha8>.<ext>` and the
-// relative path (everything after the root) is stored in
-// `product_assets.local_path`. Streaming joins root + local_path.
+// `<PRODUCT_ASSETS_ROOT>/<product_id>/<tier>/<sha>.<ext>` — `<sha>` is
+// the full sha256, i.e. the same value stored in `content_hash` — and
+// the relative path (everything after the root) is stored in
+// `product_assets.local_path`. Streaming joins root + local_path. Every
+// writer into this tree follows the layout: the `user_upload` handler
+// below and the `manual_seed` writer in
+// `scripts/seed-apple-product-images.ts`.
 const PRODUCT_ASSETS_ROOT =
   process.env.PRODUCT_ASSETS_ROOT || "/data/product-assets";
 
@@ -610,7 +614,13 @@ productsRouter.post(
   uploadProductAsset.single("file"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const id = String(req.params.id);
+      // Validate `:id` before it is interpolated into a FILESYSTEM path
+      // below (`${id}/user_upload/…` → `join(PRODUCT_ASSETS_ROOT, …)`).
+      // Traversal segments were previously stopped only incidentally,
+      // by the workspace lookup's uuid cast erroring first — a lookup
+      // that a future refactor could reorder or drop. Same idiom as the
+      // merge_into handler.
+      const { id } = parseOrThrow(IdParam, req.params);
       const file = req.file;
       if (!file) {
         throw new ValidationProblem([
@@ -641,7 +651,13 @@ productsRouter.post(
       const bytes = file.buffer;
       const sha = createHash("sha256").update(bytes).digest("hex");
       const ext = extensionForMime(mime);
-      const relPath = `${id}/user_upload/${sha.slice(0, 8)}.${ext}`;
+      // FULL digest in the filename, not a prefix. Dedup is keyed on
+      // UNIQUE (product_id, content_hash) over the whole sha256, so a
+      // truncated filename can collide for two genuinely different
+      // images under one product and silently overwrite the earlier
+      // one's bytes on disk while both rows survive in the DB. Matches
+      // the brand-asset writer in routes/brands.ts.
+      const relPath = `${id}/user_upload/${sha}.${ext}`;
       const absPath = join(PRODUCT_ASSETS_ROOT, relPath);
 
       const existing = await db
@@ -853,7 +869,17 @@ productsRouter.post(
   "/:id/merge_into",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const sourceId = String(req.params.id);
+      // Validate `:id` before it reaches SQL. It used to be raw-
+      // interpolated into the `IN (...)` predicate below, so a quote in
+      // the path terminated the literal (injection); it also meant a
+      // merely-malformed id surfaced as a Postgres uuid cast error —
+      // a 500 — rather than a validation failure. This handler now
+      // rejects a non-uuid `:id` up front with the standard 422 problem.
+      // Most other handlers in this file still read `String(req.params
+      // .id)` unchecked and do 500 on a malformed uuid; they are safe
+      // from injection because they go through drizzle's `eq()`, not a
+      // raw fragment.
+      const { id: sourceId } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(MergeProductRequest, req.body);
       if (sourceId === body.target_id) {
         throw new HttpProblem(
@@ -872,7 +898,7 @@ productsRouter.post(
           .where(
             and(
               eq(products.workspaceId, req.ctx.workspaceId),
-              sql`${products.id} IN (${sql.raw(`'${sourceId}', '${body.target_id}'`)})`,
+              inArray(products.id, [sourceId, body.target_id]),
             ),
           );
         const source = both.find((r) => r.id === sourceId);
@@ -1279,6 +1305,10 @@ export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
       400: { description: "Bad request (e.g. self-merge)", content: problemContent },
       404: { description: "Source or target not found", content: problemContent },
       409: { description: "Source already retired", content: problemContent },
+      422: {
+        description: "Validation failed (malformed `id`, missing or malformed `target_id`)",
+        content: problemContent,
+      },
     },
   });
 

@@ -207,7 +207,10 @@ async function main(): Promise<void> {
   let ok = 0, miss = 0, fail = 0, hit = 0;
   const TIMEOUT = 5 * 60 * 1000;
   for (const c of cands) {
-    process.stdout.write(`  ${ok + miss + fail + 1}/${cands.length} ${c.display_name_en ?? c.google_place_id}: `);
+    // Progress index is `ok + fail`, NOT `ok + miss + fail`: every parsed
+    // response bumps `ok` and THEN bumps exactly one of `hit`/`miss`, so
+    // `ok === hit + miss` and adding `miss` counted those rows twice.
+    process.stdout.write(`  ${ok + fail + 1}/${cands.length} ${c.display_name_en ?? c.google_place_id}: `);
     try {
       const raw = await askClaude(buildPlacePrompt(c), TIMEOUT);
       const parsed = parseClaudeJson(raw);
