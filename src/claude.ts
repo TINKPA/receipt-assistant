@@ -1,8 +1,6 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/receipts";
-
 /**
  * Build a clean env for spawning claude CLI subprocesses.
  * - Removes CLAUDECODE to avoid "nested session" errors
@@ -100,6 +98,13 @@ export function runClaude(
  * Detect the right psql command for the current environment.
  * In Docker: psql is available directly.
  * Local dev: use docker exec to reach the postgres container.
+ *
+ * The returned string is interpolated into a prompt, so it must emit the
+ * **unexpanded** `"$DATABASE_URL"` literal and let the agent's shell
+ * expand it — matching `PSQL_DISCIPLINE` in `src/ingest/prompt-contract.ts`
+ * and every other prompt. Interpolating the resolved URL would write the
+ * DB password into the prompt, and from there verbatim into the session
+ * JSONL and the Langfuse trace.
  */
 export async function detectPsqlCommand(): Promise<string> {
   // Check if psql is available locally
@@ -109,9 +114,11 @@ export async function detectPsqlCommand(): Promise<string> {
       child.on("close", (code) => code === 0 ? resolve() : reject());
       child.on("error", reject);
     });
-    return `psql "${DATABASE_URL}" -c`;
+    return `psql "$DATABASE_URL" -c`;
   } catch {
-    // Fallback: use docker exec (local dev)
-    return `docker exec langfuse-postgres-1 psql -U postgres -d receipts -c`;
+    // Fallback: use docker exec (local dev). The app DB has lived in
+    // `receipts-postgres` since ccc80e2 decoupled it from Langfuse —
+    // `langfuse-postgres-1` no longer holds these tables.
+    return `docker exec receipts-postgres psql -U postgres -d receipts -c`;
   }
 }

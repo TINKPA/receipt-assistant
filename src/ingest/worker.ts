@@ -386,6 +386,14 @@ async function runOne(item: QueueItem): Promise<void> {
     // Agent died / timed out before closing out the ingest row. Stamp
     // it with the error; leave place_id etc. untouched (the agent may
     // have gotten partway through — operators can inspect `ingests`).
+    //
+    // This console.error is load-bearing, do not drop it. Because this
+    // catch handles the rejection, the `[ingest worker] uncaught:` path
+    // never fires — so without a log here a total extraction outage
+    // produces container output indistinguishable from an idle healthy
+    // run. That is exactly how the 2026-07-28 E2BIG outage (#194) went
+    // ~11h unnoticed: 19 log lines, none of them an error.
+    console.error(`[ingest worker] ingest=${ingestId} FAILED:`, err);
     await markError(ingestId, workspaceId, err);
     busEmit("job.error", {
       batchId,
