@@ -7,7 +7,11 @@
 # based. Lines starting with '#' are comments and are NOT injected.
 #
 # Promotion is a normal repo change: add the line here, commit, deploy.
-# See .claude/skills/agent-evolver/SKILL.md (Diagnose → Step 0).
+# The curator is the `agent-evolver` skill, which owns the curation cadence at
+# its Diagnose → Step 0. It lives in the PROJECT SHELL, not in this repo:
+#   ~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/agent-evolver/
+# A bare ".claude/skills/..." path here reads as repo-relative and sends you
+# looking in the wrong tree (it did, on 2026-07-30).
 #
 # EVERY line below is injected into EVERY extractor prompt, so length is a
 # recurring cost paid on every ingest (#181 was a token-burn fix). Keep each
