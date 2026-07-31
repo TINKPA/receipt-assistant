@@ -268,17 +268,35 @@ ${brandFkGuard()}
   -- bumps; old run rows soft-deleted via retired_at). Live aggregates
   -- read WHERE retired_at IS NULL, so old purchases drop out and new
   -- ones count immediately — purchase_count stays correct, no drift.
-  -- Soft-delete every live item belonging to this tx.
+  -- Soft-delete the live items THIS PIPELINE produced. Rows the user entered
+  -- by hand (#183, source='manual') survive: you are re-reading the document,
+  -- and the document never contained them. Retiring them would silently
+  -- delete the user's own data on a machine re-read (#192).
+  --
+  -- Those survivors keep their line_no. The unique index is
+  -- (transaction_id, line_no, extraction_run), so a new row may legally reuse
+  -- a surviving row's number — but then two LIVE rows share it and the
+  -- rendered order is ambiguous. Number your items from 1 as usual; the
+  -- INSERT below shifts them past any surviving manual line.
   UPDATE transaction_items
   SET retired_at = NOW()
   WHERE transaction_id = '${ctx.transactionId}'
-    AND retired_at IS NULL;
+    AND retired_at IS NULL
+    AND source <> 'manual';
 
-  -- Insert the freshly extracted rows under run = MAX(prev)+1.
+  -- Insert the freshly extracted rows under run = MAX(prev)+1, numbered past
+  -- any manual line that survived the retire above (#192).
   WITH next_run AS (
     SELECT COALESCE(MAX(extraction_run), 0) + 1 AS run
     FROM transaction_items
     WHERE transaction_id = '${ctx.transactionId}'
+  ),
+  manual_offset AS (
+    SELECT COALESCE(MAX(line_no), 0) AS n
+    FROM transaction_items
+    WHERE transaction_id = '${ctx.transactionId}'
+      AND retired_at IS NULL
+      AND source = 'manual'
   ),
 ${itemsCte()},
 ${productsUpsert({ workspaceId: ctx.workspaceId, merchantIdExpr })}
@@ -287,6 +305,7 @@ ${transactionItemsInsert({
   txIdExpr: `'${ctx.transactionId}'`,
   runExpr: "(SELECT run FROM next_run)",
   merchantIdExpr,
+  lineNoOffsetExpr: "(SELECT n FROM manual_offset)",
 })};
 
   -- #84: recompute aggregate stats for every product this run touched.

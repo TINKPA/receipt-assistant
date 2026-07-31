@@ -195,9 +195,17 @@ export function transactionItemsInsert(opts: {
   fromPrefix?: string;
   /** RETURNING column list, when the caller wraps this in a CTE. */
   returning?: string;
+  /** SQL expression added to every `line_no`, so a run can be shifted past
+   *  rows that survived it. Re-extract passes the highest live manual line
+   *  (#192): manual rows are no longer retired, and since the unique index is
+   *  (transaction_id, line_no, extraction_run) a new run may legally reuse a
+   *  survivor's number — leaving two LIVE rows with the same line_no and an
+   *  ambiguous rendered order. Ingest passes nothing; it has no survivors. */
+  lineNoOffsetExpr?: string;
 }): string {
   const from = opts.fromPrefix ? `${opts.fromPrefix} ` : "";
   const returning = opts.returning ? `\n      RETURNING ${opts.returning}` : "";
+  const off = opts.lineNoOffsetExpr ? ` + ${opts.lineNoOffsetExpr}` : "";
   return `      INSERT INTO transaction_items (
         id, workspace_id, transaction_id, line_no, parent_line_no,
         raw_name, normalized_name, product_variant, quantity, unit,
@@ -206,8 +214,9 @@ export function transactionItemsInsert(opts: {
         line_type, product_id, tax_minor, tip_share_minor,
         discount_share_minor, extraction_run, extraction_version
       )
-      SELECT gen_random_uuid(), '${opts.workspaceId}', ${opts.txIdExpr}, item.line_no,
-             item.parent_line_no,
+      SELECT gen_random_uuid(), '${opts.workspaceId}', ${opts.txIdExpr}, item.line_no${off},
+             CASE WHEN item.parent_line_no IS NULL THEN NULL
+                  ELSE item.parent_line_no${off} END,
              item.raw_name, item.normalized_name, item.product_variant,
              item.quantity, item.unit,
              item.unit_price_minor, item.line_total_minor, item.currency,
