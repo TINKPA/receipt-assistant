@@ -4,7 +4,7 @@
 import { z } from "zod";
 import {
   AmountMinor,
-  CurrencyCode,
+  LedgerCurrencyCode,
   IsoDate,
   IsoDateTime,
   Metadata,
@@ -42,7 +42,7 @@ export const Posting = z
     transaction_id: Uuid,
     account_id: Uuid,
     amount_minor: AmountMinor,
-    currency: CurrencyCode,
+    currency: LedgerCurrencyCode,
     fx_rate: z.string().nullable(), // numeric returned as string from pg
     amount_base_minor: AmountMinor.nullable(),
     memo: z.string().nullable(),
@@ -54,7 +54,7 @@ export const NewPosting = z
   .object({
     account_id: Uuid,
     amount_minor: AmountMinor,
-    currency: CurrencyCode.optional(),
+    currency: LedgerCurrencyCode.optional(),
     fx_rate: z.string().optional(),
     amount_base_minor: AmountMinor.optional(),
     memo: z.string().optional(),
@@ -199,7 +199,7 @@ export const NewTransactionItem = z
     line_total_minor: z.number().int(),
     /** Omit to inherit the transaction's posting currency. Required
      *  only when the transaction's postings disagree on currency. */
-    currency: CurrencyCode.optional(),
+    currency: LedgerCurrencyCode.optional(),
     item_class: z.enum([
       "durable",
       "consumable",
@@ -323,7 +323,7 @@ export const UpdatePostingRequest = z
   .object({
     account_id: Uuid.optional(),
     amount_minor: AmountMinor.optional(),
-    currency: CurrencyCode.optional(),
+    currency: LedgerCurrencyCode.optional(),
     fx_rate: z.string().optional(),
     amount_base_minor: AmountMinor.optional(),
     memo: z.string().nullable().optional(),

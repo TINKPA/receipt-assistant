@@ -46,9 +46,10 @@
 - [unsupported] Packing lists and slips with zero or absent prices (often stamped "DO NOT INCLUDE THIS PACKING SLIP") mean prices were SUPPRESSED, not that the goods were free. Unsupported, not a $0 receipt.
 - [unsupported] Booking confirmations and vouchers whose Total cells are empty (salon appointments, GetYourGuide, "Your Bill Is Ready" emails that only carry a login link) announce a future or unbilled event. Unsupported.
 - [unsupported] Priceless shop printouts (wheel-alignment / CEMB reports, CA Smog Check VIR certificates) are certificates, not receipts, despite the automotive context. Do not invent a service fee.
-- [receipt_pdf] A hotel folio whose charges table is entirely BLANK (not a printed "0.00") has no amount to post: unsupported. But if that same blank folio names an award/points redemption ("World of Hyatt Award"), it IS a real stay and must be recorded, not discarded.
+- [receipt_pdf] A hotel folio whose charges table is entirely BLANK (not a printed "0.00") has no amount to post: unsupported. But if that same blank folio names an award/points redemption ("World of Hyatt Award"), it IS a real stay: record it in POINTS (#206) — total_minor = the points redeemed, currency = the programme code — never as a $0 stay, and never as unsupported.
 
 # Split tender (extends the voucher lesson above)
+- [receipt] Points and miles are the ONE tender that is not "the residual card charge" (#206): they are a currency of their own, so an award redemption is recorded in the programme's own units (total_minor = points redeemed, currency = HYATT_PT / BONVOY_PT / AA_PT), not as a $0 or residual-only charge. Gift cards and store credit still follow the residual rule below.
 - [receipt] The voucher/gift-card rule also covers insurance deductibles ("Amount to collect from Customer"), the PAYMENT column on medical/optometry ledgers, and prepaid account credit ("Applied balance", store credit). total_minor is always the residual card charge. "Amount expected from insurance" is a pending balance that was never charged, so exclude it.
 - [receipt_pdf] The inverse also happens: government payment portals (NICUSA, parking-citation payments) charge MORE than the printed fee. Use the "amount charged" / "NICServices total" line as total_minor and itemize the unlabeled convenience surcharge.
 

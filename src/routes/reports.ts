@@ -28,8 +28,11 @@ import {
   NetWorthReport,
   CashflowQuery,
   CashflowReport,
+  PointsDisclosure,
+  PointsProgrammeTotal,
 } from "../schemas/v1/report.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
+import { POINTS_CURRENCY_SQL_RE } from "../points/codes.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -60,6 +63,182 @@ function toInt(value: unknown): number {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   return Number(value);
+}
+
+// ── Points disclosure (#206) ───────────────────────────────────────────
+//
+// Points are a currency, so a redeemed award stay is spend and belongs in
+// the spend totals — that is the owner's decision and the reason #206
+// exists. But a base-currency total that quietly mixes real dollars with
+// a valuation of Hyatt points is not a number anyone can act on, so every
+// report says, in the payload, exactly how the two combine.
+//
+// The rule, stated once here and echoed in each report's `policy` string:
+//
+//   spend reports  points-valued spend IS included in the totals; the
+//                  disclosure says how much of the total it is and how
+//                  much of that rests on an unconfirmed valuation
+//   net worth      points accounts are EXCLUDED, because only redemptions
+//                  are recorded — earning is not ingested, so the balance
+//                  is a running tally of points spent, not points held,
+//                  and adding it would drag net worth down by the value
+//                  of every award ever redeemed
+//   unvalued       a programme with no configured valuation contributes
+//                  nothing to any total and is counted separately, so it
+//                  reads as a gap to fill rather than as $0 of spend
+
+type ProgrammeRow = {
+  currency: string;
+  points_minor: string | number | bigint;
+  base_minor: string | number | bigint;
+  valuation_exists: boolean;
+  valuation_confirmed: boolean;
+};
+
+const SPEND_POLICY =
+  "Loyalty points are a currency (#206): points-denominated spend is " +
+  "converted at the workspace's configured per-programme valuation and " +
+  "IS included in the totals above. `unconfirmed_base_minor` is the part " +
+  "of that resting on a valuation the owner has not confirmed; " +
+  "`unvalued_transaction_count` transactions contributed nothing because " +
+  "their programme has no valuation configured at all.";
+
+const NET_WORTH_POLICY =
+  "Loyalty points accounts are EXCLUDED from the balances above (#206). " +
+  "Only redemptions are recorded — points earning is not ingested — so a " +
+  "points account's balance is a tally of points spent, not points held, " +
+  "and including it would understate net worth by the value of every " +
+  "award redeemed. The programme totals below are that tally.";
+
+function summarize(
+  rows: ProgrammeRow[],
+  policy: string,
+  includedInTotals: boolean,
+  unvaluedTransactionCount: number,
+): z.infer<typeof PointsDisclosure> {
+  const programmes: z.infer<typeof PointsProgrammeTotal>[] = rows.map((r) => ({
+    currency: r.currency,
+    points_minor: toInt(r.points_minor),
+    base_minor: toInt(r.base_minor),
+    valuation_exists: r.valuation_exists,
+    valuation_confirmed: r.valuation_confirmed,
+  }));
+  return {
+    policy,
+    included_in_totals: includedInTotals,
+    base_minor: programmes.reduce((a, p) => a + p.base_minor, 0),
+    unconfirmed_base_minor: programmes
+      .filter((p) => !p.valuation_confirmed)
+      .reduce((a, p) => a + p.base_minor, 0),
+    unvalued_transaction_count: unvaluedTransactionCount,
+    programmes,
+  };
+}
+
+/**
+ * Points contribution to the *expense* rollups (summary / trends /
+ * cashflow). Same posting predicate those reports use — expense-type
+ * accounts, money-counting transactions — restricted to points legs.
+ */
+async function getSpendPointsDisclosure(args: {
+  workspaceId: string;
+  from?: string;
+  to?: string;
+}): Promise<z.infer<typeof PointsDisclosure>> {
+  const fromFilter = args.from
+    ? sql`AND t.occurred_on >= ${args.from}::date`
+    : sql``;
+  const toFilter = args.to ? sql`AND t.occurred_on <= ${args.to}::date` : sql``;
+
+  const res = await db.execute(sql`
+    WITH legs AS (
+      SELECT p.currency,
+             p.amount_minor,
+             COALESCE(p.amount_base_minor, 0) AS base_minor,
+             t.id AS tx_id
+        FROM postings p
+        JOIN transactions t ON t.id = p.transaction_id
+        JOIN accounts a ON a.id = p.account_id
+       WHERE p.workspace_id = ${args.workspaceId}::uuid
+         AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
+         AND a.type = 'expense'
+         AND p.amount_minor > 0
+         AND p.currency ~ ${POINTS_CURRENCY_SQL_RE}
+         ${fromFilter}
+         ${toFilter}
+    )
+    SELECT l.currency,
+           SUM(l.amount_minor)::bigint AS points_minor,
+           SUM(l.base_minor)::bigint   AS base_minor,
+           COUNT(DISTINCT l.tx_id) FILTER (WHERE l.base_minor = 0)::int
+             AS unvalued_txn_count,
+           (v.currency IS NOT NULL)    AS valuation_exists,
+           (v.confirmed_at IS NOT NULL) AS valuation_confirmed
+      FROM legs l
+      LEFT JOIN LATERAL (
+        SELECT pv.currency, pv.confirmed_at
+          FROM points_valuations pv
+         WHERE pv.workspace_id = ${args.workspaceId}::uuid
+           AND pv.currency = l.currency
+         ORDER BY pv.effective_from DESC
+         LIMIT 1
+      ) v ON TRUE
+     GROUP BY l.currency, v.currency, v.confirmed_at
+     ORDER BY base_minor DESC, l.currency ASC
+  `);
+
+  const rows = res.rows as unknown as Array<
+    ProgrammeRow & { unvalued_txn_count: number }
+  >;
+  const unvalued = rows.reduce((a, r) => a + toInt(r.unvalued_txn_count), 0);
+  return summarize(rows, SPEND_POLICY, true, unvalued);
+}
+
+/**
+ * Points asset accounts, for the net-worth report that excludes them.
+ * Balances are reported so the exclusion is auditable rather than just
+ * asserted.
+ */
+async function getAccountPointsDisclosure(args: {
+  workspaceId: string;
+  asOf: string;
+}): Promise<z.infer<typeof PointsDisclosure>> {
+  const res = await db.execute(sql`
+    SELECT a.currency,
+           COALESCE(SUM(p.amount_minor) FILTER (
+             WHERE t.status IN ('posted','reconciled') AND t.deleted_at IS NULL
+               AND t.occurred_on <= ${args.asOf}::date
+           ), 0)::bigint AS points_minor,
+           COALESCE(SUM(p.amount_base_minor) FILTER (
+             WHERE t.status IN ('posted','reconciled') AND t.deleted_at IS NULL
+               AND t.occurred_on <= ${args.asOf}::date
+           ), 0)::bigint AS base_minor,
+           (v.currency IS NOT NULL)     AS valuation_exists,
+           (v.confirmed_at IS NOT NULL) AS valuation_confirmed
+      FROM accounts a
+      LEFT JOIN postings p ON p.account_id = a.id AND p.workspace_id = a.workspace_id
+      LEFT JOIN transactions t ON t.id = p.transaction_id
+      LEFT JOIN LATERAL (
+        SELECT pv.currency, pv.confirmed_at
+          FROM points_valuations pv
+         WHERE pv.workspace_id = a.workspace_id
+           AND pv.currency = a.currency
+         ORDER BY pv.effective_from DESC
+         LIMIT 1
+      ) v ON TRUE
+     WHERE a.workspace_id = ${args.workspaceId}::uuid
+       AND a.closed_at IS NULL
+       AND a.currency ~ ${POINTS_CURRENCY_SQL_RE}
+     GROUP BY a.currency, v.currency, v.confirmed_at
+     ORDER BY a.currency ASC
+  `);
+
+  return summarize(
+    res.rows as unknown as ProgrammeRow[],
+    NET_WORTH_POLICY,
+    false,
+    0,
+  );
 }
 
 // ── Service: summary ───────────────────────────────────────────────────
@@ -166,6 +345,11 @@ export async function getSummaryReport(
     currency,
     items,
     grand_total_minor: grandTotal,
+    points: await getSpendPointsDisclosure({
+      workspaceId: args.workspaceId,
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 
@@ -270,6 +454,11 @@ export async function getTrendsReport(
     group_by: groupBy,
     currency,
     buckets,
+    points: await getSpendPointsDisclosure({
+      workspaceId: args.workspaceId,
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 
@@ -314,6 +503,13 @@ export async function getNetWorthReport(
     WHERE a.workspace_id = ${args.workspaceId}::uuid
       AND a.closed_at IS NULL
       AND a.type IN ('asset', 'liability', 'equity')
+      -- Points accounts are excluded (#206). Only redemptions are
+      -- recorded, so their balance is a tally of points SPENT, not points
+      -- held; including it would understate net worth by the value of
+      -- every award ever redeemed. The points block in the response
+      -- reports the excluded balances, so this is auditable, not just
+      -- asserted.
+      AND a.currency !~ ${POINTS_CURRENCY_SQL_RE}
     GROUP BY a.id, a.name, a.type
     ORDER BY a.type ASC, a.name ASC
   `);
@@ -349,6 +545,10 @@ export async function getNetWorthReport(
     equity_minor: equity,
     net_worth_minor: assets + liabilities + equity,
     by_account: byAccount,
+    points: await getAccountPointsDisclosure({
+      workspaceId: args.workspaceId,
+      asOf,
+    }),
   };
 }
 
@@ -435,6 +635,11 @@ export async function getCashflowReport(
     expense_minor: totalExpense,
     net_minor: totalIncome - totalExpense,
     buckets,
+    points: await getSpendPointsDisclosure({
+      workspaceId: args.workspaceId,
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 

@@ -18,6 +18,26 @@ export const CurrencyCode = z
   .regex(/^[A-Z]{3}$/, "ISO 4217 3-letter code, uppercase")
   .openapi({ example: "USD" });
 
+/**
+ * A currency a posting or account may be denominated in: ISO 4217 cash,
+ * or a loyalty-programme unit (#206).
+ *
+ * The two namespaces are disjoint by shape — ISO codes are three letters
+ * and cannot contain an underscore — which is what lets the FX path and
+ * the points-valuation path select disjoint sets of postings with a
+ * regex instead of a lookup table. See `src/points/codes.ts`.
+ *
+ * `CurrencyCode` (above) stays cash-only on purpose: a workspace base
+ * currency, and therefore a report's reporting currency, must be cash.
+ */
+export const LedgerCurrencyCode = z
+  .string()
+  .regex(
+    /^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$/,
+    "ISO 4217 3-letter code, or a points-programme code like HYATT_PT",
+  )
+  .openapi({ example: "USD" });
+
 export const AmountMinor = z
   .number()
   .int()

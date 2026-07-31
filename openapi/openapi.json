@@ -234,7 +234,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "institution": {
@@ -327,7 +327,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "institution": {
@@ -428,7 +428,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "posting_count": {
@@ -528,7 +528,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "running_balance_after_minor": {
@@ -615,7 +615,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "fx_rate": {
@@ -1309,7 +1309,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "item_class": {
@@ -4206,6 +4206,76 @@
           "avg_per_txn_minor"
         ]
       },
+      "PointsProgrammeTotal": {
+        "type": "object",
+        "properties": {
+          "currency": {
+            "type": "string",
+            "example": "HYATT_PT"
+          },
+          "points_minor": {
+            "type": "integer",
+            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "example": 14723
+          },
+          "base_minor": {
+            "type": "integer",
+            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "example": 14723
+          },
+          "valuation_exists": {
+            "type": "boolean"
+          },
+          "valuation_confirmed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "currency",
+          "points_minor",
+          "base_minor",
+          "valuation_exists",
+          "valuation_confirmed"
+        ]
+      },
+      "PointsDisclosure": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string"
+          },
+          "included_in_totals": {
+            "type": "boolean"
+          },
+          "base_minor": {
+            "type": "integer",
+            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "example": 14723
+          },
+          "unconfirmed_base_minor": {
+            "type": "integer",
+            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "example": 14723
+          },
+          "unvalued_transaction_count": {
+            "type": "integer"
+          },
+          "programmes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PointsProgrammeTotal"
+            }
+          }
+        },
+        "required": [
+          "policy",
+          "included_in_totals",
+          "base_minor",
+          "unconfirmed_base_minor",
+          "unvalued_transaction_count",
+          "programmes"
+        ]
+      },
       "SummaryReport": {
         "type": "object",
         "properties": {
@@ -4250,6 +4320,9 @@
             "type": "integer",
             "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
             "example": 14723
+          },
+          "points": {
+            "$ref": "#/components/schemas/PointsDisclosure"
           }
         },
         "required": [
@@ -4258,7 +4331,8 @@
           "group_by",
           "currency",
           "items",
-          "grand_total_minor"
+          "grand_total_minor",
+          "points"
         ]
       },
       "TrendsItem": {
@@ -4351,6 +4425,9 @@
             "items": {
               "$ref": "#/components/schemas/TrendsBucket"
             }
+          },
+          "points": {
+            "$ref": "#/components/schemas/PointsDisclosure"
           }
         },
         "required": [
@@ -4359,7 +4436,8 @@
           "period",
           "group_by",
           "currency",
-          "buckets"
+          "buckets",
+          "points"
         ]
       },
       "NetWorthAccount": {
@@ -4435,6 +4513,9 @@
             "items": {
               "$ref": "#/components/schemas/NetWorthAccount"
             }
+          },
+          "points": {
+            "$ref": "#/components/schemas/PointsDisclosure"
           }
         },
         "required": [
@@ -4444,7 +4525,8 @@
           "liabilities_minor",
           "equity_minor",
           "net_worth_minor",
-          "by_account"
+          "by_account",
+          "points"
         ]
       },
       "CashflowBucket": {
@@ -4522,6 +4604,9 @@
             "items": {
               "$ref": "#/components/schemas/CashflowBucket"
             }
+          },
+          "points": {
+            "$ref": "#/components/schemas/PointsDisclosure"
           }
         },
         "required": [
@@ -4531,7 +4616,8 @@
           "income_minor",
           "expense_minor",
           "net_minor",
-          "buckets"
+          "buckets",
+          "points"
         ]
       },
       "MerchantDetail": {
@@ -4649,7 +4735,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "fx_rate": {
@@ -4901,7 +4987,7 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^[A-Z]{3}$",
+            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
             "example": "USD"
           },
           "fx_rate": {
@@ -5482,7 +5568,7 @@
           {
             "schema": {
               "type": "string",
-              "pattern": "^[A-Z]{3}$",
+              "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
               "example": "USD"
             },
             "required": false,

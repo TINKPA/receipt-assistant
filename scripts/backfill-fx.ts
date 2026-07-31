@@ -33,6 +33,7 @@ import "dotenv/config";
 import { sql } from "drizzle-orm";
 import { db, pool } from "../src/db/client.js";
 import { normalizeTransactionFx } from "../src/fx/normalize.js";
+import { POINTS_CURRENCY_SQL_RE } from "../src/points/codes.js";
 
 interface Args {
   dryRun: boolean;
@@ -65,6 +66,11 @@ interface Candidate {
  * Expense-side (positive) foreign-currency postings, one row per
  * transaction — enough to print a meaningful before/after line. The
  * normalize pass itself operates on every leg.
+ *
+ * Points legs are excluded (#206): they also differ from the base
+ * currency but have no published rate, and handing one to `getRate()`
+ * now throws by design. They are backfilled by
+ * `src/points/valuation.ts` instead.
  */
 async function findCandidates(workspaceId: string | null): Promise<Candidate[]> {
   const res = await db.execute(sql`
@@ -81,6 +87,7 @@ async function findCandidates(workspaceId: string | null): Promise<Candidate[]> 
       JOIN transactions t ON t.id = p.transaction_id
       JOIN workspaces  w ON w.id = t.workspace_id
      WHERE p.currency <> w.base_currency
+       AND p.currency !~ ${POINTS_CURRENCY_SQL_RE}
        AND p.amount_minor > 0
        ${workspaceId ? sql`AND t.workspace_id = ${workspaceId}::uuid` : sql``}
      ORDER BY t.occurred_on
