@@ -290,7 +290,22 @@ Decision tree (stop at first match):
       "Wing Hop Fung(永合丰)Monterey Park Store" instead of plain
       "Wing Hop Fung").
 
-  (c) Address missing but receipt shows merchant + locality → Find-Place-From-Text:
+      QUALITY GATE — geocoding resolves an ADDRESS, not a BUSINESS, and a
+      street address is not a merchant (#203). If the top result's
+      \`types\` contains "premise", "subpremise", "street_address" or
+      "route", you have found the BUILDING the merchant sits in. Do NOT
+      accept it. Fall through to (c) and re-query by name, then:
+        keep the (c) result when it returns a candidate whose
+        formatted_address passes the same locality validation below;
+        keep the (b) premise ONLY if (c) also fails.
+      Symptom this prevents: the transaction links to a place with no
+      business name, no rating, no phone, no photos and no hours — which
+      is every field the place record exists to hold. Reported 10 times
+      independently across hotels, Costco warehouses, restaurants and
+      auto shops, with zero counter-examples.
+
+  (c) Address missing, OR (b) hit the quality gate → Find-Place-From-Text.
+      With a full address in hand, query "<merchant name> <locality>":
 
         Q='Wing Hop Fung Monterey Park'
         QS=\$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "\$Q")
