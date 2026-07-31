@@ -482,10 +482,13 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/ingests/{id}/retry",
     summary:
-      "Retry a failed/unsupported ingest (#158). Re-runs the original " +
-      "stored bytes through the batch pipeline (genuine-restore dedup " +
-      "branch — not suppressed). Returns 202 with the freshly-created " +
-      "ingest to poll. Only `error`/`unsupported` are retryable.",
+      "Retry a failed ingest (#158). Re-runs the original stored bytes " +
+      "through the batch pipeline (genuine-restore dedup branch — not " +
+      "suppressed). Returns 202 with the freshly-created ingest to poll. " +
+      "Accepts exactly the ingests whose `retryable` field is true, i.e. " +
+      "category `transient_actionable` or `infrastructure_fault` (#199); " +
+      "anything else 409s. `unsupported` was accepted before #199 despite " +
+      "always reporting `retryable: false`, and no longer is.",
     tags: ["ingest"],
     request: { params: z.object({ id: Uuid }) },
     responses: {

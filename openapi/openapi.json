@@ -3566,9 +3566,11 @@
           "ok",
           "in_progress",
           "transient_actionable",
+          "infrastructure_fault",
           "input_problem",
           "informational"
-        ]
+        ],
+        "description": "Why an ingest ended where it did, so a client picks its affordance from\nan enum instead of string-parsing `error` (which is agent prose).\n\n- `ok` — reached `done` and produced a transaction.\n- `in_progress` — still `queued` / `processing`.\n- `transient_actionable` — our failure, self-clearing: expired auth,\n  timeout, rate limit, upstream 5xx. Retrying the same bytes is likely\n  to succeed once the outage passes. Retryable.\n- `infrastructure_fault` — our failure, not obviously self-clearing: a\n  crash, a bad deploy, a kernel or database fault. Nothing is wrong with\n  the user's document, so do not tell them there is. Retryable, and a\n  retry is how such an incident is normally recovered.\n- `input_problem` — `unsupported`: the pipeline could not find a receipt\n  in this file. The same bytes will fail the same way; the user must\n  supply a different document. Not retryable.\n- `informational` — `dedup` / `near_dup`; not a failure at all. The\n  pre-existing transaction is in `dedup_of`. Not retryable.\n\nADDED IN #199: `infrastructure_fault`. Additive — no previously-emitted\nvalue changed meaning, but a client that exhaustively switches on this\nenum must add a branch or it will fall through to its default. Before\n#199 an unrecognized `error` string defaulted to `input_problem`, so\nbackend outages were reported to the user as bad documents; the default\nis now `infrastructure_fault`. Rows that previously came back as\n`input_problem` with `status='error'` will now come back as\n`infrastructure_fault` with `retryable: true`.\n\n`retryable` is exactly membership of `transient_actionable` /\n`infrastructure_fault`, and `POST /v1/ingests/{id}/retry` enforces the\nsame predicate — a row the API reports as retryable will be accepted,\nand one it does not will 409."
       },
       "Ingest": {
         "type": "object",
@@ -3622,7 +3624,8 @@
             "$ref": "#/components/schemas/IngestCategory"
           },
           "retryable": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether `POST /v1/ingests/{id}/retry` will accept this ingest. True exactly for categories `transient_actionable` and `infrastructure_fault`; the endpoint enforces the same predicate, so this field and the endpoint can never disagree (#199)."
           },
           "dedup_of": {
             "type": [
@@ -9450,7 +9453,7 @@
     },
     "/v1/ingests/{id}/retry": {
       "post": {
-        "summary": "Retry a failed/unsupported ingest (#158). Re-runs the original stored bytes through the batch pipeline (genuine-restore dedup branch — not suppressed). Returns 202 with the freshly-created ingest to poll. Only `error`/`unsupported` are retryable.",
+        "summary": "Retry a failed ingest (#158). Re-runs the original stored bytes through the batch pipeline (genuine-restore dedup branch — not suppressed). Returns 202 with the freshly-created ingest to poll. Accepts exactly the ingests whose `retryable` field is true, i.e. category `transient_actionable` or `infrastructure_fault` (#199); anything else 409s. `unsupported` was accepted before #199 despite always reporting `retryable: false`, and no longer is.",
         "tags": [
           "ingest"
         ],

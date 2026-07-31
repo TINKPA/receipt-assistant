@@ -12,7 +12,8 @@
     "db:seed": "tsx scripts/seed.ts",
     "openapi:generate": "tsx scripts/generate-openapi.ts",
     "eval:dates": "tsx scripts/eval-dates.ts",
-    "check:prompt-budget": "tsx scripts/check-prompt-budget.ts"
+    "check:prompt-budget": "tsx scripts/check-prompt-budget.ts",
+    "check:ingest-classification": "tsx scripts/check-ingest-classification.ts"
   },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "^7.3.4",
