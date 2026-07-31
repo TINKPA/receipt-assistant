@@ -893,6 +893,57 @@ async function extractSourceText(
   return null;
 }
 
+/**
+ * Tail guard on the decoded source inlined into the re-extract prompt (#198).
+ *
+ * 65,536 B is 3.3x the p99 of the live corpus (19,875 B) and 1.24x the largest
+ * real document (Home Depot, 52,852 B), so it fires on approximately nothing
+ * today and exists for the document that has not arrived yet.
+ *
+ * Pre-#195 an uncapped body was a crash: prompt on argv, 131,071 B ceiling.
+ * The Home Depot order confirmation already cleared it — 52,852 B decoded,
+ * 135,546 B of total prompt — and never fired only because that document
+ * happened to have zero re-extract runs. Now the prompt travels on stdin, so
+ * the failure mode changed from a loud E2BIG into a silent one: a 50 KB
+ * marketing footer diluting the extraction context and inflating the bill.
+ *
+ * Head AND tail, never head-only. Retailer order confirmations — exactly the
+ * risk class here, Home Depot / Groupon / Robinhood — print the total and the
+ * payment method in the footer. Truncating from the front alone would drop the
+ * two fields the extraction most needs while looking like it worked.
+ *
+ * Caps the DECODED text, never the raw file size, which is not merely a weak
+ * predictor but anti-correlated: the largest HTML document on disk (3,214,335 B)
+ * decodes to 1,837 B, while the breaker decodes from 121,986 to 52,852.
+ */
+const REEXTRACT_SOURCE_CAP_BYTES = 65_536;
+const REEXTRACT_SOURCE_HEAD_BYTES = 49_152;
+const REEXTRACT_SOURCE_TAIL_BYTES = 8_192;
+
+export function capSourceText(
+  text: string | null,
+  documentId: string,
+): string | null {
+  if (text === null) return null;
+  const size = Buffer.byteLength(text, "utf8");
+  if (size <= REEXTRACT_SOURCE_CAP_BYTES) return text;
+
+  const buf = Buffer.from(text, "utf8");
+  const head = buf.subarray(0, REEXTRACT_SOURCE_HEAD_BYTES).toString("utf8");
+  const tail = buf.subarray(buf.length - REEXTRACT_SOURCE_TAIL_BYTES).toString("utf8");
+  const elided = size - REEXTRACT_SOURCE_HEAD_BYTES - REEXTRACT_SOURCE_TAIL_BYTES;
+
+  // Loud on purpose. An unannounced truncation is precisely the silent
+  // degradation this guard exists to prevent, so it must never be the thing
+  // that becomes invisible.
+  console.warn(
+    `[re-extract] doc=${documentId} decoded source ${size} B exceeds ` +
+      `${REEXTRACT_SOURCE_CAP_BYTES} B cap — kept head ${REEXTRACT_SOURCE_HEAD_BYTES} B ` +
+      `+ tail ${REEXTRACT_SOURCE_TAIL_BYTES} B, elided ${elided} B`,
+  );
+  return `${head}\n\n[… ${elided} bytes elided by the ${REEXTRACT_SOURCE_CAP_BYTES} B source cap; head and tail kept …]\n\n${tail}`;
+}
+
 // ── Re-extract (Phase 4c of #80 / #91) ─────────────────────────────────
 
 /**
@@ -1055,7 +1106,7 @@ export async function reExtractDocument(
   //     block overwrites that column at the end of the run anyway.
   let sourceText: string | null = null;
   try {
-    sourceText = await extractSourceText(doc, absPath);
+    sourceText = capSourceText(await extractSourceText(doc, absPath), documentId);
   } catch (err) {
     console.warn(
       `[re-extract] doc=${documentId} source-text extraction failed: ${(err as Error).message}`,
