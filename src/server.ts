@@ -14,13 +14,50 @@ import { seed } from "./db/seed.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
+import { buildExtractorPrompt } from "./ingest/prompt.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
+
+/**
+ * Stamp the rendered extractor-prompt size into the boot log (#197).
+ *
+ * The build-time gate (`scripts/check-prompt-budget.ts`) cannot see this
+ * number completely, because `renderActiveLessons()` reads `lessons.md` from
+ * disk at RUNTIME — so prompt size is partly a property of the deploy, not
+ * only of the commit. A lessons file that grows under a running container is
+ * invisible to any check that runs at build time.
+ *
+ * It also means every deploy leaves a size record in `docker logs`, which is
+ * what was missing when the prompt crossed the argv ceiling in #194: the
+ * number existed, nothing ever printed it.
+ *
+ * Deliberately non-fatal. Refusing to boot over a prompt-size reading would
+ * turn an observability feature into an outage, which is the opposite of the
+ * point.
+ */
+function logPromptSize(): void {
+  try {
+    const empty = {
+      filePath: "",
+      ingestId: "",
+      workspaceId: "",
+      documentId: "",
+      userId: "",
+      phashNeighbors: [],
+    } as Parameters<typeof buildExtractorPrompt>[0];
+    const size = Buffer.byteLength(buildExtractorPrompt(empty), "utf8");
+    console.log(`📏 Extractor prompt ${size.toLocaleString()} B rendered (empty context)`);
+  } catch (err) {
+    console.warn("📏 Could not measure extractor prompt size:", (err as Error).message);
+  }
+}
 
 async function main(): Promise<void> {
   console.log("🗄️  Running Drizzle migrations…");
   await runMigrations();
   console.log("✅ Migrations complete");
+
+  logPromptSize();
 
   if (process.env.SEED_ON_BOOT !== "false") {
     const r = await seed();
