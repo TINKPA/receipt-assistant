@@ -672,19 +672,56 @@ in this order so you can read the output positionally:
 
   -- (4) near-duplicate candidates: Phase 4a.0. Use YOUR extracted
   --     values; the ±3-day window covers settlement-date drift.
-  SELECT t.id, t.payee, t.occurred_on,
-         t.metadata->>'order_number'  AS order_number,
-         t.metadata->>'payment_id'    AS payment_id,
-         t.metadata->>'approval_code' AS approval_code,
-         t.metadata->>'payment'       AS payment
-    FROM transactions t
-    JOIN postings p ON p.transaction_id = t.id AND p.amount_minor > 0
-   WHERE t.workspace_id = '${ctx.workspaceId}'
-     AND t.status IN ('posted','reconciled')
-     AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3
-   GROUP BY t.id
-  HAVING SUM(p.amount_minor) = <TOTAL_MINOR>
-   LIMIT 5;
+  --
+  --     TWO independent candidate paths, UNIONed. Amount alone is not
+  --     enough: it has zero discriminating power at $0 (#205), and the
+  --     old query's "amount_minor > 0" join meant a zero-total
+  --     transaction produced no rows and could never be a candidate at
+  --     all — so re-uploading a $0 document wrote a new row every time.
+  --     Conversely amount alone over-matches: five distinct $0 Amazon
+  --     orders on one day are five real orders, not duplicates, and only
+  --     the identifier can say so.
+  --
+  --     Substitute <IDENTS> with a comma-separated quoted list of every
+  --     identifier value YOU extracted, or omit branch (b) if you found
+  --     none. Identifier keys are the contract in Phase 4a.0 (#204).
+  SELECT * FROM (
+    -- (a) same amount, near date — the classic re-upload of a priced receipt
+    SELECT t.id, t.payee, t.occurred_on, 'amount' AS matched_on,
+           t.metadata->>'order_number'        AS order_number,
+           t.metadata->>'confirmation_number' AS confirmation_number,
+           t.metadata->>'invoice_number'      AS invoice_number,
+           t.metadata->>'payment_id'          AS payment_id,
+           t.metadata->>'approval_code'       AS approval_code
+      FROM transactions t
+      JOIN postings p ON p.transaction_id = t.id AND p.amount_minor >= 0
+     WHERE t.workspace_id = '${ctx.workspaceId}'
+       AND t.status IN ('posted','reconciled')
+       AND t.deleted_at IS NULL
+       AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3
+     GROUP BY t.id
+    HAVING SUM(p.amount_minor) FILTER (WHERE p.amount_minor > 0) = <TOTAL_MINOR>
+        OR (<TOTAL_MINOR> = 0 AND SUM(ABS(p.amount_minor)) = 0)
+    UNION
+    -- (b) shared identifier, ANY amount, wider window. An order number is
+    --     stronger evidence than an amount and survives a re-issued or
+    --     partially-refunded document, so it is not date-bounded as tightly.
+    SELECT t.id, t.payee, t.occurred_on, 'identifier' AS matched_on,
+           t.metadata->>'order_number', t.metadata->>'confirmation_number',
+           t.metadata->>'invoice_number', t.metadata->>'payment_id',
+           t.metadata->>'approval_code'
+      FROM transactions t
+     WHERE t.workspace_id = '${ctx.workspaceId}'
+       AND t.status IN ('posted','reconciled')
+       AND t.deleted_at IS NULL
+       AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 30 AND DATE '<YYYY-MM-DD>' + 30
+       AND (t.metadata->>'order_number' IN (<IDENTS>)
+         OR t.metadata->>'confirmation_number' IN (<IDENTS>)
+         OR t.metadata->>'invoice_number' IN (<IDENTS>)
+         OR t.metadata->>'payment_id' IN (<IDENTS>)
+         OR t.metadata->>'approval_code' IN (<IDENTS>))
+  ) cand
+   LIMIT 10;
   SQL
 
 psql prints the result sets in order. Read them once, then branch:
@@ -764,6 +801,37 @@ The same purchase may already be in the ledger via another copy
 (re-shot photo, re-scanned PDF) or another evidence channel (the email
 for a PDF you're holding, the invoice for a receipt). Inserting again
 double-counts the money. Decide attach-vs-insert as follows.
+
+── Identifier keys — a CLOSED contract, not free choice (#204) ────────
+
+A printed reference number is the single strongest dedup signal there
+is: it survives a re-shot photo, a different evidence channel, a
+partial refund, and a $0 total, none of which an amount survives. It
+only works if the writer and the reader agree on the key, so the key
+set is fixed. Store every identifier you find under EXACTLY one of:
+
+  order_number         Amazon/Newegg order refs, restaurant order or
+                       check numbers, POS transaction numbers
+  confirmation_number  hotel and travel confirmations, booking refs
+  invoice_number       invoices and folios, "Invoice #", Apple's
+                       Invoice Number, contractor bills
+  payment_id           processor ids — Square, Stripe, PayPal
+  approval_code        card auth / approval codes
+
+Rules that make this a contract rather than a suggestion:
+  * NEVER invent a sixth key. A number under a key nobody reads is
+    invisible to dedup, which is the exact failure this replaces —
+    invoice_number was on 61 transactions and confirmation_number on 17,
+    and the query read neither.
+  * When a document prints something that fits none of them, put it in
+    metadata under any name you like, but ALSO copy it to the closest
+    key above. Findable beats tidy.
+  * Never put a SKU, serial number, tracking number, loyalty number or
+    store number in these keys. They identify a product, a shipment or a
+    place — not this purchase — and dedup comparing them silently
+    matches unrelated transactions.
+  * Values are compared as text, verbatim as printed. Do not strip
+    leading zeros, dashes or prefixes.
 
 Perceptually-similar existing documents (pHash, candidate-surfacing
 ONLY — same-app screenshots of DIFFERENT purchases can land here, so
