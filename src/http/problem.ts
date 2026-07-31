@@ -192,20 +192,26 @@ export class GooglePlacesUpstreamProblem extends HttpProblem {
 }
 
 /**
- * Returned by `POST /v1/ingests/:id/retry` when the ingest is in a
- * state that cannot be re-run. Only `error` / `unsupported` ingests are
- * retryable — `done` already succeeded, `queued`/`processing` are still
- * in flight, and `dedup`/`near_dup` are duplicates whose canonical
- * transaction is reachable via `dedup_of` (retrying would re-suppress).
+ * Returned by `POST /v1/ingests/:id/retry` when the ingest is in a state
+ * that cannot be re-run. Retry is for failures on our side, so only the
+ * `transient_actionable` / `infrastructure_fault` categories qualify —
+ * `ok` already succeeded, `in_progress` is still in flight, `input_problem`
+ * would fail identically on identical bytes, and `informational`
+ * (`dedup`/`near_dup`) has a canonical transaction reachable via `dedup_of`
+ * that retrying would only re-suppress.
+ *
+ * `category` mirrors the field on the ingest resource, so a client that hid
+ * the retry control can explain the 409 without a second lookup (#199).
  */
 export class IngestNotRetryableProblem extends HttpProblem {
-  constructor(ingestId: string, status: string) {
+  constructor(ingestId: string, status: string, category: string) {
     super(
       409,
       "ingest-not-retryable",
       "Ingest is not retryable",
-      `Ingest ${ingestId} has status='${status}'. Only 'error' and 'unsupported' ingests can be retried.`,
-      { ingest_id: ingestId, status },
+      `Ingest ${ingestId} has status='${status}' (category='${category}'). ` +
+        `Only 'transient_actionable' and 'infrastructure_fault' ingests can be retried.`,
+      { ingest_id: ingestId, status, category },
     );
   }
 }

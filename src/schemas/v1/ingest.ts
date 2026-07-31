@@ -37,23 +37,52 @@ export const IngestClassification = z
   .openapi("IngestClassification");
 
 // Derived reason bucket (#158) so a client can pick the right affordance
-// without string-parsing `error`:
-//   ok                  → reached `done`, produced a transaction.
-//   in_progress         → still `queued` / `processing`.
-//   transient_actionable→ `error` from auth/timeout/rate-limit/upstream 5xx;
-//                          retrying the same bytes is likely to succeed.
-//   input_problem       → `unsupported`, or an `error` that looks like a
-//                          bad/unreadable input; user should replace/correct.
-//   informational       → `dedup` / `near_dup`; not an error. See `dedup_of`.
+// without string-parsing `error`. `infrastructure_fault` was added in #199 —
+// see the `description` below, which is the contract clients read.
 export const IngestCategory = z
   .enum([
     "ok",
     "in_progress",
     "transient_actionable",
+    "infrastructure_fault",
     "input_problem",
     "informational",
   ])
-  .openapi("IngestCategory");
+  .openapi("IngestCategory", {
+    description: [
+      "Why an ingest ended where it did, so a client picks its affordance from",
+      "an enum instead of string-parsing `error` (which is agent prose).",
+      "",
+      "- `ok` — reached `done` and produced a transaction.",
+      "- `in_progress` — still `queued` / `processing`.",
+      "- `transient_actionable` — our failure, self-clearing: expired auth,",
+      "  timeout, rate limit, upstream 5xx. Retrying the same bytes is likely",
+      "  to succeed once the outage passes. Retryable.",
+      "- `infrastructure_fault` — our failure, not obviously self-clearing: a",
+      "  crash, a bad deploy, a kernel or database fault. Nothing is wrong with",
+      "  the user's document, so do not tell them there is. Retryable, and a",
+      "  retry is how such an incident is normally recovered.",
+      "- `input_problem` — `unsupported`: the pipeline could not find a receipt",
+      "  in this file. The same bytes will fail the same way; the user must",
+      "  supply a different document. Not retryable.",
+      "- `informational` — `dedup` / `near_dup`; not a failure at all. The",
+      "  pre-existing transaction is in `dedup_of`. Not retryable.",
+      "",
+      "ADDED IN #199: `infrastructure_fault`. Additive — no previously-emitted",
+      "value changed meaning, but a client that exhaustively switches on this",
+      "enum must add a branch or it will fall through to its default. Before",
+      "#199 an unrecognized `error` string defaulted to `input_problem`, so",
+      "backend outages were reported to the user as bad documents; the default",
+      "is now `infrastructure_fault`. Rows that previously came back as",
+      "`input_problem` with `status='error'` will now come back as",
+      "`infrastructure_fault` with `retryable: true`.",
+      "",
+      "`retryable` is exactly membership of `transient_actionable` /",
+      "`infrastructure_fault`, and `POST /v1/ingests/{id}/retry` enforces the",
+      "same predicate — a row the API reports as retryable will be accepted,",
+      "and one it does not will 409.",
+    ].join("\n"),
+  });
 
 // ── produced provenance ───────────────────────────────────────────────
 
@@ -84,7 +113,13 @@ export const Ingest = z
     // the pre-existing transaction for a `dedup`/`near_dup` row so the
     // client can deep-link "already in your ledger → view it".
     category: IngestCategory,
-    retryable: z.boolean(),
+    retryable: z.boolean().openapi({
+      description:
+        "Whether `POST /v1/ingests/{id}/retry` will accept this ingest. " +
+        "True exactly for categories `transient_actionable` and " +
+        "`infrastructure_fault`; the endpoint enforces the same predicate, " +
+        "so this field and the endpoint can never disagree (#199).",
+    }),
     dedup_of: Uuid.nullable(),
     created_at: IsoDateTime,
     completed_at: IsoDateTime.nullable(),

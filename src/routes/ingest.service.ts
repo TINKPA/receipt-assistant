@@ -53,6 +53,7 @@ export type IngestCategory =
   | "ok"
   | "in_progress"
   | "transient_actionable"
+  | "infrastructure_fault"
   | "input_problem"
   | "informational";
 
@@ -99,14 +100,74 @@ const ALL_INGEST_STATUSES: readonly IngestStatus[] = [
   "near_dup",
 ];
 
-// An `error` string matching this pattern is a transient/infrastructure
-// fault (expired auth, timeout, rate-limit, upstream 5xx) — re-running the
-// same bytes is likely to succeed once the outage clears. Anything else
-// (missing date, illegible, "no total") is treated as an input problem
-// where a blind retry won't help. Matches the 401 auth-expiry class that
-// motivated #158.
+// Recognizes the *self-clearing* subset of our own infrastructure faults —
+// expired auth, timeout, rate-limit, upstream 5xx — so the client can say
+// "wait and it'll work" instead of "an operator has to look at this". Both
+// buckets are ours and both are retryable, so a miss here costs a vaguer
+// label and nothing else.
+//
+// #199: this regex used to be the *gate* — an allowlist of known-transient
+// prose with `input_problem` as the default, which meant any error string it
+// had not seen before was blamed on the user's document. `spawn E2BIG`, a
+// kernel argv-limit fault during the #194 outage, was reported to the user
+// as "This file could not be processed." It must never again decide *whose*
+// fault a failure is; see `categoryOf` for what does.
 const TRANSIENT_ERROR_RE =
   /\b(401|403|429|500|502|503|504)\b|invalid authentication|unauthor|forbidden|timed?[ -]?out|timeout|rate.?limit|overloaded|econnreset|econnrefused|etimedout|network|socket hang up|fetch failed|temporarily|try again/i;
+
+// Categories whose rows `POST /v1/ingests/:id/retry` will accept. The single
+// definition of "retryable" for this feature: the `retryable` field the API
+// reports and the guard inside `retryIngest` are both this set, so the server
+// can never refuse a retry the UI offered, or accept one it hid (#199).
+//
+// Both members are our failures, and re-running the same bytes once the fault
+// clears is exactly the recovery path — #194 was recovered by a retry of a row
+// the UI had declared non-retryable.
+const RETRYABLE_CATEGORIES: ReadonlySet<IngestCategory> = new Set([
+  "transient_actionable",
+  "infrastructure_fault",
+]);
+
+/**
+ * Map an ingest's terminal state to its reason bucket.
+ *
+ * Blame is decided by `status`, a structural enum written by the pipeline —
+ * never by pattern-matching `error`, which is agent prose (#199). The split:
+ *
+ *   - `unsupported` is the *only* way to say the document was the problem.
+ *     The extractor prompt's close-out contract reserves it for exactly that
+ *     ("classification is unsupported, set error = <reason>"), and reserves
+ *     `error` for INSERT/constraint failures. Every `error` string our own
+ *     code writes — `spawn E2BIG`, `assertArgvSafe`, "workspace not found",
+ *     "agent did not close out", "worker restart: batch abandoned" — is a
+ *     fault on our side.
+ *   - Hence `error` defaults to `infrastructure_fault`, not `input_problem`.
+ *     An unrecognized failure is far more likely ours than the user's, and
+ *     mislabelling ours as theirs is the worse of the two mistakes: it blames
+ *     a document that was never at fault, withholds the retry that would have
+ *     fixed it, and misdirects the next investigation.
+ *
+ * A future failure mode that genuinely IS about the document must therefore
+ * be raised as `status='unsupported'`, not as `error` with explanatory prose.
+ */
+function categoryOf(status: IngestStatus, error: string | null): IngestCategory {
+  switch (status) {
+    case "done":
+      return "ok";
+    case "queued":
+    case "processing":
+      return "in_progress";
+    case "dedup":
+    case "near_dup":
+      return "informational";
+    case "unsupported":
+      return "input_problem";
+    case "error":
+      return TRANSIENT_ERROR_RE.test(error ?? "")
+        ? "transient_actionable"
+        : "infrastructure_fault";
+  }
+}
 
 /**
  * Derive the reason bucket + affordance hints for one ingest (#158). Pure
@@ -118,30 +179,27 @@ export function categorizeIngest(
   error: string | null,
   produced: IngestRow["produced"],
 ): { category: IngestCategory; retryable: boolean; dedup_of: string | null } {
-  switch (status) {
-    case "done":
-      return { category: "ok", retryable: false, dedup_of: null };
-    case "queued":
-    case "processing":
-      return { category: "in_progress", retryable: false, dedup_of: null };
-    case "dedup":
-    case "near_dup":
-      return {
-        category: "informational",
-        retryable: false,
-        dedup_of: produced?.transaction_ids?.[0] ?? null,
-      };
-    case "unsupported":
-      return { category: "input_problem", retryable: false, dedup_of: null };
-    case "error": {
-      const transient = TRANSIENT_ERROR_RE.test(error ?? "");
-      return {
-        category: transient ? "transient_actionable" : "input_problem",
-        retryable: transient,
-        dedup_of: null,
-      };
-    }
-  }
+  const category = categoryOf(status, error);
+  return {
+    category,
+    retryable: RETRYABLE_CATEGORIES.has(category),
+    dedup_of:
+      category === "informational"
+        ? (produced?.transaction_ids?.[0] ?? null)
+        : null,
+  };
+}
+
+/**
+ * The one predicate behind both the `retryable` field and `retryIngest`'s
+ * guard (#199). Call this rather than re-deriving the rule; two definitions
+ * of "retryable" in one feature is the bug being fixed, not a style nit.
+ */
+export function isIngestRetryable(
+  status: IngestStatus,
+  error: string | null,
+): boolean {
+  return RETRYABLE_CATEGORIES.has(categoryOf(status, error));
 }
 
 /**
@@ -769,9 +827,21 @@ export async function listIngests(params: {
  * of the failure; the returned `ingest` is the freshly-created one the
  * caller should poll.
  *
- * Guards: only `error` / `unsupported` are retryable. `done` already
- * succeeded; `queued`/`processing` are still in flight; `dedup`/`near_dup`
- * are duplicates whose canonical transaction is reachable via `dedup_of`.
+ * Guard: `isIngestRetryable` — the same predicate that produces the
+ * `retryable` field on every ingest the API returns (#199). Retrying is for
+ * failures on *our* side (`transient_actionable`, `infrastructure_fault`),
+ * where the same bytes through the same pipeline succeed once the fault
+ * clears. `done` already succeeded; `queued`/`processing` are still in
+ * flight; `dedup`/`near_dup` are duplicates whose canonical transaction is
+ * reachable via `dedup_of`.
+ *
+ * `unsupported` was accepted here before #199 even though the `retryable`
+ * field had always reported `false` for it — the contradiction #199 fixes.
+ * It is now refused, deliberately: re-running identical bytes through an
+ * identical pipeline lands on `unsupported` again, so the permissive side of
+ * that contradiction was the wrong one to keep. Re-running the ~100 stored
+ * `unsupported` rows after the pipeline gains new document support is an
+ * operator backfill (see `scripts/`), not a per-row user affordance.
  */
 export async function retryIngest(
   workspaceId: string,
@@ -783,8 +853,8 @@ export async function retryIngest(
   poll: string;
 }> {
   const original = await getIngest(workspaceId, id); // throws NotFound
-  if (original.status !== "error" && original.status !== "unsupported") {
-    throw new IngestNotRetryableProblem(id, original.status);
+  if (!isIngestRetryable(original.status, original.error)) {
+    throw new IngestNotRetryableProblem(id, original.status, original.category);
   }
 
   const abs = resolveUploadPath(original.file_path);
