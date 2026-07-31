@@ -4,7 +4,7 @@
 import { z } from "zod";
 import {
   AmountMinor,
-  CurrencyCode,
+  LedgerCurrencyCode,
   IsoDate,
   IsoDateTime,
   Metadata,
@@ -27,7 +27,7 @@ const baseAccountFields = {
   name: z.string().min(1),
   type: AccountType,
   subtype: z.string().nullable(),
-  currency: CurrencyCode,
+  currency: LedgerCurrencyCode,
   institution: z.string().nullable(),
   last4: z.string().nullable(),
   opening_balance_minor: AmountMinor,
@@ -54,7 +54,7 @@ export const CreateAccountRequest = z
     name: z.string().min(1),
     type: AccountType,
     subtype: z.string().optional(),
-    currency: CurrencyCode.optional(), // inherit from parent if omitted
+    currency: LedgerCurrencyCode.optional(), // inherit from parent if omitted
     institution: z.string().optional(),
     last4: z.string().optional(),
     opening_balance_minor: AmountMinor.optional(),
@@ -80,7 +80,7 @@ export const AccountBalance = z
     account_id: Uuid,
     as_of: IsoDate,
     balance_minor: AmountMinor,
-    currency: CurrencyCode,
+    currency: LedgerCurrencyCode,
     posting_count: z.number().int(),
     includes_children: z.boolean(),
   })
@@ -110,7 +110,7 @@ export const RegisterItem = z
     payee: z.string().nullable(),
     narration: z.string().nullable(),
     amount_minor: AmountMinor,
-    currency: CurrencyCode,
+    currency: LedgerCurrencyCode,
     running_balance_after_minor: AmountMinor,
     counter_postings: z.array(RegisterCounterPosting),
     documents: z.array(RegisterDocumentRef),
@@ -132,7 +132,7 @@ export const ListAccountsQuery = z.object({
 
 export const BalanceQuery = z.object({
   as_of: IsoDate.optional(),
-  currency: CurrencyCode.optional(),
+  currency: LedgerCurrencyCode.optional(),
   include_children: z.coerce.boolean().optional(),
 });
 

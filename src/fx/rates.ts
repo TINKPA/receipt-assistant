@@ -21,6 +21,7 @@
  */
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
+import { isPointsCurrency } from "../points/codes.js";
 
 /** Frankfurter base URL. Read per call, not at module load, so a test can
  *  point it at a dead host to exercise the offline fallback path. */
@@ -200,6 +201,22 @@ export async function getRate(
   quote: string,
   onDate: string,
 ): Promise<ResolvedRate> {
+  // Hard stop, not a filter (#206). Loyalty points have no published
+  // rate; what they are worth is the owner's judgement, resolved by
+  // `src/points/valuation.ts`. Callers are expected to have partitioned
+  // their postings by currency shape already — this throws so that a
+  // future caller which forgets fails loudly here rather than quietly
+  // pricing an award stay off a currency-market feed.
+  for (const code of [base, quote]) {
+    if (isPointsCurrency(code)) {
+      throw new Error(
+        `Refusing to resolve an FX rate for points currency ${code}: ` +
+          `points are valued per programme (see src/points/valuation.ts), ` +
+          `never from a published FX rate`,
+      );
+    }
+  }
+
   if (base === quote) {
     return { rate: 1, asOfActual: onDate, source: "identity" };
   }

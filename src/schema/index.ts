@@ -12,6 +12,8 @@ export * from "./transaction_parties.js";
 export * from "./brands.js";
 export * from "./postings.js";
 export * from "./fx_rates.js";
+export * from "./points_programmes.js";
+export * from "./points_valuations.js";
 export * from "./documents.js";
 export * from "./audit.js";
 export * from "./idempotency.js";

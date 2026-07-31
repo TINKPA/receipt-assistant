@@ -34,12 +34,14 @@
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { getRate } from "./rates.js";
+import { isPointsCurrency } from "../points/codes.js";
 
 interface PostingRow {
   id: string;
   amount_minor: string;
   currency: string;
   fx_rate: string | null;
+  amount_base_minor: string | null;
 }
 
 export interface NormalizeResult {
@@ -93,7 +95,7 @@ export async function normalizeTransactionFx(
   const onDate = String(occurredOn).slice(0, 10);
 
   const postingsRes = await db.execute(
-    sql`SELECT id, amount_minor, currency, fx_rate
+    sql`SELECT id, amount_minor, currency, fx_rate, amount_base_minor
           FROM postings
          WHERE transaction_id = ${transactionId}::uuid
          ORDER BY id`,
@@ -101,7 +103,15 @@ export async function normalizeTransactionFx(
   const postings = postingsRes.rows as unknown as PostingRow[];
   if (postings.length === 0) return NOOP;
 
-  const foreign = postings.filter((p) => p.currency !== base);
+  // Points legs are not foreign currency — they are a different KIND of
+  // unit, with no published rate to look up (#206). They are excluded
+  // here, before `fx_rate IS NULL` is ever consulted, so that marker
+  // keeps meaning exactly one thing in the cash domain: "needs conversion
+  // at a published rate". `src/points/valuation.ts` owns these legs;
+  // whatever base amount it has already written is respected below.
+  const foreign = postings.filter(
+    (p) => p.currency !== base && !isPointsCurrency(p.currency),
+  );
   if (foreign.length === 0) return NOOP;
   const needsWork = opts.force
     ? foreign
@@ -123,6 +133,16 @@ export async function normalizeTransactionFx(
     const minor = BigInt(p.amount_minor);
     if (p.currency === base) {
       return { id: p.id, baseMinor: minor, rate: null as number | null };
+    }
+    if (isPointsCurrency(p.currency)) {
+      // Not ours to convert, but it still counts toward the residual —
+      // the trigger sums every leg, so measuring against a subset would
+      // settle the wrong number onto a cash leg.
+      return {
+        id: p.id,
+        baseMinor: BigInt(p.amount_base_minor ?? "0"),
+        rate: null as number | null,
+      };
     }
     const r = rates.get(p.currency)!;
     return {

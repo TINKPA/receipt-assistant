@@ -145,16 +145,24 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
   total_minor   : the receipt's FINAL "Grand Total" — the amount actually
                   charged — in the currency's minor unit (integer cents for
                   USD, whole units for JPY). Include handwritten tips.
-                  ⚠ Read the GRAND TOTAL line, never the item subtotal. When
-                  Gift Card / Rewards Points / store credit bring the order to
-                  \$0.00, total_minor = 0 — that IS the out-of-pocket amount
-                  charged (the goods still get itemized in items[]; the money
-                  was counted when the card/points were loaded). For a PARTIAL
-                  gift-card order, use the printed residual Grand Total, not
-                  the pre-credit subtotal.
+                  ⚠ Read the GRAND TOTAL line, never the item subtotal.
+                  Gift card / store credit / prepaid balance: total_minor is
+                  the printed residual Grand Total (0 if it covers the whole
+                  order) — that money was counted when the card was loaded.
+                  ⚠ LOYALTY POINTS AND MILES ARE NOT THAT CASE (#206). An
+                  award redemption is real spend in a non-cash currency, so
+                  never zero it: total_minor = the number of points/miles
+                  redeemed (40500, not 0) and \`currency\` = the programme
+                  code. A stay paid with both points and cash gets BOTH: the
+                  points as total_minor/currency, the cash charge as a second
+                  posting pair (see Phase 4a).
   currency      : ISO 4217 code (USD, CNY, EUR, JPY, …). Detect from
                   symbols: \$→USD, €→EUR, £→GBP, ¥ needs context
                   (CNY vs JPY).
+                  For a points/miles redemption use the programme code
+                  instead: uppercase issuer + \`_PT\`, ≤16 chars. World of
+                  Hyatt → HYATT_PT, Marriott Bonvoy → BONVOY_PT, AA miles →
+                  AA_PT. The same programme MUST always get the same code.
   category_hint : one of
                   groceries | dining | retail | cafe | transport | other
                   (vehicle repair / maintenance / parts / fuel / parking →
@@ -622,16 +630,17 @@ Invariants you MUST honor:
     write fx_rate at all — leave that column out of your INSERT so it
     stays NULL. When the receipt is already in the workspace base
     currency (USD here) that is the final, correct answer. When it is
-    NOT (a CNY / JPY / EUR receipt), your value is a placeholder that
-    only exists to satisfy the deferred balance trigger: the worker
-    re-derives both columns straight after your run using the published
-    FX rate for the receipt's own date (#184, src/fx/normalize.ts).
-    \`fx_rate IS NULL\` is precisely the marker it looks for, so a
-    guessed rate from you would suppress the real conversion and leave
-    1 CNY counted as 1 USD in every report. Do not guess a rate, do not
-    convert the total yourself, and do not "helpfully" write USD into
-    the currency column — record the currency actually printed on the
-    receipt.
+    NOT (a CNY / JPY / EUR receipt, or a points redemption), your value
+    is a placeholder that only exists to satisfy the deferred balance
+    trigger: the worker re-derives both columns straight after your run —
+    from the published FX rate for the receipt's own date for cash (#184,
+    src/fx/normalize.ts), from the configured programme valuation for
+    points (#206, src/points/valuation.ts). \`fx_rate IS NULL\` is
+    precisely the marker both look for, so a guessed rate from you would
+    suppress the real conversion and leave 1 CNY (or 1 point) counted as
+    1 USD in every report. Do not guess a rate, do not convert the total
+    yourself, and do not "helpfully" write USD into the currency column —
+    record the currency actually printed on the receipt.
   - Generate UUIDs via gen_random_uuid() inside the SQL.
   - All rows take workspace_id = WORKSPACE_ID.
   - The items[] JSON is embedded via PostgreSQL dollar-quoting
@@ -980,6 +989,20 @@ ${brandFkGuard()}
 ${itemsCte()},
     expense AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'expense' AND name = '<EXPENSE_NAME>' LIMIT 1),
     credit  AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'liability' AND name = 'Credit Card' LIMIT 1),
+    -- POINTS ONLY (#206): replace the \`credit\` CTE above with this one
+    -- when <CURRENCY> is a programme code. Points cannot be credited to
+    -- the USD card; they come out of a per-programme asset account, which
+    -- this upsert creates on first sight of the programme.
+    --   credit AS (
+    --     INSERT INTO accounts (id, workspace_id, name, type, subtype, currency)
+    --     VALUES (gen_random_uuid(), '${ctx.workspaceId}', '<PROGRAMME NAME> points', 'asset', 'points', '<CURRENCY>')
+    --     ON CONFLICT (workspace_id, currency) WHERE subtype = 'points'
+    --       DO UPDATE SET updated_at = NOW()
+    --     RETURNING id
+    --   ),
+    -- If the folio ALSO charges cash (resort fee, parking), add a second
+    -- posting pair p3/p4 in that cash currency against the real \`credit\`
+    -- card account. Each currency balances within itself.
     m AS (
       INSERT INTO merchants (workspace_id, brand_id, canonical_name, category)
       VALUES ('${ctx.workspaceId}', '<brand-id>', '<CANONICAL_NAME>', '<7-class CATEGORY>')

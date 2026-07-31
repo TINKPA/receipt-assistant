@@ -26,6 +26,8 @@ import {
   merchants,
 } from "../schema/index.js";
 import { loadPlacesByIds, type PlaceRow } from "./places.service.js";
+import { isPointsCurrency } from "../points/codes.js";
+import { resolvePointsValuation } from "../points/valuation.js";
 
 import { newId } from "../http/uuid.js";
 import {
@@ -551,13 +553,44 @@ export async function createTransaction(
     memo: string | null;
   };
 
+  // #206 — a points posting has no published rate for the client to
+  // supply, so the server resolves the programme valuation instead of
+  // demanding fx_rate + amount_base_minor from the caller. Resolved up
+  // front, once per programme, because the posting map below is sync.
+  // A programme with no valuation resolves to 0, which is the same
+  // visible `unvalued` state the ingest path produces — never a silent
+  // rejection and never a guessed number.
+  const pointsRates = new Map<string, number>();
+  for (const p of body.postings) {
+    const currency = p.currency ?? acctMap.get(p.account_id)!.currency;
+    if (!isPointsCurrency(currency) || pointsRates.has(currency)) continue;
+    const v = await resolvePointsValuation(
+      workspaceId,
+      currency,
+      baseCurrency,
+      body.occurred_on,
+    );
+    pointsRates.set(currency, v?.minorPerPoint ?? 0);
+  }
+
   const txId = newId();
   const postingInserts: PostingInsert[] = body.postings.map((p, idx) => {
     const acct = acctMap.get(p.account_id)!;
     const currency = p.currency ?? acct.currency;
     let fxRate: string | null = null;
     let amountBaseMinor: bigint;
-    if (currency === baseCurrency) {
+    if (isPointsCurrency(currency)) {
+      // An explicit client-supplied pair still wins — that is how a
+      // correction or an import of already-valued history gets in.
+      if (p.fx_rate !== undefined && p.amount_base_minor !== undefined) {
+        fxRate = p.fx_rate;
+        amountBaseMinor = BigInt(p.amount_base_minor);
+      } else {
+        const rate = pointsRates.get(currency) ?? 0;
+        fxRate = String(rate);
+        amountBaseMinor = BigInt(Math.round(Number(p.amount_minor) * rate));
+      }
+    } else if (currency === baseCurrency) {
       if (p.fx_rate !== undefined && p.fx_rate !== "1" && p.fx_rate !== "1.0") {
         // Allow redundant "1" but otherwise reject.
         const n = Number(p.fx_rate);
@@ -1534,7 +1567,29 @@ export async function addPosting(
   const currency = body.currency ?? acct.currency;
   let fxRate: string | null = null;
   let amountBaseMinor: bigint;
-  if (currency === baseCurrency) {
+  if (isPointsCurrency(currency)) {
+    // Same rule as createTransaction: the server resolves the programme
+    // valuation (#206) rather than making the client know it.
+    if (body.fx_rate !== undefined && body.amount_base_minor !== undefined) {
+      fxRate = body.fx_rate;
+      amountBaseMinor = BigInt(body.amount_base_minor);
+    } else {
+      const header = await db
+        .select({ occurredOn: transactions.occurredOn })
+        .from(transactions)
+        .where(eq(transactions.id, txId));
+      const onDate = header[0]?.occurredOn ?? new Date().toISOString().slice(0, 10);
+      const v = await resolvePointsValuation(
+        workspaceId,
+        currency,
+        baseCurrency,
+        onDate,
+      );
+      const rate = v?.minorPerPoint ?? 0;
+      fxRate = String(rate);
+      amountBaseMinor = BigInt(Math.round(Number(body.amount_minor) * rate));
+    }
+  } else if (currency === baseCurrency) {
     amountBaseMinor = BigInt(body.amount_base_minor ?? body.amount_minor);
   } else {
     if (body.fx_rate === undefined || body.amount_base_minor === undefined) {

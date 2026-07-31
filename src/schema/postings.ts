@@ -2,7 +2,7 @@ import {
   pgTable,
   uuid,
   text,
-  char,
+  varchar,
   bigint,
   numeric,
   index,
@@ -26,9 +26,14 @@ export const postings = pgTable(
       .notNull()
       .references(() => accounts.id, { onDelete: "restrict" }),
     amountMinor: bigint("amount_minor", { mode: "bigint" }).notNull(),
-    currency: char("currency", { length: 3 }).notNull(),
-    // FX rate from posting currency → workspace base currency at occurrence.
-    // Null when no conversion was needed (same currency).
+    // ISO 4217 for cash, or a points-programme code (`HYATT_PT`) for a
+    // loyalty redemption — widened from char(3) in 0038 (#206). The two
+    // namespaces are disjoint by shape; see `src/points/codes.ts`.
+    currency: varchar("currency", { length: 16 }).notNull(),
+    // Rate from posting currency → workspace base currency at occurrence,
+    // in minor units. Null when no conversion was needed (same currency).
+    // For a points leg this is the programme valuation resolved by
+    // `src/points/valuation.ts`, never a published FX rate.
     fxRate: numeric("fx_rate", { precision: 20, scale: 10 }),
     // Base-currency amount persisted so the balance trigger and reports
     // don't need to re-derive FX. Nullable during insert; app fills it

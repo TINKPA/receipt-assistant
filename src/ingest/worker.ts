@@ -26,6 +26,7 @@ import {
   workspaces,
 } from "../schema/index.js";
 import { normalizeFxSafely } from "../fx/normalize.js";
+import { valuePointsSafely } from "../points/valuation.js";
 import {
   defaultClaudeExtractor,
   type ExtractorResult,
@@ -493,6 +494,13 @@ async function runOne(item: QueueItem): Promise<void> {
   // so the SSE consumer never sees a pre-conversion total. Never throws:
   // an unconvertible posting keeps fx_rate NULL for the backfill pass
   // rather than failing an otherwise good extraction.
+  // #206 — same shape, different authority: a points leg carries the
+  // programme's configured valuation, not a market rate. Runs BEFORE the
+  // FX pass so the agent's placeholder base amount (which equals the raw
+  // points count) is replaced before anything measures a residual against
+  // it. The two passes touch disjoint legs, so the order only matters for
+  // that.
+  await valuePointsSafely(terminal.produced.transaction_ids, workspaceId);
   await normalizeFxSafely(terminal.produced.transaction_ids, workspaceId);
 
   busEmit("job.done", {

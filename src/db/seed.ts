@@ -144,5 +144,22 @@ export async function seed(): Promise<SeedResult> {
 
   await insertTree(SEED_WORKSPACE_ID, "USD", DEFAULT_CHART);
 
+  // #206 — mirror what `drizzle/0039_points_seed.sql` did for workspaces
+  // that already existed when that migration ran. A fresh install would
+  // otherwise have the programme registered but no valuation, so its
+  // first Hyatt award stay would land `unvalued`.
+  //
+  // ⚠ 1.7 cents/point is the example cited in the issue, NOT a number the
+  // owner has confirmed — hence `confirmed_at` left NULL, which is what
+  // makes every report disclose how much of its total depends on it.
+  await db.execute(sql`
+    INSERT INTO points_valuations
+      (workspace_id, currency, quote, effective_from, minor_per_point, source, note)
+    SELECT ${SEED_WORKSPACE_ID}::uuid, 'HYATT_PT', 'USD', DATE '2000-01-01',
+           1.7, 'issue-206-example',
+           'UNCONFIRMED. 1.7 US cents per point, the example cited in #206.'
+     WHERE EXISTS (SELECT 1 FROM points_programmes WHERE code = 'HYATT_PT')
+    ON CONFLICT DO NOTHING`);
+
   return { userId: SEED_USER_ID, workspaceId: SEED_WORKSPACE_ID, created: true };
 }

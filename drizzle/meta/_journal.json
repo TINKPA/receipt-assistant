@@ -267,6 +267,20 @@
       "when": 1785308346391,
       "tag": "0037_faulty_marvel_boy",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1785489375752,
+      "tag": "0038_points_as_currency",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1785489462800,
+      "tag": "0039_points_seed",
+      "breakpoints": true
     }
   ]
 }
