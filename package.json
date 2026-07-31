@@ -4,14 +4,15 @@
   "description": "Personal receipt processing assistant powered by Claude Code CLI",
   "type": "module",
   "scripts": {
-    "prebuild": "node scripts/generate-build-info.mjs",
+    "prebuild": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-budget.ts",
     "build": "tsc",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:migrate:prod": "node dist/db/migrate.js",
     "db:seed": "tsx scripts/seed.ts",
     "openapi:generate": "tsx scripts/generate-openapi.ts",
-    "eval:dates": "tsx scripts/eval-dates.ts"
+    "eval:dates": "tsx scripts/eval-dates.ts",
+    "check:prompt-budget": "tsx scripts/check-prompt-budget.ts"
   },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "^7.3.4",
