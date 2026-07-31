@@ -1,16 +1,16 @@
 {
   "_comment": "Rendered size of the extraction prompts with an EMPTY context, in bytes. Regenerate deliberately with `npm run check:prompt-budget -- --update-baseline` in the same commit as the prompt change, so growth arrives as a reviewable diff. See scripts/check-prompt-budget.ts and issue #197.",
-  "generatedAt": "2026-07-31T08:39:35.541Z",
+  "generatedAt": "2026-07-31T08:54:23.802Z",
   "totals": {
-    "ingest": 137635,
-    "reextract": 85260
+    "ingest": 141555,
+    "reextract": 86272
   },
   "modules": {
     "line-item-prompt.ts": 38269,
     "brand-icon-prompt.ts": 14889,
     "prompt-contract.ts": 14411,
     "document-read-prompt.ts": 2458,
-    "items-sql.ts": 5979,
-    "prompt.ts (inline)": 61629
+    "items-sql.ts": 6054,
+    "prompt.ts (inline)": 65474
   }
 }
