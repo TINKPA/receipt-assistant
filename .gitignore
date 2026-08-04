@@ -4,6 +4,12 @@ dist/
 *.db
 .DS_Store
 
+# Build artifact — rewritten by scripts/generate-build-info.mjs on every
+# prebuild. Tracking it dirtied the worktree after every build and swept a
+# stale sha/branch into 12 unrelated commits (#219). Scripts that import it
+# generate it first; the Dockerfile generates it during `npm run build`.
+src/generated/
+
 # Local secrets — use .env.example as the template
 .env
 .env.*
