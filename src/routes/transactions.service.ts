@@ -1003,7 +1003,25 @@ export async function listTransactions(
   if (query.trip_id) conditions.push(sql`t.trip_id = ${query.trip_id}::uuid`);
   if (query.source_ingest_id) conditions.push(sql`t.source_ingest_id = ${query.source_ingest_id}::uuid`);
   if (query.payee_contains) conditions.push(sql`t.payee ILIKE ${"%" + query.payee_contains + "%"}`);
-  if (query.q) conditions.push(sql`(COALESCE(t.payee, '') || ' ' || COALESCE(t.narration, '')) ILIKE ${"%" + query.q + "%"}`);
+  // `q` spans the header AND the line items. Header-only search was a
+  // payee-only search in practice — `narration` is populated on 0.4% of rows,
+  // while 98% carry line items — so typing a product name found nothing (#217).
+  // Both name columns are matched: `normalized_name` is the cleaned name,
+  // `raw_name` the original listing title. An accessory bought *for* an iPad
+  // often says so only in `raw_name`, and recall matters more here than tidy
+  // results — a spurious hit is skipped at a glance, a missing one is never
+  // known about.
+  if (query.q) {
+    const needle = `%${query.q}%`;
+    conditions.push(sql`(
+      (COALESCE(t.payee, '') || ' ' || COALESCE(t.narration, '')) ILIKE ${needle}
+      OR EXISTS (
+        SELECT 1 FROM transaction_items ti
+        WHERE ti.transaction_id = t.id
+          AND (ti.raw_name ILIKE ${needle} OR COALESCE(ti.normalized_name, '') ILIKE ${needle})
+      )
+    )`);
+  }
   if (query.account_id) {
     conditions.push(sql`EXISTS (SELECT 1 FROM postings p WHERE p.transaction_id = t.id AND p.account_id = ${query.account_id}::uuid)`);
   }
