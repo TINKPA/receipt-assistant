@@ -41,6 +41,19 @@ export const Posting = z
     id: Uuid,
     transaction_id: Uuid,
     account_id: Uuid,
+    /** Type of the posting's account, denormalized so a posting is
+     *  interpretable on its own (#221). Pick the spend leg with
+     *  `account_type === 'expense'` and then READ THE SIGN — positive is
+     *  a purchase, negative is a refund of one. Picking the leg by sign
+     *  instead silently inverts every refund. */
+    account_type: z
+      .enum(["asset", "liability", "equity", "income", "expense"])
+      .openapi({
+        description:
+          "Type of this posting's account. Select the spend leg with " +
+          "account_type='expense', then read the sign: positive = purchase, " +
+          "negative = refund. Do NOT select the leg by sign — that inverts refunds.",
+      }),
     amount_minor: AmountMinor,
     currency: LedgerCurrencyCode,
     fx_rate: z.string().nullable(), // numeric returned as string from pg

@@ -608,6 +608,17 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "account_type": {
+            "type": "string",
+            "enum": [
+              "asset",
+              "liability",
+              "equity",
+              "income",
+              "expense"
+            ],
+            "description": "Type of this posting's account. Select the spend leg with account_type='expense', then read the sign: positive = purchase, negative = refund. Do NOT select the leg by sign — that inverts refunds."
+          },
           "amount_minor": {
             "type": "integer",
             "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
@@ -647,6 +658,7 @@
           "id",
           "transaction_id",
           "account_id",
+          "account_type",
           "amount_minor",
           "currency",
           "fx_rate",

@@ -600,6 +600,11 @@ brandsRouter.get(
       const currency = ((wsRow.rows[0] as any)?.base_currency as string) ?? "USD";
 
       // 4. Per-merchant stats (money-counting rows only: posted/reconciled, not deleted)
+      //
+      // Spend sums pick the expense leg by account type, not by sign —
+      // see the same rule and its cost in `merchants.ts` / `reports.ts`
+      // (#221). `total_minor` on the recent-transaction rows below is
+      // likewise signed: negative means refund.
       const perMerchantStats = new Map<
         string,
         { txnCount: number; lifetime: number; currentMonth: number; lastDate: string | null }
@@ -614,9 +619,9 @@ brandsRouter.get(
           SELECT
             t.merchant_id::text AS merchant_id,
             COUNT(DISTINCT t.id)::bigint AS txn_count,
-            COALESCE(SUM(CASE WHEN p.amount_minor > 0 THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime,
+            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime,
             COALESCE(SUM(CASE
-              WHEN p.amount_minor > 0
+              WHEN a.type = 'expense'
                AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
                AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
               THEN p.amount_minor ELSE 0
@@ -624,6 +629,7 @@ brandsRouter.get(
             MAX(t.occurred_on)::text AS last_date
           FROM transactions t
           JOIN postings p ON p.transaction_id = t.id
+          JOIN accounts a ON a.id = p.account_id
           WHERE t.workspace_id = ${workspaceId}::uuid
             AND t.merchant_id IN (
               SELECT id FROM merchants
@@ -663,9 +669,10 @@ brandsRouter.get(
             m.canonical_name AS merchant_canonical_name,
             m.custom_name AS merchant_custom_name,
             (
-              SELECT COALESCE(SUM(CASE WHEN p.amount_minor > 0 THEN p.amount_minor ELSE 0 END), 0)::bigint
+              SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
               FROM postings p
-              WHERE p.transaction_id = t.id
+              JOIN accounts a ON a.id = p.account_id
+              WHERE p.transaction_id = t.id AND a.type = 'expense'
             ) AS total_minor,
             (
               SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
