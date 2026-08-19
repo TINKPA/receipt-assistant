@@ -10,6 +10,34 @@
  * user-supplied date range and the number of accounts), so these
  * endpoints return full arrays without keyset pagination.
  *
+ * ── Picking the spend leg: by ACCOUNT TYPE, never by sign (#221) ──────
+ *
+ * Every rollup here used to carry `AND p.amount_minor > 0` next to
+ * `a.type = 'expense'`. On a purchase the two say the same thing — the
+ * expense leg is the positive one, the card leg the negative one — so
+ * the sign test read as harmless belt-and-braces.
+ *
+ * It was not harmless. A refund posts the SAME pair with the signs
+ * reversed (expense −X, card +X), which is the only correct way to
+ * write one in a double-entry ledger: it nets the money back out of the
+ * category it was spent from. `> 0` dropped exactly that leg, so a
+ * refund already sitting correctly in the ledger was invisible to every
+ * report. Measured on production 2026-08-19: five such refunds, and
+ * `/v1/reports/summary` over all time read $312,046.70 against a true
+ * ledger balance of $311,782.44 — overstated by $264.26, the sum of the
+ * five. November 2024 Shopping read $512.75 against a true $441.58.
+ *
+ * `a.type = 'expense'` alone already selects the right leg, so the fix
+ * is to delete the sign test rather than to special-case refunds. The
+ * rule for anything added here later: **the expense leg is the spend
+ * leg regardless of sign.** A negative one is a refund and belongs in
+ * the total; filtering it out does not make the number more
+ * conservative, it makes it wrong.
+ *
+ * `merchants.ts` and `brands.ts` carry the same rule with a different
+ * shape — they had no `accounts` join at all, so there the sign test
+ * was the ONLY leg selector and had to be replaced by a join, not
+ * deleted. See the comments there.
  */
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { sql } from "drizzle-orm";
@@ -162,7 +190,6 @@ async function getSpendPointsDisclosure(args: {
        WHERE p.workspace_id = ${args.workspaceId}::uuid
          AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
          AND a.type = 'expense'
-         AND p.amount_minor > 0
          AND p.currency ~ ${POINTS_CURRENCY_SQL_RE}
          ${fromFilter}
          ${toFilter}
@@ -306,7 +333,6 @@ export async function getSummaryReport(
       WHERE p.workspace_id = ${args.workspaceId}::uuid
         AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         AND a.type = 'expense'
-        AND p.amount_base_minor > 0
         ${fromFilter}
         ${toFilter}
     )
@@ -401,7 +427,6 @@ export async function getTrendsReport(
       WHERE p.workspace_id = ${args.workspaceId}::uuid
         AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
         AND a.type = 'expense'
-        AND p.amount_base_minor > 0
         ${fromFilter}
         ${toFilter}
     )
@@ -601,7 +626,7 @@ export async function getCashflowReport(
     SELECT
       month,
       COALESCE(-SUM(amount_base_minor) FILTER (WHERE acct_type = 'income'), 0)::bigint AS income_minor,
-      COALESCE(SUM(amount_base_minor)  FILTER (WHERE acct_type = 'expense' AND amount_base_minor > 0), 0)::bigint AS expense_minor
+      COALESCE(SUM(amount_base_minor)  FILTER (WHERE acct_type = 'expense'), 0)::bigint AS expense_minor
     FROM filtered
     GROUP BY month
     ORDER BY month ASC

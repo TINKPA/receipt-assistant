@@ -14,9 +14,14 @@
  *    or reaching its achievement-plan `target_days` horizon.
  *
  * Money note: the expense side of a posting carries a POSITIVE
- * `amount_base_minor` (the card/cash side is the negative one), so the
- * rules filter on `amount_base_minor > 0` and compare the raw values —
- * no ABS() anywhere in this file.
+ * `amount_base_minor` on a purchase (the card/cash side is the negative
+ * one), so the rules select the spend leg with `a.type = 'expense'` and
+ * compare the raw values — no ABS() anywhere in this file.
+ *
+ * They do NOT also test the sign (#221). A refund posts the same pair
+ * reversed — expense −X, card +X — and that negative expense leg is a
+ * real reduction of the category it reverses. Filtering it out would
+ * make a month that netted out to nothing still register as a spike.
  */
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -52,7 +57,7 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${workspaceId}::uuid
-        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense' AND p.amount_base_minor > 0
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense'
         AND to_char(t.occurred_on, 'YYYY-MM') = ${thisYm}
       GROUP BY 1
     ), prev AS (
@@ -61,7 +66,7 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
       JOIN transactions t ON t.id = p.transaction_id
       JOIN accounts a ON a.id = p.account_id
       WHERE p.workspace_id = ${workspaceId}::uuid
-        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense' AND p.amount_base_minor > 0
+        AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL AND a.type = 'expense'
         AND to_char(t.occurred_on, 'YYYY-MM') = ${prevYm}
         AND EXTRACT(DAY FROM t.occurred_on) <= ${dayOfMonth}
       GROUP BY 1

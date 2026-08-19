@@ -24,7 +24,7 @@ LEDGER SCHEMA (PostgreSQL; amounts in MINOR units — divide by 100 for dollars)
 - owned_items(id, product_id, transaction_item_id, acquired_on, condition, retired_at, target_days)
 - wish_items(id, title, target_price_minor, planned_days, urgency, status)
 - documents(id, kind, ocr_text) + document_links(document_id, transaction_id)
-CONVENTIONS: spending total for a period = SUM(p.amount_base_minor) joined to expense accounts with amount_base_minor > 0 and t.status IN ('posted','reconciled') AND t.deleted_at IS NULL. Dates are local; occurred_on is the receipt date.`;
+CONVENTIONS: spending total for a period = SUM(p.amount_base_minor) joined to expense accounts (a.type = 'expense') with t.status IN ('posted','reconciled') AND t.deleted_at IS NULL. Do NOT add an amount_base_minor > 0 filter: a refund is booked as a negative expense leg against the category it reverses, and excluding it overstates spend. Income sits on a.type = 'income' with a NEGATIVE amount, so report income as -SUM(p.amount_base_minor). Dates are local; occurred_on is the receipt date.`;
 
 export async function askLedger(
   workspaceId: string,

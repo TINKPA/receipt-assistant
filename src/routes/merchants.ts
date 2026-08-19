@@ -113,6 +113,19 @@ merchantsRouter.use(
  * KPIs (lifetime/current-month spend); they remain visible in the
  * companion `/transactions` endpoint so the merchant page can render
  * them with strikethrough.
+ *
+ * Spend sums pick the expense leg by ACCOUNT TYPE, via the `accounts`
+ * join (#221). They used to pick it by sign (`amount_minor > 0`), which
+ * on a refund selects the wrong leg entirely: a return posts expense −X
+ * / card +X, so the sign test grabbed the card's +X and reported a
+ * refund as if it were a purchase of the same size. Costco's lifetime
+ * spend read $7,320.91 against a true $7,154.59 for that reason. The
+ * type test is also the only correct selector here — unlike the
+ * `reports.ts` rollups this query has no `a.type` predicate to fall
+ * back on, so the join had to be ADDED rather than the sign test
+ * simply deleted. The join stays out of the row filter (the type test
+ * lives in the CASE) so `COUNT(DISTINCT t.id)` keeps counting every
+ * transaction, including any with no expense leg at all.
  */
 merchantsRouter.get(
   "/:id",
@@ -125,9 +138,9 @@ merchantsRouter.get(
       WITH s AS (
         SELECT
           COUNT(DISTINCT t.id)::bigint AS txn_count,
-          COALESCE(SUM(CASE WHEN p.amount_minor > 0 THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
+          COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
           COALESCE(SUM(CASE
-            WHEN p.amount_minor > 0
+            WHEN a.type = 'expense'
              AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
              AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
             THEN p.amount_minor ELSE 0
@@ -135,6 +148,7 @@ merchantsRouter.get(
           MAX(t.occurred_on)::text AS last_date
         FROM transactions t
         JOIN postings p ON p.transaction_id = t.id
+        JOIN accounts a ON a.id = p.account_id
         WHERE t.workspace_id = ${req.ctx.workspaceId}::uuid
           AND t.merchant_id = ${merchant.id}::uuid
           AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
@@ -171,6 +185,10 @@ merchantsRouter.get(
  * detail page. Sort is fixed at `occurred_on DESC, id DESC` (the same
  * keyset the ledger uses) so this can ride the
  * `transactions_merchant_idx` index. Cursor encodes "<date>|<id>".
+ *
+ * `total_minor` is the expense leg, signed (#221): positive for a
+ * purchase, NEGATIVE for a refund. Clients render the sign; they must
+ * not `Math.abs()` it, or a return reads as a second purchase.
  */
 merchantsRouter.get(
   "/:id/transactions",
@@ -196,9 +214,10 @@ merchantsRouter.get(
         t.payee,
         t.status::text AS status,
         (
-          SELECT COALESCE(SUM(CASE WHEN p.amount_minor > 0 THEN p.amount_minor ELSE 0 END), 0)::bigint
+          SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
           FROM postings p
-          WHERE p.transaction_id = t.id
+          JOIN accounts a ON a.id = p.account_id
+          WHERE p.transaction_id = t.id AND a.type = 'expense'
         ) AS total_minor,
         (
           SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1

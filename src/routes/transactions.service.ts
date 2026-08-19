@@ -104,6 +104,10 @@ export interface PostingRow {
   id: string;
   transaction_id: string;
   account_id: string;
+  /** The posting's account's `type`, denormalized (#221). Selecting the
+   *  spend leg by type is the only correct way; by sign is wrong on
+   *  refunds. See `mapPostingRow`. */
+  account_type: "asset" | "liability" | "equity" | "income" | "expense";
   amount_minor: number;
   currency: string;
   fx_rate: string | null;
@@ -278,11 +282,25 @@ function bigintToNumberNullable(v: unknown): number | null {
   return bigintToNumber(v);
 }
 
+/**
+ * Coerce a posting row to the `Posting` DTO.
+ *
+ * `account_type` (#221) is denormalized from the posting's account on
+ * every fetch path, which is why each of those queries joins `accounts`.
+ * Without it a posting is not interpretable on its own: a client holding
+ * `{amount_minor: 7117}` cannot tell a $71.17 purchase (expense leg,
+ * positive) from the credit side of a $71.17 REFUND (liability leg,
+ * also positive). Clients used to guess with `amount_minor > 0`, which
+ * is right for purchases and backwards for refunds — the frontend's
+ * `totalMinorFromPostings` showed returns as same-size purchases for
+ * exactly that reason. Select the leg by type, then read the sign.
+ */
 function mapPostingRow(row: any): PostingRow {
   return {
     id: row.id,
     transaction_id: row.transactionId ?? row.transaction_id,
     account_id: row.accountId ?? row.account_id,
+    account_type: row.accountType ?? row.account_type,
     amount_minor: bigintToNumber(row.amountMinor ?? row.amount_minor),
     currency: row.currency,
     fx_rate: row.fxRate ?? row.fx_rate ?? null,
@@ -293,6 +311,21 @@ function mapPostingRow(row: any): PostingRow {
     created_at: toIsoString(row.createdAt ?? row.created_at),
   };
 }
+
+/** Column map for every drizzle posting fetch: the posting's own columns
+ *  plus `accountType` from the joined `accounts` row (#221). */
+const POSTING_COLUMNS = {
+  id: postings.id,
+  transactionId: postings.transactionId,
+  accountId: postings.accountId,
+  accountType: accounts.type,
+  amountMinor: postings.amountMinor,
+  currency: postings.currency,
+  fxRate: postings.fxRate,
+  amountBaseMinor: postings.amountBaseMinor,
+  memo: postings.memo,
+  createdAt: postings.createdAt,
+} as const;
 
 /**
  * Coerce a single row from `transaction_items` or a JSONB object to the
@@ -442,8 +475,9 @@ async function loadTransactionFull(
   if (rows.length === 0) return null;
   const t = rows[0]!;
   const posts = await runner
-    .select()
+    .select(POSTING_COLUMNS)
     .from(postings)
+    .innerJoin(accounts, eq(accounts.id, postings.accountId))
     .where(eq(postings.transactionId, id))
     .orderBy(postings.createdAt);
   const docLinks = await runner
@@ -1092,7 +1126,11 @@ export async function listTransactions(
   // straight back out of the page rows this function just selected.
   const idArrayLiteral = `ARRAY[${ids.map((i) => `'${i}'`).join(",")}]::uuid[]`;
   const postRes = await db.execute(
-    sql`SELECT * FROM postings WHERE transaction_id = ANY(${sql.raw(idArrayLiteral)}) ORDER BY created_at ASC`,
+    sql`SELECT p.*, a.type AS account_type
+          FROM postings p
+          JOIN accounts a ON a.id = p.account_id
+         WHERE p.transaction_id = ANY(${sql.raw(idArrayLiteral)})
+         ORDER BY p.created_at ASC`,
   );
   const postByTx = new Map<string, any[]>();
   for (const p of postRes.rows as any[]) {
@@ -1662,8 +1700,9 @@ export async function addPosting(
       });
 
       const postRows = await tx
-        .select()
+        .select(POSTING_COLUMNS)
         .from(postings)
+        .innerJoin(accounts, eq(accounts.id, postings.accountId))
         .where(eq(postings.id, newPostingId));
       return mapPostingRow(postRows[0]!);
     });
@@ -1728,8 +1767,9 @@ export async function updatePosting(
       });
 
       const postRows = await tx
-        .select()
+        .select(POSTING_COLUMNS)
         .from(postings)
+        .innerJoin(accounts, eq(accounts.id, postings.accountId))
         .where(eq(postings.id, postingId));
       return mapPostingRow(postRows[0]!);
     });
@@ -1832,7 +1872,12 @@ export async function listPostings(
 
   const where = sql.join(conditions, sql` AND `);
   const res = await db.execute(
-    sql`SELECT * FROM postings p WHERE ${where} ORDER BY p.created_at DESC, p.id DESC LIMIT ${limit + 1}`,
+    sql`SELECT p.*, a.type AS account_type
+          FROM postings p
+          JOIN accounts a ON a.id = p.account_id
+         WHERE ${where}
+         ORDER BY p.created_at DESC, p.id DESC
+         LIMIT ${limit + 1}`,
   );
   const rows = res.rows as any[];
   const hasMore = rows.length > limit;
@@ -1855,8 +1900,9 @@ export async function getPosting(
   id: string,
 ): Promise<PostingRow> {
   const rows = await db
-    .select()
+    .select(POSTING_COLUMNS)
     .from(postings)
+    .innerJoin(accounts, eq(accounts.id, postings.accountId))
     .where(
       and(eq(postings.id, id), eq(postings.workspaceId, workspaceId)),
     );
