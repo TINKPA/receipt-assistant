@@ -16,13 +16,23 @@
  * `batch_plus_recent_90d` scope (compare against the prior 90d window)
  * will land alongside payment-link because it shares the same SQL shape.
  *
- * Why expense side?
- * -----------------
+ * Why the expense/income side?
+ * ----------------------------
  * Every receipt-kind extraction produces two postings: the expense
- * debit and the credit-card credit. Summing the expense-side postings
- * gives us a positive total that's stable regardless of which expense
- * category the agent picked. Summing both sides would be zero (it's a
- * balanced transaction — that's the whole point of double-entry).
+ * debit and the credit-card credit. Keying on the expense-side posting
+ * gives a total that's stable regardless of which expense category the
+ * agent picked. Summing both sides would be zero (it's a balanced
+ * transaction — that's the whole point of double-entry).
+ *
+ * That leg is selected by ACCOUNT TYPE and compared SIGNED (#221). It
+ * used to be selected with `GREATEST(amount_base_minor, 0)`, i.e. by
+ * sign, which is wrong in three ways once refunds and income exist:
+ * a refund's positive leg is the CARD leg, so a $71.17 return keyed as
+ * +7117 and could be grouped with a same-day $71.17 PURCHASE from the
+ * same payee and auto-voided as its duplicate; income has no expense
+ * leg at all; and the `> 0` guard then dropped every genuine refund
+ * pair from consideration. Income is negated so it keys positive, the
+ * same way an income document's own total reads.
  */
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -59,9 +69,10 @@ export async function detectDuplicates(params: {
   // on them reliably) and NULL occurred_on (should never happen — date
   // is NOT NULL in schema — but belt-and-braces).
   //
-  // amount_base_minor is signed: positive on the expense debit, negative
-  // on the credit-card credit. Summing only positive values keeps us on
-  // the expense side without hard-coding account IDs.
+  // amount_base_minor is signed: positive on the expense debit of a
+  // purchase, negative on the credit-card credit — and reversed on a
+  // refund. Select the leg by account type, keep the sign, and let two
+  // refunds group with each other rather than with a purchase (#221).
   const res = await db.execute(sql`
     WITH batch_txns AS (
       SELECT t.id,
@@ -69,9 +80,11 @@ export async function detectDuplicates(params: {
              t.payee,
              t.created_at,
              t.status,
-             COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0) AS total_expense_base_minor
+             COALESCE(SUM(CASE WHEN a.type = 'income' THEN -p.amount_base_minor
+                               ELSE p.amount_base_minor END), 0) AS total_expense_base_minor
         FROM transactions t
         JOIN postings p ON p.transaction_id = t.id
+        JOIN accounts a ON a.id = p.account_id AND a.type IN ('expense', 'income')
        WHERE t.workspace_id = ${workspaceId}::uuid
          AND t.status IN ('posted', 'reconciled')
          AND t.source_ingest_id IN (
@@ -86,7 +99,10 @@ export async function detectDuplicates(params: {
              ARRAY_AGG(id ORDER BY created_at ASC, id ASC) AS ids
         FROM batch_txns
        WHERE payee IS NOT NULL
-         AND total_expense_base_minor > 0
+         -- <> 0, not > 0: a refund pair keys NEGATIVE and must still
+         -- group. Zero-total rows stay excluded — they carry no
+         -- discriminating power and #205 already learned that lesson.
+         AND total_expense_base_minor <> 0
        GROUP BY occurred_on, payee, total_expense_base_minor
       HAVING COUNT(*) >= 2
     )
