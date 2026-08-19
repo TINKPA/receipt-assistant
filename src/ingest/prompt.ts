@@ -752,14 +752,19 @@ in this order so you can read the output positionally:
   --     orders on one day are five real orders, not duplicates, and only
   --     the identifier can say so.
   --
-  --     Branch (a) sums the EXPENSE leg, picked by account type and
-  --     compared SIGNED (#221). Picking it by sign broke both ways once
-  --     refunds exist: a refund's positive leg is the CARD leg, so a
-  --     $28.86 refund looked exactly like a $28.86 purchase and could
-  --     attach to the very purchase it reverses, while a second copy of
-  --     that refund could never match its own earlier row. Signed
-  --     comparison fixes both, and subsumes the $0 case: a zero-total
-  --     transaction now sums to 0 and matches <TOTAL_MINOR> = 0.
+  --     Branch (a) sums the leg that carries the MEANING of the
+  --     transaction — expense for spend, income for earnings — picked by
+  --     account type and compared SIGNED (#221). Picking it by sign
+  --     broke both ways once refunds exist: a refund's positive leg is
+  --     the CARD leg, so a $28.86 refund looked exactly like a $28.86
+  --     purchase and could attach to the very purchase it reverses,
+  --     while a second copy of that refund could never match its own
+  --     earlier row. Income is negated so it compares against the
+  --     POSITIVE total_minor an income document carries; an income row
+  --     has no expense leg at all, so leaving it out of the join made
+  --     every income transaction invisible to amount dedup. Signed
+  --     comparison also subsumes the $0 case: a zero-total transaction
+  --     sums to 0 and matches <TOTAL_MINOR> = 0.
   --
   --     Substitute <IDENTS> with a comma-separated quoted list of every
   --     identifier value YOU extracted, or omit branch (b) if you found
@@ -775,13 +780,14 @@ in this order so you can read the output positionally:
            t.metadata->>'approval_code'       AS approval_code
       FROM transactions t
       JOIN postings p ON p.transaction_id = t.id
-      JOIN accounts a ON a.id = p.account_id AND a.type = 'expense'
+      JOIN accounts a ON a.id = p.account_id AND a.type IN ('expense','income')
      WHERE t.workspace_id = '${ctx.workspaceId}'
        AND t.status IN ('posted','reconciled')
        AND t.deleted_at IS NULL
        AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3
      GROUP BY t.id
-    HAVING SUM(p.amount_minor) = <TOTAL_MINOR>
+    HAVING SUM(CASE WHEN a.type = 'income' THEN -p.amount_minor
+                    ELSE p.amount_minor END) = <TOTAL_MINOR>
     UNION
     -- (b) shared identifier, ANY amount, wider window. An order number is
     --     stronger evidence than an amount and survives a re-issued or
