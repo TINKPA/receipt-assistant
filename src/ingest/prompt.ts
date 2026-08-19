@@ -130,6 +130,45 @@ images). Then decide which category:
   statement_pdf   credit-card or bank statement with many line items
   unsupported     anything else (W-2, menu, junk, illegible, non-financial)
 
+That axis is the document's FORMAT. Now decide the second axis, which
+way the money moved. They are independent: a refund confirmation email
+is \`receipt_email\` + \`refund\`.
+
+── Phase 1b — Money direction (#221) ──────────────────────────────────
+
+  purchase   money left the user. The overwhelming default.
+  refund     money came BACK to the user because a purchase was undone
+             or reduced — a return, a cancelled order, a price
+             adjustment, a service credit, a warranty reimbursement, a
+             chargeback, a duplicate charge reversed.
+  income     money came IN and no purchase of the user's is being
+             undone — selling or trading in a device (buyback, "we pay
+             you $525 for your drone"), a payout, an insurance claim
+             settlement, a rebate on something never bought here.
+  transfer   money moved between the user's OWN pockets, or to another
+             person, with nothing bought or sold — Zelle / Venmo /
+             WeChat P2P, a gift-card or stored-value top-up, a bank-to-
+             bank move. NOT SUPPORTED YET: classify the document
+             \`unsupported\` with reason "transfer — not spend, not
+             income" and stop. Do not force it into one of the others.
+
+**A refund is NOT income**, and the test that separates them is: **was
+something the user bought being undone?** Returning a drone you bought
+→ refund. Selling a drone you already owned → income. The document can
+look identical; only that question decides. A refund is the user's own
+money coming back, so it nets against the category the purchase used;
+calling it income would inflate income and spend at once and leave that
+category overstated forever.
+
+Borderline calls, decided:
+  - Trade-in credit INSIDE a purchase (phone traded toward a new one,
+    one receipt, one net total) → \`purchase\` at the net total. That is
+    a discount line, not a separate income event.
+  - Insurance / purchase-protection payout → \`income\`. The purchase
+    stands; this is new money.
+  - Deposit returned (rental, utility) → \`refund\`.
+  - A statement's credit rows → per-row in 4b, not here.
+
 ${NO_JSON_SCHEMA_RULE}
 
 ── Phase 2 — Extract ──────────────────────────────────────────────────
@@ -156,6 +195,13 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   code. A stay paid with both points and cash gets BOTH: the
                   points as total_minor/currency, the cash charge as a second
                   posting pair (see Phase 4a).
+                  ⚠ SIGN — a \`refund\` (Phase 1b) carries a NEGATIVE
+                  total_minor, and so does every items[] line and its
+                  tax: a $28.86 refund is -2886, not 2886. The sign is
+                  what nets the money back out of its category, and
+                  Phase 4a's template needs no other change to book it.
+                  \`income\` keeps total_minor POSITIVE — that path
+                  changes the posting PAIR, not the sign.
   currency      : ISO 4217 code (USD, CNY, EUR, JPY, …). Detect from
                   symbols: \$→USD, €→EUR, £→GBP, ¥ needs context
                   (CNY vs JPY).
@@ -706,11 +752,21 @@ in this order so you can read the output positionally:
   --     orders on one day are five real orders, not duplicates, and only
   --     the identifier can say so.
   --
+  --     Branch (a) sums the EXPENSE leg, picked by account type and
+  --     compared SIGNED (#221). Picking it by sign broke both ways once
+  --     refunds exist: a refund's positive leg is the CARD leg, so a
+  --     $28.86 refund looked exactly like a $28.86 purchase and could
+  --     attach to the very purchase it reverses, while a second copy of
+  --     that refund could never match its own earlier row. Signed
+  --     comparison fixes both, and subsumes the $0 case: a zero-total
+  --     transaction now sums to 0 and matches <TOTAL_MINOR> = 0.
+  --
   --     Substitute <IDENTS> with a comma-separated quoted list of every
   --     identifier value YOU extracted, or omit branch (b) if you found
   --     none. Identifier keys are the contract in Phase 4a.0 (#204).
   SELECT * FROM (
-    -- (a) same amount, near date — the classic re-upload of a priced receipt
+    -- (a) same signed amount, near date — the classic re-upload of a
+    --     priced receipt, and the re-upload of a refund
     SELECT t.id, t.payee, t.occurred_on, 'amount' AS matched_on,
            t.metadata->>'order_number'        AS order_number,
            t.metadata->>'confirmation_number' AS confirmation_number,
@@ -718,14 +774,14 @@ in this order so you can read the output positionally:
            t.metadata->>'payment_id'          AS payment_id,
            t.metadata->>'approval_code'       AS approval_code
       FROM transactions t
-      JOIN postings p ON p.transaction_id = t.id AND p.amount_minor >= 0
+      JOIN postings p ON p.transaction_id = t.id
+      JOIN accounts a ON a.id = p.account_id AND a.type = 'expense'
      WHERE t.workspace_id = '${ctx.workspaceId}'
        AND t.status IN ('posted','reconciled')
        AND t.deleted_at IS NULL
        AND t.occurred_on BETWEEN DATE '<YYYY-MM-DD>' - 3 AND DATE '<YYYY-MM-DD>' + 3
      GROUP BY t.id
-    HAVING SUM(p.amount_minor) FILTER (WHERE p.amount_minor > 0) = <TOTAL_MINOR>
-        OR (<TOTAL_MINOR> = 0 AND SUM(ABS(p.amount_minor)) = 0)
+    HAVING SUM(p.amount_minor) = <TOTAL_MINOR>
     UNION
     -- (b) shared identifier, ANY amount, wider window. An order number is
     --     stronger evidence than an amount and survives a re-issued or
@@ -870,6 +926,25 @@ Union that result with any pHash-neighbor transactions above, then walk
 this tree (tiebreaker strength: order/receipt number > payment auth
 code / card last-4 > time-of-day > items list):
 
+0. **DIRECTION GATE — before anything else (#221).** A candidate is a
+   duplicate only if the money moved the SAME way. Never attach across
+   directions: a refund against the purchase it reverses, income
+   against the purchase of the thing sold, or a purchase against a
+   refund are all DISTINCT events — INSERT, do not attach. Attaching a
+   refund to its own purchase makes the reversal vanish into the row it
+   was meant to undo and the money stays double-counted forever.
+
+   Read a candidate's direction off its expense-leg sign (branch (a)
+   matched it signed, so a negative-total candidate is a refund), or off
+   \`metadata.flow\`. Only same-direction candidates reach steps 1-4.
+
+   **\`refund_of\`.** A refund almost always reprints the original's
+   order number, so branch (b) usually has the purchase already. When
+   exactly one purchase candidate shares an identifier with this refund,
+   add \`'refund_of', '<PURCHASE_TX_ID>',\` to the template's metadata
+   object. Otherwise omit it — never guess from amount and date, and the
+   refund nets correctly either way. It is provenance, not plumbing.
+
 1. **No candidate** → proceed to the normal INSERT below.
 2. **A candidate matches on a STRONG tiebreaker** (same order/receipt
    number, or same auth code, or same card last-4 + same time-of-day +
@@ -944,6 +1019,41 @@ buckets, use Services as the catch-all. Never invent a new account
 and never leave the category blank.
 
 Mirror side is Credit Card (default).
+
+── Which posting pair — by money direction (#221) ─────────────────────
+
+**purchase** — the template below, unchanged. Expense +TOTAL_MINOR,
+Credit Card -TOTAL_MINOR.
+
+**refund** — the same template, with TOTAL_MINOR NEGATIVE (Phase 2).
+Nothing else differs: -2886 yields expense -2886 / card +2886. Use the
+SAME expense account the original purchase used — a returned pair of
+shoes comes out of Shopping, because "what did Shopping actually cost
+me" is the question only netting can answer.
+
+  Do NOT: post to an Income account, invent an \`Expenses:Refunds\`
+  account, flip the mirror side, or write ABS() anywhere.
+
+**income** — a DIFFERENT pair. New money has no expense side, so
+replace the \`expense\` and \`credit\` CTEs with:
+
+    income  AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'income' AND name = '<Salary|Other>' LIMIT 1),
+    deposit AS (SELECT id FROM accounts WHERE workspace_id = '${ctx.workspaceId}' AND type = 'asset' AND name = '<Checking|Savings|Cash>' LIMIT 1),
+
+and the two posting inserts become
+
+    p1: deposit.id, <TOTAL_MINOR>     -- asset debit, POSITIVE
+    p2: income.id, -<TOTAL_MINOR>     -- income credit, NEGATIVE
+
+Accounts: \`Other\` unless the document is genuinely payroll;
+\`Checking\` unless it names where the money landed (check or ACH →
+Checking, cash in hand → Cash). Never create an account for a payout
+processor — PayPal / Venmo / Zelle payouts land in Checking.
+
+Still emit the Phase 2.5 merchant block: the counterparty is a real
+merchant (Jay Brokers, Assurant) and the brand graph wants it.
+\`category\` is simply unused on an income row, since the spend rollups
+join \`a.type = 'expense'\`.
 
 Template — **this whole heredoc is Turn B: ONE Bash tool call.**
 Substitute your extracted values for the placeholders; the subqueries
@@ -1023,6 +1133,14 @@ ${itemsCte()},
         jsonb_build_object(
           'source', 'ingest',
           'classification', '<receipt_image|receipt_email|receipt_pdf>',
+          -- Phase 1b money direction. REQUIRED on every transaction.
+          -- The postings are the truth; this records the decision you
+          -- made, so a wrong booking is auditable instead of having to
+          -- be reverse-engineered from signs (#221).
+          'flow', '<purchase|refund|income>',
+          -- refund ONLY, and only when Turn A branch (b) matched a
+          -- purchase on a shared identifier. Delete this line otherwise.
+          'refund_of', '<PURCHASE_TX_ID>',
           'category_hint', '<CATEGORY_HINT>',
           'source_ingest_id', '${ctx.ingestId}',
           'merchant', jsonb_build_object(
@@ -1103,6 +1221,11 @@ ${transactionItemsInsert({
     AND ti.item_class = 'durable'
     AND ti.product_id IS NOT NULL
   ON CONFLICT (transaction_item_id, instance_index) DO NOTHING;
+
+  -- (5b) OPTIONAL, \`income\` flow ONLY — retire what was sold. Copy the
+  --      guarded UPDATE from 4a-bis verbatim; its "exactly one live
+  --      instance" count guard is not optional. Delete this statement
+  --      for purchase and refund flows, which is every normal receipt.
 
   -- (6) Stamp the document: ties the file back to this ingest AND
   --     stores the OCR text, so \`documents.ocr_text\` is populated by
@@ -1300,6 +1423,40 @@ to re-run. Delete Turn B (5) entirely when nothing qualifies — which
 is the common case: non-durable items, durables you judge not worth
 tracking, and product-less lines all fall out.
 
+**Selling it is the other half (#221).** An \`income\` buyback / trade-in
+/ resale means the user no longer owns the thing, so leaving it in
+inventory is a lie they have to find and undo by hand. When the flow is
+\`income\` and the document names a specific item, RETIRE the matching
+row instead of inserting one — statement (5b) of Turn B:
+
+  UPDATE owned_items o
+     SET retired_at = NOW(),
+         condition  = COALESCE(o.condition, 'sold'),
+         notes      = CONCAT_WS(' ', o.notes, 'sold via <PAYEE> <YYYY-MM-DD>'),
+         updated_at = NOW()
+   WHERE o.workspace_id = '${ctx.workspaceId}'
+     AND o.retired_at IS NULL
+     AND o.product_id = (
+       SELECT p.id FROM products p
+        WHERE p.workspace_id = '${ctx.workspaceId}'
+          AND p.canonical_name ILIKE '<PRODUCT NAME AS SOLD>'
+        LIMIT 1)
+     AND (SELECT count(*) FROM owned_items o2
+           WHERE o2.workspace_id = o.workspace_id
+             AND o2.product_id = o.product_id
+             AND o2.retired_at IS NULL) = 1;
+
+The trailing count guard is load-bearing: retire ONLY when exactly one
+live instance of that product is owned. Two identical iPhones and one
+buyback receipt cannot say which one left, and retiring the wrong
+instance destroys its serial / warranty / location. When the guard
+suppresses the update, or no product matches, say so in
+\`metadata.owned_items_note\` and leave inventory alone — an un-retired
+item is a nuisance, a wrongly-retired one is lost data. For a \`refund\`
+of a tracked durable, note it there too and move on; its owned_items
+row hangs off the ORIGINAL purchase's transaction_item, which the
+refund does not touch. Delete (5b) for purchase and refund flows.
+
 ### 4a-ter. transaction_parties — the party graph (#149 P4)
 
 The card statement sees one merchant; the receipt sees more. Record
@@ -1360,6 +1517,14 @@ Loop over each row on the statement. Per row: one BEGIN/COMMIT, same
 shape as 4a (expense side determined by payee name, mirror = Credit
 Card). If a row's payee is ambiguous or zero-amount, skip it but log a
 warning line.
+
+Statement CREDIT rows (printed as a credit, a minus sign, or in a
+"Payments and Credits" section) are refunds and take a NEGATIVE
+amount_minor, which the 4a template turns into the correct reversal
+with no other change (#221). Set \`metadata.flow\` = 'refund' on those
+rows. The one exception is the row that PAYS the card bill — that is a
+transfer, not a refund; skip it with a warning line, exactly like an
+ambiguous payee.
 
 Track every successful tx_id in a shell variable and include them all
 in the final ingest close-out (Phase 5).

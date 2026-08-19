@@ -163,6 +163,13 @@ guess, never fall back to today's date.
   raw_text      : full transcription (for \`documents.ocr_text\`)
   items         : REQUIRED structured line-item array (#81). Each item
                   is one object with the exact shape below.
+                  ⚠ If this transaction is a REFUND — its postings put a
+                  NEGATIVE amount on the expense account, and
+                  \`metadata.flow\` reads 'refund' — then every line total
+                  and tax stays NEGATIVE (#221). Do not "correct" them to
+                  positive. Postings are out of scope for re-extract, so
+                  flipping the items' sign would leave the line items
+                  contradicting the ledger they belong to.
 
 ${ITEM_SCHEMA}
 

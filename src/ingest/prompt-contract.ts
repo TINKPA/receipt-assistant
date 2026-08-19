@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
  * pure liability, and nothing reads or compares either value. The path
  * is distinguished by `metadata.extraction.source ∈ {'ingest','re-extract'}`.
  */
-export const PROMPT_VERSION = "3.1";
+export const PROMPT_VERSION = "3.2";
 
 /**
  * The model identifier stamped into `transactions.metadata.extraction.model`
