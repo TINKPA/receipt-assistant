@@ -112,7 +112,10 @@ ${PSQL_DISCIPLINE}
 
 Optional: if you want to discover schema details, \`\\d\` works:
   psql "\$DATABASE_URL" -c "\\d transactions"
-  psql "\$DATABASE_URL" -c "SELECT id, name, type FROM accounts WHERE workspace_id = '${ctx.workspaceId}' ORDER BY type, name"
+
+Do NOT spend a turn listing \`accounts\`. The names are fixed (Phase 4
+primer) and every id is resolved inline as a CTE in the write, so that
+query cannot tell you anything the prompt has not already told you.
 
 ${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest" })}
 ${renderActiveLessons()}
@@ -651,11 +654,20 @@ transaction as already-up-to-date and skip it.
 v1 schema primer (workspace_id is required on every row):
 
   accounts        — chart of accounts; type IN (asset|liability|equity|income|expense)
-                   seeded for WORKSPACE_ID:
-                     expense: Dining, Groceries, Transport, Utilities,
-                              Entertainment, Other, Expenses (parent)
+                   You never need to query this table. The expense
+                   account name IS the \`merchant.category\` you emit in
+                   Phase 2.5 — the seven canonical names are listed once,
+                   in 4.1 — and every id you need is resolved inline as a
+                   CTE in the write statement itself. The other types are
+                   fixed:
                      liability: Credit Card
-                     asset: Cash, Checking, Savings
+                     asset:     Cash, Checking, Savings
+                     income:    Salary, Other
+                     equity:    Opening Balance
+                   Each type also has a parent row (Expenses, Assets,
+                   Liabilities, Income, Equity) — never post to a parent.
+                   Points accounts ("World of Hyatt points", #206/#215)
+                   are created on demand by the write, not seeded.
   transactions    — one per receipt (or one per statement row)
                    status IN (draft|posted|reconciled|error)
                    set status='posted' for completed receipts.
