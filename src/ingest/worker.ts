@@ -8,10 +8,13 @@
  * the agent updated to build the SSE event payload.
  *
  * Design notes
- *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (default 3).
- *     Claude CLI calls dominate latency (30-60s each with geocoding +
- *     SQL writes) and three in parallel is empirically enough for a
- *     laptop host without starving OAuth refresh.
+ *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 3;
+ *     production compose pins 1, the sandbox 6). Production is serialized
+ *     for CORRECTNESS, not throughput: overlapping extractions of two
+ *     documents describing one money event cannot see each other's
+ *     not-yet-written transaction, so same-batch dedup misses and the
+ *     ledger double counts (#225). Serial extraction closes that window.
+ *     Uploads are fire-and-forget, so the wall-clock cost is unfelt.
  *   - No resume on restart. On boot we scan for `pending/processing`
  *     batches older than 5 minutes and mark them `failed`; in-flight
  *     ingests of those batches flip to `error`. Durable queuing is a

@@ -28,7 +28,7 @@ Expected: HTTP 202 + JSON with `batchId`, `status="pending"`, `items[]`, `poll`.
 
 ## Step 2 — Poll for completion
 
-Each file spawns its own `claude -p` (bounded by `MAX_CLAUDE_CONCURRENCY`, default 3). Expect 15–60 seconds per file.
+Each file spawns its own `claude -p` (bounded by `MAX_CLAUDE_CONCURRENCY` — **1 in production**, 6 in the sandbox). Production is serialized on purpose so same-batch dedup can see each preceding write (#225), so expect 15–60 seconds **per file, sequentially**.
 
 ```bash
 while :; do

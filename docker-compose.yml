@@ -75,12 +75,21 @@ services:
       # via its Bash tool (for Phase 3 geocoding during extraction). Empty
       # is fine — the prompt instructs the agent to skip geocoding.
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
-      # Worker concurrency for `claude -p` extraction. Default 3 is fine
-      # for steady-state single-receipt uploads but starves batch evals
-      # (e.g. scripts/eval-dates.ts on a 23-fixture manifest). CPU floor is
-      # ~10% even at concurrency 3 — host has headroom. Bumped to 6 to
-      # halve eval wall-clock without straining Anthropic API rate limits.
-      MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
+      # Worker concurrency for `claude -p` extraction. PRODUCTION RUNS
+      # SERIALIZED (1) ON PURPOSE — this is a correctness setting, not a
+      # throughput one. Two documents of the same money event uploaded in
+      # one batch cannot see each other while their extractions overlap:
+      # neither one's Turn A candidate query finds the other's not-yet-
+      # written transaction, so both are booked and the ledger double
+      # counts (#225 — two real double counts on 2026-08-19). At 1 the
+      # second extraction starts after the first has committed, so the
+      # existing ±30-day identifier search finds it and the race is gone.
+      # Latency is not the trade it looks like: uploads are fire-and-
+      # forget (users photograph and walk away), so N receipts taking
+      # N×30-60s instead of N/6 costs nobody anything. DO NOT raise this
+      # to speed up an eval — the sandbox (docker-compose.test.yml) keeps
+      # 6 for exactly that, on throwaway data where dedup doesn't matter.
+      MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-1}
       # logo.dev API keys for #101 Phase 2 brand-icon acquisition. The
       # publishable key (pk_…) is embedded in img.logo.dev URLs the agent
       # follows; the secret key (sk_…) authorizes api.logo.dev/search,
