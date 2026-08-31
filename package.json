@@ -13,7 +13,8 @@
     "openapi:generate": "node scripts/generate-build-info.mjs && tsx scripts/generate-openapi.ts",
     "eval:dates": "tsx scripts/eval-dates.ts",
     "check:prompt-budget": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-budget.ts",
-    "check:ingest-classification": "node scripts/generate-build-info.mjs && tsx scripts/check-ingest-classification.ts"
+    "check:ingest-classification": "node scripts/generate-build-info.mjs && tsx scripts/check-ingest-classification.ts",
+    "measure:turns": "tsx scripts/measure-ingest-turns.ts"
   },
   "dependencies": {
     "@asteasolutions/zod-to-openapi": "^7.3.4",
