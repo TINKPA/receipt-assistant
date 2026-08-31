@@ -2158,6 +2158,18 @@
                   "null"
                 ]
               },
+              "paid_currency": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "paid_base_minor": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "payee": {
                 "type": [
                   "string",
