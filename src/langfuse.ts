@@ -65,6 +65,28 @@ interface TokenUsage {
   cache_creation_input_tokens?: number;
 }
 
+/**
+ * Every input token the API billed for this call.
+ *
+ * All three buckets are billed: `input_tokens` is what was sent fresh,
+ * `cache_read_input_tokens` is what was served from cache, and
+ * `cache_creation_input_tokens` is what was *written* to cache on this call.
+ * Omitting the third undercounted ingest input by 5.5–12.9% (median ~9%)
+ * across the six production runs measured in #227 — on a single T-Mobile PDF
+ * it hid 106,022 of 1,123,757. Cache writes are not free, and on this
+ * workload the first turn writes the whole ~84K-token prompt.
+ *
+ * Kept as one function because the trace total and the per-generation
+ * `usageDetails` must never drift apart; they did, and that was the bug.
+ */
+function billedInputTokens(u: TokenUsage): number {
+  return (
+    (u.input_tokens ?? 0) +
+    (u.cache_read_input_tokens ?? 0) +
+    (u.cache_creation_input_tokens ?? 0)
+  );
+}
+
 function getUserText(msg: JsonlMessage): string {
   const content = msg.message?.content;
   if (typeof content === "string") return content;
@@ -288,7 +310,7 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
     let totalInput = 0;
     let totalOutput = 0;
     for (const g of groups) {
-      totalInput += (g.usage.input_tokens ?? 0) + (g.usage.cache_read_input_tokens ?? 0);
+      totalInput += billedInputTokens(g.usage);
       totalOutput += g.usage.output_tokens ?? 0;
     }
 
@@ -342,12 +364,16 @@ export async function ingestSession(jsonlPath: string, tags?: string[]): Promise
           startTime: g.inputTs ?? g.timestamp,
           endTime: g.timestamp,
           usageDetails: {
-            input: (g.usage.input_tokens ?? 0) + (g.usage.cache_read_input_tokens ?? 0),
+            // Langfuse sums every key here into `total`, so this stays a
+            // two-key total-only view; the fresh/cache-read/cache-write
+            // split lives in `metadata` below where it cannot double-count.
+            input: billedInputTokens(g.usage),
             output: g.usage.output_tokens ?? 0,
           },
           metadata: {
             tool_calls: uniqueTools,
             stop_reason: g.stopReason,
+            input_fresh: g.usage.input_tokens ?? 0,
             cache_read: g.usage.cache_read_input_tokens ?? 0,
             cache_create: g.usage.cache_creation_input_tokens ?? 0,
           },
