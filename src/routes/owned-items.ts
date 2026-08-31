@@ -104,6 +104,11 @@ function expandedExtras(row: any) {
       row.paid_minor === null || row.paid_minor === undefined
         ? null
         : Number(row.paid_minor),
+    paid_currency: row.paid_currency ?? null,
+    paid_base_minor:
+      row.paid_base_minor === null || row.paid_base_minor === undefined
+        ? null
+        : Number(row.paid_base_minor),
     payee: row.payee ?? null,
     merchant_brand_id: row.merchant_brand_id ?? null,
   };
@@ -149,6 +154,24 @@ ownedItemsRouter.get(
                   COALESCE(p.custom_name, p.canonical_name) AS product_name,
                   p.item_class AS item_class,
                   COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor,
+                  ti.currency AS paid_currency,
+                  -- #216: the base-currency equivalent, via the rate the
+                  -- transaction's OWN posting was converted at. Both the FX
+                  -- pass and the points valuation pass write fx_rate with
+                  -- the same "multiply to reach base minor" meaning, so one
+                  -- expression covers a CNY line and a HYATT_PT line alike.
+                  --
+                  -- NULL fx_rate on a non-base line means nobody ever
+                  -- converted it, so the answer is UNKNOWN and this stays
+                  -- NULL. Coalescing to 1 would hand back yuan labelled as
+                  -- dollars, which is the bug being fixed.
+                  CASE
+                    WHEN fx.rate IS NOT NULL
+                      THEN ROUND(COALESCE(ti.effective_total_minor, ti.line_total_minor) * fx.rate)
+                    WHEN ti.currency = w.base_currency
+                      THEN COALESCE(ti.effective_total_minor, ti.line_total_minor)
+                    ELSE NULL
+                  END AS paid_base_minor,
                   t.payee AS payee,
                   m.brand_id AS merchant_brand_id
                 FROM owned_items o
@@ -156,6 +179,15 @@ ownedItemsRouter.get(
                 LEFT JOIN transaction_items ti ON ti.id = o.transaction_item_id
                 LEFT JOIN transactions t ON t.id = ti.transaction_id
                 LEFT JOIN merchants m ON m.id = t.merchant_id
+                LEFT JOIN workspaces w ON w.id = o.workspace_id
+                LEFT JOIN LATERAL (
+                  SELECT po.fx_rate AS rate
+                    FROM postings po
+                   WHERE po.transaction_id = ti.transaction_id
+                     AND po.currency = ti.currency
+                     AND po.fx_rate IS NOT NULL
+                   LIMIT 1
+                ) fx ON TRUE
                 WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`
           : sql`SELECT * FROM owned_items o WHERE ${where} ORDER BY o.updated_at DESC, o.id DESC LIMIT ${limit + 1}`,
       );

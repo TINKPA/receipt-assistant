@@ -41,7 +41,28 @@ export const OwnedItem = z
 export const OwnedItemExpanded = OwnedItem.extend({
   product_name: z.string().nullable().optional(),
   item_class: z.string().nullable().optional(),
+  /** What the line cost, **in the currency the line was recorded in** —
+   *  which is NOT necessarily the workspace base currency, and is not
+   *  necessarily even cash. Read it with `paid_currency`; on its own it
+   *  is an integer of unknown unit and unknown scale (points are stored
+   *  as whole units, cash as hundredths). For anything that sums or
+   *  divides — a $/day, a portfolio total — use `paid_base_minor`. */
   paid_minor: z.number().int().nullable().optional(),
+  /** Currency of `paid_minor`: an ISO-4217 code, or a points code such as
+   *  `HYATT_PT` for an award-acquired item (#206). Added in #216 — before
+   *  it, clients had no way to tell a CNY line from a USD one and six live
+   *  rows rendered yuan behind a dollar sign. */
+  paid_currency: z.string().nullable().optional(),
+  /** `paid_minor` converted to the workspace base currency at the rate the
+   *  transaction's own posting was converted at, so it is directly
+   *  comparable and summable across items.
+   *
+   *  **Null means the conversion is unknown, not zero** — a non-base line
+   *  whose transaction never got an `fx_rate` (e.g. a zero-total receipt).
+   *  Clients must suppress derived figures rather than fall back to
+   *  `paid_minor`, which is the exact substitution this field exists to
+   *  stop. */
+  paid_base_minor: z.number().int().nullable().optional(),
   payee: z.string().nullable().optional(),
   merchant_brand_id: z.string().nullable().optional(),
 }).openapi("OwnedItemExpanded");
