@@ -232,8 +232,16 @@ documentsRouter.get(
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader(
       "Content-Security-Policy",
+      // `style-src` is deliberately 'unsafe-inline' and NOTHING else.
+      // Inline is required — the sanitizer now passes the document's own
+      // <style> blocks and `style=` attributes through (#243) — but no
+      // remote origin is: `<link>` is not an allowed tag, so a remote
+      // stylesheet was already unreachable, and dropping http:/https:
+      // here closes `@import url(...)`, the one way an allowed <style>
+      // block could have reached out. A SingleFile capture inlines
+      // everything it needs, so this costs nothing real.
       "default-src 'none'; img-src http: https: data: cid:; " +
-        "style-src 'unsafe-inline' http: https:; font-src http: https: data:; " +
+        "style-src 'unsafe-inline'; font-src http: https: data:; " +
         "base-uri 'none'; form-action 'none'",
     );
     setEtag(res, DOC_VERSION);
