@@ -273,12 +273,48 @@ function escapeHtml(s: string): string {
     .replace(/>/g, "&gt;");
 }
 
-const EMAIL_SANITIZE: sanitizeHtml.IOptions = {
+/** Exported for `scripts/smoke-sanitize.ts`, which asserts the
+ *  containment properties this profile is responsible for (#243). */
+export const EMAIL_SANITIZE: sanitizeHtml.IOptions = {
   allowedTags: sanitizeHtml.defaults.allowedTags.concat([
     "img", "center", "font", "table", "thead", "tbody", "tfoot",
     "tr", "td", "th", "colgroup", "col", "h1", "h2", "h3", "h4", "h5",
     "h6", "span", "u", "s", "strike", "small", "big", "sup", "sub",
+    // #243 — a saved portal invoice carries its whole design in <style>
+    // blocks and selects it with classes. Dropping the blocks while
+    // `allowedAttributes` keeps `class` left the markup with every
+    // selector hook and no rule to match: 6 blocks and 267 class
+    // attributes in, 0 blocks and 240 hooks out, rendering as bare
+    // tables. `<link>` stays disallowed, so a stylesheet still cannot
+    // be fetched — only the ones already inlined in the document render.
+    "style",
   ]),
+  // sanitize-html warns on `script` and `style` in `allowedTags` and asks
+  // for this acknowledgement (index.js:128-133). It suppresses a console
+  // warning and changes NOTHING about the filtering — without it every
+  // single render logs a multi-line warning to stderr in production.
+  //
+  // Accounting for the risk, which is what the option asks:
+  //   * `</style>` cannot smuggle markup — the parser ends the element
+  //     there and whatever follows still faces this allowlist
+  //     (asserted in scripts/smoke-sanitize.ts).
+  //   * CSS cannot read text; the attribute-selector exfiltration
+  //     technique needs form controls, which are not allowed tags.
+  //   * What remains is a load-time beacon via `url(...)`, the same
+  //     class of request as the remote `<img>` this profile already
+  //     permits on purpose — not a new one.
+  //   * `@import` is closed at the route: `style-src 'unsafe-inline'`
+  //     with no remote origin (src/routes/documents.ts).
+  //   * Script execution is impossible regardless: the response carries
+  //     `default-src 'none'` and the frontend frames it with `sandbox=""`.
+  allowVulnerableTags: true,
+  // `allowedTags` alone would be a no-op here. sanitize-html's default
+  // `nonTextTags` — script, style, textarea, option, xmp — discard the
+  // CONTENTS of those tags as well as the tag, so the CSS text went with
+  // the element. Override the list to release `style` and nothing else.
+  // `script` MUST stay on it: disallowed-and-not-listed would escape the
+  // script body into the document as visible text.
+  nonTextTags: ["script", "textarea", "option", "xmp"],
   allowedAttributes: {
     "*": [
       "style", "class", "align", "valign", "width", "height", "bgcolor",
