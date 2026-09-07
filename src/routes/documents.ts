@@ -73,6 +73,27 @@ const upload = multer({
  */
 const DOC_VERSION = 1;
 
+/**
+ * ETag for `/rendered` ONLY — deliberately not `DOC_VERSION`.
+ *
+ * `DOC_VERSION` rests on "freshly-materialized immutable metadata",
+ * which is true of a document's bytes and false of its rendering: what
+ * this route returns is a FUNCTION of those bytes and the sanitizer
+ * profile plus CSP that present them, and that function changes when we
+ * change it.
+ *
+ * The route answers If-None-Match with a 304, so a tag that never moves
+ * means every browser that has already opened a fold keeps its stale
+ * copy forever — #243 shipped the fix and no existing reader would have
+ * seen it. Bump this whenever `renderDocumentHtml` or this response's
+ * CSP changes.
+ *
+ *   1 — original render
+ *   2 — #243: <style> allowed through, style-src narrowed to
+ *       'unsafe-inline'
+ */
+const RENDER_VERSION = 2;
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function asyncHandler<T>(
@@ -244,7 +265,7 @@ documentsRouter.get(
         "style-src 'unsafe-inline'; font-src http: https: data:; " +
         "base-uri 'none'; form-action 'none'",
     );
-    setEtag(res, DOC_VERSION);
+    setEtag(res, RENDER_VERSION);
     res.send(html);
   }),
 );
