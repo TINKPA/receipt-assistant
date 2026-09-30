@@ -71,7 +71,10 @@ export const CreateOwnedItemRequest = z
   .object({
     product_id: Uuid,
     /** Optional — manual entries (gifts) skip this. */
-    transaction_item_id: Uuid.optional(),
+    transaction_item_id: Uuid.optional().openapi({
+      description:
+        "The purchase line this item came from. Pass it whenever the purchase is known: `paid_minor` and the $/day figure derive from the linked line, so an item created without it has both permanently null. Omit only for items with no purchase (gifts, inherited).",
+    }),
     instance_index: z.number().int().positive().optional(),
     serial_number: z.string().optional(),
     location: z.string().optional(),
@@ -81,6 +84,7 @@ export const CreateOwnedItemRequest = z
     notes: z.string().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
+  .strict()
   .openapi("CreateOwnedItemRequest");
 
 export const UpdateOwnedItemRequest = z
@@ -98,6 +102,7 @@ export const UpdateOwnedItemRequest = z
     target_days: z.number().int().positive().nullable().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
+  .strict()
   .openapi("UpdateOwnedItemRequest");
 
 export const ListOwnedItemsQuery = z.object({

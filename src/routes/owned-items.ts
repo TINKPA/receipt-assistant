@@ -378,7 +378,8 @@ export function registerOwnedItemsOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/owned-items",
     summary: "List owned physical-instance items",
     description:
-      "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item.",
+      "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item. " +
+      "`paid_minor`, `paid_currency` and `paid_base_minor` appear ONLY under `expand=product`: the plain list and `GET /v1/owned-items/{id}` omit them, so a correctly linked item looks unlinked without it.",
     tags: ["owned-items"],
     request: { query: ListOwnedItemsQuery },
     responses: {

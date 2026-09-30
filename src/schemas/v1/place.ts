@@ -102,6 +102,7 @@ export const UpdatePlaceRequest = z
      *  backward compatibility. */
     custom_name_zh: z.string().nullable().optional(),
   })
+  .strict()
   .openapi("UpdatePlaceRequest");
 
 /**

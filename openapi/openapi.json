@@ -351,7 +351,8 @@
         "required": [
           "name",
           "type"
-        ]
+        ],
+        "additionalProperties": false
       },
       "UpdateAccountRequest": {
         "type": "object",
@@ -405,7 +406,8 @@
             "default": {},
             "description": "User-defined JSON object; not schema-validated."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "AccountBalance": {
         "type": "object",
@@ -1920,7 +1922,8 @@
           "product_key",
           "canonical_name",
           "item_class"
-        ]
+        ],
+        "additionalProperties": false
       },
       "UpdateProductRequest": {
         "type": "object",
@@ -1966,7 +1969,8 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           }
-        }
+        },
+        "additionalProperties": false
       },
       "MergeProductRequest": {
         "type": "object",
@@ -2197,6 +2201,7 @@
           "transaction_item_id": {
             "type": "string",
             "format": "uuid",
+            "description": "The purchase line this item came from. Pass it whenever the purchase is known: `paid_minor` and the $/day figure derive from the linked line, so an item created without it has both permanently null. Omit only for items with no purchase (gifts, inherited).",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
           "instance_index": {
@@ -2234,7 +2239,8 @@
         },
         "required": [
           "product_id"
-        ]
+        ],
+        "additionalProperties": false
       },
       "UpdateOwnedItemRequest": {
         "type": "object",
@@ -2299,7 +2305,8 @@
             "type": "object",
             "additionalProperties": {}
           }
-        }
+        },
+        "additionalProperties": false
       },
       "WishItem": {
         "type": "object",
@@ -2458,7 +2465,8 @@
         },
         "required": [
           "title"
-        ]
+        ],
+        "additionalProperties": false
       },
       "UpdateWishItemRequest": {
         "type": "object",
@@ -2532,7 +2540,8 @@
             "type": "object",
             "additionalProperties": {}
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Insight": {
         "type": "object",
@@ -3304,7 +3313,8 @@
               "null"
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "UploadBrandAssetForm": {
         "type": "object",
@@ -3471,7 +3481,8 @@
         },
         "required": [
           "transaction_id"
-        ]
+        ],
+        "additionalProperties": false
       },
       "BatchStatus": {
         "type": "string",
@@ -4837,7 +4848,8 @@
         "required": [
           "occurred_on",
           "postings"
-        ]
+        ],
+        "additionalProperties": false
       },
       "UpdateTransactionRequest": {
         "type": "object",
@@ -4881,7 +4893,8 @@
             "default": {},
             "description": "User-defined JSON object; not schema-validated."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "NearDupReviewResponse": {
         "type": "object",
@@ -5028,7 +5041,8 @@
               "null"
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ReExtractDocumentResponse": {
         "type": "object",
@@ -5097,7 +5111,8 @@
               "null"
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ReDerivePlaceResponse": {
         "type": "object",
@@ -7427,7 +7442,7 @@
     "/v1/owned-items": {
       "get": {
         "summary": "List owned physical-instance items",
-        "description": "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item.",
+        "description": "With `expand=product`, rows are OwnedItemExpanded — catalog name/class plus paid amount, payee, and brand from the linked transaction item. `paid_minor`, `paid_currency` and `paid_base_minor` appear ONLY under `expand=product`: the plain list and `GET /v1/owned-items/{id}` omit them, so a correctly linked item looks unlinked without it.",
         "tags": [
           "owned-items"
         ],
