@@ -74,7 +74,11 @@ CREATE TEMP TABLE snapshot ON COMMIT DROP AS SELECT :'snap'::jsonb AS snap;
 
 -- (2) explicit deletes, in FK order — replica mode disables cascades.
 DELETE FROM owned_items         WHERE transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = :'tx');
-DELETE FROM wish_items          WHERE transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = :'tx');
+-- wish_items hang off the transaction itself (converted_transaction_id),
+-- not off a line item. Delete exactly the rows the snapshot re-inserts: a
+-- wish converted to this transaction AFTER the snapshot is not ours to drop.
+DELETE FROM wish_items          WHERE id IN (SELECT (w->>'id')::uuid
+                                               FROM jsonb_array_elements(COALESCE((SELECT snap->'wish_items' FROM snapshot), '[]'::jsonb)) w);
 DELETE FROM transaction_parties WHERE transaction_id = :'tx';
 DELETE FROM transaction_items   WHERE transaction_id = :'tx';
 DELETE FROM transaction_events  WHERE transaction_id = :'tx';
@@ -95,14 +99,14 @@ INSERT INTO transaction_items (
   unit_price_minor, line_total_minor, currency,
   item_class, durability_tier, food_kind, tags, confidence,
   line_type, product_id, tax_minor, tip_share_minor, discount_share_minor,
-  extraction_run, extraction_version, retired_at, created_at, updated_at
+  extraction_run, extraction_version, retired_at, metadata, source, created_at
 )
 SELECT id, workspace_id, transaction_id, line_no, parent_line_no,
        raw_name, normalized_name, product_variant, quantity, unit,
        unit_price_minor, line_total_minor, currency,
        item_class, durability_tier, food_kind, tags, confidence,
        line_type, product_id, tax_minor, tip_share_minor, discount_share_minor,
-       extraction_run, extraction_version, retired_at, created_at, updated_at
+       extraction_run, extraction_version, retired_at, metadata, source, created_at
   FROM jsonb_to_recordset(COALESCE((SELECT snap->'transaction_items' FROM snapshot), '[]'::jsonb))
     AS x(id uuid, workspace_id uuid, transaction_id uuid, line_no int, parent_line_no int,
          raw_name text, normalized_name text, product_variant text, quantity numeric, unit text,
@@ -110,7 +114,7 @@ SELECT id, workspace_id, transaction_id, line_no, parent_line_no,
          item_class text, durability_tier text, food_kind text, tags text[], confidence text,
          line_type text, product_id uuid, tax_minor bigint, tip_share_minor bigint,
          discount_share_minor bigint, extraction_run int, extraction_version text,
-         retired_at timestamptz, created_at timestamptz, updated_at timestamptz);
+         retired_at timestamptz, metadata jsonb, source text, created_at timestamptz);
 
 INSERT INTO document_links
 SELECT * FROM jsonb_populate_recordset(NULL::document_links, COALESCE((SELECT snap->'document_links' FROM snapshot), '[]'::jsonb));
