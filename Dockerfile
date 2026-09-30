@@ -66,7 +66,14 @@ RUN for f in /etc/ImageMagick-*/policy.xml; do \
     done
 
 # Claude Code CLI — invoked by src/claude.ts as a subprocess.
-RUN npm install -g @anthropic-ai/claude-code
+#
+# PINNED. The CLI is the extraction agent's runtime: its system prompt,
+# tool list and skill loading are part of every turn's context, so an
+# unpinned install silently changes agent behaviour and token cost on any
+# rebuild. 2.1.285, for one, syncs the account's skills (pdf, xlsx, …)
+# into ~/.claude: +2.9K tokens per turn and a broken turn-2 cache (#227).
+# Bump this deliberately, and re-measure with `npm run measure:turns`.
+RUN npm install -g @anthropic-ai/claude-code@2.1.251
 
 WORKDIR /app
 
