@@ -15,10 +15,9 @@
  *     not-yet-written transaction, so same-batch dedup misses and the
  *     ledger double counts (#225). Serial extraction closes that window.
  *     Uploads are fire-and-forget, so the wall-clock cost is unfelt.
- *   - No resume on restart. On boot we scan for `pending/processing`
- *     batches older than 5 minutes and mark them `failed`; in-flight
- *     ingests of those batches flip to `error`. Durable queuing is a
- *     future concern.
+ *   - No resume on restart. On boot we mark every `pending/processing`
+ *     batch `failed`; in-flight ingests of those batches flip to `error`
+ *     (retryable). Durable queuing is a future concern.
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -56,7 +55,6 @@ import { trackLangfuse } from "../langfuse.js";
 // ── Configuration ─────────────────────────────────────────────────────
 
 const DEFAULT_CONCURRENCY = 3;
-const STARTUP_RECOVERY_AGE_MS = 5 * 60 * 1000;
 
 function getConcurrency(): number {
   const raw = Number(process.env.MAX_CLAUDE_CONCURRENCY);
@@ -635,21 +633,25 @@ async function triggerAutoReconcile(
  * them `failed`. Their stuck ingests flip to `error` so clients stop
  * polling forever.
  *
- * Runs once at server boot (from `src/server.ts`). Safe to call
- * multiple times; the WHERE clause filters on the age window + status
- * so newly-minted batches aren't touched.
+ * Runs once at server boot (from `src/server.ts`), BEFORE the HTTP server
+ * listens. BOOT-ONLY: the queue lives in this process's memory, so at
+ * that moment every `pending/processing` batch is orphaned by
+ * construction — whatever its age. Calling this while the worker is
+ * draining would fail live batches.
+ *
+ * There is deliberately no age window (#247). One used to skip batches
+ * younger than 5 minutes, which are exactly the ones a restart is most
+ * likely to have interrupted; they stayed `queued/processing` forever,
+ * and the retry endpoint refuses rows that still look in-progress.
  */
 export async function recoverStaleBatches(): Promise<{
   failedBatches: number;
   erroredIngests: number;
 }> {
-  const cutoff = new Date(Date.now() - STARTUP_RECOVERY_AGE_MS).toISOString();
   const stale = await db
     .select({ id: batches.id })
     .from(batches)
-    .where(
-      sql`status IN ('pending','processing') AND created_at < ${cutoff}::timestamptz`,
-    );
+    .where(sql`status IN ('pending','processing')`);
   if (stale.length === 0) return { failedBatches: 0, erroredIngests: 0 };
 
   const batchIds = stale.map((b) => b.id);
@@ -679,8 +681,9 @@ export async function recoverStaleBatches(): Promise<{
 }
 
 /**
- * Start the worker. Idempotent. For Phase 1 there's nothing async to
- * spin up; the queue drains on its own once `enqueue` is called.
+ * Start the worker. Call once, at boot (see `recoverStaleBatches`). For
+ * Phase 1 there's nothing async to spin up; the queue drains on its own
+ * once `enqueue` is called.
  */
 export async function start(): Promise<void> {
   await recoverStaleBatches().catch((err) => {
