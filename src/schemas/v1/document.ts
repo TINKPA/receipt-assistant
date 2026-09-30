@@ -49,6 +49,7 @@ export const Document = z
 
 export const CreateDocumentLinkRequest = z
   .object({ transaction_id: Uuid })
+  .strict()
   .openapi("CreateDocumentLinkRequest");
 
 /**

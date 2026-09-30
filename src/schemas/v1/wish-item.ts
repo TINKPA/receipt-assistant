@@ -47,6 +47,7 @@ export const CreateWishItemRequest = z
     snoozed_until: IsoDate.optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
+  .strict()
   .openapi("CreateWishItemRequest");
 
 export const UpdateWishItemRequest = z
@@ -64,6 +65,7 @@ export const UpdateWishItemRequest = z
     converted_transaction_id: Uuid.nullable().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
+  .strict()
   .openapi("UpdateWishItemRequest");
 
 export const ListWishItemsQuery = z.object({

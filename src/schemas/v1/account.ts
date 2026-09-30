@@ -60,6 +60,7 @@ export const CreateAccountRequest = z
     opening_balance_minor: AmountMinor.optional(),
     metadata: Metadata.optional(),
   })
+  .strict()
   .openapi("CreateAccountRequest");
 
 export const UpdateAccountRequest = z
@@ -73,6 +74,7 @@ export const UpdateAccountRequest = z
     closed_at: IsoDateTime.nullable().optional(),
     metadata: Metadata.optional(),
   })
+  .strict()
   .openapi("UpdateAccountRequest");
 
 export const AccountBalance = z

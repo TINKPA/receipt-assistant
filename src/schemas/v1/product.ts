@@ -153,6 +153,7 @@ export const CreateProductRequest = z
     notes: z.string().nullable().optional(),
     metadata: Metadata.optional(),
   })
+  .strict()
   .openapi("CreateProductRequest");
 
 export const UpdateProductRequest = z
@@ -171,6 +172,7 @@ export const UpdateProductRequest = z
      *  `preferred_asset_chosen_at=now()` so re-seed honors the choice. */
     preferred_asset_id: Uuid.nullable().optional(),
   })
+  .strict()
   .openapi("UpdateProductRequest");
 
 export const ListProductsQuery = z.object({

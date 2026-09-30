@@ -313,6 +313,7 @@ export const CreateTransactionRequest = z
     trip_id: Uuid.optional(),
     metadata: Metadata.optional(),
   })
+  .strict()
   .openapi("CreateTransactionRequest");
 
 export const UpdateTransactionRequest = z
@@ -324,6 +325,7 @@ export const UpdateTransactionRequest = z
     trip_id: Uuid.nullable().optional(),
     metadata: Metadata.optional(),
   })
+  .strict()
   .openapi("UpdateTransactionRequest");
 
 export const UnreconcileTransactionRequest = z
@@ -341,6 +343,7 @@ export const UpdatePostingRequest = z
     amount_base_minor: AmountMinor.optional(),
     memo: z.string().nullable().optional(),
   })
+  .strict()
   .openapi("UpdatePostingRequest");
 
 // Filter surface for GET /v1/transactions

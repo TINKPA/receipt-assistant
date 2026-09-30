@@ -84,6 +84,7 @@ export const UpdateBrandRequest = z
     name: z.string().optional(),
     domain: z.string().nullable().optional(),
   })
+  .strict()
   .openapi("UpdateBrandRequest");
 
 /**
