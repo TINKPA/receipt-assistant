@@ -26,13 +26,14 @@ Receipts can genuinely be wrong (mis-shot, wrong merchant, duplicate). Both soft
 **`DELETE /v1/documents/:id`**
 - default: soft delete (sets `deleted_at`). `GET` and link-creation hide the row; `?include_deleted=true` surfaces it. Re-uploading the same bytes resurrects via the sha256 dedup path.
 - `?hard=true`: removes the row + image file. Refuses with 409 if links exist (caller must add `?cascade=true`).
-- `?cascade=true`: in one DB transaction, also handles linked txns — `posted` → voided (mirror reversal), `draft|error` → hard-deleted, `voided` → left alone (link is kept as historical record), `reconciled` → **always aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge of every linked txn + the doc + the file.
+- `?cascade=true`: in one DB transaction, also handles linked txns — `posted` → soft-deleted (`deleted_at`), `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **always aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge of every linked txn + the doc + the file.
 
 **`POST /v1/documents/:id/restore`** — clears `deleted_at`.
 
 **`DELETE /v1/transactions/:id`**
-- default: only `draft|error` may be deleted; `posted|voided` return 409 must-void-instead.
-- `?hard=true`: caller forces a hard delete (postings + document_links cascade via FK). `reconciled` is the one status that still rejects.
+- default: soft delete (sets `deleted_at`). The row drops out of every money query; `POST /v1/transactions/:id/restore` brings it back.
+- `?hard=true`: physical delete (postings + document_links cascade via FK).
+- `reconciled` rejects both with 409.
 
 The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging — so we make the user click twice.
 
@@ -416,17 +417,17 @@ Re-running re-extract on the same document with the same `PROMPT_VERSION` and mo
 
 ## Schema editing workflow (OpenAPI contract)
 
-The HTTP API contract lives in `src/schemas/` (one zod file per resource: `receipt.ts`, `job.ts`, `summary.ts`, `ask.ts`, `health.ts`, `common.ts`). Routes are registered in `src/openapi.ts`. The generated `openapi/openapi.json` is a build artifact — **never edit it by hand**, it gets overwritten.
+The HTTP API contract lives in `src/schemas/v1/` (one zod file per resource: `transaction.ts`, `document.ts`, `ingest.ts`, `account.ts`, …, plus a shared `common.ts`). Each `src/routes/<resource>.ts` registers its own paths in a `registerXOpenApi(registry)` function, which `src/openapi.ts` calls. The generated `openapi/openapi.json` is a build artifact — **never edit it by hand**, it gets overwritten.
 
 When you change a schema or add a new endpoint:
 
-1. Edit the relevant `src/schemas/*.ts` (or add a new file).
-2. Register/update the route in `src/openapi.ts` with method, request, responses.
-3. Add or modify the actual Express handler in `src/server.ts`.
+1. Edit the relevant `src/schemas/v1/*.ts` (or add a new file).
+2. Register/update the route in that resource's `registerXOpenApi` (`src/routes/<resource>.ts`) with method, request, responses.
+3. Add or modify the actual Express handler in the same `src/routes/<resource>.ts`.
 4. Run `npm run openapi:generate` to regenerate `openapi/openapi.json`.
 5. Commit the schema, route registration, handler, and regenerated spec **in the same commit**. A stale `openapi.json` misleads client codegen and breaks PR diffs.
 
-**Never inline a new `z.object()` directly in `server.ts`.** Schemas defined inline don't appear in the OpenAPI spec, so the frontend and any future client can't see them. The `src/schemas/` + registry layout exists so a single source describes every endpoint.
+**Never inline a new request/response `z.object()` directly in `src/routes/*.ts`.** Schemas defined inline don't appear in the OpenAPI spec, so the frontend and any future client can't see them. The `src/schemas/` + registry layout exists so a single source describes every endpoint.
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
 
@@ -559,7 +560,7 @@ three paths 404. Point at the **mini** (production); `localhost` is the
 dev box and lands in the wrong DB.
 
 ```bash
-BASE=http://100.84.82.96:3000
+BASE=http://100.110.13.13:3000
 
 # 1. Upload
 BATCH=$(curl -sS -X POST "$BASE/v1/ingest/batch" \
@@ -572,7 +573,7 @@ curl -sS "$BASE/v1/batches/$BATCH" | jq '.items[] | {id,status,error,produced}'
 
 # 3. Inspect the transaction (the data of record — payee/date/total/
 #    postings/items are all here)
-TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_id')
+TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_ids[0]')
 curl -sS "$BASE/v1/transactions/$TX" | jq .
 ```
 
