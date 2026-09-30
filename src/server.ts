@@ -15,6 +15,7 @@ import { start as startIngestWorker } from "./ingest/worker.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 import { buildExtractorPrompt } from "./ingest/prompt.js";
+import { iconPipelineFileExists } from "./ingest/brand-icon-prompt.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
@@ -72,6 +73,13 @@ async function main(): Promise<void> {
     console.warn(
       "⚠️  GOOGLE_MAPS_API_KEY not set — receipt geocoding will be skipped. " +
         "Set the env var in .env to enable Google Maps Geocoding + Places API calls during Phase 3 of extraction.",
+    );
+  }
+
+  if (!iconPipelineFileExists()) {
+    console.warn(
+      "⚠️  brand-icon-pipeline.md not found at the path the extractor prompt points to — " +
+        "every extraction will skip brand-icon acquisition. Check the Dockerfile COPY (#227).",
     );
   }
 

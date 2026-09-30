@@ -79,6 +79,11 @@ COPY --from=builder /app/dist ./dist
 # next to dist/ingest/prompt.js explicitly. lessons.proposed.md (the agent's
 # raw proposals) is NOT here — it stays a runtime bind-mount on the mini.
 COPY --from=builder /app/src/ingest/lessons.md ./dist/ingest/lessons.md
+# On-demand Phase 4b/4c icon procedure (#227). NOT part of the prompt: the
+# prompt's icon gate tells the agent to `cat` this exact path when a brand
+# needs icon work. The path is hard-wired in src/ingest/brand-icon-prompt.ts
+# (ICON_PIPELINE_PATH) — move one, move the other.
+COPY --from=builder /app/src/ingest/brand-icon-pipeline.md ./dist/ingest/brand-icon-pipeline.md
 # Drizzle migrations (SQL files + journal) ship with the image — the
 # migrate runner resolves `<app>/drizzle/` at boot to apply any pending
 # schema changes. Committing these into the image is deliberate: it means

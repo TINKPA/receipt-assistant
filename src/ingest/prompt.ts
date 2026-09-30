@@ -10,7 +10,7 @@
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
-  PHASE_4B_4C_ICON_PIPELINE,
+  PHASE_4B_4C_ICON_GATE,
 } from "./brand-icon-prompt.js";
 import {
   PROMPT_VERSION,
@@ -1557,7 +1557,7 @@ the asset is readily found; skip it when the core is already committed
 and an icon is not close at hand. Never chase an icon across many
 fallback providers — one or two cheap tries, then move on and close.
 
-${PHASE_4B_4C_ICON_PIPELINE}
+${PHASE_4B_4C_ICON_GATE}
 
 
 ── Phase 5 — Close the ingest row (Turn C) ────────────────────────────

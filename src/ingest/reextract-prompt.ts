@@ -39,7 +39,7 @@
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
-  PHASE_4B_4C_ICON_PIPELINE,
+  PHASE_4B_4C_ICON_GATE,
 } from "./brand-icon-prompt.js";
 import {
   PROMPT_VERSION,
@@ -366,12 +366,13 @@ transaction's merchant row:
 If the SELECT returns NULL (soft-deleted / orphaned tx), skip Phase 3.
 
 Step 2: substitute the returned brand_id for <bid> and the
-canonical_name for <canonical_name> in the inlined phases that
-follow, then execute them verbatim:
+canonical_name for <canonical_name> in the phases that follow (and in
+the on-demand icon procedure, if the gate sends you to it), then
+execute them verbatim:
 
 ${PHASE_2_6_BRAND_DISCOVERY}
 
-${PHASE_4B_4C_ICON_PIPELINE}
+${PHASE_4B_4C_ICON_GATE}
 
 Most re-extracts hit Case A (already-resolved) on the cache pre-check
 and complete in one SELECT. Case B (re-judge existing candidates with

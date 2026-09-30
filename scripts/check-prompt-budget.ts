@@ -182,6 +182,12 @@ function main(): void {
   // accounted for by imported fragments.
   const imported = Object.values(byModule).reduce((a, b) => a + b, 0);
   byModule["prompt.ts (inline)"] = Math.max(0, ingestBytes - imported);
+  // In neither rendered prompt, but the agent loads it into context on demand
+  // (#227). Recorded in the baseline so it moves in the diff like every other
+  // block; it is not part of the totals the ratchet fails on.
+  byModule["brand-icon-pipeline.md (on demand)"] = bytes(
+    readFileSync(path.join(HERE, "../src/ingest/brand-icon-pipeline.md"), "utf8"),
+  );
 
   if (update) {
     const next: Baseline = {
