@@ -38,11 +38,15 @@ FROM node:22-bookworm AS runtime
 
 # Build tools kept for any on-demand native rebuilds; postgresql-client is
 # handy for debugging (psql) and curl is used by healthchecks / entrypoint.
+# jq is a prompt dependency: the brand-icon tiers in
+# src/ingest/brand-icon-prompt.ts pipe curl into it, and without it every
+# one of those commands exits 127 and costs the agent a wasted turn (#230).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         make \
         g++ \
         curl \
+        jq \
         postgresql-client \
         poppler-utils \
         ghostscript \
