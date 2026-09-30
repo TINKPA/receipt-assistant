@@ -1,6 +1,19 @@
-# Receipt Assistant — Claude Code Instructions
+# Receipt Assistant: developer guide
 
-You are a receipt parsing assistant. Your job is to extract structured data from receipt images.
+This file is for whoever is **developing** this repo: a person, or an AI working in the checkout. It is not the extraction agent's instructions, and the extraction agent never sees it.
+
+## Two audiences, two sets of files
+
+| Reader | What it needs | Where that lives |
+|---|---|---|
+| Developer (you) | How the project is built, deployed and debugged | This file, `README.md`, `docs/` |
+| Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract |
+| Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger, read-only | `src/insights/ask.ts` |
+
+Keep them apart:
+
+- **A rule for an agent goes in its prompt, never in this file.** Changing what the extraction agent does is a prompt change; see "When to bump `PROMPT_VERSION`".
+- **`CLAUDE.md` must not be in the runtime image.** Claude Code auto-loads a `CLAUDE.md` from its working directory, and both agents run with cwd `/app`. A copy there costs about 18.7K input tokens on every turn of every extraction (#227). The `Dockerfile` does not copy it and `.dockerignore` keeps it out of the build context.
 
 ## Database Schema
 
@@ -36,19 +49,6 @@ Receipts can genuinely be wrong (mis-shot, wrong merchant, duplicate). Both soft
 - `reconciled` rejects both with 409.
 
 The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging — so we make the user click twice.
-
-## Extraction Rules
-
-These apply to the agent that reads a receipt image and writes a `transaction` + `postings` to the ledger:
-
-1. **Date format**: Always YYYY-MM-DD. If year is missing, use current year.
-2. **Total**: Use the FINAL total (after tax, after tip). If subtotal and total both exist, use total.
-3. **Currency detection**: $ → USD, ¥ → detect context (CNY vs JPY), € → EUR, £ → GBP.
-4. **Category**: Pick the single most appropriate category from the allowed values.
-5. **Don't guess**: If a field is not visible on the receipt, omit it. Don't fabricate data.
-6. **Line items**: Extract as many as you can read. Include quantity and price when visible.
-7. **Language**: Receipts may be in English, Chinese, or other languages. Handle all.
-8. **OCR text**: Persist the full receipt transcription on the `documents.ocr_text` column for future reference.
 
 ## Extraction provenance — `metadata.extraction` (Phase 1 of #80)
 
@@ -430,16 +430,6 @@ When you change a schema or add a new endpoint:
 **Never inline a new request/response `z.object()` directly in `src/routes/*.ts`.** Schemas defined inline don't appear in the OpenAPI spec, so the frontend and any future client can't see them. The `src/schemas/` + registry layout exists so a single source describes every endpoint.
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
-
-## Image Reading
-
-To read a receipt image, use the Bash tool:
-```bash
-# View the image (Claude can read image files directly)
-cat /path/to/receipt.jpg
-```
-
-Or use the Read tool to inspect the file.
 
 ## Langfuse Observability
 

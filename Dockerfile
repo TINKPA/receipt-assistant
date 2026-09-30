@@ -97,7 +97,12 @@ COPY --from=builder /app/drizzle ./drizzle
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/tsconfig.json ./tsconfig.json
-COPY package.json CLAUDE.md ./
+# CLAUDE.md is deliberately NOT copied. It is the developer guide, and
+# Claude Code auto-loads a CLAUDE.md from the working directory: with the
+# agents spawned in /app it would be re-read on every turn of every
+# extraction (~18.7K tokens, #227). The agents' instructions are the
+# prompts compiled into dist/.
+COPY package.json ./
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 
 ENV NODE_ENV=production

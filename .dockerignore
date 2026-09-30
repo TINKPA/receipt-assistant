@@ -19,9 +19,9 @@ langfuse
 .DS_Store
 *.swp
 
-# Docs (CLAUDE.md is explicitly re-included because Dockerfile needs it)
+# Docs. CLAUDE.md included: it is the developer guide and must not reach
+# the image, where Claude Code would load it into every extraction (#227).
 *.md
-!CLAUDE.md
 
 # Local data / uploads
 data
