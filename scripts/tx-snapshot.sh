@@ -37,8 +37,7 @@ SELECT jsonb_pretty(jsonb_build_object(
   'document_links',      (SELECT jsonb_agg(to_jsonb(dl)) FROM document_links dl     WHERE dl.transaction_id = '$TX'),
   'transaction_events',  (SELECT jsonb_agg(to_jsonb(te)) FROM transaction_events te WHERE te.transaction_id = '$TX'),
   'transaction_parties', (SELECT jsonb_agg(to_jsonb(tp)) FROM transaction_parties tp WHERE tp.transaction_id = '$TX'),
-  'wish_items',          (SELECT jsonb_agg(to_jsonb(w))  FROM wish_items w
-                            WHERE w.transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = '$TX')),
+  'wish_items',          (SELECT jsonb_agg(to_jsonb(w))  FROM wish_items w          WHERE w.converted_transaction_id = '$TX'),
   'owned_items',         (SELECT jsonb_agg(to_jsonb(o))  FROM owned_items o
                             WHERE o.transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = '$TX')),
   'documents',           (SELECT jsonb_agg(to_jsonb(d))  FROM documents d
@@ -49,12 +48,20 @@ SELECT jsonb_pretty(jsonb_build_object(
 ));
 SQL
 
-docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$OUT"
+# Write to a temp file and move it into place only once the guard passes.
+# Redirecting straight to "$OUT" truncates it first, so a failed run left a
+# zero-byte file named after the transaction — a decoy for anyone later
+# asking "did I snapshot that one?" (#242).
+TMP="$(mktemp "$OUT_DIR/.$TX.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
 
-if [ ! -s "$OUT" ] || ! grep -q '"transactions"' "$OUT"; then
+docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$TMP"
+
+if [ ! -s "$TMP" ] || ! grep -q '"transactions"' "$TMP"; then
   echo "tx-snapshot: EMPTY or malformed snapshot for $TX — refusing to claim success" >&2
   exit 1
 fi
+mv "$TMP" "$OUT"
 
 echo "tx-snapshot: wrote $OUT ($(wc -c < "$OUT") bytes)"
 echo "tx-snapshot: copy it OFF the box — $OUT_DIR is not backed up."
