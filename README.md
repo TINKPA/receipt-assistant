@@ -7,7 +7,7 @@ An open-source, AI-native receipt parsing backend that extracts structured data 
 ```
                      ┌──────────────┐
   Receipt Image ───► │  Express API │ ───► PostgreSQL (receipts db)
-  (POST /receipt)    │   :3000      │              ▲
+  (/v1/ingest/batch) │   :3000      │              ▲
                      └──────┬───────┘              │
                             │                      │ writes via psql tool
                             ▼                      │
@@ -120,32 +120,35 @@ rebuilds are typically 10–20 seconds.
 ### 4. Test with a receipt
 
 ```bash
-# 1. Upload — returns { jobId, receiptId }
-curl -X POST http://localhost:3000/receipt -F "image=@receipt.jpg"
-
-# 2. Poll job status (queued → done / error)
-curl http://localhost:3000/jobs/<jobId>
-
-# 3. Fetch the parsed receipt (merchant, date, total, items, ...)
-curl http://localhost:3000/receipt/<receiptId> | jq .
+BASE=http://localhost:3000
+BATCH=$(curl -sS -X POST "$BASE/v1/ingest/batch" -F "file=@receipt.jpg" | jq -r .batchId)
+until [[ "$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r .status)" =~ ^(extracted|reconciled|failed)$ ]]; do sleep 3; done
+curl -sS "$BASE/v1/batches/$BATCH" | jq '.items[] | {id,status,error,produced}'
+TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_ids[0]')
+curl -sS "$BASE/v1/transactions/$TX" | jq .
 ```
+
+- Line 2 uploads the file and returns a `batchId`. Extraction runs in the background.
+- Line 3 polls until the batch is `extracted`, `reconciled` or `failed`; line 4 shows each file's result.
+- Lines 5 and 6 fetch the transaction the agent wrote: payee, date, postings and line items.
 
 ## API Reference
 
-The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1). The table below is for quick reference — the spec is the source of truth.
+The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1). The table below is for quick reference — the spec is the source of truth. A running server also serves it at `/openapi.json`, with Swagger UI at `/docs`.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/receipt` | Upload receipt image, returns jobId for async processing |
-| `GET` | `/jobs/:id` | Poll job status (`queued` → `done` or `error`) |
-| `GET` | `/jobs/:id/stream` | SSE stream for real-time progress |
-| `GET` | `/receipts` | List receipts (`?from=&to=&category=&limit=`) |
-| `GET` | `/receipt/:id` | Get single receipt with line items |
-| `DELETE` | `/receipt/:id` | Delete a receipt |
-| `GET` | `/receipt/:id/image` | Serve the original receipt image |
-| `GET` | `/summary` | Spending summary by category (`?from=&to=`) |
-| `POST` | `/ask` | Ask a natural language question about spending |
-| `GET` | `/health` | Health check |
+| Area | Endpoints | What it covers |
+|------|-----------|----------------|
+| Ingest | `POST /v1/ingest/batch` | Upload receipt files (images, PDFs, `.eml`); returns a `batchId` for async extraction |
+| | `GET /v1/batches`, `GET /v1/batches/:id`, `GET /v1/batches/:id/stream` | Batch status, per-file results, SSE progress |
+| | `GET /v1/ingests`, `GET /v1/ingests/problems`, `POST /v1/ingests/:id/retry` | Per-file ingest rows; list and retry failures |
+| Reconcile | `/v1/batches/:id/reconcile` (+ `/apply`, `/reject`) | Review and apply a batch's reconcile proposals |
+| Ledger | `/v1/transactions` (+ `/bulk`, `/:id/restore`, `/:id/reconcile`, `/:id/unreconcile`, `/:id/items`, `/:id/postings`) | Double-entry transactions with their postings and line items |
+| | `/v1/accounts` (+ `/:id/balance`, `/:id/register`), `GET /v1/postings`, `GET /v1/items` | Chart of accounts; posting and line-item search |
+| Documents | `/v1/documents` (+ `/:id/content`, `/:id/rendered`, `/:id/links`, `/:id/restore`, `/:id/re-extract`) | Stored receipt files and their links to transactions |
+| Catalog | `/v1/products`, `/v1/owned-items`, `/v1/wish-items`, `/v1/brands`, `/v1/merchants/:id`, `/v1/places/:id` | Products, owned and wished-for items, brands, merchants, places |
+| Reports | `GET /v1/reports/summary`, `/cashflow`, `/net_worth`, `/trends` | Spending and balance aggregates |
+| Insights | `GET /v1/insights`, `POST /v1/insights/ask` | Generated insights; natural-language questions about spending |
+| Meta | `GET /health`, `GET /version`, `POST /v1/admin/re-derive` | Health check, build info, batch re-projection |
 
 ### OpenAPI contract (for client codegen)
 
@@ -154,8 +157,9 @@ The frontend, and any future client, generates typed bindings from `openapi/open
 | File / command | Purpose |
 |---------------|---------|
 | `openapi/openapi.json` | Generated spec — **commit-tracked**, source of truth for SDK codegen |
-| `src/schemas/*.ts` | One zod schema per resource (`receipt`, `job`, `summary`, `ask`, `health`, `common`) |
-| `src/openapi.ts` | Route registry: maps schemas to all 9 paths / 10 method+path pairs |
+| `src/schemas/v1/*.ts` | One zod schema file per resource (`transaction`, `document`, `ingest`, `account`, …) |
+| `src/routes/*.ts` | Each resource's handlers, plus a `registerXOpenApi(registry)` that registers its paths |
+| `src/openapi.ts` | Builds the registry by calling every `registerXOpenApi` |
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` after editing schemas |
 
 See [`CLAUDE.md` → Schema editing workflow](CLAUDE.md#schema-editing-workflow-openapi-contract) for the edit-and-regen rules.
@@ -192,7 +196,7 @@ OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_
 
 - **Runtime**: Node.js 22 + TypeScript (ES2022)
 - **Framework**: Express 5
-- **Database**: PostgreSQL (shared with Langfuse)
+- **Database**: PostgreSQL 17 (its own instance; Langfuse runs a separate one)
 - **AI**: Claude Code CLI (`claude -p`) with subscription auth
 - **Monitoring**: Langfuse (self-hosted)
 - **Image Processing**: heic-convert (HEIC → JPEG)
