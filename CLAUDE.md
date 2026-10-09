@@ -597,7 +597,7 @@ App state is split across three host locations by data type. Each location is ch
 |---|---|---|---|
 | `/data` | `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/` | User content (receipt images, PII) | Outer project lives in iCloud, so the user's own receipt corpus syncs across their Macs. Pin via Finder → "Keep Downloaded" if Optimize Mac Storage is on. |
 | `/var/lib/postgresql/data` | `~/Developer/receipt-assistant-data/postgres/` | Runtime state (DB binary) | Sibling dir outside any git repo and outside iCloud. Postgres binary contains extracted PII; this repo is public on GitHub. iCloud + Postgres fsync is hostile. Sibling is the right side of both lines. |
-| `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials) | Same reason: `.credentials.json` is sensitive; keep it far from `git add -f` and never on iCloud. |
+| `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials — now an inert escape-hatch; live auth is the `CLAUDE_CODE_OAUTH_TOKEN` setup-token, see below) | Same reason: `.credentials.json` is sensitive; keep it far from `git add -f` and never on iCloud. |
 
 `docker-compose.yml` uses absolute `${HOME}/...` paths so they resolve identically for any local user. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
 
@@ -613,28 +613,39 @@ App state is split across three host locations by data type. Each location is ch
 
 Bind mounts move the failure boundary: a container or volume reset no longer touches the host filesystem. The data only goes away if *you* `rm -rf` the bind path explicitly.
 
-### Claude Code OAuth — bind mount at sibling dir
+### Claude Code OAuth — long-lived setup-token (Era 6, 2026-10-08 onward)
 
-Auth is still **not** an env var, and still **not** a bind mount of the host's `~/.claude/.credentials.json`. The container holds its own independent OAuth session at `~/Developer/receipt-assistant-data/claude/`, seeded once via `docker exec -it receipt-assistant claude /login`. The in-container CLI refreshes both `accessToken` and `refreshToken` on expiry and writes rotation back into that path on the host. No collision with the host's native `claude` CLI because nothing is shared.
+Auth is a **long-lived `claude setup-token`** supplied via the `CLAUDE_CODE_OAUTH_TOKEN` env var (read from `.env`), **not** an interactive `/login` session and **not** an API key (`src/claude.ts` deletes `ANTHROPIC_API_KEY` to force subscription auth; it passes `CLAUDE_CODE_OAUTH_TOKEN` through). The token is the SSOT-stored `anthropic/oauth-token` in personal-vault — a setup-token on the Max-subscription quota, ~365-day TTL, fp `632c964f037d` — **the same token OpenClaw (agents `main` + `autotrader`) already runs on**. One line in `.env`:
+
+```
+CLAUDE_CODE_OAUTH_TOKEN=<setup-token from personal-vault anthropic/oauth-token>
+```
+
+Why this replaced the per-container `/login` session (Era 5): that session self-refreshed its access+refresh tokens in-container, but the refresh token still lapsed or got server-invalidated periodically and failed **silently** with *"OAuth session expired and could not be refreshed"* (8 incidents Aug–Sep 2026) — the daily receipt cron would then surface a confusing shell-level failure while nothing got ingested. A setup-token is purpose-built for unattended use: one value, valid ~1 year, no refresh dance.
+
+**Precedence — verified 2026-10-08:** when `CLAUDE_CODE_OAUTH_TOKEN` is set it is the **sole** auth gate. Proof: a garbage value `401`s (`OAuth access token is invalid`) even though the mounted `~/Developer/receipt-assistant-data/claude/.credentials.json` is still valid. So the bind mount is now only an **inert escape-hatch** — it is *not* a live fallback. The deliberate trade: self-refresh is off, so the token must be **rotated before its ~2027-07-31 expiry** or extraction hard-`401`s.
+
+**Rotation (do all four, or consumers drift):** on the mini run `claude setup-token`, then (1) update `.env` here and `docker compose up -d receipt-assistant`, (2) `openclaw models auth paste-token --provider anthropic --agent main`, (3) the same for `--agent autotrader`, (4) update the personal-vault `anthropic/oauth-token` record. Keep the value out of git — it lives only in `.env` (gitignored) and the vault.
 
 **Operate this via the `setup` skill** — first-time bootstrap, 401 diagnosis, recovery procedures all live there.
 
-### Five-era timeline of OAuth approaches
+### Six-era timeline of OAuth approaches
 
-- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized file had `refreshToken: ""`. Result: 24h 401 cycle.
+- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized value was a *short-lived access token* with `refreshToken: ""`. Result: 24h 401 cycle. (Era 6 reuses the same env var but with a *long-lived setup-token* — see below — so this failure mode does not recur.)
 - **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW.** Broke because host and container shared a single OAuth session: host's `claude` CLI rotates the refresh token on every interactive use, invalidating the container's next call. Result: 401 every few hours.
 - **Era 3 (2026-04-20 → 2026-05-09) — Docker-managed named volume `claude-code-config`.** Worked operationally but vulnerable to volume wipes (and was wiped along with everything else on 2026-05-09).
 - **Era 4 (2026-05-09 → 2026-05-11) — host bind mount at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`.** Volume-reset-resilient but mixed runtime state into the outer project notebook, which complicated the 2026-05-11 outer-project iCloud migration.
-- **Era 5 (2026-05-11 onward) — host bind mount at `~/Developer/receipt-assistant-data/claude/`.** Sibling dir, deliberately outside this repo and outside iCloud. Same OAuth isolation, with the runtime-state-leaks-into-docs-notebook problem solved by physical separation.
+- **Era 5 (2026-05-11 → 2026-10-08) — host bind mount at `~/Developer/receipt-assistant-data/claude/`.** Sibling dir, deliberately outside this repo and outside iCloud. Same OAuth isolation, with the runtime-state-leaks-into-docs-notebook problem solved by physical separation. Retired because the per-container `/login` refresh token still lapsed/got invalidated and failed silently (8× Aug–Sep 2026).
+- **Era 6 (2026-10-08 onward) — long-lived `claude setup-token` via `CLAUDE_CODE_OAUTH_TOKEN`.** The token from personal-vault `anthropic/oauth-token` (the one OpenClaw already uses). **Not** Era 1 redux: Era 1 failed on a *short-lived access token* with an empty refresh (24h 401 cycle); a setup-token is a ~365-day credential designed to be used this way, so there is no refresh to lose. Sole auth gate when set; the Era-5 bind mount stays as an inert escape-hatch. Only new recurring cost: rotate before ~2027-07-31. See "Claude Code OAuth" above.
 
 ### Hard rules
 
-- **Never re-introduce `CLAUDE_CODE_OAUTH_TOKEN`** to `.env` or `docker-compose.yml`. Env var overrides the on-disk credentials file and disables self-refresh → Era 1's 24h 401 cycle.
+- **`CLAUDE_CODE_OAUTH_TOKEN` must be a long-lived `claude setup-token`, never a short-lived access token.** The env var overrides the on-disk credentials file and disables self-refresh — fatal for a short-lived token (Era 1's 24h 401 cycle) but correct for a ~365-day setup-token (Era 6, current). It is the **sole** auth gate when set (a stale/garbage value hard-401s with no fallback), so rotate it before its ~2027-07-31 expiry.
 - **Never bind-mount the host's `~/.claude/` or `~/.claude/.credentials.json`** into the container. The host/container collision is Era 2's bug. Use the dedicated `~/Developer/receipt-assistant-data/claude/`, which the host's native CLI never touches.
 - **Never `rm -rf ~/Developer/receipt-assistant-data/`** — that's the postgres ledger + the OAuth session in one stroke. `docker compose down -v` is harmless (bind mounts are not Docker-managed) but the host directory is unforgiving.
 - **Never periodically sync host Keychain → `receipt-assistant-data/claude/`.** Re-introduces rotation collisions; in-container auto-refresh is the intended mechanism.
 - **Never move runtime data (postgres, claude) into this repo or into the outer iCloud notebook.** Repo placement risks a public-repo PII / credential leak; iCloud placement is incompatible with Postgres write semantics and risks credential exfil via sync. Only `data/uploads/` (user images) belongs in iCloud — postgres + claude stay in the sibling dir.
-- **Recovery on 401:** `docker exec -it receipt-assistant claude /login`, follow the OAuth code flow.
+- **Recovery on 401 (Era 6):** the setup-token has expired or been revoked — mint a new one with `claude setup-token` on the mini, put it in `.env`, `docker compose up -d receipt-assistant`, and update the vault + OpenClaw (full steps under "Rotation" above). The `claude /login` escape-hatch only takes effect if you first **unset** `CLAUDE_CODE_OAUTH_TOKEN` (the env var wins over any on-disk `/login` session).
 
 ## GitHub Issues
 

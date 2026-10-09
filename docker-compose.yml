@@ -71,6 +71,16 @@ services:
       # Matches the Anthropic-official devcontainer convention and pairs with
       # the ./data/claude bind-mount below.
       CLAUDE_CONFIG_DIR: /home/node/.claude
+      # Long-lived Claude *setup-token* (Max-subscription quota, ~365d TTL,
+      # from personal-vault anthropic/oauth-token fp 632c964f037d — the SAME
+      # token OpenClaw uses). This env var is the SOLE auth gate for the
+      # in-container `claude -p`: it overrides (and disables self-refresh of)
+      # the mounted credentials.json, which is now only an escape-hatch. Must
+      # be a *setup-token*, NOT a short-lived access token (that was Era 1's
+      # 24h-401 bug). Rotate before ~2027-07-31: `claude setup-token` on mini
+      # -> paste into .env -> up -d -> update vault + `openclaw models auth
+      # paste-token`. Full rationale in CLAUDE.md 'Claude Code OAuth'.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       # Google Maps API key reachable by the in-container `claude -p` agent
       # via its Bash tool (for Phase 3 geocoding during extraction). Empty
       # is fine — the prompt instructs the agent to skip geocoding.
