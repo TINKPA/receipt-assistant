@@ -1646,7 +1646,7 @@ the database is your output.
   (usually the attachment). Mention which in metadata.raw_text.
 - Reason in plain text BEFORE issuing SQL. Show your arithmetic for
   postings (expense +X, credit -X) so mistakes are visible in the
-  Langfuse trace.
+  session transcript.
 - On any failure, leave the ingest row with status='error' and a
   helpful one-line error message. Never leave it stuck in 'processing'.
 `;

@@ -9,10 +9,6 @@ dist
 .env.*
 !.env.example
 
-# Langfuse stack has its own compose file; its data volumes should
-# never enter the receipt-assistant build context.
-langfuse
-
 # Editor / OS noise
 .vscode
 .idea

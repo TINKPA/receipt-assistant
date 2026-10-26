@@ -46,7 +46,7 @@ export interface RunClaudeOptions {
   args?: string[];
   timeoutMs: number;
   /** Pre-allocated session id. The ingest path mints its own before
-   *  spawning so the Langfuse JSONL path is known while the agent is
+   *  spawning so the session JSONL path is known while the agent is
    *  still running (root CLAUDE.md invariant); other callers omit it and
    *  get a fresh one back. */
   sessionId?: string;
@@ -122,7 +122,7 @@ export function runClaude(
  * expand it — matching `PSQL_DISCIPLINE` in `src/ingest/prompt-contract.ts`
  * and every other prompt. Interpolating the resolved URL would write the
  * DB password into the prompt, and from there verbatim into the session
- * JSONL and the Langfuse trace.
+ * JSONL.
  */
 export async function detectPsqlCommand(): Promise<string> {
   // Check if psql is available locally
@@ -134,9 +134,7 @@ export async function detectPsqlCommand(): Promise<string> {
     });
     return `psql "$DATABASE_URL" -c`;
   } catch {
-    // Fallback: use docker exec (local dev). The app DB has lived in
-    // `receipts-postgres` since ccc80e2 decoupled it from Langfuse —
-    // `langfuse-postgres-1` no longer holds these tables.
+    // Fallback: use docker exec (local dev).
     return `docker exec receipts-postgres psql -U postgres -d receipts -c`;
   }
 }

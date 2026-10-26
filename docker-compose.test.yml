@@ -25,7 +25,6 @@
 #     ↑ both are sibling dirs — NOT in any git repo, NOT in iCloud
 #   • Container names: receipts-test-postgres, receipt-assistant-test
 #   • Ports:           3001 (backend), 5433 (postgres) on the host
-#   • No Langfuse — sandbox runs don't pollute prod traces
 #
 # What's SHARED with prod (intentional, avoids running `claude /login` twice):
 #   • Claude OAuth credentials → ~/Developer/receipt-assistant-data/claude/

@@ -71,13 +71,13 @@ curl -sS http://localhost:3000/v1/ingests/$INGEST_ID | jq .
 curl -sS "http://localhost:3000/v1/transactions?source_ingest_id=$INGEST_ID" | jq '.items[0]'
 ```
 
-## Step 5 — Langfuse trace (optional)
+## Step 5 — Session transcript (optional)
 
-Each `claude -p` invocation records a Langfuse trace keyed on the pre-allocated session-id. Pull traces via the REST API (**never** scrape the UI):
+Each `claude -p` invocation writes a Claude Code session JSONL keyed on the pre-allocated session-id. The prompt carries the ingest id, so grep finds it; `measure:turns` reports turns and billed tokens:
 
 ```bash
-curl -sS http://localhost:3333/api/public/traces \
-  -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" | jq '.data[0:3]'
+JSONL=$(grep -l "$INGEST_ID" ~/Developer/receipt-assistant-data/claude/projects/-app/*.jsonl)
+npm run measure:turns -- --session="$JSONL"
 ```
 
 ## What to verify manually
@@ -85,7 +85,7 @@ curl -sS http://localhost:3333/api/public/traces \
 - All 3 ingests reach `status="done"` (or `"unsupported"` for known-hard cases).
 - Each produced transaction has a matching document linked.
 - `/v1/transactions?source_ingest_id=<id>` returns exactly one row per ingest.
-- Langfuse traces exist with reasonable `total_tokens` values.
+- Each ingest has a session JSONL with reasonable billed-token totals.
 - On the **hard fixtures** from CLAUDE.md (Costco gas receipt, handwritten tip, AYCE sushi), `date_match` accuracy is the known weak dimension — don't panic if 1/3 fails on dates. That's tracked in issue #27.
 
 ## Failure modes and how to diagnose
@@ -93,7 +93,7 @@ curl -sS http://localhost:3333/api/public/traces \
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `counts.error > 0` with "401" in `ingests.error` | Claude CLI can't reach Anthropic | Run the `setup` skill — credential file drift |
-| `counts.unsupported` hit for a real receipt | Agent's final JSON fence was malformed | Inspect Langfuse trace output; the fallback coercer logs a reason |
+| `counts.unsupported` hit for a real receipt | Agent's final JSON fence was malformed | Inspect the session JSONL's final assistant message; the fallback coercer logs a reason |
 | Ingest stuck at `processing` for >5 min | Worker hang (rare) | Restart container; `recoverStaleBatches()` will mark it `failed` on boot |
 | `statement_pdf` classification → marked `unsupported` with note "Phase 2" | Expected Phase 1 behavior | Statement pipeline deferred; file as `receipt_pdf` if it's actually a single-invoice doc |
 

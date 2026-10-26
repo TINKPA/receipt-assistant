@@ -2,24 +2,15 @@
 #
 #   docker compose up -d --build
 #
-# Two independent units:
-#   1. receipt-assistant + receipts-postgres (the app + its own DB)
-#   2. Langfuse stack (optional developer observability, pulled in via
-#      `include:`). Comment out the `include:` block below to run the app
-#      without Langfuse — trace ingestion fails silently when the Langfuse
-#      host is unreachable, so nothing else breaks.
-#
-# Requires Docker Compose v2.20+ for `include:` support.
+# receipt-assistant + receipts-postgres (the app + its own DB). Agent
+# traces are Claude Code's own session JSONL under the ./claude bind-mount
+# below — there is no separate observability stack.
 
 name: receipt-assistant
 
-include:
-  - path: langfuse/docker-compose.yml
-
 services:
   # ── Main app database ──────────────────────────────────────────────
-  # Dedicated postgres for receipt-assistant. Kept separate from
-  # Langfuse's postgres so the two stacks can be deployed independently.
+  # Dedicated postgres for receipt-assistant.
   receipts-postgres:
     image: docker.io/postgres:17
     container_name: receipts-postgres
@@ -61,12 +52,6 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
-      # Langfuse is optional. If the Langfuse stack isn't running, the app
-      # still works — trace ingestion is fire-and-forget and tolerates
-      # connection failures.
-      LANGFUSE_HOST: http://langfuse-web:3000
-      LANGFUSE_PUBLIC_KEY: pk-receipt-local
-      LANGFUSE_SECRET_KEY: sk-receipt-local
       # Tell the `claude` CLI explicitly where its config + credentials live.
       # Matches the Anthropic-official devcontainer convention and pairs with
       # the ./data/claude bind-mount below.
@@ -127,6 +112,9 @@ services:
       # OAuth session, seeded once via `docker exec -it receipt-assistant
       # claude /login`; the CLI self-refreshes and writes back here.
       # Survives compose down/up and OrbStack resets. See `setup` skill.
+      # Also holds every agent run's transcript, projects/-app/<session>.jsonl
+      # — the system's only trace store. The image's managed settings keep
+      # them permanently (100 years) instead of the CLI's 30-day default (Dockerfile).
       - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
       # Brand icon assets cache (#101 Phase 2). Each brand_assets row's
       # `local_path` is relative to /data/brand-assets/, structure:

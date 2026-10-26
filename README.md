@@ -1,6 +1,6 @@
 # Receipt Assistant
 
-An open-source, AI-native receipt parsing backend that extracts structured data from receipt images using Claude Code CLI, stores results in PostgreSQL, and monitors every AI call through Langfuse.
+An open-source, AI-native receipt parsing backend that extracts structured data from receipt images using Claude Code CLI, stores results in PostgreSQL, and keeps the full transcript of every AI call as Claude Code session JSONL.
 
 ## Architecture
 
@@ -14,11 +14,11 @@ An open-source, AI-native receipt parsing backend that extracts structured data 
                   ┌── Single-call agent ──┐        │
                   │   claude -p           │────────┘
                   │   reads image         │
-                  │   reasons in text     │        ┌─────────────┐
-                  │   writes to Postgres  │───────►│ Langfuse    │
-                  │   via psql tool call  │        │ :3333       │
-                  └───────────────────────┘        │ auto-ingest │
-                                                   └─────────────┘
+                  │   reasons in text     │        ┌───────────────┐
+                  │   writes to Postgres  │───────►│ session JSONL │
+                  │   via psql tool call  │        │ ~/.claude/    │
+                  └───────────────────────┘        │ projects/-app │
+                                                   └───────────────┘
 ```
 
 ### Single-call agent pipeline
@@ -49,20 +49,13 @@ Every extraction includes metadata stored as PostgreSQL JSONB:
 
 ## Quick Start
 
-Two independent units live in the root `docker-compose.yml`:
-
-1. **receipt-assistant + its own postgres** — the app and its database,
-   deployable on their own.
-2. **Langfuse stack** (postgres, clickhouse, minio, redis, web, worker) —
-   optional developer observability, pulled in via `include:`. Comment out
-   the `include:` line in `docker-compose.yml` to run the app without it;
-   trace ingestion fails silently when Langfuse is unreachable.
+The root `docker-compose.yml` runs **receipt-assistant + its own postgres**.
 
 Everything runs in Docker — there is no `npm run dev` on the host.
 
 ### Prerequisites
 
-- Docker Desktop (or Docker Engine) with Compose v2.20+ (for `include:` support)
+- Docker Desktop (or Docker Engine) with Compose v2
 - A Claude Code subscription (Pro / Max / Team / Enterprise) to log in with
 
 ### 1. Bring everything up
@@ -75,10 +68,8 @@ What happens:
 - dedicated `receipts-postgres` starts and auto-creates the `receipts` database
 - the receipt-assistant image is built (multi-stage: tsc in a builder stage, lean runtime)
 - receipt-assistant starts on port 3000 (REST)
-- the Langfuse stack starts in parallel
 
-First-time pull of the Langfuse images is 2–3 GB; expect 3–5 minutes on a
-fresh machine. Follow progress with:
+Follow progress with:
 
 ```bash
 docker compose logs -f
@@ -90,8 +81,6 @@ Once everything is up:
 curl http://localhost:3000/health
 # { "status": "ok", "service": "receipt-assistant", "version": "1.0.0" }
 ```
-
-Langfuse dashboard: http://localhost:3333 (admin@local.dev / admin123)
 
 ### 2. Log the container into Claude (one-time)
 
@@ -113,7 +102,7 @@ Eventually the refresh token expires server-side (weeks to months). When that ha
 docker compose up -d --build receipt-assistant
 ```
 
-Only the app is rebuilt; the DB and Langfuse keep running. Layer caching in
+Only the app is rebuilt; the DB keeps running. Layer caching in
 the Dockerfile means unchanged `package.json` skips the `npm ci` step, so
 rebuilds are typically 10–20 seconds.
 
@@ -164,25 +153,19 @@ The frontend, and any future client, generates typed bindings from `openapi/open
 
 See [`CLAUDE.md` → Schema editing workflow](CLAUDE.md#schema-editing-workflow-openapi-contract) for the edit-and-regen rules.
 
-## Langfuse Monitoring
+## Agent transcripts
 
-Every `claude -p` call is automatically traced in Langfuse with:
-- Model name, token usage, latency
-- Input prompt and output
-- Phase tags (`phase-1/quick`, `phase-2/full`)
-- Tool calls
-
-### Query traces via API
+Every `claude -p` call is recorded by Claude Code itself — prompt, reasoning, every tool call and result, per-turn token usage — at `~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.jsonl` (bind-mounted from the container). The image pins `cleanupPeriodDays` to 36500 (100 years, i.e. permanent) in managed settings; the CLI default would delete them after 30 days.
 
 ```bash
-# List recent traces
-curl -s http://localhost:3333/api/public/traces \
-  -u "pk-receipt-local:sk-receipt-local"
+# Turns and billed tokens for the 20 most recent runs
+npm run measure:turns -- --last=20
 
-# Get a specific trace
-curl -s http://localhost:3333/api/public/traces/<trace-id> \
-  -u "pk-receipt-local:sk-receipt-local"
+# Find the run for an ingest
+grep -l "<ingest-id>" ~/Developer/receipt-assistant-data/claude/projects/-app/*.jsonl
 ```
+
+See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-jsonl) for live tailing.
 
 ## Scripts
 
@@ -196,9 +179,9 @@ OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_
 
 - **Runtime**: Node.js 22 + TypeScript (ES2022)
 - **Framework**: Express 5
-- **Database**: PostgreSQL 17 (its own instance; Langfuse runs a separate one)
+- **Database**: PostgreSQL 17
 - **AI**: Claude Code CLI (`claude -p`) with subscription auth
-- **Monitoring**: Langfuse (self-hosted)
+- **Tracing**: Claude Code session JSONL (no separate stack)
 - **Image Processing**: heic-convert (HEIC → JPEG)
 
 ## Frontend

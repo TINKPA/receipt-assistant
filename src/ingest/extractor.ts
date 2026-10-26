@@ -8,7 +8,7 @@
  */
 import { randomUUID } from "crypto";
 import { runClaude } from "../claude.js";
-import { getSessionJsonlPath } from "../langfuse.js";
+import { getSessionJsonlPath } from "../session-transcript.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
 import {
   buildReExtractPrompt,
@@ -50,7 +50,7 @@ export interface ExtractorInput {
 }
 
 export interface ExtractorResult {
-  /** Langfuse session id pre-allocated before spawn. */
+  /** Claude session id pre-allocated before spawn (names the JSONL). */
   sessionId: string;
   /** stdout captured from the claude subprocess (the DONE summary line). */
   stdout: string;
@@ -88,7 +88,7 @@ async function runExtractorClaude(
 
 /**
  * Production extractor: spawns `claude -p` with a pre-allocated session
- * id (invariant from root CLAUDE.md — Langfuse's JSONL discovery relies
+ * id (invariant from root CLAUDE.md — finding the session JSONL relies
  * on the UUID being stable across the lifecycle of one extraction).
  */
 export const defaultClaudeExtractor: Extractor = async (input) => {
@@ -103,9 +103,9 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
   };
   const prompt = buildExtractorPrompt(ctx);
   // Log the live-transcript path BEFORE spawn so an operator can
-  // `tail -f` it mid-run. The agent loop can take 30-900s and may hang;
-  // Langfuse only ingests on exit, so without this line there is no
-  // way to see what the agent is doing in real time.
+  // `tail -f` it mid-run. The agent loop can take 30-900s and may hang,
+  // and this line is the only link from an ingest to its transcript
+  // short of grepping every JSONL for the ingest id.
   console.log(
     `[claude] extract ingestId=${input.ingestId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
   );
