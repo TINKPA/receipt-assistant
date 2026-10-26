@@ -39,7 +39,7 @@ export const AskRequest = z
 export const AskResponse = z
   .object({
     answer: z.string(),
-    /** Claude session id — the Langfuse trace key for this answer. */
+    /** Claude session id — names the session JSONL for this answer. */
     session_id: z.string(),
     elapsed_ms: z.number().int(),
   })

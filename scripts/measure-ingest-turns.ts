@@ -18,14 +18,10 @@
  *
  * Verified on session 2d8659bf (T-Mobile receipt PDF): 24 assistant
  * records, 10 distinct `message.id`, 0 ids whose records carry differing
- * usage, 0 content blocks repeated within an id. Langfuse's own API on
- * the same trace independently reports 10 generations.
+ * usage, 0 content blocks repeated within an id. Langfuse (since removed)
+ * independently reported 10 generations for the same session.
  *
  * This script groups by `message.id`, which is correct by construction.
- * `src/langfuse.ts` groups by usage identity instead — a heuristic, but
- * one that agrees with `message.id` on every session measured so far.
- * If this script and a Langfuse trace ever disagree on turn count, that
- * heuristic is where to look first.
  *
  * The second trap, inherited from #227: `billed input` is
  * `input_tokens + cache_read + cache_creation`. Cache WRITES are billed,
@@ -58,7 +54,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 
-import { getSessionJsonlPath } from "../src/langfuse.js";
+import { getSessionJsonlPath } from "../src/session-transcript.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 

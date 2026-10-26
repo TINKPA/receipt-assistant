@@ -30,7 +30,6 @@ import {
   EXTRACTION_MODEL,
 } from "../ingest/prompt-contract.js";
 import { buildInfo } from "../generated/build-info.js";
-import { trackLangfuse } from "../langfuse.js";
 
 export type DocumentKindValue =
   | "receipt_image"
@@ -1004,7 +1003,7 @@ export interface ReExtractDocumentResult {
    *  from "only metadata.extraction was stamped." */
   ocr_text_changed: boolean;
   /** Re-extract is observability-first; carry the session id so the
-   *  operator can pull the Langfuse trace without a join. */
+   *  operator can open the session JSONL without a join. */
   session_id: string;
   /** `written` when the agent's psql block moved something, `no_change`
    *  when it demonstrably wrote nothing. `agent_error` is part of the
@@ -1185,13 +1184,6 @@ export async function reExtractDocument(
       },
     );
   }
-
-  // 3b) Ship the session transcript to Langfuse (#181). Fire-and-forget
-  //     — `trackLangfuse` never throws and never blocks the response.
-  //     Without this, re-extract produced ZERO traces (every trace on
-  //     the box came from ingest), so there was no way to measure token
-  //     burn or turn count on the path the re-extract campaign uses.
-  trackLangfuse(sessionId, [documentId, transactionId, "re-extract"]);
 
   // 4) Snapshot AFTER. Agent has now UPDATEd transactions + documents.
   const afterSnapshot = await snapshotReExtractFields(transactionId, doc.id);

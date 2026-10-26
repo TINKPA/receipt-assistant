@@ -75,6 +75,17 @@ RUN for f in /etc/ImageMagick-*/policy.xml; do \
 # Bump this deliberately, and re-measure with `npm run measure:turns`.
 RUN npm install -g @anthropic-ai/claude-code@2.1.251
 
+# Session transcripts (~/.claude/projects/-app/<session>.jsonl) are the
+# only trace of every agent run — prompts, tool calls, tool results,
+# per-turn token usage. The CLI deletes them after 30 days by default
+# (`cleanupPeriodDays`), which had already eaten everything older than a
+# month when Langfuse was removed. Managed settings outrank every other
+# scope, so neither a `docker exec … claude` session nor a stray
+# settings.json in the bind-mounted ~/.claude can shorten it. 0 is not
+# "forever" — it fails validation.
+RUN mkdir -p /etc/claude-code && \
+    echo '{"cleanupPeriodDays": 3650}' > /etc/claude-code/managed-settings.json
+
 WORKDIR /app
 
 # Copy compiled output and production node_modules from the builder stage.

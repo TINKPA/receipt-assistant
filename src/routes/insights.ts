@@ -168,7 +168,7 @@ export function registerInsightsOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/insights/ask",
     summary: "Ask a natural-language question against the whole ledger",
     description:
-      "Synchronous; the claude worker answers in ~10-60s with a read-only SQL session. The session_id is the Langfuse trace key.",
+      "Synchronous; the claude worker answers in ~10-60s with a read-only SQL session. The session_id names the Claude Code session transcript (JSONL) for this answer.",
     tags: ["insights"],
     request: {
       body: { content: { "application/json": { schema: AskRequest } } },

@@ -311,7 +311,7 @@ END
 
 ### Observability
 
-The `session_id` field in the response is the pre-allocated UUID passed to `claude -p`; query the Langfuse trace API at `http://localhost:3333/api/public/traces?sessionId=<X>` to inspect the model's reasoning and the SQL it wrote. Re-extract follows the same Langfuse pattern as ingest — no UI scraping, REST only.
+The `session_id` field in the response is the pre-allocated UUID passed to `claude -p`; its transcript is `~/Developer/receipt-assistant-data/claude/projects/-app/<session_id>.jsonl` on the host — the model's reasoning and every SQL statement it ran. See "Agent transcripts" below.
 
 ### Idempotency, sort of
 
@@ -431,39 +431,39 @@ When you change a schema or add a new endpoint:
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
 
-## Langfuse Observability
+## Agent transcripts (session JSONL)
 
-Self-hosted Langfuse runs alongside the app for LLM monitoring.
-All `claude -p` calls auto-ingest session traces via `src/langfuse.ts`.
+There is no observability stack. Langfuse was removed; it only ever re-read the file below and truncated each field to 2–5K characters. Claude Code writes the full transcript of every `claude -p` run itself — prompt, thinking, every tool call and result, per-turn `usage` — to:
 
-### Querying Langfuse via API
-
-**Always use the Langfuse REST API for programmatic access** — don't
-navigate the web UI manually when you need to inspect traces, compare
-outputs, or verify data.
-
-```bash
-# List recent traces (with input/output)
-curl -s http://$LANGFUSE_HOST/api/public/traces \
-  -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY"
-
-# Get a specific trace by ID
-curl -s http://$LANGFUSE_HOST/api/public/traces/<trace-id> \
-  -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY"
-
-# Get observations (generations) for a trace
-curl -s "http://$LANGFUSE_HOST/api/public/observations?traceId=<trace-id>" \
-  -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY"
+```
+container: /home/node/.claude/projects/-app/<session-id>.jsonl
+host:      ~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.jsonl
 ```
 
-Local dev defaults:
-- Host: `http://localhost:3333`
-- Public key: `pk-receipt-local`
-- Secret key: `sk-receipt-local`
+`src/session-transcript.ts::getSessionJsonlPath` is the one place that path is computed.
 
-### Live trace: tail the JSONL while the extractor is running (recommended for debugging hangs / errors)
+**Retention is pinned in the image, not by default.** The CLI deletes transcripts older than `cleanupPeriodDays` (default 30). The Dockerfile writes `/etc/claude-code/managed-settings.json` with `cleanupPeriodDays: 3650`; managed settings outrank every other scope. Do not drop that line, and do not "fix" it to `0` — 0 fails validation. Runs made on the host (e.g. `scripts/smoke-v1-ingest.ts`) land in the host's own `~/.claude/projects/` under the host's retention, not here.
 
-Langfuse only ingests the trace **after** `claude -p` exits — so if an extraction hangs, times out, or crashes mid-loop, Langfuse never sees it and you have nothing to inspect. **This is the right tool when something looks stuck.**
+Pre-removal history: every Langfuse trace (May–Oct 2026, 1300 traces / 21,826 observations, fields truncated) is exported to `~/Developer/receipt-assistant-data/langfuse-export/{traces,observations}.jsonl`. It is the only copy of runs older than the 30-day window that had already been swept.
+
+### Finding a run
+
+```bash
+T=~/Developer/receipt-assistant-data/claude/projects/-app
+
+# Ingest / re-extract → session: the prompt carries the ingest id and the
+# document/transaction ids, so grep is the durable lookup (docker logs rotate).
+grep -l "$INGEST_ID" $T/*.jsonl
+
+# Turns, billed input (fresh + cache read + cache write) and output tokens,
+# deduplicated by message.id — the numbers Langfuse used to approximate.
+npm run measure:turns -- --session=<id|path>
+npm run measure:turns -- --last=20
+```
+
+### Live trace: tail the JSONL while the extractor is running
+
+The transcript is written in real time, so a hung, timed-out or crashed extraction is fully inspectable while it happens. **This is the right tool when something looks stuck.**
 
 `src/ingest/extractor.ts` (both `defaultClaudeExtractor` and `defaultClaudeReExtractor`) logs the live transcript path to stdout the instant it spawns the subprocess. Grep `docker logs` for the spawn line, then `tail -f` the JSONL on the host — it's bind-mounted, so no `docker exec` needed and the file is being written in real time by the in-container `claude` CLI:
 
@@ -504,18 +504,6 @@ for line in sys.stdin:
                     print(f'  result: {str(inner)[:120]}')
 "
 ```
-
-When to reach for this vs. Langfuse:
-
-| Symptom | Use |
-|---|---|
-| Extraction is stuck in `processing` for >2 min | **Tail the JSONL** — Langfuse hasn't seen anything yet |
-| `claude -p` timed out / hit `CLAUDE_TIMEOUT_MS` | **Tail the JSONL** — Langfuse's trace will be missing or partial; the JSONL has the last events the agent emitted |
-| Agent exited with a SQL error, want to see what it tried to write | **Tail the JSONL** for the `tool_use:Bash` blocks; Langfuse compresses these |
-| Reviewing a past, completed extraction | **Langfuse REST API** — that's its job |
-| Comparing date-OCR accuracy across many receipts | **Langfuse REST API** + the app's `/v1/transactions` |
-
-The JSONL is the source of truth Langfuse ingests from — when the two ever disagree, the JSONL is right.
 
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
@@ -567,8 +555,8 @@ TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_
 curl -sS "$BASE/v1/transactions/$TX" | jq .
 ```
 
-For the Langfuse trace, query the API directly (see
-"Query Langfuse" above). Never trust a wrapper script's display —
+For what the agent did, read its session JSONL (see "Agent
+transcripts" above). Never trust a wrapper script's display —
 go to `/v1/transactions/:id` for ground truth. (Earlier
 `verify-receipt.sh` printed all-None while the DB had correct data;
 deleted to avoid that trap.)
@@ -584,7 +572,7 @@ curl -sS --max-time 1000 -X POST "$BASE/v1/documents/$DOC/re-extract" | jq .
 ### Why API over UI
 
 - **Scriptable**: can diff outputs, run assertions, batch-verify
-- **Cross-reference**: compare Langfuse trace output with app API
+- **Cross-reference**: compare the session JSONL with the app API
   result in a single command pipeline
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
@@ -597,7 +585,7 @@ App state is split across three host locations by data type. Each location is ch
 |---|---|---|---|
 | `/data` | `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/` | User content (receipt images, PII) | Outer project lives in iCloud, so the user's own receipt corpus syncs across their Macs. Pin via Finder → "Keep Downloaded" if Optimize Mac Storage is on. |
 | `/var/lib/postgresql/data` | `~/Developer/receipt-assistant-data/postgres/` | Runtime state (DB binary) | Sibling dir outside any git repo and outside iCloud. Postgres binary contains extracted PII; this repo is public on GitHub. iCloud + Postgres fsync is hostile. Sibling is the right side of both lines. |
-| `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials — now an inert escape-hatch; live auth is the `CLAUDE_CODE_OAUTH_TOKEN` setup-token, see below) | Same reason: `.credentials.json` is sensitive; keep it far from `git add -f` and never on iCloud. |
+| `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials — now an inert escape-hatch; live auth is the `CLAUDE_CODE_OAUTH_TOKEN` setup-token, see below) + every agent session transcript (`projects/-app/*.jsonl`, the only trace store) | Same reason: `.credentials.json` is sensitive and transcripts carry receipt PII; keep both far from `git add -f` and never on iCloud. |
 
 `docker-compose.yml` uses absolute `${HOME}/...` paths so they resolve identically for any local user. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
 

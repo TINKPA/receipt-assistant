@@ -50,7 +50,6 @@ async function pickExtractor(absPath: string) {
   if (process.env.EXTRACTOR_STUB_ALLOWED !== "1") return defaultClaudeExtractor;
   return (await isStubFile(absPath)) ? stubFileExtractor : defaultClaudeExtractor;
 }
-import { trackLangfuse } from "../langfuse.js";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -364,16 +363,9 @@ async function runOne(item: QueueItem): Promise<void> {
   }
 
   // The agent is responsible for UPDATE ingests SET status=... at the
-  // end of its run (see Phase 5 of prompt.ts). Read the row it wrote
-  // BEFORE kicking off Langfuse ingestion so the classification tag
-  // (which tests and trace filters rely on) is available.
+  // end of its run (see Phase 5 of prompt.ts).
   const terminal = await readIngestTerminal(ingestId, workspaceId);
 
-  if (result.sessionId) {
-    const tags: string[] = [batchId, ingestId];
-    if (terminal?.classification) tags.push(terminal.classification);
-    trackLangfuse(result.sessionId, tags);
-  }
   if (!terminal) {
     // Agent exited 0 but didn't close out — treat as error.
     const msg =
