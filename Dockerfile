@@ -81,10 +81,15 @@ RUN npm install -g @anthropic-ai/claude-code@2.1.251
 # (`cleanupPeriodDays`), which had already eaten everything older than a
 # month when Langfuse was removed. Managed settings outrank every other
 # scope, so neither a `docker exec … claude` session nor a stray
-# settings.json in the bind-mounted ~/.claude can shorten it. 0 is not
-# "forever" — it fails validation.
+# settings.json in the bind-mounted ~/.claude can shorten it.
+#
+# Meant as "never delete". The CLI has no such value: the schema is
+# int().positive() with no maximum, and 0 fails validation. 36500 (100
+# years) is permanent in practice; don't go astronomically higher — the
+# sweep computes a cutoff of now − N days, and past ~1e8 days that leaves
+# the range a JS Date can represent.
 RUN mkdir -p /etc/claude-code && \
-    echo '{"cleanupPeriodDays": 3650}' > /etc/claude-code/managed-settings.json
+    echo '{"cleanupPeriodDays": 36500}' > /etc/claude-code/managed-settings.json
 
 WORKDIR /app
 

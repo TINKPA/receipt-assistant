@@ -114,7 +114,7 @@ services:
       # Survives compose down/up and OrbStack resets. See `setup` skill.
       # Also holds every agent run's transcript, projects/-app/<session>.jsonl
       # — the system's only trace store. The image's managed settings keep
-      # them for 10 years instead of the CLI's 30-day default (Dockerfile).
+      # them permanently (100 years) instead of the CLI's 30-day default (Dockerfile).
       - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
       # Brand icon assets cache (#101 Phase 2). Each brand_assets row's
       # `local_path` is relative to /data/brand-assets/, structure:

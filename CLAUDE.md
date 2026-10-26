@@ -442,7 +442,7 @@ host:      ~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.
 
 `src/session-transcript.ts::getSessionJsonlPath` is the one place that path is computed.
 
-**Retention is pinned in the image, not by default.** The CLI deletes transcripts older than `cleanupPeriodDays` (default 30). The Dockerfile writes `/etc/claude-code/managed-settings.json` with `cleanupPeriodDays: 3650`; managed settings outrank every other scope. Do not drop that line, and do not "fix" it to `0` — 0 fails validation. Runs made on the host (e.g. `scripts/smoke-v1-ingest.ts`) land in the host's own `~/.claude/projects/` under the host's retention, not here.
+**Retention is pinned in the image, not by default.** The CLI deletes transcripts older than `cleanupPeriodDays` (default 30). The Dockerfile writes `/etc/claude-code/managed-settings.json` with `cleanupPeriodDays: 36500` — intended as permanent; the CLI has no "never" value. Managed settings outrank every other scope. Do not drop that line, and do not "fix" it to `0` (fails validation) or to an astronomical number (the sweep's `now − N days` cutoff leaves the JS Date range past ~1e8 days). Runs made on the host (e.g. `scripts/smoke-v1-ingest.ts`) land in the host's own `~/.claude/projects/` under the host's retention, not here.
 
 Pre-removal history: every Langfuse trace (May–Oct 2026, 1300 traces / 21,826 observations, fields truncated) is exported to `~/Developer/receipt-assistant-data/langfuse-export/{traces,observations}.jsonl`. It is the only copy of runs older than the 30-day window that had already been swept.
 

@@ -155,7 +155,7 @@ See [`CLAUDE.md` → Schema editing workflow](CLAUDE.md#schema-editing-workflow-
 
 ## Agent transcripts
 
-Every `claude -p` call is recorded by Claude Code itself — prompt, reasoning, every tool call and result, per-turn token usage — at `~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.jsonl` (bind-mounted from the container). The image pins `cleanupPeriodDays` to 10 years in managed settings; the CLI default would delete them after 30 days.
+Every `claude -p` call is recorded by Claude Code itself — prompt, reasoning, every tool call and result, per-turn token usage — at `~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.jsonl` (bind-mounted from the container). The image pins `cleanupPeriodDays` to 36500 (100 years, i.e. permanent) in managed settings; the CLI default would delete them after 30 days.
 
 ```bash
 # Turns and billed tokens for the 20 most recent runs
