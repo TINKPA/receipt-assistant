@@ -31,18 +31,18 @@ read -r -d '' SQL <<SQL || true
 SELECT jsonb_pretty(jsonb_build_object(
   'transaction_id', '$TX'::text,
   'captured_at',    NOW()::text,
-  'transactions',        (SELECT jsonb_agg(to_jsonb(t))  FROM transactions t        WHERE t.id = '$TX'),
-  'postings',            (SELECT jsonb_agg(to_jsonb(p))  FROM postings p            WHERE p.transaction_id = '$TX'),
-  'transaction_items',   (SELECT jsonb_agg(to_jsonb(ti)) FROM transaction_items ti  WHERE ti.transaction_id = '$TX'),
-  'document_links',      (SELECT jsonb_agg(to_jsonb(dl)) FROM document_links dl     WHERE dl.transaction_id = '$TX'),
-  'transaction_events',  (SELECT jsonb_agg(to_jsonb(te)) FROM transaction_events te WHERE te.transaction_id = '$TX'),
-  'transaction_parties', (SELECT jsonb_agg(to_jsonb(tp)) FROM transaction_parties tp WHERE tp.transaction_id = '$TX'),
-  'wish_items',          (SELECT jsonb_agg(to_jsonb(w))  FROM wish_items w          WHERE w.converted_transaction_id = '$TX'),
-  'owned_items',         (SELECT jsonb_agg(to_jsonb(o))  FROM owned_items o
+  'transactions',        (SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)  FROM transactions t        WHERE t.id = '$TX'),
+  'postings',            (SELECT COALESCE(jsonb_agg(to_jsonb(p)), '[]'::jsonb)  FROM postings p            WHERE p.transaction_id = '$TX'),
+  'transaction_items',   (SELECT COALESCE(jsonb_agg(to_jsonb(ti)), '[]'::jsonb) FROM transaction_items ti  WHERE ti.transaction_id = '$TX'),
+  'document_links',      (SELECT COALESCE(jsonb_agg(to_jsonb(dl)), '[]'::jsonb) FROM document_links dl     WHERE dl.transaction_id = '$TX'),
+  'transaction_events',  (SELECT COALESCE(jsonb_agg(to_jsonb(te)), '[]'::jsonb) FROM transaction_events te WHERE te.transaction_id = '$TX'),
+  'transaction_parties', (SELECT COALESCE(jsonb_agg(to_jsonb(tp)), '[]'::jsonb) FROM transaction_parties tp WHERE tp.transaction_id = '$TX'),
+  'wish_items',          (SELECT COALESCE(jsonb_agg(to_jsonb(w)), '[]'::jsonb)  FROM wish_items w          WHERE w.converted_transaction_id = '$TX'),
+  'owned_items',         (SELECT COALESCE(jsonb_agg(to_jsonb(o)), '[]'::jsonb)  FROM owned_items o
                             WHERE o.transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = '$TX')),
-  'documents',           (SELECT jsonb_agg(to_jsonb(d))  FROM documents d
+  'documents',           (SELECT COALESCE(jsonb_agg(to_jsonb(d)), '[]'::jsonb)  FROM documents d
                             WHERE d.id IN (SELECT document_id FROM document_links WHERE transaction_id = '$TX')),
-  'products',            (SELECT jsonb_agg(to_jsonb(pr)) FROM products pr
+  'products',            (SELECT COALESCE(jsonb_agg(to_jsonb(pr)), '[]'::jsonb) FROM products pr
                             WHERE pr.id IN (SELECT DISTINCT product_id FROM transaction_items
                                              WHERE transaction_id = '$TX' AND product_id IS NOT NULL))
 ));
@@ -55,7 +55,11 @@ SQL
 TMP="$(mktemp "$OUT_DIR/.$TX.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
-docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$TMP"
+# No `-i`, and stdin from /dev/null: this script is meant to be piped in via
+# `ssh mini 'bash -s' < tx-snapshot.sh`, so stdin IS the rest of the script.
+# `docker exec -i` read it, bash found nothing left to run after this line,
+# and the run exited 0 in silence with no snapshot written (#242).
+docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$TMP" < /dev/null
 
 if [ ! -s "$TMP" ] || ! grep -q '"transactions"' "$TMP"; then
   echo "tx-snapshot: EMPTY or malformed snapshot for $TX — refusing to claim success" >&2
