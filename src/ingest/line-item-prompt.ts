@@ -397,10 +397,34 @@ Two different failures, two different answers. Do not confuse them.
     emit exactly ONE row —
       line_type='other', item_class='other', confidence='low',
       raw_name='TOTAL ONLY',
-      line_total_minor = the receipt's printed grand total, in minor
-                         units (cents), as you read it off the paper,
+      line_total_minor = the printed SUBTOTAL (pre-tax, pre-tip), in
+                         minor units (cents), whenever the receipt prints
+                         a Subtotal / Tax / Tip breakdown or a PRE-TIP
+                         amount — and emit that tax and tip as their own
+                         tax / tip rows. Only when the paper prints
+                         nothing but a single total does this row carry
+                         that total. (The row counts in A below, and A
+                         must tie to the SUBTOTAL: the grand total here
+                         double-counts tax + tip.)
       parent_line_no=NULL, product_key=NULL,
       tags=['no-item-section'].
+
+    Card tender slips (PRE-TIP AMT / Amount, then TIP and TOTAL as
+    ruled write-in lines) are this case. A BLANK write-in line is not
+    \$0 and not unsupported: the pre-tip amount is the charged amount.
+    If a tip IS written in, book it as a tip row and the written total
+    as the grand total. Some terminals print a "Subtotal" that already
+    includes the tip, under a blank "Total:" — then that Subtotal is
+    the grand total.
+
+  PRICES legible, NAMES hidden — e.g. a card slip laid over the check
+  covers the item-name column while every price stays readable and the
+  prices tie to the printed subtotal. Nothing is missing, so this is
+  neither TOTAL ONLY nor a bridge: emit one row per readable price,
+  line_type='other', item_class='other', product_key=NULL,
+  confidence='low', raw_name='ITEM NAME OBSCURED',
+  tags=['occluded','unreadable']. Do NOT invent product_keys to make
+  them 'product' rows — invented keys permanently pollute products.
 
   SOME lines are readable but part of the item block is BLOCKED — a
   hand or thumb over the paper, a fold, a glare or flash band, a tear,
