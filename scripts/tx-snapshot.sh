@@ -55,7 +55,11 @@ SQL
 TMP="$(mktemp "$OUT_DIR/.$TX.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 
-docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$TMP"
+# No `-i`, and stdin from /dev/null: this script is meant to be piped in via
+# `ssh mini 'bash -s' < tx-snapshot.sh`, so stdin IS the rest of the script.
+# `docker exec -i` read it, bash found nothing left to run after this line,
+# and the run exited 0 in silence with no snapshot written (#242).
+docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" -tA -c "$SQL" > "$TMP" < /dev/null
 
 if [ ! -s "$TMP" ] || ! grep -q '"transactions"' "$TMP"; then
   echo "tx-snapshot: EMPTY or malformed snapshot for $TX — refusing to claim success" >&2
