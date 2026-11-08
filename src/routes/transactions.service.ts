@@ -957,6 +957,10 @@ type SortColumn = "occurred_on" | "created_at" | "amount";
 interface ListCursor {
   sort: SortColumn;
   value: string;
+  /** sort=occurred_on only: the within-day key, the row's `occurred_at`
+   *  as ISO-8601 or `-infinity` when the row has no time. Absent on
+   *  cursors issued before the within-day key existed. */
+  at?: string;
   id: string;
 }
 
@@ -1080,6 +1084,16 @@ export async function listTransactions(
   // under a different sort, results would be wrong — callers must
   // not mix sorts within a pagination session. The cursor carries
   // its sort so we can at least detect and refuse the mix.
+  // sort=occurred_on orders by date, then by time of day within the date.
+  // Without this second key, same-day rows came back in uuid order, i.e.
+  // at random: lunch under dinner, this morning's upload under last
+  // night's. Rows with no occurred_at sink to the bottom of their day
+  // (desc) — their position within the day is genuinely unknown.
+  const tieSql =
+    sortCol === "occurred_on"
+      ? sql`COALESCE(t.occurred_at, '-infinity'::timestamptz)`
+      : null;
+
   const cursor = normalizeCursor(decodeCursor<ListCursor | LegacyListCursor>(query.cursor ?? undefined));
   if (cursor) {
     if (cursor.sort !== sortCol) {
@@ -1091,7 +1105,17 @@ export async function listTransactions(
           "Either keep the original sort or omit the cursor to start fresh.",
       );
     }
-    if (wantDesc) {
+    if (tieSql) {
+      // A cursor issued before the within-day key existed has no `at`.
+      // Resume from the edge of that day that re-shows rows rather than
+      // skipping them: a duplicate on one page is harmless, a gap is not.
+      const at = cursor.at ?? (wantDesc ? "infinity" : "-infinity");
+      conditions.push(
+        wantDesc
+          ? sql`(${sortColSql}, ${tieSql}, t.id) < (${cursor.value}${cursorCast}, ${at}::timestamptz, ${cursor.id}::uuid)`
+          : sql`(${sortColSql}, ${tieSql}, t.id) > (${cursor.value}${cursorCast}, ${at}::timestamptz, ${cursor.id}::uuid)`,
+      );
+    } else if (wantDesc) {
       conditions.push(sql`(${sortColSql}, t.id) < (${cursor.value}${cursorCast}, ${cursor.id}::uuid)`);
     } else {
       conditions.push(sql`(${sortColSql}, t.id) > (${cursor.value}${cursorCast}, ${cursor.id}::uuid)`);
@@ -1099,9 +1123,10 @@ export async function listTransactions(
   }
 
   const where = sql.join(conditions, sql` AND `);
-  const orderSql = wantDesc
-    ? sql`${sortColSql} DESC, t.id DESC`
-    : sql`${sortColSql} ASC, t.id ASC`;
+  const dir = wantDesc ? sql`DESC` : sql`ASC`;
+  const orderSql = tieSql
+    ? sql`${sortColSql} ${dir}, ${tieSql} ${dir}, t.id ${dir}`
+    : sql`${sortColSql} ${dir}, t.id ${dir}`;
 
   // When sorting by amount, expose the computed value as `sort_amount`
   // so we can recover it for the next_cursor below without re-querying.
@@ -1198,9 +1223,11 @@ export async function listTransactions(
 
   const last = page[page.length - 1]!;
   let cursorValue: string;
+  let cursorAt: string | undefined;
   switch (sortCol) {
     case "occurred_on":
       cursorValue = toIsoDate(last.occurred_on);
+      cursorAt = last.occurred_at ? toIsoString(last.occurred_at) : "-infinity";
       break;
     case "amount":
       // sort_amount comes back as a string from node-postgres for bigint;
@@ -1212,7 +1239,7 @@ export async function listTransactions(
       break;
   }
   const nextCursor = hasMore
-    ? encodeCursor({ sort: sortCol, value: cursorValue, id: last.id })
+    ? encodeCursor({ sort: sortCol, value: cursorValue, at: cursorAt, id: last.id })
     : null;
 
   return { items, next_cursor: nextCursor };
