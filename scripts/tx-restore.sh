@@ -55,7 +55,7 @@ if [ "$RESTORE_DOCS" = "1" ]; then
     ocr_model_version = s.ocr_model_version,
     updated_at        = s.updated_at
   FROM (
-    SELECT * FROM jsonb_to_recordset((SELECT snap->'documents' FROM snapshot))
+    SELECT * FROM jsonb_to_recordset((SELECT NULLIF(snap->'documents', 'null'::jsonb) FROM snapshot))
       AS x(id uuid, ocr_text text, ocr_model_version text, updated_at timestamptz)
   ) s
   WHERE d.id = s.id;
@@ -71,6 +71,11 @@ BEGIN;
 SET LOCAL session_replication_role = replica;
 
 CREATE TEMP TABLE snapshot ON COMMIT DROP AS SELECT :'snap'::jsonb AS snap;
+-- An empty table is stored as JSON null, not SQL NULL (jsonb_agg over no
+-- rows is NULL; jsonb_build_object keeps it as 'null'). COALESCE only
+-- catches SQL NULL, so every read goes through NULLIF(..., 'null') first —
+-- otherwise jsonb_array_elements fails with "cannot extract elements from a
+-- scalar" on any transaction with no wish items (#242).
 
 -- (2) explicit deletes, in FK order — replica mode disables cascades.
 DELETE FROM owned_items         WHERE transaction_item_id IN (SELECT id FROM transaction_items WHERE transaction_id = :'tx');
@@ -78,7 +83,7 @@ DELETE FROM owned_items         WHERE transaction_item_id IN (SELECT id FROM tra
 -- not off a line item. Delete exactly the rows the snapshot re-inserts: a
 -- wish converted to this transaction AFTER the snapshot is not ours to drop.
 DELETE FROM wish_items          WHERE id IN (SELECT (w->>'id')::uuid
-                                               FROM jsonb_array_elements(COALESCE((SELECT snap->'wish_items' FROM snapshot), '[]'::jsonb)) w);
+                                               FROM jsonb_array_elements(COALESCE((SELECT NULLIF(snap->'wish_items', 'null'::jsonb) FROM snapshot), '[]'::jsonb)) w);
 DELETE FROM transaction_parties WHERE transaction_id = :'tx';
 DELETE FROM transaction_items   WHERE transaction_id = :'tx';
 DELETE FROM transaction_events  WHERE transaction_id = :'tx';
@@ -87,10 +92,10 @@ DELETE FROM postings            WHERE transaction_id = :'tx';
 DELETE FROM transactions        WHERE id = :'tx';
 
 INSERT INTO transactions
-SELECT * FROM jsonb_populate_recordset(NULL::transactions, (SELECT snap->'transactions' FROM snapshot));
+SELECT * FROM jsonb_populate_recordset(NULL::transactions, (SELECT NULLIF(snap->'transactions', 'null'::jsonb) FROM snapshot));
 
 INSERT INTO postings
-SELECT * FROM jsonb_populate_recordset(NULL::postings, (SELECT snap->'postings' FROM snapshot));
+SELECT * FROM jsonb_populate_recordset(NULL::postings, (SELECT NULLIF(snap->'postings', 'null'::jsonb) FROM snapshot));
 
 -- (3) effective_total_minor is GENERATED — explicit column list only.
 INSERT INTO transaction_items (
@@ -107,7 +112,7 @@ SELECT id, workspace_id, transaction_id, line_no, parent_line_no,
        item_class, durability_tier, food_kind, tags, confidence,
        line_type, product_id, tax_minor, tip_share_minor, discount_share_minor,
        extraction_run, extraction_version, retired_at, metadata, source, created_at
-  FROM jsonb_to_recordset(COALESCE((SELECT snap->'transaction_items' FROM snapshot), '[]'::jsonb))
+  FROM jsonb_to_recordset(COALESCE((SELECT NULLIF(snap->'transaction_items', 'null'::jsonb) FROM snapshot), '[]'::jsonb))
     AS x(id uuid, workspace_id uuid, transaction_id uuid, line_no int, parent_line_no int,
          raw_name text, normalized_name text, product_variant text, quantity numeric, unit text,
          unit_price_minor bigint, line_total_minor bigint, currency text,
@@ -117,19 +122,19 @@ SELECT id, workspace_id, transaction_id, line_no, parent_line_no,
          retired_at timestamptz, metadata jsonb, source text, created_at timestamptz);
 
 INSERT INTO document_links
-SELECT * FROM jsonb_populate_recordset(NULL::document_links, COALESCE((SELECT snap->'document_links' FROM snapshot), '[]'::jsonb));
+SELECT * FROM jsonb_populate_recordset(NULL::document_links, COALESCE((SELECT NULLIF(snap->'document_links', 'null'::jsonb) FROM snapshot), '[]'::jsonb));
 
 INSERT INTO transaction_events
-SELECT * FROM jsonb_populate_recordset(NULL::transaction_events, COALESCE((SELECT snap->'transaction_events' FROM snapshot), '[]'::jsonb));
+SELECT * FROM jsonb_populate_recordset(NULL::transaction_events, COALESCE((SELECT NULLIF(snap->'transaction_events', 'null'::jsonb) FROM snapshot), '[]'::jsonb));
 
 INSERT INTO transaction_parties
-SELECT * FROM jsonb_populate_recordset(NULL::transaction_parties, COALESCE((SELECT snap->'transaction_parties' FROM snapshot), '[]'::jsonb));
+SELECT * FROM jsonb_populate_recordset(NULL::transaction_parties, COALESCE((SELECT NULLIF(snap->'transaction_parties', 'null'::jsonb) FROM snapshot), '[]'::jsonb));
 
 INSERT INTO owned_items
-SELECT * FROM jsonb_populate_recordset(NULL::owned_items, COALESCE((SELECT snap->'owned_items' FROM snapshot), '[]'::jsonb));
+SELECT * FROM jsonb_populate_recordset(NULL::owned_items, COALESCE((SELECT NULLIF(snap->'owned_items', 'null'::jsonb) FROM snapshot), '[]'::jsonb));
 
 INSERT INTO wish_items
-SELECT * FROM jsonb_populate_recordset(NULL::wish_items, COALESCE((SELECT snap->'wish_items' FROM snapshot), '[]'::jsonb));
+SELECT * FROM jsonb_populate_recordset(NULL::wish_items, COALESCE((SELECT NULLIF(snap->'wish_items', 'null'::jsonb) FROM snapshot), '[]'::jsonb));
 
 $DOC_RESTORE
 
