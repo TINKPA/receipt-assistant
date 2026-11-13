@@ -28,6 +28,12 @@
 -- written to be re-run: on a cluster that already has the roles, and on a
 -- database restored from a dump into a cluster that does not.
 --
+-- NEEDS A CONNECTION THAT MAY CREATE AND ALTER ROLES (a superuser, or a
+-- role with CREATEROLE). The compose files connect as `postgres`. With a
+-- DATABASE_URL role that merely owns the database this file fails with
+-- "permission denied to create role" (or "to alter role"), and because every pending migration
+-- runs in one transaction, none of them is applied.
+--
 -- DDL only. It touches no row.
 -- ═══════════════════════════════════════════════════════════════════════
 
@@ -46,6 +52,26 @@ $$;--> statement-breakpoint
 -- NOINHERIT: a membership someone adds later grants nothing by itself.
 ALTER ROLE receipts_agent WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;--> statement-breakpoint
 ALTER ROLE receipts_ro WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;--> statement-breakpoint
+
+-- A membership is a second way to hold privileges, and NOINHERIT only
+-- means it takes a SET ROLE to use one. Neither role is a member of
+-- anything; a pre-existing role is brought back to that.
+DO $$
+DECLARE
+  m record;
+BEGIN
+  FOR m IN
+    SELECT g.rolname AS granted, r.rolname AS member, gr.rolname AS grantor
+      FROM pg_auth_members am
+      JOIN pg_roles g  ON g.oid  = am.roleid
+      JOIN pg_roles r  ON r.oid  = am.member
+      JOIN pg_roles gr ON gr.oid = am.grantor
+     WHERE r.rolname IN ('receipts_agent', 'receipts_ro')
+  LOOP
+    EXECUTE format('REVOKE %I FROM %I GRANTED BY %I', m.granted, m.member, m.grantor);
+  END LOOP;
+END
+$$;--> statement-breakpoint
 
 -- Session defaults. A role can override these for its own session, so
 -- they are guard rails (a runaway query, a forgotten transaction). The
@@ -68,6 +94,12 @@ BEGIN
 END
 $$;--> statement-breakpoint
 GRANT USAGE ON SCHEMA public TO receipts_agent, receipts_ro;--> statement-breakpoint
+
+-- Creating a large object takes no table privilege, only EXECUTE on these
+-- three functions, which PUBLIC holds by default: a role that may write
+-- to no table could still write to the database. Nothing in this
+-- application uses large objects, and the owner connection is unaffected.
+REVOKE EXECUTE ON FUNCTION pg_catalog.lo_creat(integer), pg_catalog.lo_create(oid), pg_catalog.lo_from_bytea(oid, bytea) FROM PUBLIC;--> statement-breakpoint
 
 -- Start from nothing, so a re-run converges on the list below instead of
 -- adding to whatever was there.
@@ -109,7 +141,8 @@ BEGIN
     SELECT * FROM (VALUES
       ('accounts',            true,  ARRAY['updated_at']),
       ('brand_assets',        true,  ARRAY['last_seen_at', 'agent_relevance', 'agent_notes',
-                                           'extraction_version', 'retired_at', 'width', 'height']),
+                                           'extraction_version', 'retired_at', 'width', 'height',
+                                           'content_type']),
       ('brands',              true,  ARRAY['name', 'domain', 'parent_id', 'preferred_asset_id',
                                            'metadata', 'updated_at']),
       ('document_links',      true,  ARRAY[]::text[]),

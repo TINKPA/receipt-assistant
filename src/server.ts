@@ -14,10 +14,14 @@ import { pool } from "./db/client.js";
 import {
   AGENT_GRANTS,
   AGENT_ROLE,
+  AgentRoleSyncBlockedError,
   RO_ROLE,
   auditAgentRoles,
+  endAgentRoleSessions,
   rolePasswordEnvName,
   syncAgentRoles,
+  verifyAgentLogins,
+  type AgentRoleSyncReport,
 } from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
@@ -66,15 +70,36 @@ function logPromptSize(): void {
  * Bring the two agent database roles in line with `src/db/agent-roles.ts`:
  * passwords from the environment, privileges from `AGENT_GRANTS`.
  *
- * Non-fatal. If this throws, the HTTP API and everything that does not
- * spawn an agent still work, and the next extraction fails on its first
- * psql call with a login or permission error that names the role — which
- * is a better outage than a server that will not boot. The error line
- * below is what to look for.
+ * Non-fatal, and bounded: the sync gives up on a lock after ten seconds
+ * instead of waiting in front of `app.listen`, and gets one retry after
+ * the leftover agent-role sessions are ended. If it fails, the HTTP API
+ * and everything that does not spawn an agent still work, the roles keep
+ * what the previous boot gave them, and if that was nothing the next
+ * extraction fails on its first psql call with a login or permission
+ * error that names the role — which is a better outage than a server that
+ * will not boot. The error lines below are what to look for.
+ *
+ * The login check runs whether or not the sync succeeded: it answers the
+ * question that matters, "can an agent started now reach the database".
  */
 async function syncAgentDbRoles(): Promise<void> {
   try {
-    const report = await syncAgentRoles(pool);
+    let report: AgentRoleSyncReport;
+    try {
+      report = await syncAgentRoles(pool);
+    } catch (err) {
+      if (!(err instanceof AgentRoleSyncBlockedError)) throw err;
+      // Something holds a lock the sync needs. This server has started no
+      // agent yet, so a session under an agent role is an orphan of an
+      // earlier process (or was left behind on purpose). End them, try
+      // once more, and say what was ended.
+      const ended = await endAgentRoleSessions(pool);
+      console.error(
+        `❌ Agent DB role sync was blocked by another session. Ended ${ended.length} leftover ` +
+          `agent-role session(s)${ended.length ? `: ${ended.join("; ")}` : ""}. Retrying once.`,
+      );
+      report = await syncAgentRoles(pool);
+    }
     console.log(
       `🔐 Agent DB roles synced: ${AGENT_ROLE} on ${Object.keys(AGENT_GRANTS).length} tables, ` +
         `${RO_ROLE} read-only on all`,
@@ -97,9 +122,16 @@ async function syncAgentDbRoles(): Promise<void> {
     for (const line of drift) console.error(`❌ Agent DB role drift: ${line}`);
   } catch (err) {
     console.error(
-      "❌ Agent DB role sync FAILED — extraction and Ask will not be able to reach the database:",
+      "❌ Agent DB role sync FAILED — extraction and Ask may not be able to reach the database:",
       (err as Error).message,
     );
+  }
+  try {
+    for (const line of await verifyAgentLogins()) {
+      console.error(`❌ Agent DB login check: ${line}`);
+    }
+  } catch (err) {
+    console.error("❌ Agent DB login check could not run:", (err as Error).message);
   }
 }
 

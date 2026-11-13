@@ -2,11 +2,15 @@
  * Database roles for the two `claude -p` agents.
  *
  * The server's own pool keeps connecting as whatever `DATABASE_URL` says
- * (the owner of the schema). The agents never see that URL. Each child is
- * spawned with a `DATABASE_URL` of its own (see `src/claude.ts`):
+ * (the owner of the schema). That URL is in neither child's environment.
+ * What reaches the database on an agent's behalf logs in as:
  *
- *   extraction / re-extract  →  `receipts_agent`
- *   Ask                      →  `receipts_ro`
+ *   extraction / re-extract  →  `receipts_agent`  the child's own
+ *                               `DATABASE_URL` (see `src/claude.ts`)
+ *   Ask                      →  `receipts_ro`     used by the SERVER to run
+ *                               the SQL the model writes; the Ask child
+ *                               has no tools and no database URL at all
+ *                               (see `src/insights/ledger-query.ts`)
  *
  * What each role may do is decided HERE, in `AGENT_GRANTS`, and nowhere
  * else. Migration 0041 creates the roles and applies the list as it stood
@@ -14,9 +18,12 @@
  * every boot. So changing what the agent may touch is an edit to this file
  * and a deploy — not a new migration.
  *
- * Privileges are the boundary. The prompts still tell the agents what to
- * do, but an instruction is not a control: a receipt email is text written
- * by a stranger and it lands inside the extraction prompt.
+ * Privileges are the boundary for whatever arrives through these logins.
+ * The prompts still tell the agents what to do, but an instruction is not
+ * a control: a receipt email is text written by a stranger and it lands
+ * inside the extraction prompt. They are NOT a boundary around the
+ * extraction agent as a whole, which has a shell and can reach the owner
+ * login by other means: see "What this does not bound" in CLAUDE.md.
  *
  * ── Policy for tables added later ──────────────────────────────────────
  *
@@ -34,7 +41,7 @@
  *                   not covered by this list, and boot logs every table
  *                   the role cannot touch.
  */
-import type pg from "pg";
+import pg from "pg";
 
 /** Role the extraction and re-extract agents connect as. */
 export const AGENT_ROLE = "receipts_agent";
@@ -82,7 +89,12 @@ export function roleDatabaseUrl(
 ): string {
   const url = new URL(base);
   url.username = role;
-  url.password = rolePassword(role).value;
+  // Percent-encode it ourselves. The URL setter escapes some characters
+  // but leaves `%` alone, so a password containing one came out as a
+  // string libpq rejects ("invalid percent-encoded token") or, worse,
+  // decodes to a different password. encodeURIComponent leaves nothing
+  // for the setter to reinterpret.
+  url.password = encodeURIComponent(rolePassword(role).value);
   return url.toString();
 }
 
@@ -128,9 +140,12 @@ export const AGENT_GRANTS: Readonly<Record<string, TableGrant>> = {
       "retired_at",
       // Not in a template SET list. The procedure says to record
       // dimensions "if you can", and the agent has filled them in with a
-      // follow-up UPDATE.
+      // follow-up UPDATE; one production run corrected `content_type` in
+      // the same statement, and refusing a column takes the whole UPDATE
+      // (the relevance judgment included) down with it.
       "width",
       "height",
+      "content_type",
     ],
   },
   // No `user_chose_at`: the icon a user picked stays picked.
@@ -223,9 +238,13 @@ export const AGENT_GRANTS: Readonly<Record<string, TableGrant>> = {
 export const RO_DENY_TABLES: readonly string[] = [];
 
 /**
- * Per-role session defaults. A role can change these for its own session,
- * so they are guard rails (a runaway query, a forgotten transaction), not
- * part of the boundary.
+ * Per-role session defaults. Guard rails (a runaway query, a forgotten
+ * transaction), not part of the boundary: a role can change them for its
+ * own session, and Postgres lets any role `ALTER ROLE` itself, which also
+ * covers its own password. Such a change lasts until the next boot, when
+ * `syncAgentRoles` puts both back. The extraction agent can therefore lock
+ * itself out until a restart; the Ask path cannot, because the server runs
+ * its SQL inside a read-only transaction (`src/insights/ledger-query.ts`).
  */
 export const ROLE_SETTINGS: Readonly<Record<AgentDbRole, Readonly<Record<string, string>>>> = {
   [AGENT_ROLE]: {
@@ -239,7 +258,24 @@ export const ROLE_SETTINGS: Readonly<Record<AgentDbRole, Readonly<Record<string,
   },
 };
 
+/**
+ * The functions that create a large object. EXECUTE on them is PUBLIC's by
+ * default and is revoked: a role with no write privilege on any table
+ * could otherwise still write to the database (and fill its disk).
+ * `lo_import` is not here because it is superuser-only already.
+ */
+export const LARGE_OBJECT_CREATORS = [
+  "pg_catalog.lo_creat(integer)",
+  "pg_catalog.lo_create(oid)",
+  "pg_catalog.lo_from_bytea(oid, bytea)",
+] as const;
+
 // ── Applying it ────────────────────────────────────────────────────────
+
+/** How long the boot-time sync waits for any one lock before giving up. */
+const SYNC_LOCK_TIMEOUT = "10s";
+/** SQLSTATE lock_not_available: what `lock_timeout` raises. */
+const LOCK_NOT_AVAILABLE = "55P03";
 
 const IDENT = /^[a-z_][a-z0-9_]*$/;
 
@@ -278,18 +314,31 @@ export interface AgentRoleSyncReport {
 /**
  * Make the two roles match this file: create them if a restore dropped
  * them (roles live in the cluster, not in a database dump), set their
- * passwords from the environment, then replace their privileges with
- * exactly `AGENT_GRANTS` / SELECT-everything.
+ * passwords from the environment, drop any membership they were given,
+ * then replace their privileges with exactly `AGENT_GRANTS` /
+ * SELECT-everything.
  *
  * One transaction, so a running agent never sees a half-applied set.
  * Needs a connection that owns the tables and may alter roles — today
- * that is the server's own.
+ * that is the server's own, a superuser. Every lock wait is bounded
+ * (`SYNC_LOCK_TIMEOUT`); when one runs out this throws
+ * `AgentRoleSyncBlockedError` and the roles stay as the previous boot
+ * left them.
  */
 export async function syncAgentRoles(pool: pg.Pool): Promise<AgentRoleSyncReport> {
   const report: AgentRoleSyncReport = { defaultPasswords: [], skipped: [], agentCannotSee: [] };
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Nothing below may wait without end. Two things here can be blocked
+    // by a session logged in as one of the agent roles: the advisory lock
+    // on the next line (any role may take one, and the key is in a public
+    // repository), and ALTER ROLE, which waits behind a role's own
+    // uncommitted ALTER ROLE. Postgres does not notice a dead client while
+    // a backend sleeps, so such a session can outlive the agent that
+    // opened it. This runs in front of `app.listen`: an unbounded wait
+    // here was a server that never came up and logged nothing.
+    await client.query(`SET LOCAL lock_timeout = '${SYNC_LOCK_TIMEOUT}'`);
     // Two servers booting against one database would otherwise race each
     // other's catalog updates ("tuple concurrently updated").
     await client.query("SELECT pg_advisory_xact_lock(hashtext('receipts.agent_roles'))");
@@ -313,7 +362,25 @@ export async function syncAgentRoles(pool: pg.Pool): Promise<AgentRoleSyncReport
       }
     }
 
+    // A membership is a second way to hold privileges, and NOINHERIT only
+    // means it takes a `SET ROLE` to use one. Neither role should be a
+    // member of anything.
+    const memberships = await client.query<{ sql: string }>(
+      `SELECT format('REVOKE %I FROM %I GRANTED BY %I', g.rolname, m.rolname, gr.rolname) AS sql
+         FROM pg_auth_members am
+         JOIN pg_roles g  ON g.oid  = am.roleid
+         JOIN pg_roles m  ON m.oid  = am.member
+         JOIN pg_roles gr ON gr.oid = am.grantor
+        WHERE m.rolname = ANY($1::text[])`,
+      [[AGENT_ROLE, RO_ROLE]],
+    );
+    for (const row of memberships.rows) await client.query(row.sql);
+
     const both = `${ident(AGENT_ROLE)}, ${ident(RO_ROLE)}`;
+    // Creating a large object needs no table privilege, only EXECUTE on
+    // these, which PUBLIC holds by default. Nothing in this application
+    // uses large objects; the owner connection is unaffected.
+    await client.query(`REVOKE EXECUTE ON FUNCTION ${LARGE_OBJECT_CREATORS.join(", ")} FROM PUBLIC`);
     await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${both}`);
     await client.query(`REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${both}`);
     await client.query(`REVOKE CREATE ON SCHEMA public FROM PUBLIC`);
@@ -362,12 +429,85 @@ export async function syncAgentRoles(pool: pg.Pool): Promise<AgentRoleSyncReport
     return report;
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if ((err as { code?: string }).code === LOCK_NOT_AVAILABLE) {
+      throw new AgentRoleSyncBlockedError(
+        `agent role sync gave up after waiting ${SYNC_LOCK_TIMEOUT} for a lock, so the roles keep the ` +
+          `passwords and privileges they had`,
+      );
+    }
     // The failing statement may be the ALTER ROLE that carries a password;
     // pg puts no SQL text in `message`, and nothing else is forwarded.
     throw new Error(`agent role sync failed: ${(err as Error).message}`);
   } finally {
     client.release();
   }
+}
+
+/** The sync could not get a lock in time. Another session holds it. */
+export class AgentRoleSyncBlockedError extends Error {}
+
+/**
+ * End every session logged in as one of the agent roles, and say which.
+ *
+ * For boot, after the sync was blocked. At that point this server has
+ * started no agent yet, so a session under either role belongs to a
+ * process that no longer exists: Postgres keeps a backend alive while it
+ * sleeps or waits, long after the client that opened it was killed. Such
+ * a session is the only thing an agent role can put in the sync's way.
+ */
+export async function endAgentRoleSessions(db: Queryable): Promise<string[]> {
+  // Materialized first: the planner is free to evaluate WHERE conditions
+  // in any order, and pg_terminate_backend must only ever see these rows.
+  const { rows } = await db.query<{ who: string }>(
+    `WITH leftover AS MATERIALIZED (
+       SELECT pid, usename, state, backend_start
+         FROM pg_stat_activity
+        WHERE usename = ANY($1::text[]) AND pid <> pg_backend_pid()
+     )
+     SELECT format('pid %s (%s, %s, connected %s ago)', pid, usename, state,
+                   date_trunc('second', now() - backend_start)) AS who,
+            pg_terminate_backend(pid) AS ended
+       FROM leftover`,
+    [[AGENT_ROLE, RO_ROLE]],
+  );
+  return rows.map((r) => r.who);
+}
+
+/**
+ * Log in as each role with the exact URL an agent child is handed.
+ *
+ * The sync above can succeed while that URL does not work: it sets the
+ * password with one piece of code and the URL is built by another. A
+ * password containing `%` did exactly that, and the first anyone would
+ * have heard of it was every extraction failing at its first psql call.
+ * Returns one line per role that cannot log in; empty means both can.
+ */
+export async function verifyAgentLogins(): Promise<string[]> {
+  const problems: string[] = [];
+  for (const role of [AGENT_ROLE, RO_ROLE] as const) {
+    const client = new pg.Client({
+      connectionString: roleDatabaseUrl(role),
+      connectionTimeoutMillis: 10_000,
+    });
+    // A connection that dies between queries emits 'error'; unhandled,
+    // that would take the server down from a diagnostic.
+    client.on("error", () => {});
+    try {
+      await client.connect();
+      const { rows } = await client.query<{ who: string; su: string }>(
+        `SELECT session_user AS who, current_setting('is_superuser') AS su`,
+      );
+      const { who, su } = rows[0]!;
+      if (who !== role || su !== "off") {
+        problems.push(`${role}: its URL logs in as ${who} (superuser=${su})`);
+      }
+    } catch (err) {
+      problems.push(`${role}: cannot log in with the URL the agents are given — ${(err as Error).message}`);
+    } finally {
+      await client.end().catch(() => {});
+    }
+  }
+  return problems;
 }
 
 // ── Checking it ────────────────────────────────────────────────────────
@@ -500,7 +640,9 @@ export async function auditAgentRoles(db: Queryable): Promise<string[]> {
      SELECT r.rolname, 'EXECUTE on ' || p.oid::regprocedure::text
        FROM pg_roles r CROSS JOIN pg_proc p
       WHERE r.rolname = ANY($1::text[])
-        AND p.proname IN ('pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'lo_import', 'lo_export')
+        AND p.pronamespace = 'pg_catalog'::regnamespace
+        AND p.proname IN ('pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'lo_import', 'lo_export',
+                          'lo_creat', 'lo_create', 'lo_from_bytea')
         AND has_function_privilege(r.oid, p.oid, 'EXECUTE')`,
     [[AGENT_ROLE, RO_ROLE]],
   );

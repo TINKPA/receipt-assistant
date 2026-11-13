@@ -35,7 +35,7 @@
  *   npm run check:agent-grants            check (exit 1 on a violation)
  *   npm run check:agent-grants -- --list  also print the derived table
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { is } from "drizzle-orm";
@@ -59,6 +59,8 @@ const NOT_IN_A_TEMPLATE: Record<string, string> = {
   "brand_assets.width":
     "The icon procedure says to record dimensions \"if you can\"; the agent has done it as a follow-up UPDATE.",
   "brand_assets.height": "As width.",
+  "brand_assets.content_type":
+    "As width: one production run corrected it in the same UPDATE as its relevance judgment, and a refused column fails the whole statement.",
   "places.lat":
     "Not in the template's DO UPDATE list; the agent has added it when refreshing a place from the same Google response.",
   "places.lng": "As lat.",
@@ -73,6 +75,44 @@ for (const value of Object.values(schema)) {
     TABLES.set(cfg.name, new Set(cfg.columns.map((c) => c.name)));
   }
 }
+
+/**
+ * Views exist only in migration SQL, not in the drizzle schema. A template
+ * that reads one needs a grant like any table, so they have to be known
+ * here or `FROM some_view` would pass as prose.
+ */
+const VIEWS = new Set<string>();
+{
+  const dir = path.join(HERE, "..", "drizzle");
+  for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    const sql = readFileSync(path.join(dir, file), "utf8");
+    for (const m of sql.matchAll(
+      /\b(CREATE(?:\s+OR\s+REPLACE)?(?:\s+MATERIALIZED)?|DROP(?:\s+MATERIALIZED)?)\s+VIEW\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?(?:"?public"?\.)?"?([a-z_][a-z0-9_]*)"?/gi,
+    )) {
+      if (/^DROP/i.test(m[1]!)) VIEWS.delete(m[2]!);
+      else VIEWS.add(m[2]!);
+    }
+  }
+}
+
+/** A table or a view: anything a statement can name after FROM. */
+function isRelation(name: string): boolean {
+  return TABLES.has(name) || VIEWS.has(name);
+}
+
+/**
+ * How a table name may be written: bare, quoted, or schema-qualified. The
+ * keywords around it are matched in any case — the templates happen to be
+ * uppercase today, and a lowercase `update transactions set status …`
+ * added later must not walk past this check.
+ *
+ * Case-insensitive matching also reads prose ("update the row and set
+ * …"). So a lowercase statement only counts when it names a real table;
+ * an uppercase one that names something unknown is still reported, as
+ * before.
+ */
+const NAME = String.raw`(?:"?public"?\.)?"?([a-z_][a-z0-9_]*)"?`;
+const isUpper = (keyword: string) => keyword === keyword.toUpperCase();
 
 // ── What the templates use ─────────────────────────────────────────────
 
@@ -119,7 +159,7 @@ function setListEnd(text: string): number {
     const ch = text[i];
     if (ch === "(") depth++;
     else if (ch === ")") depth--;
-    else if (depth <= 0 && (ch === ";" || /^(?:WHERE|FROM|RETURNING)\b/.test(text.slice(i, i + 10)))) {
+    else if (depth <= 0 && (ch === ";" || /^(?:WHERE|FROM|RETURNING)\b/i.test(text.slice(i, i + 10)))) {
       if (ch === ";" || !/[A-Za-z0-9_]/.test(text[i - 1] ?? " ")) return i;
     }
   }
@@ -131,8 +171,8 @@ function setColumns(afterSet: string): string[] {
   const clause = afterSet.slice(0, setListEnd(afterSet));
   const cols: string[] = [];
   for (const part of splitTopLevel(clause)) {
-    const m = /^[\s<]*(?:[a-z_][a-z0-9_]*\.)?"?([a-z_][a-z0-9_]*)"?\s*=(?!=)/.exec(part);
-    if (m) cols.push(m[1]!);
+    const m = /^[\s<]*(?:[a-z_][a-z0-9_]*\.)?"?([a-z_][a-z0-9_]*)"?\s*=(?!=)/i.exec(part);
+    if (m) cols.push(m[1]!.toLowerCase());
   }
   return cols;
 }
@@ -146,19 +186,19 @@ function scan(source: string, text: string): void {
     .replace(/\$([a-z_]*)\$[^\n$]*\$\1\$/g, "''")
     .replace(/'[^'\n]*'/g, "''");
 
-  for (const m of sql.matchAll(/\bINSERT INTO\s+"?([a-z_][a-z0-9_]*)"?/g)) {
-    const table = m[1]!;
+  for (const m of sql.matchAll(new RegExp(String.raw`\b(INSERT\s+INTO)\s+${NAME}`, "gi"))) {
+    const table = m[2]!.toLowerCase();
     if (!TABLES.has(table)) {
-      violations.push(`${source}: INSERT INTO ${table} — not a table in src/schema`);
+      if (isUpper(m[1]!)) violations.push(`${source}: INSERT INTO ${table} — not a table in src/schema`);
       continue;
     }
     usage(table).insert = true;
     // An upsert's DO UPDATE belongs to this INSERT: look ahead to the end
     // of the statement.
     const rest = sql.slice(m.index! + m[0].length);
-    const stmtEnd = rest.search(/;|\bINSERT INTO\b/);
+    const stmtEnd = rest.search(/;|\bINSERT\s+INTO\b/i);
     const stmt = stmtEnd === -1 ? rest : rest.slice(0, stmtEnd);
-    const upsert = /\bDO UPDATE\s+SET\b/.exec(stmt);
+    const upsert = /\bDO\s+UPDATE\s+SET\b/i.exec(stmt);
     if (upsert) {
       for (const col of setColumns(stmt.slice(upsert.index + upsert[0].length))) {
         usage(table).update.add(col);
@@ -167,12 +207,12 @@ function scan(source: string, text: string): void {
   }
 
   for (const m of sql.matchAll(
-    /\bUPDATE\s+(?:ONLY\s+)?"?([a-z_][a-z0-9_]*)"?(?:\s+(?:AS\s+)?[a-z_][a-z0-9_]*)?\s+SET\b/g,
+    new RegExp(String.raw`\b(UPDATE)\s+(?:ONLY\s+)?${NAME}(?:\s+(?:AS\s+)?[a-z_][a-z0-9_]*)?\s+SET\b`, "gi"),
   )) {
-    const table = m[1]!;
-    if (/\bDO\s*$/.test(sql.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    const table = m[2]!.toLowerCase();
+    if (/\bDO\s*$/i.test(sql.slice(Math.max(0, m.index! - 8), m.index!))) continue;
     if (!TABLES.has(table)) {
-      violations.push(`${source}: UPDATE ${table} — not a table in src/schema`);
+      if (isUpper(m[1]!)) violations.push(`${source}: UPDATE ${table} — not a table in src/schema`);
       continue;
     }
     const cols = setColumns(sql.slice(m.index! + m[0].length));
@@ -182,18 +222,27 @@ function scan(source: string, text: string): void {
     for (const col of cols) usage(table).update.add(col);
   }
 
-  for (const m of sql.matchAll(/\b(?:FROM|JOIN)\s+"?([a-z_][a-z0-9_]*)"?/g)) {
-    // CTE names and prose ("FROM the receipt") are simply not tables.
-    if (TABLES.has(m[1]!)) usage(m[1]!).select = true;
+  for (const m of sql.matchAll(new RegExp(String.raw`\b(?:FROM|JOIN)\s+${NAME}`, "gi"))) {
+    // CTE names and prose ("FROM the receipt") are simply not relations.
+    const name = m[1]!.toLowerCase();
+    if (isRelation(name)) usage(name).select = true;
   }
 
-  for (const m of sql.matchAll(/\bDELETE FROM\s+"?([a-z_][a-z0-9_]*)"?/g)) {
-    if (TABLES.has(m[1]!)) violations.push(`${source}: DELETE FROM ${m[1]} — the agent role has no DELETE`);
+  for (const m of sql.matchAll(new RegExp(String.raw`\bDELETE\s+FROM\s+(?:ONLY\s+)?${NAME}`, "gi"))) {
+    const name = m[1]!.toLowerCase();
+    if (isRelation(name)) violations.push(`${source}: DELETE FROM ${name} — the agent role has no DELETE`);
   }
   for (const m of sql.matchAll(
-    /\b(TRUNCATE(?:\s+TABLE)?|DROP\s+TABLE|ALTER\s+TABLE|CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE)\s+"?([a-z_][a-z0-9_]*)"?/g,
+    new RegExp(
+      String.raw`\b(TRUNCATE(?:\s+TABLE)?|DROP\s+TABLE|ALTER\s+TABLE|CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?${NAME}`,
+      "gi",
+    ),
   )) {
-    violations.push(`${source}: ${m[1]} ${m[2]} — the agent role has no DDL`);
+    // Lowercase and naming nothing real is prose ("…create table rows…").
+    // CREATE TABLE never names an existing table, so it is always SQL.
+    if (isUpper(m[1]!) || isRelation(m[2]!.toLowerCase()) || /^create/i.test(m[1]!)) {
+      violations.push(`${source}: ${m[1]!.toUpperCase().replace(/\s+/g, " ")} ${m[2]} — the agent role has no DDL`);
+    }
   }
 }
 
@@ -229,7 +278,12 @@ scanBothWays(
 for (const [table, u] of used) {
   const grant = AGENT_GRANTS[table];
   if (!grant) {
-    violations.push(`templates use ${table}, which AGENT_GRANTS does not list`);
+    violations.push(
+      VIEWS.has(table)
+        ? `templates read the view ${table}; receipts_agent has no grant on it (AGENT_GRANTS lists tables only). ` +
+            `Read the table underneath it, or extend src/db/agent-roles.ts to grant on views`
+        : `templates use ${table}, which AGENT_GRANTS does not list`,
+    );
     continue;
   }
   if (u.insert && !grant.insert) violations.push(`templates INSERT INTO ${table}; AGENT_GRANTS has no insert for it`);
