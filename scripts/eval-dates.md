@@ -38,7 +38,10 @@ manifest is committed, the per-run report is not).
    > design) take the Phase 4a.0 attach path and close `near_dup`
    > instead of re-extracting — and the eval scores nothing. The
    > sandbox stack + `scripts/sandbox-reset.sh` gives the empty-DB
-   > environment where every fixture genuinely re-extracts.
+   > environment where every fixture genuinely re-extracts:
+   > `docker compose -f docker-compose.test.yml up -d --build`, then
+   > `./scripts/sandbox-reset.sh`, then
+   > `npm run eval:dates -- --base=http://localhost:3001`.
 4. POSTs all fixtures in a single multipart batch to `/v1/ingest/batch`.
 5. Polls `/v1/batches/<id>` every 3 s until every ingest reaches a
    terminal state (`done` / `unsupported` / `error`). 10 min timeout.

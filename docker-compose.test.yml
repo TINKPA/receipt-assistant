@@ -1,38 +1,75 @@
-# Sandbox stack for frontend-test-runner.
+# Sandbox stack: a second copy of the app and its database, for evals,
+# regression harnesses and frontend test runs.
 #
 #   docker compose -f docker-compose.test.yml up -d --build
+#   ./scripts/sandbox-reset.sh        # back to an empty ledger, no restart
 #
-# The `name:` below pins the compose project. Do NOT remove it. Without it,
-# Compose derives the project name from the directory — which is the same
-# directory the production compose file lives in — and because both files
-# declare the SAME service names (`receipts-postgres`, `receipt-assistant`),
-# Compose concludes the running PRODUCTION containers are stale instances of
-# this file's services and destroys them. That happened on 2026-07-28: a
-# `docker compose -f docker-compose.test.yml up -d` without `-p` removed the
-# prod app and DB containers and took the backend down for ~3 minutes. Data
-# survived only because postgres is on a bind mount, not a named volume.
-# `name:` makes the `-p` flag unnecessary and the mistake impossible.
+# It runs beside production on its own ports and shares NO state with it.
+# Everything the sandbox can write is its own:
 #
-# Side-by-side with the production stack — different ports, different
-# postgres volume, different uploads dir, different container names.
-# Production stack stays running on 3000/5432 while this one runs on
-# 3001/5433. Synthetic test receipts uploaded here never touch the
-# iCloud-synced production uploads dir or the production DB.
+#   Image            receipt-assistant:sandbox    (production: :local)
+#   Containers       receipt-assistant-test, receipts-test-postgres
+#   Ports            3001 (API), 5433 (postgres) on the host
+#   Postgres data    ~/Developer/receipt-assistant-data/test-postgres/
+#   /data            ~/Developer/receipt-assistant-data/test-uploads/
+#                    The whole of /data is this ONE directory: uploads/,
+#                    brand-assets/, product-assets/ and prompt-lessons/ all
+#                    live inside it. Production splits the same paths over
+#                    four mounts; the sandbox mounts none of those.
+#   Claude state     ~/Developer/receipt-assistant-data/test-claude/
+#                    Config, session state and every sandbox agent
+#                    transcript (projects/-app/<session>.jsonl).
 #
-# What's SEPARATE from prod (the whole point of the sandbox):
-#   • Postgres binary: ~/Developer/receipt-assistant-data/test-postgres/
-#   • Uploads dir:     ~/Developer/receipt-assistant-data/test-uploads/
-#     ↑ both are sibling dirs — NOT in any git repo, NOT in iCloud
-#   • Container names: receipts-test-postgres, receipt-assistant-test
-#   • Ports:           3001 (backend), 5433 (postgres) on the host
+# All three host directories are siblings of the repo: outside git, outside
+# iCloud. On a fresh machine:
+#   mkdir -p ~/Developer/receipt-assistant-data/{test-postgres,test-uploads,test-claude}
 #
-# What's SHARED with prod (intentional, avoids running `claude /login` twice):
-#   • Claude OAuth credentials → ~/Developer/receipt-assistant-data/claude/
-#   • Brand assets cache       → ~/Developer/receipt-assistant-data/brand-assets/
-#     (icons are content-addressable, safe to share across stacks)
+# Three rules keep it that way. Do not undo them.
 #
-# Reset script: scripts/sandbox-reset.sh — TRUNCATEs all test tables and
-# nukes test-uploads/, fast (~1s) versus a full down/up cycle.
+# 1. `name:` pins the compose project. Without it, Compose derives the
+#    project name from the directory, which is the directory the production
+#    compose file lives in, and because both files declare the SAME service
+#    names (`receipts-postgres`, `receipt-assistant`) it concludes the
+#    running PRODUCTION containers are stale instances of this file's
+#    services and destroys them. That happened on 2026-07-28: a
+#    `docker compose -f docker-compose.test.yml up -d` without `-p` removed
+#    the production app and DB containers and took the backend down for
+#    about 3 minutes. Data survived only because postgres is on a bind
+#    mount. `name:` makes the `-p` flag unnecessary and the mistake
+#    impossible.
+#
+# 2. The image tag is the sandbox's own. Both files build from the same
+#    Dockerfile, and a tag is just a pointer: when this file also said
+#    `receipt-assistant:local`, building the sandbox from a branch moved the
+#    tag production runs, and the next `docker compose up -d
+#    receipt-assistant` on production (the documented token-rotation step)
+#    would have recreated the production container from that branch build,
+#    whose boot applies that branch's migrations to the production ledger.
+#
+# 3. No production path is mounted, not even read-only. The sandbox used to
+#    mount production's Claude directory and brand-assets directory
+#    read-write. Its agent transcripts landed in production's
+#    projects/-app/, the only trace store production has, and its icon
+#    downloads wrote to `<brand_id>/<tier>/<name>` paths that production's
+#    `brand_assets` rows point at.
+#
+# What the two stacks still have in common is the account behind the keys,
+# not any file: CLAUDE_CODE_OAUTH_TOKEN, GOOGLE_MAPS_API_KEY and the
+# logo.dev keys are read from the same `.env`, so sandbox agent runs draw
+# on the same Claude subscription quota and the same API billing.
+#
+# `.env` is read from the directory this file is in. A git worktree has no
+# `.env` (it is gitignored), so the token renders empty there and every
+# real extraction fails on auth; stub uploads still work. From a worktree:
+#   docker compose --env-file ~/Developer/receipt-assistant/.env \
+#     -f docker-compose.test.yml up -d --build
+#
+# A worktree build is also stamped `unknown`. The Dockerfile copies `.git`
+# to read the commit, and in a worktree `.git` is a one-line pointer to a
+# host path the builder cannot follow. `/version` and every
+# `metadata.extraction.prompt_git_sha` written by that image say `unknown`.
+# To tie an eval run to its commit, check the branch out in the main
+# checkout and build there.
 
 name: receipts-test
 
@@ -61,7 +98,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: receipt-assistant:local
+    # NOT `receipt-assistant:local`. That tag is production's. See rule 2.
+    image: receipt-assistant:sandbox
     container_name: receipt-assistant-test
     depends_on:
       receipts-postgres:
@@ -71,6 +109,10 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
       CLAUDE_CONFIG_DIR: /home/node/.claude
+      # Same variable, same `.env`, same setup-token as production. When set
+      # it is the only thing `claude -p` authenticates with, so the sandbox
+      # needs no credentials file and no `claude /login` of its own.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
       # Test-only: lets stub instruction files ("__stub__": true JSON)
@@ -80,7 +122,7 @@ services:
       LOGODEV_PUBLISHABLE_KEY: ${LOGODEV_PUBLISHABLE_KEY:-}
       LOGODEV_SECRET_KEY: ${LOGODEV_SECRET_KEY:-}
     volumes:
+      # Every source below must be a `test-*` directory. See rule 3.
       - ${HOME}/Developer/receipt-assistant-data/test-uploads:/data
-      - ${HOME}/Developer/receipt-assistant-data/claude:/home/node/.claude
-      - ${HOME}/Developer/receipt-assistant-data/brand-assets:/data/brand-assets
+      - ${HOME}/Developer/receipt-assistant-data/test-claude:/home/node/.claude
     restart: unless-stopped
