@@ -31,6 +31,12 @@ import {
   USER_EDITED_METADATA_PATH,
   type SoftLayer3TxField,
 } from "../projection/layer3.js";
+import {
+  applyClientTxMetadataPatch,
+  metadataDelta,
+  metadataDeltaSql,
+  type JsonObject,
+} from "../projection/metadata-patch.js";
 import { resolvePointsValuation } from "../points/valuation.js";
 
 import { newId } from "../http/uuid.js";
@@ -230,14 +236,21 @@ function pgCode(err: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * The message of the Postgres error itself — the first error in the
+ * `cause` chain that carries a SQLSTATE. Drizzle wraps it in an error
+ * whose own message is the failed statement and its parameters
+ * ("Failed query: commit\nparams: "); that wrapper is not for a client.
+ */
 function pgMessage(err: unknown): string {
-  const parts: string[] = [];
   let cur: any = err;
   while (cur) {
-    if (typeof cur.message === "string") parts.push(cur.message);
+    if (typeof cur.code === "string" && typeof cur.message === "string") {
+      return cur.message;
+    }
     cur = cur.cause;
   }
-  return parts.join(" | ");
+  return "";
 }
 
 /**
@@ -529,6 +542,371 @@ async function loadWorkspaceBaseCurrency(
   return rows[0]!.baseCurrency;
 }
 
+// ── Mutation guards ────────────────────────────────────────────────────
+
+type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Load a transaction head row AND take its row lock for the rest of the
+ * surrounding DB transaction. Every If-Match-guarded mutation in this
+ * file starts here.
+ *
+ * The lock is what makes the If-Match check mean something. Without it
+ * the read and the write are two statements at READ COMMITTED: two
+ * PATCHes carrying the same If-Match both read version N, both pass the
+ * check and both write. It also covers the writers that never send an
+ * If-Match — the FX and points passes `jsonb_set` their provenance into
+ * `metadata` — because `updateTransaction` read-modify-writes that
+ * column: with the lock held, such a pass either lands first (and the
+ * `bump_version` trigger turns the PATCH into a 412) or waits and
+ * applies on top of the committed row. Neither side's write is lost.
+ *
+ * LOCK ORDER: postings before the head row. A mutation that writes or
+ * deletes EXISTING posting rows takes their locks first (`lockPostingRow`
+ * for one posting, `lockPostingRowsOf` for whole transactions), then
+ * this one. See `lockPostingRow` for why.
+ */
+async function lockTransactionRow(tx: DbTx, workspaceId: string, id: string) {
+  const rows = await tx
+    .select()
+    .from(transactions)
+    .where(
+      and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
+    )
+    .for("update");
+  if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
+  return rows[0]!;
+}
+
+/**
+ * Load one posting of a transaction and take its row lock. Call it
+ * BEFORE `lockTransactionRow` — the order is the point.
+ *
+ * The FX and points passes (`src/fx/normalize.ts`,
+ * `src/points/valuation.ts`) write a transaction's postings first, in id
+ * order, and its `metadata` second, in one DB transaction. A posting
+ * PATCH or DELETE that held the head row and then reached for the
+ * posting would meet such a pass head-on: each holds the row the other
+ * needs, and Postgres ends it by aborting one of them after
+ * `deadlock_timeout` — a 500 for the API call, or a silently unconverted
+ * foreign leg when the pass is the one aborted (`normalizeFxSafely`
+ * swallows the error). Taking the posting first puts both writers in the
+ * same order, so one simply waits: the pass lands, its metadata write
+ * bumps the version, and the PATCH answers 412 against the row it can
+ * now see.
+ *
+ * The whole file follows the one rule so no pair of writers can cross:
+ * postings (in id order) before the head row. A hard delete removes the
+ * postings through the FK cascade, which would take them AFTER the head
+ * row, so the delete paths lock them explicitly first
+ * (`lockPostingRowsOf`). Adding a posting takes only the head row: the
+ * new row is nobody else's to wait for.
+ *
+ * Returns null when the transaction has no such posting; the caller
+ * reports that after the head-row checks, so a missing transaction or a
+ * stale If-Match is still what the client hears first.
+ */
+async function lockPostingRow(
+  tx: DbTx,
+  workspaceId: string,
+  txId: string,
+  postingId: string,
+) {
+  const rows = await tx
+    .select()
+    .from(postings)
+    .where(
+      and(
+        eq(postings.id, postingId),
+        eq(postings.transactionId, txId),
+        eq(postings.workspaceId, workspaceId),
+      ),
+    )
+    .for("update");
+  return rows[0] ?? null;
+}
+
+/**
+ * Lock every posting of the given transactions, in id order. For the
+ * paths that delete whole transactions (`deleteTransaction` here, the
+ * cascade in documents.service.ts): call it BEFORE locking the head
+ * rows. See `lockPostingRow` for the rule this keeps.
+ */
+export async function lockPostingRowsOf(
+  tx: DbTx,
+  transactionIds: string[],
+): Promise<void> {
+  if (transactionIds.length === 0) return;
+  await tx
+    .select({ id: postings.id })
+    .from(postings)
+    .where(inArray(postings.transactionId, transactionIds))
+    .orderBy(postings.id)
+    .for("update");
+}
+
+/**
+ * Posting mutations change what a transaction is worth, so they are
+ * refused in the two states where that must not move:
+ *
+ *   - soft-deleted — the row is out of every money query; editing it is
+ *     editing a tombstone. Restore first.
+ *   - reconciled — the amounts were matched to a bank line. The delete
+ *     paths already refuse this state; changing the amounts in place
+ *     breaks the match just as surely. Unreconcile first.
+ */
+function assertPostingsMutable(row: {
+  id: string;
+  status: string;
+  deletedAt: Date | null;
+}): void {
+  if (row.deletedAt !== null) {
+    throw new HttpProblem(
+      409,
+      "transaction-deleted",
+      "Transaction is soft-deleted",
+      `Transaction ${row.id} has deleted_at set; restore it before changing its postings.`,
+      { transaction_id: row.id },
+    );
+  }
+  if (row.status === "reconciled") {
+    throw new HttpProblem(
+      409,
+      "transaction-reconciled",
+      "Transaction is reconciled",
+      `Transaction ${row.id} is reconciled. Unreconcile it first, then change its postings.`,
+      // `transaction_status`, not `status`: problem extras are spread
+      // over the body, and a `status` key there replaces the RFC 7807
+      // HTTP status code with the string "reconciled".
+      { transaction_id: row.id, transaction_status: row.status },
+    );
+  }
+}
+
+/** What the caller said about one posting's money, after the currency
+ *  and native amount have been defaulted from the account / the stored
+ *  row. `fxRate` and `amountBaseMinor` are exactly what was supplied. */
+interface PostingMoneyInput {
+  currency: string;
+  amountMinor: number;
+  fxRate: string | undefined;
+  amountBaseMinor: number | undefined;
+}
+
+const FX_RATE_SHAPE = /^\d+(\.\d+)?([eE][+-]?\d+)?$/;
+/** `postings.fx_rate` is numeric(20,10): ten integer digits, ten
+ *  decimals. A larger value overflows the column; a smaller positive one
+ *  is stored as zero. */
+const FX_RATE_LIMIT = 1e10;
+const FX_RATE_DECIMALS = 10;
+
+/**
+ * The one place a posting's base-currency side is decided, shared by
+ * create, add and update so the three cannot drift.
+ *
+ * `amount_minor` is what the document says; `amount_base_minor` is the
+ * same money in the workspace base currency, and it is the column the
+ * balance trigger and every report sum. The rules keep the pair from
+ * disagreeing silently:
+ *
+ *   - Base currency: the two are the same number by definition. The
+ *     server sets `amount_base_minor = amount_minor` and `fx_rate = NULL`;
+ *     a client-supplied base amount that differs is refused rather than
+ *     stored (it used to be stored, and the trigger — which only sums the
+ *     base column — could not see the disagreement).
+ *   - Foreign cash: `fx_rate` and `amount_base_minor` must arrive
+ *     together. There is no rate source on the request path, so the
+ *     server cannot restate one from the other.
+ *   - Points: an explicit pair wins (a correction, or an import of
+ *     already-valued history); with neither, the server applies the
+ *     programme valuation (#206). `pointsRate` is that valuation in base
+ *     minor units per point, 0 when the programme has none.
+ *
+ * The base amount may round to zero but never points the other way from
+ * the native amount. Whether `amount_base_minor` is numerically
+ * `amount_minor × fx_rate` is NOT checked here: the FX pass settles
+ * rounding residue onto one leg, so the product is only approximate.
+ */
+function resolvePostingMoney(
+  input: PostingMoneyInput,
+  baseCurrency: string,
+  pointsRate: number | undefined,
+  pathPrefix = "",
+): { fxRate: string | null; amountBaseMinor: bigint } {
+  const { currency, amountMinor, fxRate, amountBaseMinor } = input;
+  const at = (field: string): string => `${pathPrefix}${field}`;
+
+  if (currency === baseCurrency) {
+    if (fxRate !== undefined && Number(fxRate) !== 1) {
+      throw new ValidationProblem([
+        {
+          path: at("fx_rate"),
+          code: "unexpected",
+          message:
+            "fx_rate must be omitted when currency equals the workspace base currency",
+        },
+      ]);
+    }
+    if (amountBaseMinor !== undefined && amountBaseMinor !== amountMinor) {
+      throw new ValidationProblem(
+        [
+          {
+            path: at("amount_base_minor"),
+            code: "mismatch",
+            message: `amount_base_minor (${amountBaseMinor}) must equal amount_minor (${amountMinor}) for a ${baseCurrency} posting; omit it and the server sets it`,
+          },
+        ],
+        "Base-currency postings carry one amount",
+      );
+    }
+    return { fxRate: null, amountBaseMinor: BigInt(amountMinor) };
+  }
+
+  const points = isPointsCurrency(currency);
+  if ((fxRate === undefined) !== (amountBaseMinor === undefined)) {
+    throw new ValidationProblem(
+      [
+        {
+          path: at(fxRate === undefined ? "fx_rate" : "amount_base_minor"),
+          code: "required",
+          message: points
+            ? "fx_rate and amount_base_minor must be supplied together, or both omitted to apply the programme valuation"
+            : "fx_rate and amount_base_minor must be supplied together for a non-base-currency posting",
+        },
+      ],
+      "fx_rate and amount_base_minor travel together",
+    );
+  }
+  if (fxRate === undefined || amountBaseMinor === undefined) {
+    if (!points) {
+      throw new ValidationProblem(
+        [
+          {
+            path: at("fx_rate"),
+            code: "required",
+            message: `fx_rate + amount_base_minor required for a ${currency} posting (workspace base currency is ${baseCurrency})`,
+          },
+        ],
+        "Non-base-currency postings must supply fx_rate and amount_base_minor",
+      );
+    }
+    const rate = pointsRate ?? 0;
+    return {
+      fxRate: String(rate),
+      amountBaseMinor: BigInt(Math.round(amountMinor * rate)),
+    };
+  }
+
+  const rate = FX_RATE_SHAPE.test(fxRate) ? Number(fxRate) : NaN;
+  // Judge the rate as the column will hold it. A points programme may be
+  // unvalued (rate 0); a cash rate may not, and that includes one so
+  // small it rounds to zero at the column's ten decimals.
+  const inRange = Number.isFinite(rate) && rate < FX_RATE_LIMIT;
+  const storedAsZero = inRange && Number(rate.toFixed(FX_RATE_DECIMALS)) === 0;
+  if (!inRange || (!points && storedAsZero)) {
+    throw new ValidationProblem([
+      {
+        path: at("fx_rate"),
+        code: "invalid",
+        message: points
+          ? "fx_rate must be a non-negative decimal number below 10^10"
+          : "fx_rate must be a positive decimal number below 10^10, and at least 10^-10",
+      },
+    ]);
+  }
+  if (
+    amountBaseMinor !== 0 &&
+    Math.sign(amountBaseMinor) !== Math.sign(amountMinor)
+  ) {
+    throw new ValidationProblem(
+      [
+        {
+          path: at("amount_base_minor"),
+          code: "sign_mismatch",
+          message: `amount_base_minor (${amountBaseMinor}) must have the same sign as amount_minor (${amountMinor})`,
+        },
+      ],
+      "A posting's native and base amounts must point the same way",
+    );
+  }
+  return { fxRate, amountBaseMinor: BigInt(amountBaseMinor) };
+}
+
+/** Programme valuation for a points currency on a date, in base minor
+ *  units per point; 0 when the programme has none (the visible
+ *  `unvalued` state, never a guessed number). */
+async function pointsRateOn(
+  workspaceId: string,
+  currency: string,
+  baseCurrency: string,
+  onDate: string,
+): Promise<number> {
+  const v = await resolvePointsValuation(
+    workspaceId,
+    currency,
+    baseCurrency,
+    onDate,
+  );
+  return v?.minorPerPoint ?? 0;
+}
+
+/** Workspace-scoped account lookup for a posting; 422 when the id is
+ *  unknown or belongs to another workspace. */
+async function loadPostingAccount(
+  runner: typeof db,
+  workspaceId: string,
+  accountId: string,
+): Promise<{ id: string; currency: string }> {
+  const rows = await runner
+    .select({
+      id: accounts.id,
+      currency: accounts.currency,
+      workspaceId: accounts.workspaceId,
+    })
+    .from(accounts)
+    .where(eq(accounts.id, accountId));
+  const acct = rows[0];
+  if (!acct || acct.workspaceId !== workspaceId) {
+    throw new ValidationProblem([
+      {
+        path: "account_id",
+        code: "not_found",
+        message: `Account ${accountId} not found in workspace`,
+      },
+    ]);
+  }
+  return { id: acct.id, currency: acct.currency };
+}
+
+/** The fields of a posting worth keeping in an audit event. */
+interface PostingAuditSnapshot {
+  account_id: string;
+  amount_minor: number;
+  currency: string;
+  fx_rate: string | null;
+  amount_base_minor: number | null;
+  memo: string | null;
+}
+
+function postingAuditSnapshot(p: {
+  accountId: string;
+  amountMinor: bigint;
+  currency: string;
+  fxRate: string | null;
+  amountBaseMinor: bigint | null;
+  memo: string | null;
+}): PostingAuditSnapshot {
+  return {
+    account_id: p.accountId,
+    amount_minor: Number(p.amountMinor),
+    currency: p.currency,
+    fx_rate: p.fxRate,
+    amount_base_minor:
+      p.amountBaseMinor === null ? null : Number(p.amountBaseMinor),
+    memo: p.memo,
+  };
+}
+
 // ── Create ─────────────────────────────────────────────────────────────
 
 export async function createTransaction(
@@ -602,55 +980,27 @@ export async function createTransaction(
   for (const p of body.postings) {
     const currency = p.currency ?? acctMap.get(p.account_id)!.currency;
     if (!isPointsCurrency(currency) || pointsRates.has(currency)) continue;
-    const v = await resolvePointsValuation(
-      workspaceId,
+    pointsRates.set(
       currency,
-      baseCurrency,
-      body.occurred_on,
+      await pointsRateOn(workspaceId, currency, baseCurrency, body.occurred_on),
     );
-    pointsRates.set(currency, v?.minorPerPoint ?? 0);
   }
 
   const txId = newId();
   const postingInserts: PostingInsert[] = body.postings.map((p, idx) => {
     const acct = acctMap.get(p.account_id)!;
     const currency = p.currency ?? acct.currency;
-    let fxRate: string | null = null;
-    let amountBaseMinor: bigint;
-    if (isPointsCurrency(currency)) {
-      // An explicit client-supplied pair still wins — that is how a
-      // correction or an import of already-valued history gets in.
-      if (p.fx_rate !== undefined && p.amount_base_minor !== undefined) {
-        fxRate = p.fx_rate;
-        amountBaseMinor = BigInt(p.amount_base_minor);
-      } else {
-        const rate = pointsRates.get(currency) ?? 0;
-        fxRate = String(rate);
-        amountBaseMinor = BigInt(Math.round(Number(p.amount_minor) * rate));
-      }
-    } else if (currency === baseCurrency) {
-      if (p.fx_rate !== undefined && p.fx_rate !== "1" && p.fx_rate !== "1.0") {
-        // Allow redundant "1" but otherwise reject.
-        const n = Number(p.fx_rate);
-        if (!Number.isFinite(n) || n !== 1) {
-          throw new ValidationProblem(
-            [{ path: `postings.${idx}.fx_rate`, code: "unexpected", message: "fx_rate must be null when currency equals workspace base currency" }],
-          );
-        }
-      }
-      amountBaseMinor = BigInt(p.amount_base_minor ?? p.amount_minor);
-    } else {
-      if (p.fx_rate === undefined || p.amount_base_minor === undefined) {
-        throw new ValidationProblem(
-          [
-            { path: `postings.${idx}.fx_rate`, code: "required", message: "fx_rate + amount_base_minor required for non-base currency postings" },
-          ],
-          "Non-base-currency postings must supply fx_rate and amount_base_minor",
-        );
-      }
-      fxRate = p.fx_rate;
-      amountBaseMinor = BigInt(p.amount_base_minor);
-    }
+    const money = resolvePostingMoney(
+      {
+        currency,
+        amountMinor: p.amount_minor,
+        fxRate: p.fx_rate,
+        amountBaseMinor: p.amount_base_minor,
+      },
+      baseCurrency,
+      pointsRates.get(currency),
+      `postings.${idx}.`,
+    );
     return {
       id: newId(),
       workspaceId,
@@ -658,8 +1008,8 @@ export async function createTransaction(
       accountId: p.account_id,
       amountMinor: BigInt(p.amount_minor),
       currency,
-      fxRate,
-      amountBaseMinor,
+      fxRate: money.fxRate,
+      amountBaseMinor: money.amountBaseMinor,
       memo: p.memo ?? null,
     };
   });
@@ -893,9 +1243,31 @@ export async function addTransactionItems(
     seen.add(ins.lineNo);
   }
 
+  // The rows and their audit event commit together: a crash between two
+  // autocommitted statements used to leave line items with no
+  // `items_added` event explaining where they came from.
   let inserted;
   try {
-    inserted = await db.insert(transactionItems).values(inserts).returning();
+    inserted = await db.transaction(async (tx) => {
+      const rows = await tx
+        .insert(transactionItems)
+        .values(inserts)
+        .returning();
+      await tx.insert(transactionEvents).values({
+        id: newId(),
+        workspaceId,
+        transactionId: txId,
+        eventType: "items_added",
+        actorId: userId,
+        payload: {
+          source: "manual",
+          extraction_run: run,
+          line_nos: inserts.map((i) => i.lineNo),
+          count: inserts.length,
+        },
+      });
+      return rows;
+    });
   } catch (err) {
     // 23505 on transaction_items_line_no_run_uq — an explicit line_no
     // already exists in the live run. This makes an explicit line_no a
@@ -910,20 +1282,6 @@ export async function addTransactionItems(
     }
     throw err;
   }
-
-  await db.insert(transactionEvents).values({
-    id: newId(),
-    workspaceId,
-    transactionId: txId,
-    eventType: "items_added",
-    actorId: userId,
-    payload: {
-      source: "manual",
-      extraction_run: run,
-      line_nos: inserts.map((i) => i.lineNo),
-      count: inserts.length,
-    },
-  });
 
   const byLine = new Map(inserted.map((r: any) => [Number(r.lineNo), r]));
   return {
@@ -1259,25 +1617,17 @@ export async function updateTransaction(
   patch: UpdateReq,
 ): Promise<TransactionRow> {
   return await db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(transactions)
-      .where(
-        and(
-          eq(transactions.id, id),
-          eq(transactions.workspaceId, workspaceId),
-        ),
-      );
-    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-    const current = rows[0]!;
+    const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
-      // Caller is expected to have pre-checked with requireIfMatch, but
-      // defence-in-depth: race between fetch and update.
+      // The route pre-checks with requireIfMatch on an unlocked read;
+      // this is the check that counts, made under the row lock.
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
 
     const updates: Record<string, unknown> = {};
+    // The audit event records both sides of every field that moved.
     const oldSnap: Record<string, unknown> = {};
+    const newSnap: Record<string, unknown> = {};
     // SOFT Layer-3 fields (see `src/projection/layer3.ts`) — when the
     // user PATCHes one of these, we flag `metadata.user_edited.<field>`
     // so re-extract (#91 Phase 4c) preserves the user value across
@@ -1287,57 +1637,98 @@ export async function updateTransaction(
     if (patch.occurred_on !== undefined) {
       updates.occurredOn = patch.occurred_on;
       oldSnap.occurred_on = current.occurredOn;
+      newSnap.occurred_on = patch.occurred_on;
       userEditedAdditions.occurred_on = true;
     }
     if (patch.occurred_at !== undefined) {
       updates.occurredAt = patch.occurred_at === null ? null : new Date(patch.occurred_at);
       oldSnap.occurred_at = current.occurredAt;
+      newSnap.occurred_at = patch.occurred_at;
       userEditedAdditions.occurred_at = true;
     }
     if (patch.payee !== undefined) {
       updates.payee = patch.payee;
       oldSnap.payee = current.payee;
+      newSnap.payee = patch.payee;
       userEditedAdditions.payee = true;
     }
     if (patch.narration !== undefined) {
       updates.narration = patch.narration;
       oldSnap.narration = current.narration;
+      newSnap.narration = patch.narration;
     }
     if (patch.trip_id !== undefined) {
       updates.tripId = patch.trip_id;
       oldSnap.trip_id = current.tripId;
-    }
-    if (patch.metadata !== undefined) {
-      updates.metadata = patch.metadata;
-      oldSnap.metadata = current.metadata;
+      newSnap.trip_id = patch.trip_id;
     }
 
-    // Merge user_edited flags into the metadata write. If the patch
-    // didn't specify `metadata`, we still need to update it (to add
-    // the flags); if it did, we layer flags on top so they always
-    // win — the user can't accidentally drop their own edit-protection
-    // by sending a `metadata: {}` patch.
+    // `metadata` is a JSON Merge Patch (RFC 7396) over the stored object,
+    // never a replacement: the web client sends `metadata: {}` on every
+    // save, and that must change nothing. See
+    // `src/projection/metadata-patch.ts` for the rules and for which
+    // keys a client may not change.
+    const currentMetadata: JsonObject =
+      current.metadata !== null &&
+      typeof current.metadata === "object" &&
+      !Array.isArray(current.metadata)
+        ? (current.metadata as JsonObject)
+        : {};
+    let nextMetadata = currentMetadata;
+    if (patch.metadata !== undefined) {
+      const applied = applyClientTxMetadataPatch(currentMetadata, patch.metadata);
+      if (applied.refusedKeys.length > 0) {
+        throw new ValidationProblem(
+          applied.refusedKeys.map((k) => ({
+            path: `metadata.${k}`,
+            code: "server_owned",
+            message: `metadata.${k} is maintained by the server and cannot be changed or removed through PATCH`,
+          })),
+          "Patch would change server-owned metadata",
+        );
+      }
+      nextMetadata = applied.next;
+    }
+
+    // The server's own write to `metadata`: flag the soft fields this
+    // PATCH named. Layered on after the client patch, and `user_edited`
+    // is server-owned, so a client can neither forge nor clear a flag.
     if (Object.keys(userEditedAdditions).length > 0) {
-      const currentMetadata =
-        (current.metadata as Record<string, unknown> | null) ?? {};
-      const patchMetadata =
-        (patch.metadata as Record<string, unknown> | undefined) ?? null;
-      const baseMetadata = patchMetadata ?? currentMetadata;
-      const existingUserEdited =
-        (baseMetadata[USER_EDITED_METADATA_PATH] as Record<string, unknown> | undefined) ??
-        (currentMetadata[USER_EDITED_METADATA_PATH] as Record<string, unknown> | undefined) ??
-        {};
-      updates.metadata = {
-        ...baseMetadata,
+      const existing = nextMetadata[USER_EDITED_METADATA_PATH];
+      nextMetadata = {
+        ...nextMetadata,
         [USER_EDITED_METADATA_PATH]: {
-          ...existingUserEdited,
+          ...(existing !== null &&
+          typeof existing === "object" &&
+          !Array.isArray(existing)
+            ? (existing as JsonObject)
+            : {}),
           ...userEditedAdditions,
         },
       };
     }
 
+    // Write the column only when a key actually moved, and log only
+    // those keys: the full object runs to tens of kilobytes (items,
+    // raw_text) and would otherwise be copied into every `updated` event.
+    // In the two picks a key missing from `new` was removed and a key
+    // missing from `old` was added.
+    const delta = metadataDelta(currentMetadata, nextMetadata);
+    if (delta) {
+      // Only the keys that moved are written (`metadataDeltaSql`), over
+      // the stored value — the row is locked, so that is the value read
+      // above. Untouched keys never round-trip through JavaScript.
+      updates.metadata =
+        current.metadata === currentMetadata
+          ? metadataDeltaSql(transactions.metadata, delta)
+          : nextMetadata; // stored value was not an object; replace it
+      oldSnap.metadata = delta.oldValues;
+      newSnap.metadata = delta.newValues;
+    }
+
     if (Object.keys(updates).length === 0) {
-      // No-op patch: still bump the audit trail? No — idempotent no-op.
+      // Nothing to write (empty patch, or `metadata: {}` alone): no
+      // version bump and no event.
       const full = await loadTransactionFull(tx as unknown as typeof db, workspaceId, id);
       return full!;
     }
@@ -1353,7 +1744,7 @@ export async function updateTransaction(
       transactionId: id,
       eventType: "updated",
       actorId: userId,
-      payload: { old: oldSnap, new: patch },
+      payload: { old: oldSnap, new: newSnap },
     });
 
     const full = await loadTransactionFull(tx as unknown as typeof db, workspaceId, id);
@@ -1370,14 +1761,10 @@ export async function deleteTransaction(
   opts: { userId?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(transactions)
-      .where(
-        and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-      );
-    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-    const current = rows[0]!;
+    // The DELETE below takes the postings through the FK cascade; lock
+    // them first so the order is postings, then head row (`lockPostingRow`).
+    await lockPostingRowsOf(tx, [id]);
+    const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
@@ -1389,7 +1776,7 @@ export async function deleteTransaction(
         "cannot-delete-reconciled",
         "Cannot delete reconciled transaction",
         `Transaction ${id} is reconciled. Unreconcile it first, then DELETE.`,
-        { transaction_id: id, status: current.status },
+        { transaction_id: id, transaction_status: current.status },
       );
     }
     await tx.insert(transactionEvents).values({
@@ -1430,14 +1817,7 @@ export async function softDeleteTransaction(
   opts: { userId?: string; reason?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(transactions)
-      .where(
-        and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-      );
-    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-    const current = rows[0]!;
+    const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
@@ -1448,7 +1828,7 @@ export async function softDeleteTransaction(
         "cannot-delete-reconciled",
         "Cannot delete reconciled transaction",
         `Transaction ${id} is reconciled. Unreconcile it first, then delete.`,
-        { transaction_id: id, status: current.status },
+        { transaction_id: id, transaction_status: current.status },
       );
     }
     await tx
@@ -1480,14 +1860,7 @@ export async function restoreTransaction(
   opts: { userId?: string } = {},
 ): Promise<TransactionRow> {
   return await db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(transactions)
-      .where(
-        and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-      );
-    if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-    const current = rows[0]!;
+    const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
     }
@@ -1523,14 +1896,7 @@ export async function reconcileTransaction(
 ): Promise<TransactionRow> {
   return await mapBalanceErrors(async () => {
     return await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-      const current = rows[0]!;
+      const current = await lockTransactionRow(tx, workspaceId, id);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
@@ -1540,7 +1906,7 @@ export async function reconcileTransaction(
           "invalid-state",
           "Cannot reconcile",
           `Transaction ${id} is in status=${current.status}; only 'posted' may be reconciled.`,
-          { transaction_id: id, status: current.status },
+          { transaction_id: id, transaction_status: current.status },
         );
       }
 
@@ -1584,14 +1950,7 @@ export async function unreconcileTransaction(
 ): Promise<TransactionRow> {
   return await mapBalanceErrors(async () => {
     return await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, id), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
-      const current = rows[0]!;
+      const current = await lockTransactionRow(tx, workspaceId, id);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
@@ -1601,7 +1960,7 @@ export async function unreconcileTransaction(
           "invalid-state",
           "Cannot unreconcile",
           `Transaction ${id} is in status=${current.status}; only 'reconciled' may be unreconciled.`,
-          { transaction_id: id, status: current.status },
+          { transaction_id: id, transaction_status: current.status },
         );
       }
 
@@ -1630,6 +1989,15 @@ export async function unreconcileTransaction(
 }
 
 // ── Posting-level mutations ────────────────────────────────────────────
+//
+// All three take the head row's lock, check If-Match under it, refuse a
+// reconciled or soft-deleted transaction (`assertPostingsMutable`), and
+// decide the base-currency side in `resolvePostingMoney`. Update and
+// delete take the posting's own lock before the head row's
+// (`lockPostingRow`) so they queue behind the FX and points passes
+// instead of deadlocking with them. Their audit events carry the values
+// that changed, old and new — a removed posting's amount used to
+// survive nowhere.
 
 export async function addPosting(
   workspaceId: string,
@@ -1639,80 +2007,49 @@ export async function addPosting(
   body: NewPostingT,
 ): Promise<PostingRow> {
   const baseCurrency = await loadWorkspaceBaseCurrency(db, workspaceId);
-
-  const acctRows = await db
-    .select({ id: accounts.id, currency: accounts.currency, workspaceId: accounts.workspaceId })
-    .from(accounts)
-    .where(eq(accounts.id, body.account_id));
-  const acct = acctRows[0];
-  if (!acct || acct.workspaceId !== workspaceId) {
-    throw new ValidationProblem(
-      [{ path: "account_id", code: "not_found", message: `Account ${body.account_id} not found in workspace` }],
-    );
-  }
-
+  const acct = await loadPostingAccount(db, workspaceId, body.account_id);
   const currency = body.currency ?? acct.currency;
-  let fxRate: string | null = null;
-  let amountBaseMinor: bigint;
-  if (isPointsCurrency(currency)) {
-    // Same rule as createTransaction: the server resolves the programme
-    // valuation (#206) rather than making the client know it.
-    if (body.fx_rate !== undefined && body.amount_base_minor !== undefined) {
-      fxRate = body.fx_rate;
-      amountBaseMinor = BigInt(body.amount_base_minor);
-    } else {
-      const header = await db
-        .select({ occurredOn: transactions.occurredOn })
-        .from(transactions)
-        .where(eq(transactions.id, txId));
-      const onDate = header[0]?.occurredOn ?? new Date().toISOString().slice(0, 10);
-      const v = await resolvePointsValuation(
-        workspaceId,
-        currency,
-        baseCurrency,
-        onDate,
-      );
-      const rate = v?.minorPerPoint ?? 0;
-      fxRate = String(rate);
-      amountBaseMinor = BigInt(Math.round(Number(body.amount_minor) * rate));
-    }
-  } else if (currency === baseCurrency) {
-    amountBaseMinor = BigInt(body.amount_base_minor ?? body.amount_minor);
-  } else {
-    if (body.fx_rate === undefined || body.amount_base_minor === undefined) {
-      throw new ValidationProblem([
-        { path: "fx_rate", code: "required", message: "fx_rate + amount_base_minor required for non-base currency postings" },
-      ]);
-    }
-    fxRate = body.fx_rate;
-    amountBaseMinor = BigInt(body.amount_base_minor);
-  }
 
   return await mapBalanceErrors(async () => {
     return await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, txId), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
-      const current = rows[0]!;
+      const current = await lockTransactionRow(tx, workspaceId, txId);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
+      assertPostingsMutable(current);
+
+      // Same rule as createTransaction: for a points leg with no explicit
+      // pair the server resolves the programme valuation (#206), as of
+      // the transaction's own date.
+      const pointsRate =
+        isPointsCurrency(currency) && body.fx_rate === undefined
+          ? await pointsRateOn(workspaceId, currency, baseCurrency, current.occurredOn)
+          : undefined;
+      const money = resolvePostingMoney(
+        {
+          currency,
+          amountMinor: body.amount_minor,
+          fxRate: body.fx_rate,
+          amountBaseMinor: body.amount_base_minor,
+        },
+        baseCurrency,
+        pointsRate,
+      );
 
       const newPostingId = newId();
+      const inserted = {
+        accountId: body.account_id,
+        amountMinor: BigInt(body.amount_minor),
+        currency,
+        fxRate: money.fxRate,
+        amountBaseMinor: money.amountBaseMinor,
+        memo: body.memo ?? null,
+      };
       await tx.insert(postings).values({
         id: newPostingId,
         workspaceId,
         transactionId: txId,
-        accountId: body.account_id,
-        amountMinor: BigInt(body.amount_minor),
-        currency,
-        fxRate,
-        amountBaseMinor,
-        memo: body.memo ?? null,
+        ...inserted,
       });
 
       // Bump parent version via a dummy UPDATE to fire the version trigger.
@@ -1727,7 +2064,10 @@ export async function addPosting(
         transactionId: txId,
         eventType: "posting_added",
         actorId: userId,
-        payload: { posting_id: newPostingId, account_id: body.account_id, amount_minor: body.amount_minor },
+        payload: {
+          posting_id: newPostingId,
+          new: postingAuditSnapshot(inserted),
+        },
       });
 
       const postRows = await tx
@@ -1748,54 +2088,109 @@ export async function updatePosting(
   expectedVersion: number,
   patch: UpdatePostingReq,
 ): Promise<PostingRow> {
+  const baseCurrency = await loadWorkspaceBaseCurrency(db, workspaceId);
+
   return await mapBalanceErrors(async () => {
     return await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, txId), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
-      const current = rows[0]!;
+      // Posting first, head row second: see `lockPostingRow`.
+      const existing = await lockPostingRow(tx, workspaceId, txId, postingId);
+      const current = await lockTransactionRow(tx, workspaceId, txId);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
+      assertPostingsMutable(current);
+      if (!existing) throw new NotFoundProblem("Posting", postingId);
 
-      const existingRows = await tx
-        .select()
-        .from(postings)
-        .where(eq(postings.id, postingId));
-      if (existingRows.length === 0 || existingRows[0]!.transactionId !== txId) {
-        throw new NotFoundProblem("Posting", postingId);
+      const next = {
+        accountId: existing.accountId,
+        amountMinor: existing.amountMinor,
+        currency: existing.currency,
+        fxRate: existing.fxRate,
+        amountBaseMinor: existing.amountBaseMinor,
+        memo: existing.memo,
+      };
+
+      if (patch.account_id !== undefined && patch.account_id !== existing.accountId) {
+        // The FK only proves the account exists somewhere; this proves it
+        // is one of this workspace's. The posting keeps its own currency:
+        // re-categorising a leg does not re-denominate it.
+        await loadPostingAccount(
+          tx as unknown as typeof db,
+          workspaceId,
+          patch.account_id,
+        );
+        next.accountId = patch.account_id;
+      }
+      if (patch.memo !== undefined) next.memo = patch.memo;
+
+      // Any patch that names a money field restates the whole pair, so
+      // `amount_minor` can never move while `amount_base_minor` stays
+      // behind (the balance trigger sums only the base column and would
+      // not notice). A memo- or account-only patch leaves both alone.
+      const touchesMoney =
+        patch.amount_minor !== undefined ||
+        patch.currency !== undefined ||
+        patch.fx_rate !== undefined ||
+        patch.amount_base_minor !== undefined;
+      if (touchesMoney) {
+        const currency = patch.currency ?? existing.currency;
+        const amountMinor = patch.amount_minor ?? Number(existing.amountMinor);
+        const pointsRate =
+          isPointsCurrency(currency) && patch.fx_rate === undefined
+            ? await pointsRateOn(workspaceId, currency, baseCurrency, current.occurredOn)
+            : undefined;
+        const money = resolvePostingMoney(
+          {
+            currency,
+            amountMinor,
+            fxRate: patch.fx_rate,
+            amountBaseMinor: patch.amount_base_minor,
+          },
+          baseCurrency,
+          pointsRate,
+        );
+        next.currency = currency;
+        next.amountMinor = BigInt(amountMinor);
+        next.fxRate = money.fxRate;
+        next.amountBaseMinor = money.amountBaseMinor;
       }
 
-      const updates: Record<string, unknown> = {};
-      if (patch.account_id !== undefined) updates.accountId = patch.account_id;
-      if (patch.amount_minor !== undefined) updates.amountMinor = BigInt(patch.amount_minor);
-      if (patch.currency !== undefined) updates.currency = patch.currency;
-      if (patch.fx_rate !== undefined) updates.fxRate = patch.fx_rate;
-      if (patch.amount_base_minor !== undefined) updates.amountBaseMinor = BigInt(patch.amount_base_minor);
-      if (patch.memo !== undefined) updates.memo = patch.memo;
+      // Diff on the audit shape so the event and the write agree on what
+      // moved. `fx_rate` is compared as a number: the column hands back
+      // "0.1389000000" for a patched "0.1389".
+      const before = postingAuditSnapshot(existing);
+      const after = postingAuditSnapshot(next);
+      const sameRate =
+        before.fx_rate === after.fx_rate ||
+        (before.fx_rate !== null &&
+          after.fx_rate !== null &&
+          Number(before.fx_rate) === Number(after.fx_rate));
+      const changed = (
+        Object.keys(before) as Array<keyof PostingAuditSnapshot>
+      ).filter((k) => (k === "fx_rate" ? !sameRate : before[k] !== after[k]));
 
-      if (Object.keys(updates).length > 0) {
-        await tx.update(postings).set(updates).where(eq(postings.id, postingId));
+      if (changed.length > 0) {
+        await tx.update(postings).set(next).where(eq(postings.id, postingId));
+
+        // Bump parent version.
+        await tx
+          .update(transactions)
+          .set({ updatedAt: new Date() })
+          .where(eq(transactions.id, txId));
+
+        await tx.insert(transactionEvents).values({
+          id: newId(),
+          workspaceId,
+          transactionId: txId,
+          eventType: "posting_updated",
+          actorId: userId,
+          payload: {
+            posting_id: postingId,
+            old: Object.fromEntries(changed.map((k) => [k, before[k]])),
+            new: Object.fromEntries(changed.map((k) => [k, after[k]])),
+          },
+        });
       }
-
-      // Bump parent version.
-      await tx
-        .update(transactions)
-        .set({ updatedAt: new Date() })
-        .where(eq(transactions.id, txId));
-
-      await tx.insert(transactionEvents).values({
-        id: newId(),
-        workspaceId,
-        transactionId: txId,
-        eventType: "posting_updated",
-        actorId: userId,
-        payload: { posting_id: postingId, patch },
-      });
 
       const postRows = await tx
         .select(POSTING_COLUMNS)
@@ -1816,17 +2211,13 @@ export async function deletePosting(
 ): Promise<void> {
   await mapBalanceErrors(async () => {
     await db.transaction(async (tx) => {
-      const rows = await tx
-        .select()
-        .from(transactions)
-        .where(
-          and(eq(transactions.id, txId), eq(transactions.workspaceId, workspaceId)),
-        );
-      if (rows.length === 0) throw new NotFoundProblem("Transaction", txId);
-      const current = rows[0]!;
+      // Posting first, head row second: see `lockPostingRow`.
+      await lockPostingRow(tx, workspaceId, txId, postingId);
+      const current = await lockTransactionRow(tx, workspaceId, txId);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
+      assertPostingsMutable(current);
 
       const allPostings = await tx
         .select()
@@ -1856,7 +2247,9 @@ export async function deletePosting(
         transactionId: txId,
         eventType: "posting_removed",
         actorId: userId,
-        payload: { posting_id: postingId },
+        // The row is gone after this; the event is the only record of
+        // what it was.
+        payload: { posting_id: postingId, old: postingAuditSnapshot(target) },
       });
     });
   });
@@ -1955,25 +2348,29 @@ export async function dismissNearDupFlag(
   txId: string,
 ): Promise<{ id: string; flagged_for_review: boolean; reviewed_at: string } | null> {
   const reviewedAt = new Date().toISOString();
-  const res = await db.execute(sql`
-    UPDATE transactions
-       SET metadata = jsonb_set(
-             jsonb_set(metadata, '{near_dup_check,flagged_for_review}', 'false'::jsonb),
-             '{near_dup_check,reviewed_at}', to_jsonb(${reviewedAt}::text)
-           ),
-           updated_at = NOW()
-     WHERE id = ${txId}::uuid
-       AND workspace_id = ${workspaceId}::uuid
-       AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE
-     RETURNING id`);
-  if (res.rows.length === 0) return null;
-  await db.insert(transactionEvents).values({
-    id: newId(),
-    workspaceId,
-    transactionId: txId,
-    eventType: "near_dup_reviewed",
-    actorId: userId,
-    payload: { action: "dismiss", reviewed_at: reviewedAt },
+  // One DB transaction: the flag flip and the event that explains it
+  // commit together or not at all.
+  return await db.transaction(async (tx) => {
+    const res = await tx.execute(sql`
+      UPDATE transactions
+         SET metadata = jsonb_set(
+               jsonb_set(metadata, '{near_dup_check,flagged_for_review}', 'false'::jsonb),
+               '{near_dup_check,reviewed_at}', to_jsonb(${reviewedAt}::text)
+             ),
+             updated_at = NOW()
+       WHERE id = ${txId}::uuid
+         AND workspace_id = ${workspaceId}::uuid
+         AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE
+       RETURNING id`);
+    if (res.rows.length === 0) return null;
+    await tx.insert(transactionEvents).values({
+      id: newId(),
+      workspaceId,
+      transactionId: txId,
+      eventType: "near_dup_reviewed",
+      actorId: userId,
+      payload: { action: "dismiss", reviewed_at: reviewedAt },
+    });
+    return { id: txId, flagged_for_review: false, reviewed_at: reviewedAt };
   });
-  return { id: txId, flagged_for_review: false, reviewed_at: reviewedAt };
 }

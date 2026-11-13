@@ -65,6 +65,7 @@ import {
   deletePosting,
 } from "./transactions.service.js";
 import { ProblemDetails, paginated, IdParam, Uuid } from "../schemas/v1/common.js";
+import { SERVER_OWNED_TX_METADATA_KEYS } from "../projection/metadata-patch.js";
 
 export const transactionsRouter: Router = Router();
 
@@ -508,6 +509,19 @@ transactionsRouter.post(
 
 // ── OpenAPI registration ───────────────────────────────────────────────
 
+/** Shared prose for the posting add / update endpoints. The rules are
+ *  enforced in `resolvePostingMoney` and `assertPostingsMutable`
+ *  (transactions.service.ts). */
+const POSTING_MUTATION_RULES =
+  "Refused with 409 while the transaction is `reconciled` (`errors/transaction-reconciled` — " +
+  "unreconcile first) or soft-deleted (`errors/transaction-deleted` — restore first).\n\n" +
+  "`amount_minor` and `amount_base_minor` are kept consistent:\n" +
+  "- **Base-currency posting** — the server sets `amount_base_minor = amount_minor` and " +
+  "`fx_rate = null`. Omit both; a different `amount_base_minor` is a 422.\n" +
+  "- **Foreign-cash posting** — `fx_rate` and `amount_base_minor` are required together.\n" +
+  "- **Points posting** — supply both, or neither to apply the programme valuation.\n\n" +
+  "`amount_base_minor` must not have the opposite sign to `amount_minor`.";
+
 export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);
   registry.register("Posting", PostingSchema);
@@ -579,6 +593,20 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/transactions/{id}",
     summary: "Patch transaction head fields",
+    description:
+      "JSON Merge Patch (RFC 7396). A field the body does not name is left alone.\n\n" +
+      "**`metadata` merges, it does not replace.** Objects merge recursively, a `null` value " +
+      "removes that key, any other value replaces it, and `metadata: {}` changes nothing. " +
+      "Send only the keys you mean to change.\n\n" +
+      "**Server-owned metadata keys cannot be changed here.** These are provenance and " +
+      "bookkeeping the server maintains: " +
+      SERVER_OWNED_TX_METADATA_KEYS.map((k) => `\`${k}\``).join(", ") +
+      ". A patch that would change or remove one is refused with 422 (violation code " +
+      "`server_owned`); echoing a key back with its current value is a no-op and is accepted, " +
+      "so a client may GET the object, change its own keys and PATCH the whole object back.\n\n" +
+      "Patching `payee`, `occurred_on` or `occurred_at` sets `metadata.user_edited.<field>`, " +
+      "which keeps re-extract from overwriting the value.\n\n" +
+      "A patch that changes nothing returns 200 without bumping `version`.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -595,6 +623,11 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: TransactionSchema } },
       },
       412: { description: "Version mismatch", content: problemContent },
+      422: {
+        description:
+          "Validation failed, or the patch would change a server-owned metadata key",
+        content: problemContent,
+      },
       428: { description: "If-Match required", content: problemContent },
     },
   });
@@ -732,6 +765,7 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/transactions/{id}/postings",
     summary: "Add a posting to a transaction",
+    description: POSTING_MUTATION_RULES,
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -743,7 +777,14 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         description: "Posting added",
         content: { "application/json": { schema: PostingSchema } },
       },
-      422: { description: "Imbalance", content: problemContent },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description: "Imbalance, unknown account, or inconsistent amounts",
+        content: problemContent,
+      },
     },
   });
 
@@ -804,6 +845,13 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/transactions/{tid}/postings/{pid}",
     summary: "Update a posting",
+    description:
+      POSTING_MUTATION_RULES +
+      "\n\nA patch that names any of `amount_minor`, `currency`, `fx_rate` or " +
+      "`amount_base_minor` restates the whole pair under the rules above, so the native " +
+      "amount cannot change while the base amount stays behind. A patch of only `memo` " +
+      "and/or `account_id` leaves the amounts alone; `account_id` must be an account in " +
+      "this workspace. A patch that changes nothing returns 200 without bumping `version`.",
     tags: ["transactions"],
     request: {
       params: z.object({ tid: Uuid, pid: Uuid }),
@@ -816,6 +864,14 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       200: {
         description: "Updated",
         content: { "application/json": { schema: PostingSchema } },
+      },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description: "Imbalance, unknown account, or inconsistent amounts",
+        content: problemContent,
       },
     },
   });
@@ -831,6 +887,10 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     },
     responses: {
       204: { description: "Deleted" },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
       422: { description: "Would leave <2 postings", content: problemContent },
     },
   });

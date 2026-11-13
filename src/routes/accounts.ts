@@ -7,7 +7,7 @@
  * `problemHandler`.
  *
  */
-import { Router, type Request, type Response, type NextFunction } from "express";
+import express, { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
 import { sql, and, eq, isNull, asc } from "drizzle-orm";
 import {
@@ -17,6 +17,7 @@ import {
 import { db } from "../db/client.js";
 import { accounts, workspaces } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
+import { metadataPatchSet } from "../projection/metadata-patch.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   setEtag,
@@ -33,6 +34,7 @@ import {
   AccountInUseProblem,
   NotFoundProblem,
   ValidationProblem,
+  VersionMismatchProblem,
 } from "../http/problem.js";
 
 import {
@@ -299,7 +301,6 @@ export async function updateAccountService(
   // Verify optimistic-concurrency version (caller already checked the
   // header, but re-check with fresh row in case of race).
   if (current.version !== args.ifMatchVersion) {
-    const { VersionMismatchProblem } = await import("../http/problem.js");
     throw new VersionMismatchProblem(current.version, args.ifMatchVersion);
   }
 
@@ -319,12 +320,14 @@ export async function updateAccountService(
         "Parent account type must match child type",
       );
     }
-    // Cycle check: can't re-parent under a descendant.
+    // Cycle check: can't re-parent under self…
     if (patch.parent_id === id) {
       throw new ValidationProblem(
         [{ path: "parent_id", code: "self_parent", message: "Cannot parent under self" }],
       );
     }
+    // …or under any descendant: checked below, in the same DB
+    // transaction as the write.
   }
 
   const updateVals: Partial<typeof accounts.$inferInsert> = {};
@@ -337,20 +340,83 @@ export async function updateAccountService(
   if (patch.closed_at !== undefined) {
     updateVals.closedAt = patch.closed_at ? new Date(patch.closed_at) : null;
   }
-  if (patch.metadata !== undefined) updateVals.metadata = patch.metadata;
+  // `metadata` is a JSON Merge Patch (RFC 7396) over the stored object,
+  // same as on transactions: `{}` changes nothing, `null` removes a key.
+  // Written as a jsonb expression naming only the keys that moved; the
+  // version predicate below pins it to the row read above.
+  if (patch.metadata !== undefined) {
+    const set = metadataPatchSet(accounts.metadata, current.metadata, patch.metadata);
+    if (set !== undefined) updateVals.metadata = set;
+  }
 
   if (Object.keys(updateVals).length === 0) {
     // No-op patch: return current.
     return rowToDto(current);
   }
 
-  await db
-    .update(accounts)
-    .set(updateVals)
-    .where(and(eq(accounts.workspaceId, workspaceId), eq(accounts.id, id)));
+  const newParentId = patch.parent_id ?? null;
+  const written = await db.transaction(async (tx) => {
+    if (newParentId !== null) {
+      // One re-parent at a time per workspace. The descendant check reads
+      // other accounts' parent pointers, and the version predicate on the
+      // write only pins THIS row: without the lock, "put X under Y" and
+      // "put Y under X" sent together each pass the check against the
+      // other's old parent, and both commit — a two-node cycle. The lock
+      // is released at commit, so the second request walks the tree the
+      // first one left and is refused.
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`accounts.reparent:${workspaceId}`}, 0))`,
+      );
+      // Walk UP from the proposed parent; meeting this account on the way
+      // means the new parent sits inside its own subtree. `UNION` (not
+      // `UNION ALL`) so the walk terminates even if a cycle already
+      // exists in the data.
+      const loop = await tx.execute(sql`
+        WITH RECURSIVE ancestors(id, parent_id) AS (
+          SELECT id, parent_id FROM accounts
+           WHERE workspace_id = ${workspaceId}::uuid AND id = ${newParentId}::uuid
+          UNION
+          SELECT a.id, a.parent_id FROM accounts a
+            JOIN ancestors c ON a.id = c.parent_id
+           WHERE a.workspace_id = ${workspaceId}::uuid
+        )
+        SELECT 1 FROM ancestors WHERE id = ${id}::uuid LIMIT 1`);
+      if (loop.rows.length > 0) {
+        throw new ValidationProblem(
+          [
+            {
+              path: "parent_id",
+              code: "cycle",
+              message: `Account ${newParentId} is a descendant of ${id}; re-parenting under it would create a cycle`,
+            },
+          ],
+          "Cannot parent an account under its own descendant",
+        );
+      }
+    }
+
+    // The version predicate makes check-and-write one statement: of two
+    // PATCHes carrying the same If-Match, the second matches no row (the
+    // trigger has bumped `version`) and gets a 412 instead of silently
+    // overwriting the first.
+    return await tx
+      .update(accounts)
+      .set(updateVals)
+      .where(
+        and(
+          eq(accounts.workspaceId, workspaceId),
+          eq(accounts.id, id),
+          eq(accounts.version, args.ifMatchVersion),
+        ),
+      )
+      .returning({ id: accounts.id });
+  });
 
   const updated = await fetchAccount(workspaceId, id);
   if (!updated) throw new NotFoundProblem("Account", id);
+  if (written.length === 0) {
+    throw new VersionMismatchProblem(Number(updated.version), args.ifMatchVersion);
+  }
   return rowToDto(updated);
 }
 
@@ -364,7 +430,6 @@ export async function deleteAccountService(
   const current = await fetchAccount(workspaceId, id);
   if (!current) throw new NotFoundProblem("Account", id);
   if (current.version !== ifMatchVersion) {
-    const { VersionMismatchProblem } = await import("../http/problem.js");
     throw new VersionMismatchProblem(current.version, ifMatchVersion);
   }
 
@@ -399,17 +464,35 @@ export async function getBalanceService(
 
   const asOf =
     args.asOf ?? new Date().toISOString().slice(0, 10); // today in UTC
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  // The sum below is over `amount_base_minor`, so the figure is in the
+  // workspace base currency whatever the caller asks for. It used to be
+  // labelled with the requested currency instead — the same number
+  // presented as EUR, JPY, anything. There is no conversion on this
+  // path, so a different currency is refused rather than mislabelled.
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
+  if (args.currency !== undefined && args.currency !== currency) {
+    throw new ValidationProblem(
+      [
+        {
+          path: "currency",
+          code: "unsupported",
+          message: `Balances are summed in the workspace base currency (${currency}); conversion to ${args.currency} is not available`,
+        },
+      ],
+      "Balance is only available in the workspace base currency",
+    );
+  }
 
   // Gather relevant account IDs: either just this one, or the subtree.
+  // `UNION`, not `UNION ALL`: it deduplicates, so the recursion ends even
+  // if the parent chain ever contains a cycle.
   const result = await db.execute(
     args.includeChildren
       ? sql`
           WITH RECURSIVE subtree(id) AS (
             SELECT id FROM accounts
               WHERE workspace_id = ${args.workspaceId}::uuid AND id = ${args.accountId}::uuid
-            UNION ALL
+            UNION
             SELECT a.id FROM accounts a
               JOIN subtree s ON a.parent_id = s.id
               WHERE a.workspace_id = ${args.workspaceId}::uuid
@@ -491,8 +574,12 @@ export async function getRegisterService(
   const statusFilter = args.includeDeleted
     ? sql`AND t.status IN ('posted', 'reconciled')`
     : sql`AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL`;
+  // `from` trims what is SHOWN, not what is summed: it is applied in the
+  // outer query, after the window, so the first visible row's running
+  // balance still includes everything before `from`. Inside the CTE it
+  // restarted the balance at zero on the first day of the range.
   const fromFilter = args.from
-    ? sql`AND t.occurred_on >= ${args.from}::date`
+    ? sql`AND occurred_on >= ${args.from}::date`
     : sql``;
   const toFilter = args.to
     ? sql`AND t.occurred_on <= ${args.to}::date`
@@ -530,12 +617,12 @@ export async function getRegisterService(
       WHERE p.workspace_id = ${args.workspaceId}::uuid
         AND p.account_id = ${args.accountId}::uuid
         ${statusFilter}
-        ${fromFilter}
         ${toFilter}
     )
     SELECT *
       FROM all_rows
      WHERE 1 = 1
+       ${fromFilter}
        ${cursorFilter}
      ORDER BY occurred_on DESC, posting_id DESC
      LIMIT ${limit + 1}
@@ -674,6 +761,14 @@ export async function getRegisterService(
 // ── Router ──────────────────────────────────────────────────────────────
 
 export const accountsRouter: Router = Router();
+
+// Parse `application/merge-patch+json` bodies. PATCH /:id documents that
+// content type, but the app-level `express.json()` only covers
+// `application/json` — a merge-patch request arrived with no body, was
+// read as an empty patch, and returned 200 having changed nothing.
+accountsRouter.use(
+  express.json({ type: "application/merge-patch+json", limit: "1mb" }),
+);
 
 accountsRouter.get(
   "/",
@@ -860,6 +955,10 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/accounts/{id}",
     summary: "Patch account (rename / re-parent / close)",
+    description:
+      "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
+      "replacing it (`null` removes a key, `{}` changes nothing). `parent_id` may not be the " +
+      "account itself or any of its descendants.",
     tags: ["accounts"],
     request: {
       params: IdParam,
@@ -910,6 +1009,10 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/accounts/{id}/balance",
     summary: "Account balance as of a date",
+    description:
+      "Sum of `amount_base_minor` over the account's live postings, so `balance_minor` is " +
+      "always in the workspace base currency and `currency` says which that is. There is no " +
+      "conversion on this path: `?currency=` is accepted only when it equals the base currency.",
     tags: ["accounts"],
     request: { params: IdParam, query: BalanceQuery },
     responses: {
@@ -918,6 +1021,10 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: AccountBalance } },
       },
       404: { description: "Account not found", ...problemResponse },
+      422: {
+        description: "`currency` is not the workspace base currency",
+        ...problemResponse,
+      },
     },
   });
 
@@ -925,6 +1032,10 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/accounts/{id}/register",
     summary: "Register (checkbook view) with running balance",
+    description:
+      "`running_balance_after_minor` is the account's balance after that posting, counted " +
+      "from the account's first posting. `from` limits which rows are returned, not what the " +
+      "balance includes.",
     tags: ["accounts"],
     request: { params: IdParam, query: RegisterQuery },
     responses: {

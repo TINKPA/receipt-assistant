@@ -8,6 +8,7 @@ import {
   IsoDate,
   IsoDateTime,
   Metadata,
+  MetadataPatch,
   Uuid,
 } from "./common.js";
 
@@ -72,7 +73,8 @@ export const UpdateAccountRequest = z
     last4: z.string().nullable().optional(),
     parent_id: Uuid.nullable().optional(),
     closed_at: IsoDateTime.nullable().optional(),
-    metadata: Metadata.optional(),
+    /** Merge patch, not a replacement — see `MetadataPatch`. */
+    metadata: MetadataPatch.optional(),
   })
   .strict()
   .openapi("UpdateAccountRequest");
