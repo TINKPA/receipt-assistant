@@ -34,6 +34,7 @@ import {
   type DecodedAttachment,
 } from "../ingest/document-read-prompt.js";
 import { buildInfo } from "../generated/build-info.js";
+import { liveTransactions } from "../db/live.js";
 
 export type DocumentKindValue =
   | "receipt_image"
@@ -1107,7 +1108,11 @@ export interface ReExtractDocumentResult {
  * Contract:
  *   - Resolves the linked transaction via `document_links`. If the
  *     document has zero links or more than one, returns null (404) or
- *     422 respectively — re-extract is per-tx and we don't pick.
+ *     422 respectively — re-extract is per-tx and we don't pick. One
+ *     case is not a choice: when exactly one of several linked
+ *     transactions is live, that is the one. A receipt re-uploaded after
+ *     its transaction was deleted is extracted again, and its document
+ *     then links to the deleted row and to the new one.
  *   - Snapshots Layer-2 tx fields BEFORE spawning the agent. The agent
  *     writes the UPDATE itself (Layer-3 CASE shielding lives in the
  *     prompt). After the agent returns we snapshot again, diff, and
@@ -1193,6 +1198,23 @@ export async function reExtractDocument(
     );
   }
   let transactionId: string;
+  // Only consulted when the caller did not choose and there is more
+  // than one link: the linked transactions that are LIVE. A link to a
+  // soft-deleted transaction is history (the row a re-upload replaced,
+  // or a duplicate whose undo has not been run), not a second candidate.
+  const liveLinked =
+    linkRows.length > 1 && !options.transactionId
+      ? (
+          (
+            await db.execute(sql`
+              SELECT t.id
+                FROM document_links dl
+                JOIN ${liveTransactions} t ON t.id = dl.transaction_id
+               WHERE dl.document_id = ${documentId}::uuid
+                 AND t.workspace_id = ${workspaceId}::uuid`)
+          ).rows as Array<{ id: string }>
+        ).map((r) => r.id)
+      : [];
   if (linkRows.length === 1) {
     transactionId = linkRows[0]!.transactionId;
   } else if (
@@ -1202,6 +1224,8 @@ export async function reExtractDocument(
     // Multi-link documents are no longer a dead end (#167): the caller
     // names which transaction to re-derive via `?transaction_id=`.
     transactionId = options.transactionId;
+  } else if (liveLinked.length === 1) {
+    transactionId = liveLinked[0]!;
   } else {
     throw new HttpProblem(
       422,

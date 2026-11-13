@@ -18,6 +18,7 @@ import { and, eq, sql } from "drizzle-orm";
 import * as path from "path";
 import { readFile } from "fs/promises";
 import { db } from "../db/client.js";
+import { liveTransactions } from "../db/live.js";
 import { batches, ingests } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import {
@@ -349,6 +350,9 @@ export interface IncomingFile {
   bytes: Buffer;
 }
 
+/** Tail of the per-workspace upload chain (see `createBatchFromFiles`). */
+const seedChains = new Map<string, Promise<unknown>>();
+
 /**
  * Drive the whole upload pipeline for a batch:
  *   1. Persist every file to disk (once per sha, via the existing
@@ -360,8 +364,50 @@ export interface IncomingFile {
  * We want an `ingests` row for every file even if its document was a
  * sha256 dedup hit — the ingest is the audit trail for "I tried to
  * process this file today", independent of document storage.
+ *
+ * One request at a time per workspace. The L1 decision below is
+ * check-then-insert: "is a transaction live for these bytes, or an
+ * ingest in flight?" is answered first, and the `queued` ingest row that
+ * makes the answer "yes" for everyone else is written only after the
+ * whole request has been probed. Two requests carrying the same bytes
+ * within that window both read "no" and both extract. For bytes that
+ * already have a live transaction the first probe answers on its own, so
+ * the window only matters when there is none: a first upload, or a
+ * re-upload after the transaction was deleted — which extracts again
+ * since the probe learned what a soft delete is, and so made the window
+ * reachable for every deleted receipt. Serializing the probe and the
+ * insert closes it. In-process is enough: the queue the ingests go onto
+ * lives in this process too (`worker.ts`).
  */
-export async function createBatchFromFiles(params: {
+export function createBatchFromFiles(params: {
+  workspaceId: string;
+  files: IncomingFile[];
+  autoReconcile: boolean;
+}): Promise<{
+  batch: BatchSummaryRow;
+  items: Array<{ ingestId: string; filename: string; mime_type: string | null }>;
+}> {
+  const prev = seedChains.get(params.workspaceId) ?? Promise.resolve();
+  // `prev` is always a tail (below), and a tail never rejects.
+  const run = prev.then(() => seedBatchFromFiles(params));
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  seedChains.set(params.workspaceId, tail);
+  // Drop the entry once this request is the last one in line, so the
+  // map does not keep one settled promise per workspace forever.
+  void tail.then(() => {
+    if (seedChains.get(params.workspaceId) === tail) {
+      seedChains.delete(params.workspaceId);
+    }
+  });
+  return run;
+}
+
+/** The body of `createBatchFromFiles`; runs inside the per-workspace
+ *  critical section. */
+async function seedBatchFromFiles(params: {
   workspaceId: string;
   files: IncomingFile[];
   autoReconcile: boolean;
@@ -443,8 +489,8 @@ export async function createBatchFromFiles(params: {
     // when it matches a live transaction, OR a sibling ingest still in
     // flight (another request, or an earlier file in THIS request). The
     // only `!created` case we still extract is a genuine restore: prior
-    // transaction voided/errored, nothing live and nothing in flight
-    // (findLiveTransactionForDocument deliberately ignores voided links).
+    // transaction deleted/errored, nothing live and nothing in flight
+    // (findLiveTransactionForDocument ignores links to deleted rows).
     let bornDedup = false;
     let dedupOf: string | null = null;
     if (!created) {
@@ -558,12 +604,15 @@ export async function createBatchFromFiles(params: {
 }
 
 /**
- * L1 dedup probe (#124). Returns the id of a LIVE transaction (posted or
- * reconciled) already linked to `documentId`, or null if none. A `voided`
- * or `draft` link must NOT suppress a re-ingest — the user may be
- * re-uploading precisely because the prior transaction was voided. One
- * O(ms) indexed lookup per dedup-hit file; `document_links_txn_idx` +
- * the documents PK keep it cheap.
+ * L1 dedup probe (#124). Returns the id of a LIVE transaction already
+ * linked to `documentId`, or null if none. A link to a soft-deleted or
+ * `draft` transaction must NOT suppress a re-ingest — the user may be
+ * re-uploading precisely because the prior transaction was wrong and
+ * they deleted it. Reads through `ledger_live_transactions`: a
+ * soft-deleted row keeps status `posted`, so the status filter this used
+ * to carry closed such a re-upload as "identical file already linked to
+ * a transaction" and the receipt never extracted again. One O(ms)
+ * lookup per dedup-hit file.
  */
 async function findLiveTransactionForDocument(
   workspaceId: string,
@@ -572,11 +621,10 @@ async function findLiveTransactionForDocument(
   const res = await db.execute(sql`
     SELECT t.id
       FROM document_links dl
-      JOIN transactions t ON t.id = dl.transaction_id
+      JOIN ${liveTransactions} t ON t.id = dl.transaction_id
      WHERE dl.document_id = ${documentId}::uuid
        AND t.workspace_id = ${workspaceId}::uuid
-       AND t.status IN ('posted', 'reconciled')
-     ORDER BY t.created_at ASC
+     ORDER BY t.created_at ASC, t.id ASC
      LIMIT 1
   `);
   const row = res.rows[0] as { id: string } | undefined;

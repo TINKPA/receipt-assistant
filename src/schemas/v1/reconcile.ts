@@ -19,8 +19,26 @@ export const ReconcileKind = z
   .enum(["dedup", "payment_link", "trip_group", "inventory"])
   .openapi("ReconcileKind");
 
+/**
+ * Proposal lifecycle:
+ *
+ *   proposed     — waiting for a decision
+ *   auto_applied — applied by the engine (score at or above the threshold)
+ *   user_applied — applied through `/reconcile/apply`
+ *   rejected     — declined through `/reconcile/reject`; ledger untouched
+ *   reverted     — was applied, then taken back through `/reconcile/undo`
+ *   stale        — closed by the engine because a transaction it names is
+ *                  no longer live; ledger untouched
+ */
 export const ReconcileProposalStatus = z
-  .enum(["proposed", "auto_applied", "user_applied", "rejected"])
+  .enum([
+    "proposed",
+    "auto_applied",
+    "user_applied",
+    "rejected",
+    "reverted",
+    "stale",
+  ])
   .openapi("ReconcileProposalStatus");
 
 export const ReconcileScope = z
@@ -33,7 +51,13 @@ export const ReconcileScope = z
  * A single reconcile finding.
  *
  * `payload` shape by kind:
- *   dedup         → { duplicate_of: <txn_id>, duplicate: <txn_id>, key: {...} }
+ *   dedup         → { duplicate: <txn_id>, duplicate_of: <txn_id>,
+ *                     pass: "in_batch" | "cross_batch", key: {...},
+ *                     reasons: [...] }
+ *                   plus, once applied, `applied: { at, by, via,
+ *                   duplicate_prior_status, links: [{ document_id,
+ *                   linked_at, canonical_had_link }] }` — the record undo
+ *                   reads — and `reverted` / `stale` once those happen.
  *   payment_link  → (stubbed) never emitted in Phase 2a
  *   inventory     → (stubbed) never emitted in Phase 2a
  *   trip_group    → (stubbed) never emitted in Phase 2a
@@ -100,6 +124,12 @@ export const RejectRequest = z
   })
   .openapi("RejectRequest");
 
+export const UndoRequest = z
+  .object({
+    proposal_ids: z.array(Uuid).min(1),
+  })
+  .openapi("UndoRequest");
+
 // ── Response shapes ───────────────────────────────────────────────────
 
 export const ReconcileBatchStatus = z
@@ -145,3 +175,34 @@ export const RejectResult = z
     ),
   })
   .openapi("RejectResult");
+
+export const UndoneProposal = z
+  .object({
+    id: Uuid,
+    /** The duplicate that was removed by the apply and is live again. */
+    transaction_id: Uuid,
+    /** The transaction that had absorbed its documents. */
+    canonical_id: Uuid,
+    /** False when the transaction had already been restored by other
+     *  means; its documents are still moved back. */
+    restored: z.boolean(),
+    documents_relinked: z.array(Uuid),
+    documents_removed_from_canonical: z.array(Uuid),
+    /** `recorded`: the apply stored which links it moved. `inferred`: the
+     *  proposal predates that record and the links were rebuilt from
+     *  ingest history and link timestamps. */
+    links_source: z.enum(["recorded", "inferred"]),
+  })
+  .openapi("UndoneProposal");
+
+export const UndoResult = z
+  .object({
+    reverted: z.array(UndoneProposal),
+    skipped: z.array(
+      z.object({
+        id: Uuid,
+        reason: z.string(),
+      }),
+    ),
+  })
+  .openapi("UndoResult");

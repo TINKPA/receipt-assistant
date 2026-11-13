@@ -5,6 +5,7 @@
  *   GET    /v1/batches/:id/reconcile          — latest result
  *   POST   /v1/batches/:id/reconcile/apply    — accept proposal(s)
  *   POST   /v1/batches/:id/reconcile/reject   — reject proposal(s)
+ *   POST   /v1/batches/:id/reconcile/undo     — take back applied proposal(s)
  *
  * Mounted from `src/app.ts` at `/v1/batches` via a separate router. The
  * path shape `POST /v1/batches/:id/reconcile` cannot be colocated on
@@ -12,7 +13,7 @@
  * GET handler's param parsing; keeping a sibling router is simpler and
  * leaves the ingest module owned by #32 Phase 1.
  *
- * All four endpoints delegate to `src/reconcile/engine.ts`. The route
+ * All five endpoints delegate to `src/reconcile/engine.ts`. The route
  * layer only handles HTTP details: param parsing, status-code mapping
  * (200 when idempotent replay, 201 on first-time reconcile, 202 when
  * the batch is mid-reconcile on another caller's thread), and OpenAPI
@@ -31,12 +32,15 @@ import {
   ReconcileResult,
   RejectRequest,
   RejectResult,
+  UndoRequest,
+  UndoResult,
 } from "../schemas/v1/reconcile.js";
 import {
   applyProposals,
   getReconcileResult,
   rejectProposals,
   runReconcile,
+  undoProposals,
 } from "../reconcile/engine.js";
 
 function asyncHandler(
@@ -138,6 +142,28 @@ reconcileRouter.post(
   }),
 );
 
+// ── POST /v1/batches/:id/reconcile/undo ───────────────────────────────
+//
+// The inverse of apply, for a proposal in `auto_applied` / `user_applied`:
+// the duplicate is restored and the documents the apply moved to the
+// surviving transaction go back to it, in one database transaction. The
+// proposal ends `reverted` and the pair is not proposed again.
+
+reconcileRouter.post(
+  "/:id/reconcile/undo",
+  asyncHandler(async (req, res) => {
+    const { id: batchId } = parseOrThrow(BatchIdParams, req.params);
+    const body = parseOrThrow(UndoRequest, req.body ?? {});
+    const out = await undoProposals({
+      workspaceId: req.ctx.workspaceId,
+      userId: req.ctx.userId,
+      batchId,
+      proposalIds: body.proposal_ids,
+    });
+    res.json(out);
+  }),
+);
+
 // ── OpenAPI registration ──────────────────────────────────────────────
 
 export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
@@ -147,6 +173,8 @@ export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
   registry.register("ApplyResult", ApplyResult);
   registry.register("RejectRequest", RejectRequest);
   registry.register("RejectResult", RejectResult);
+  registry.register("UndoRequest", UndoRequest);
+  registry.register("UndoResult", UndoResult);
 
   const problemContent = {
     "application/problem+json": { schema: ProblemDetails },
@@ -203,7 +231,7 @@ export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/batches/{id}/reconcile/apply",
     summary:
-      "Apply one or more reconcile proposals. For dedup proposals this voids the duplicate via the ledger service.",
+      "Apply one or more reconcile proposals. For a dedup proposal this moves the duplicate's document links to the surviving transaction and soft-deletes the duplicate, in one database transaction, and records which links moved so the apply can be undone. Refused (listed under `skipped`) when either transaction is no longer live, when the duplicate is reconciled, or when the two moved money in opposite directions.",
     tags: ["reconcile"],
     request: {
       params: z.object({ id: Uuid }),
@@ -233,6 +261,26 @@ export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
       200: {
         description: "Per-id reject/skip outcomes",
         content: { "application/json": { schema: RejectResult } },
+      },
+      404: { description: "Batch not found", content: problemContent },
+      422: { description: "Validation failed", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "post",
+    path: "/v1/batches/{id}/reconcile/undo",
+    summary:
+      "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
+    tags: ["reconcile"],
+    request: {
+      params: z.object({ id: Uuid }),
+      body: { content: { "application/json": { schema: UndoRequest } } },
+    },
+    responses: {
+      200: {
+        description: "Per-id undo/skip outcomes",
+        content: { "application/json": { schema: UndoResult } },
       },
       404: { description: "Batch not found", content: problemContent },
       422: { description: "Validation failed", content: problemContent },

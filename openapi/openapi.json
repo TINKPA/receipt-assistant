@@ -4010,7 +4010,9 @@
           "proposed",
           "auto_applied",
           "user_applied",
-          "rejected"
+          "rejected",
+          "reverted",
+          "stale"
         ]
       },
       "ReconcileProposal": {
@@ -4204,6 +4206,113 @@
         },
         "required": [
           "rejected",
+          "skipped"
+        ]
+      },
+      "UndoRequest": {
+        "type": "object",
+        "properties": {
+          "proposal_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "proposal_ids"
+        ]
+      },
+      "UndoneProposal": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "canonical_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "restored": {
+            "type": "boolean"
+          },
+          "documents_relinked": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "documents_removed_from_canonical": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "links_source": {
+            "type": "string",
+            "enum": [
+              "recorded",
+              "inferred"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "transaction_id",
+          "canonical_id",
+          "restored",
+          "documents_relinked",
+          "documents_removed_from_canonical",
+          "links_source"
+        ]
+      },
+      "UndoResult": {
+        "type": "object",
+        "properties": {
+          "reverted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UndoneProposal"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "reason"
+              ]
+            }
+          }
+        },
+        "required": [
+          "reverted",
           "skipped"
         ]
       },
@@ -9746,7 +9855,7 @@
     },
     "/v1/batches/{id}/reconcile/apply": {
       "post": {
-        "summary": "Apply one or more reconcile proposals. For dedup proposals this voids the duplicate via the ledger service.",
+        "summary": "Apply one or more reconcile proposals. For a dedup proposal this moves the duplicate's document links to the surviving transaction and soft-deletes the duplicate, in one database transaction, and records which links moved so the apply can be undone. Refused (listed under `skipped`) when either transaction is no longer live, when the duplicate is reconciled, or when the two moved money in opposite directions.",
         "tags": [
           "reconcile"
         ],
@@ -9839,6 +9948,67 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RejectResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/batches/{id}/reconcile/undo": {
+      "post": {
+        "summary": "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UndoRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-id undo/skip outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UndoResult"
                 }
               }
             }
