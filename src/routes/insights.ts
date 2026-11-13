@@ -10,7 +10,7 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
-import { sql, eq, and, isNull, desc } from "drizzle-orm";
+import { eq, and, isNull, desc } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { insights } from "../schema/index.js";
 import { parseOrThrow } from "../http/validate.js";

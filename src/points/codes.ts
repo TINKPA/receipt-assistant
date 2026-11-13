@@ -42,9 +42,6 @@
 /** Points/miles unit, e.g. `HYATT_PT`, `AA_PT`, `BONVOY_PT`. */
 export const POINTS_CURRENCY_RE = /^[A-Z][A-Z0-9]{1,12}_PT$/;
 
-/** Cash currency, ISO 4217. */
-export const CASH_CURRENCY_RE = /^[A-Z]{3}$/;
-
 /**
  * The points pattern as a POSIX regex string, for use as a **bound
  * parameter** in SQL (`WHERE currency ~ ${POINTS_CURRENCY_SQL_RE}`).
@@ -55,8 +52,4 @@ export const POINTS_CURRENCY_SQL_RE = "^[A-Z][A-Z0-9]{1,12}_PT$";
 
 export function isPointsCurrency(code: string): boolean {
   return POINTS_CURRENCY_RE.test(code);
-}
-
-export function isCashCurrency(code: string): boolean {
-  return CASH_CURRENCY_RE.test(code);
 }

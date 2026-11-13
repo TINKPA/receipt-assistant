@@ -1,7 +1,6 @@
 node_modules/
 dist/
 /data/
-*.db
 .DS_Store
 
 # Build artifact — rewritten by scripts/generate-build-info.mjs on every

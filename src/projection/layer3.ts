@@ -28,9 +28,11 @@
  *    re-extract reads this allowlist via `isFieldUserEdited` and
  *    skips the field on the UPDATE.
  *
- * The wire-up for the SOFT path lives in Phase 4c. This module
- * exports the contract so both `updateTransaction` and the future
- * `reExtractDocument` service read from one source of truth.
+ * Writer: `updateTransaction` in `src/routes/transactions.service.ts`
+ * takes its field type and metadata key from here. Reader: the
+ * re-extract UPDATE in `src/ingest/reextract-prompt.ts`, which spells
+ * the same three fields out as SQL CASE expressions — keep the two in
+ * step when this list changes.
  */
 
 /**
@@ -80,8 +82,8 @@ export const HARD_LAYER3_TX_FIELDS = [
  *
  * Set by `updateTransaction` whenever the PATCH body specifies a
  * value for a SOFT-Layer-3 field. Read by re-extract via
- * `isFieldUserEdited`. Phase 4c wires both sides; 91b only
- * publishes the convention.
+ * the CASE expressions in the re-extract prompt (and by
+ * `isFieldUserEdited` for any TypeScript caller).
  *
  * Why a flag set rather than per-field timestamps: the only thing
  * re-extract needs to know is "has the user touched this." Time

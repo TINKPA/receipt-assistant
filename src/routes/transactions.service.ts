@@ -27,6 +27,10 @@ import {
 } from "../schema/index.js";
 import { loadPlacesByIds, type PlaceRow } from "./places.service.js";
 import { isPointsCurrency } from "../points/codes.js";
+import {
+  USER_EDITED_METADATA_PATH,
+  type SoftLayer3TxField,
+} from "../projection/layer3.js";
 import { resolvePointsValuation } from "../points/valuation.js";
 
 import { newId } from "../http/uuid.js";
@@ -1279,7 +1283,7 @@ export async function updateTransaction(
     // so re-extract (#91 Phase 4c) preserves the user value across
     // a re-OCR. Builds up alongside the column updates and is merged
     // into the final `metadata` update below.
-    const userEditedAdditions: Record<string, true> = {};
+    const userEditedAdditions: Partial<Record<SoftLayer3TxField, true>> = {};
     if (patch.occurred_on !== undefined) {
       updates.occurredOn = patch.occurred_on;
       oldSnap.occurred_on = current.occurredOn;
@@ -1320,12 +1324,12 @@ export async function updateTransaction(
         (patch.metadata as Record<string, unknown> | undefined) ?? null;
       const baseMetadata = patchMetadata ?? currentMetadata;
       const existingUserEdited =
-        (baseMetadata.user_edited as Record<string, unknown> | undefined) ??
-        (currentMetadata.user_edited as Record<string, unknown> | undefined) ??
+        (baseMetadata[USER_EDITED_METADATA_PATH] as Record<string, unknown> | undefined) ??
+        (currentMetadata[USER_EDITED_METADATA_PATH] as Record<string, unknown> | undefined) ??
         {};
       updates.metadata = {
         ...baseMetadata,
-        user_edited: {
+        [USER_EDITED_METADATA_PATH]: {
           ...existingUserEdited,
           ...userEditedAdditions,
         },

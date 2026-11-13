@@ -56,7 +56,7 @@ Everything runs in Docker — there is no `npm run dev` on the host.
 ### Prerequisites
 
 - Docker Desktop (or Docker Engine) with Compose v2
-- A Claude Code subscription (Pro / Max / Team / Enterprise) to log in with
+- A Claude Code subscription (Pro / Max / Team / Enterprise), and the `claude` CLI on some machine to mint a token with
 
 ### 1. Bring everything up
 
@@ -82,19 +82,16 @@ curl http://localhost:3000/health
 # { "status": "ok", "service": "receipt-assistant", "version": "1.0.0" }
 ```
 
-### 2. Log the container into Claude (one-time)
+### 2. Give the container a Claude token (one-time)
 
-The container holds its own OAuth session, independent of anything on the host. Bootstrap it **once**:
+Auth is a long-lived setup-token on your Claude subscription, passed as an environment variable. Mint one and put it in `.env` **before** step 1 (or re-run `docker compose up -d receipt-assistant` afterwards):
 
 ```bash
-docker exec -it receipt-assistant claude /login
-# Follow the prompt: open the URL in a browser, authenticate,
-# paste the returned code back into the terminal.
+claude setup-token          # prints a token valid for about a year
+cp .env.example .env        # then set CLAUDE_CODE_OAUTH_TOKEN=<that token>
 ```
 
-Credentials persist on the host at `~/Developer/receipt-assistant-data/claude/` (bind-mounted into the container at `/home/node/.claude`) and survive every `docker compose down` / `up` / `restart` — and OrbStack resets, unlike Docker named volumes. The in-container CLI self-refreshes access + refresh tokens on expiry and writes rotation back into the bind path. No env var, no host Keychain sync, no recurring script.
-
-Eventually the refresh token expires server-side (weeks to months). When that happens the next call returns 401 — rerun the same `claude /login` inside the container. For full bootstrap, migration, and 401-recovery procedures, invoke the **`setup` skill** in Claude Code inside this project.
+When the variable is set it is the only credential the container uses, and it does not refresh itself: when it expires or is revoked, extraction returns 401 until you mint a new one. Rotation, 401 diagnosis and the reasons behind this design are in [`CLAUDE.md`](CLAUDE.md#claude-code-oauth--long-lived-setup-token-era-6-2026-10-08-onward).
 
 ### 3. After changing source code
 
@@ -169,11 +166,18 @@ See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-json
 
 ## Scripts
 
-| Script | Usage |
-|--------|-------|
-| `scripts/benchmark.sh` | Upload 10 receipts sequentially, measure per-phase timing via SSE |
+Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, for `.sh`). The ones with an npm alias:
 
-OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/.claude/skills/setup/SKILL.md`) — there is no recurring shell script for token refresh. The in-container CLI self-refreshes via the RW volume mount configured in `docker-compose.yml`.
+| Command | Purpose |
+|---------|---------|
+| `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
+| `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
+| `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
+| `npm run measure:turns` | Turns and billed tokens per extraction, from session JSONL |
+| `npm run eval:dates` | Date-accuracy eval against the fixture set (`scripts/eval-dates.md`) |
+| `npm run db:migrate:prod` | Apply migrations inside the runtime image |
+
+The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
 
 ## Tech Stack
 
@@ -182,7 +186,7 @@ OAuth credential management lives in the **`setup` skill** (see `~/Documents/10_
 - **Database**: PostgreSQL 17
 - **AI**: Claude Code CLI (`claude -p`) with subscription auth
 - **Tracing**: Claude Code session JSONL (no separate stack)
-- **Image Processing**: heic-convert (HEIC → JPEG)
+- **Image Processing**: sharp (perceptual hashes for dedup)
 
 ## Frontend
 
