@@ -37,7 +37,11 @@
  *                           i.e. retry the conversions that failed at
  *                           ingest, without touching anything that
  *                           already converted. Combines with either
- *                           flag above.
+ *                           flag above. Also the step that converts a
+ *                           receipt after its date has been corrected:
+ *                           editing the date does not re-run FX.
+ *     --date YYYY-MM-DD     Only transactions that occurred on this date.
+ *                           Combines with any of the above.
  *
  *   Supplying a rate the source does not publish:
  *
@@ -49,10 +53,34 @@
  *                           recorded in `fx_rates` for that date with
  *                           source `manual`, so the conversion is as
  *                           reproducible as a published one. It is never
- *                           used for a date the source does publish.
+ *                           used for a date the source does publish, nor
+ *                           for a date in the future (the source may yet
+ *                           publish it, and a recorded manual rate would
+ *                           be served in its place from then on; correct
+ *                           the receipt's date instead).
  *                           Typical use, after an ingest logged "left
  *                           unconverted":
  *                             --unconverted --currency TWD --rate 0.0312
+ *
+ *   Correcting a rate supplied earlier with --rate (a typo, say):
+ *
+ *                             --currency TWD --date 2026-10-01 --rate 0.0312
+ *
+ *                           Name the date and leave `--unconverted` out.
+ *                           The `manual` rate recorded for that date is
+ *                           replaced and every posting of the currency on
+ *                           that date is re-derived at the new one. Both
+ *                           conditions are deliberate. Without `--date`,
+ *                           one command would flatten every date's
+ *                           hand-supplied rate to a single number; with
+ *                           `--unconverted`, the postings converted at
+ *                           the old rate would not be selected and would
+ *                           disagree with the rate on record. In either
+ *                           case the recorded rate is kept and the output
+ *                           says so. A published rate is never replaced.
+ *                           (With `--workspace`, postings of other
+ *                           workspaces on that date keep the old amount
+ *                           until they are re-derived too.)
  *
  * Safety:
  *   - Except under `--unconverted`, runs with `force: true`, so it
@@ -64,7 +92,11 @@
  *   - One DB transaction per ledger transaction, so an interrupted run
  *     leaves the ledger balanced.
  *   - Idempotent: a second run recomputes the same numbers from the
- *     same cached rates and writes the same values.
+ *     same cached rates, finds them already in place and writes nothing
+ *     (no version bump on the transaction).
+ *   - Every overwrite of a rate or base amount a posting already carried
+ *     is logged in `derivation_events` (`entity_type = 'transaction'`)
+ *     with the postings' before and after, in the same DB transaction.
  *   - A currency or date the rate source does not publish is reported as
  *     NOT PUBLISHED and left alone. Re-running will not change that; the
  *     posting needs a rate supplied with `--rate`, or its date corrected.
@@ -75,9 +107,12 @@ import { db, pool } from "../src/db/client.js";
 import { normalizeTransactionFx } from "../src/fx/normalize.js";
 import { FxRateNotPublishedError, getRate } from "../src/fx/rates.js";
 import { POINTS_CURRENCY_SQL_RE } from "../src/points/codes.js";
+import { unconvertedLegSql } from "../src/fx/unconverted.js";
+import { findMisScaledPostings } from "../src/fx/magnitude-check.js";
 import {
   currencyExponent,
   formatMinor,
+  fxRatesEqual,
   postingFxRate,
   toBaseMinor,
 } from "../src/ledger/money.js";
@@ -88,6 +123,8 @@ interface Args {
   currencies: string[] | null;
   exponentMismatch: boolean;
   unconverted: boolean;
+  /** `--date`: only transactions that occurred on this day. */
+  date: string | null;
   /** `--rate`: one whole unit of the single `--currency`, in base units. */
   manualRate: string | null;
 }
@@ -99,6 +136,7 @@ function parseArgs(argv: string[]): Args {
     currencies: null,
     exponentMismatch: false,
     unconverted: false,
+    date: null,
     manualRate: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -107,7 +145,18 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--workspace") out.workspaceId = argv[++i] ?? null;
     else if (a === "--exponent-mismatch") out.exponentMismatch = true;
     else if (a === "--unconverted") out.unconverted = true;
-    else if (a === "--rate") {
+    else if (a === "--date") {
+      const raw = argv[++i] ?? "";
+      const parsed = Date.parse(`${raw}T00:00:00Z`);
+      if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(raw) ||
+        Number.isNaN(parsed) ||
+        new Date(parsed).toISOString().slice(0, 10) !== raw
+      ) {
+        throw new Error("--date takes a calendar date, e.g. --date 2026-10-01");
+      }
+      out.date = raw;
+    } else if (a === "--rate") {
       const raw = argv[++i] ?? "";
       if (!/^\d+(\.\d+)?$/.test(raw) || Number(raw) <= 0) {
         throw new Error("--rate takes a positive decimal, e.g. --rate 0.0312");
@@ -165,10 +214,9 @@ async function findCandidates(args: Args): Promise<Candidate[]> {
         sql`, `,
       )})`
     : sql``;
-  // A leg with no rate only matters if it carries an amount: zero
-  // converts to zero at any rate.
+  // The same definition of "unconverted" the reports disclose by.
   const having = args.unconverted
-    ? sql`HAVING COUNT(*) FILTER (WHERE p.fx_rate IS NULL AND p.amount_minor <> 0) > 0`
+    ? sql`HAVING COUNT(*) FILTER (WHERE ${unconvertedLegSql("p", sql`w.base_currency`)}) > 0`
     : sql`HAVING bool_or(p.amount_minor > 0)`;
 
   const res = await db.execute(sql`
@@ -188,6 +236,7 @@ async function findCandidates(args: Args): Promise<Candidate[]> {
      WHERE p.currency <> w.base_currency
        AND p.currency !~ ${POINTS_CURRENCY_SQL_RE}
        ${args.workspaceId ? sql`AND t.workspace_id = ${args.workspaceId}::uuid` : sql``}
+       ${args.date ? sql`AND t.occurred_on = ${args.date}::date` : sql``}
        ${currencyFilter}
      GROUP BY t.id, t.workspace_id, t.occurred_on, t.payee, p.currency, w.base_currency
      ${having}
@@ -217,16 +266,27 @@ interface Outcome {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  // `--date` narrows which transactions are visited; it does not by
+  // itself narrow which of their currencies are re-derived.
   const targeted =
     args.currencies !== null || args.exponentMismatch || args.unconverted;
   const candidates = await findCandidates(args);
+  const today = new Date().toISOString().slice(0, 10);
 
   if (candidates.length === 0) {
     console.log(
-      targeted
+      targeted || args.date !== null
         ? "No postings match the selection — nothing to backfill."
         : "No foreign-currency postings found — nothing to backfill.",
     );
+    if (args.unconverted && args.manualRate !== null) {
+      console.log(
+        `--unconverted selects only postings with no rate yet. To replace ` +
+          `a rate supplied earlier with --rate, name its date and leave ` +
+          `--unconverted out: --currency ${args.currencies![0]} ` +
+          `--date YYYY-MM-DD --rate ${args.manualRate}`,
+      );
+    }
     return;
   }
 
@@ -235,6 +295,7 @@ async function main(): Promise<void> {
     args.exponentMismatch ? "exponent differs from base" : null,
     args.currencies ? `currency in ${args.currencies.join(",")}` : null,
     args.unconverted ? "no fx_rate yet" : null,
+    args.date ? `on ${args.date}` : null,
   ].filter(Boolean);
   console.log(
     `Found ${txCount} transaction(s) with foreign-currency postings` +
@@ -268,6 +329,7 @@ async function main(): Promise<void> {
   const totals = new Map<string, { old: bigint; new: bigint }>();
   let failures = 0;
   let notPublished = 0;
+  let futureDated = 0;
 
   for (const lines of byTransaction.values()) {
     const first = lines[0]!;
@@ -288,31 +350,87 @@ async function main(): Promise<void> {
           });
 
     let outcomes: Map<string, Outcome>;
+    const notes: string[] = [];
+    let future = false;
     try {
-      try {
-        outcomes = await run();
-      } catch (err) {
-        // `--rate` applies only here: the source has said it has no rate
-        // for this currency on this date. A timeout or a 5xx never
-        // reaches this branch, so a manual number cannot shadow a rate
-        // that exists and was merely unreachable.
-        if (!(err instanceof FxRateNotPublishedError) || args.manualRate === null) {
-          throw err;
-        }
+      // `--rate` comes with exactly one `--currency`, so `first` is the
+      // only line. A rate supplied by hand on an earlier run is on
+      // record for this date as a `manual` cache row.
+      const recorded =
+        args.manualRate !== null
+          ? await readManualRate(first.currency, first.base_currency, onDate)
+          : null;
+      const differs =
+        recorded !== null && !fxRatesEqual(recorded, args.manualRate!);
+
+      if (differs && !args.unconverted && args.date !== null) {
+        // The correction path: the date was named and every posting of
+        // the currency on it is being re-derived, so the rate on record
+        // and the postings change together.
+        notes.push(
+          `manual ${first.currency} rate for ${onDate} ` +
+            `${args.dryRun ? "would be " : ""}replaced: ` +
+            `${Number(recorded)} → ${args.manualRate}`,
+        );
         if (args.dryRun) {
-          outcomes = previewManual(lines, args.manualRate, onDate);
+          outcomes = previewManual(lines, args.manualRate!, onDate);
         } else {
-          await recordManualRate(err.base, err.quote, err.onDate, args.manualRate);
+          await recordManualRate(
+            first.currency,
+            first.base_currency,
+            onDate,
+            args.manualRate!,
+          );
           outcomes = await run();
+        }
+      } else {
+        if (differs) {
+          notes.push(
+            `a manual ${first.currency} rate of ${Number(recorded)} is ` +
+              `already recorded for ${onDate} and was kept. To replace it ` +
+              `for every posting on that date: --currency ` +
+              `${first.currency} --date ${onDate} --rate ` +
+              `${args.manualRate} (without --unconverted)`,
+          );
+        }
+        try {
+          outcomes = await run();
+        } catch (err) {
+          // `--rate` applies only here: the source has said it has no
+          // rate for this currency on this date. A timeout or a 5xx
+          // never reaches this branch, so a manual number cannot shadow
+          // a rate that exists and was merely unreachable.
+          if (
+            !(err instanceof FxRateNotPublishedError) ||
+            args.manualRate === null
+          ) {
+            throw err;
+          }
+          // Nor a rate that does not exist YET: the source answers 404
+          // for a date far enough ahead, and may publish it when the day
+          // comes. A manual row recorded now would be served in its
+          // place from then on.
+          if (onDate > today) {
+            future = true;
+            throw err;
+          }
+          if (args.dryRun) {
+            outcomes = previewManual(lines, args.manualRate, onDate);
+          } else {
+            await recordManualRate(err.base, err.quote, err.onDate, args.manualRate);
+            outcomes = await run();
+          }
         }
       }
     } catch (err) {
       const permanent = err instanceof FxRateNotPublishedError;
       if (permanent) notPublished++;
       else failures++;
+      if (future) futureDated++;
       console.error(
         `${onDate.padEnd(11)} ${label.padEnd(26)} ` +
-          `${permanent ? "NOT PUBLISHED" : "FAILED"}: ` +
+          `${permanent ? "NOT PUBLISHED" : "FAILED"}` +
+          `${future ? " (dated in the future; --rate not applied)" : ""}: ` +
           (err instanceof Error ? err.message : String(err)),
       );
       continue;
@@ -340,6 +458,24 @@ async function main(): Promise<void> {
         ].join(" "),
       );
     }
+    // `--rate` is for dates the source has no rate for. Where it has
+    // one, the posting is converted at the published rate and the
+    // number on the command line is ignored; say so, since nothing else
+    // in the row does once the posting is already right ("unchanged").
+    if (args.manualRate !== null) {
+      const usedManual =
+        [...outcomes.values()].some((o) => o.source === "manual") ||
+        (!args.dryRun &&
+          (await readManualRate(first.currency, first.base_currency, onDate)) !==
+            null);
+      if (!usedManual) {
+        notes.push(
+          `--rate not used: the source publishes ${first.currency} for ` +
+            `${onDate}, and a published rate is never replaced`,
+        );
+      }
+    }
+    for (const note of notes) console.log(`${" ".repeat(12)}↳ ${note}`);
   }
 
   console.log();
@@ -352,9 +488,18 @@ async function main(): Promise<void> {
   if (notPublished > 0) {
     console.log(
       `${notPublished} transaction(s) are in a currency or on a date the ` +
-        `rate source does not publish. Re-running will not convert them; ` +
-        `supply a rate with --unconverted --currency CUR --rate N, or ` +
-        `correct the date.`,
+        `rate source does not publish. Re-running as they stand will not ` +
+        `convert them. Supply a rate with --unconverted --currency CUR ` +
+        `--rate N; or, where the date is wrong, correct it on the ` +
+        `transaction and run --unconverted again (editing the date does ` +
+        `not convert it by itself).`,
+    );
+  }
+  if (futureDated > 0) {
+    console.log(
+      `${futureDated} of them are dated in the future, where --rate is ` +
+        `not applied: the source may still publish that date. Correct the ` +
+        `date, or run again once it has passed.`,
     );
   }
   if (failures > 0) {
@@ -363,7 +508,36 @@ async function main(): Promise<void> {
         `current values and can be retried by re-running this script.`,
     );
   }
+  await reportMagnitude(args);
   if (args.dryRun) console.log("Dry run — no rows were modified.");
+}
+
+/**
+ * Closing line: are any postings (anywhere, not just in this run's
+ * selection) still booked at the published rate although their currency
+ * and the base currency differ in decimals? That is the state
+ * `--exponent-mismatch` exists to repair and the server warns about at
+ * boot, so a run ends by saying whether it is gone.
+ */
+async function reportMagnitude(args: Args): Promise<void> {
+  const groups = await findMisScaledPostings();
+  if (groups.length === 0) {
+    if (args.exponentMismatch) {
+      console.log("Magnitude check: no posting is booked at the wrong power of ten.");
+    }
+    return;
+  }
+  const postings = groups.reduce((n, g) => n + g.postings, 0);
+  const transactions = groups.reduce((n, g) => n + g.transactions, 0);
+  console.log(
+    `Magnitude check: ${postings} posting(s) in ${transactions} ` +
+      `transaction(s) (${groups.map((g) => g.currency).join(", ")}) ` +
+      `${args.dryRun ? "are" : "are still"} booked at the wrong power of ` +
+      `ten` +
+      (args.exponentMismatch && !args.dryRun
+        ? " — see the failures above."
+        : "; --exponent-mismatch repairs them."),
+  );
 }
 
 /** Resolve the rates for a transaction's lines without writing anything. */
@@ -407,10 +581,36 @@ function previewManual(
 }
 
 /**
+ * The rate someone supplied by hand for this currency and date on an
+ * earlier run, or null when there is none (including when the cached
+ * rate for that date is a published one).
+ */
+async function readManualRate(
+  currency: string,
+  baseCurrency: string,
+  onDate: string,
+): Promise<string | null> {
+  const res = await db.execute(
+    sql`SELECT rate::text AS rate
+          FROM fx_rates
+         WHERE as_of = ${onDate}::date
+           AND base = ${currency}
+           AND quote = ${baseCurrency}
+           AND source = 'manual'`,
+  );
+  return (res.rows[0] as { rate: string } | undefined)?.rate ?? null;
+}
+
+/**
  * Put a hand-supplied rate where the resolver looks first. From then on
  * it is an ordinary cache hit for that currency and date: this run, the
  * ingest of another receipt from the same day, and any later re-derive
  * all get the same number, labelled `manual` in `metadata.fx`.
+ *
+ * Replaces a `manual` row already there (that is how a mistyped rate is
+ * corrected; the caller decides when that is allowed) and never a
+ * published one: the WHERE on the conflict branch makes the statement a
+ * no-op against any other source.
  */
 async function recordManualRate(
   currency: string,
@@ -422,7 +622,11 @@ async function recordManualRate(
     sql`INSERT INTO fx_rates (as_of, base, quote, rate, as_of_actual, source)
         VALUES (${onDate}::date, ${currency}, ${baseCurrency},
                 ${manualRate}::numeric, ${onDate}::date, 'manual')
-        ON CONFLICT (as_of, base, quote) DO NOTHING`,
+        ON CONFLICT (as_of, base, quote) DO UPDATE
+              SET rate = EXCLUDED.rate,
+                  as_of_actual = EXCLUDED.as_of_actual,
+                  fetched_at = NOW()
+            WHERE fx_rates.source = 'manual'`,
   );
 }
 

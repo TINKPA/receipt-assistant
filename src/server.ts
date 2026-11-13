@@ -16,6 +16,7 @@ import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 import { buildExtractorPrompt } from "./ingest/prompt.js";
 import { iconPipelineFileExists } from "./ingest/brand-icon-prompt.js";
+import { warnAboutMisScaledPostings } from "./fx/magnitude-check.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
@@ -68,6 +69,12 @@ async function main(): Promise<void> {
         : `🌱 Workspace ${r.workspaceId} already present`,
     );
   }
+
+  // Postings converted before FX respected currency exponents stay at
+  // the wrong power of ten until `scripts/backfill-fx.ts
+  // --exponent-mismatch` is run; there is no migration for it. Read-only
+  // and non-fatal: it only says so in the boot log.
+  await warnAboutMisScaledPostings();
 
   if (!process.env.GOOGLE_MAPS_API_KEY) {
     console.warn(

@@ -46,12 +46,50 @@
  * push the whole residual onto the largest converted leg before writing.
  * All legs update inside one transaction so the trigger sees the finished
  * state.
+ *
+ * ## Writes only what changes, and leaves a trail when it overwrites
+ *
+ * A run that computes the numbers the postings already hold writes
+ * nothing: no posting, no `metadata.fx`, and so no version bump on the
+ * transaction (the `transactions` trigger bumps it on any UPDATE, which
+ * would hand a 412 to a client holding the previous ETag for a change
+ * that changed nothing).
+ *
+ * `fx_rate` and `amount_base_minor` are derived values, so overwriting a
+ * pair a posting already carried is a re-derivation in the sense of the
+ * three-layer model, and it is logged like every other one: a
+ * `derivation_events` row (`entity_type = 'transaction'`) with the
+ * postings' before and after, inserted in the same DB transaction as the
+ * UPDATE. A first conversion (a posting that had no rate yet) is part of
+ * ingest and is recorded by `metadata.fx` alone.
  */
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { FxRateNotPublishedError, getRate } from "./rates.js";
 import { isPointsCurrency } from "../points/codes.js";
-import { postingFxRate, toBaseMinor } from "../ledger/money.js";
+import { fxRatesEqual, postingFxRate, toBaseMinor } from "../ledger/money.js";
+import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
+
+/** `derivation_events.model` for this pass: arithmetic, no model. */
+const FX_DERIVATION_MODEL = "ts-deterministic";
+
+/**
+ * The build's git sha for `derivation_events.prompt_git_sha`.
+ *
+ * `src/generated/build-info.ts` is written by the build and is not in
+ * the repository, and this module is also loaded by scripts run straight
+ * from a checkout with `tsx`. A static import would make every one of
+ * them fail on a tree that has not been built, for the sake of one audit
+ * column; so it is looked up when an event is actually written.
+ */
+async function buildGitSha(): Promise<string> {
+  try {
+    const mod = await import("../generated/build-info.js");
+    return mod.buildInfo.gitSha;
+  } catch {
+    return "unknown";
+  }
+}
 
 interface PostingRow {
   id: string;
@@ -62,7 +100,8 @@ interface PostingRow {
 }
 
 export interface NormalizeResult {
-  /** `false` when the transaction needed no conversion — see `NOOP`. */
+  /** `false` when nothing was written: the transaction needed no
+   *  conversion, or already held exactly what the pass computed. */
   changed: boolean;
   /** Per-currency rates applied, for logging / backfill reports. */
   applied: Array<{
@@ -120,13 +159,15 @@ export async function normalizeTransactionFx(
   if (!base) return NOOP;
 
   const header = await db.execute(
-    sql`SELECT occurred_on, metadata->'fx'->'rates' AS prior_rates
+    sql`SELECT occurred_on,
+               metadata->'fx' AS prior_fx,
+               metadata->'fx'->'rates' AS prior_rates
           FROM transactions
          WHERE id = ${transactionId}::uuid
            AND workspace_id = ${workspaceId}::uuid`,
   );
   const headerRow = header.rows[0] as
-    | { occurred_on: string; prior_rates: unknown }
+    | { occurred_on: string; prior_fx: unknown; prior_rates: unknown }
     | undefined;
   const occurredOn = headerRow?.occurred_on;
   if (!occurredOn) return NOOP;
@@ -211,6 +252,20 @@ export async function normalizeTransactionFx(
     target.baseMinor -= residual;
   }
 
+  // What would actually change. A posting is written only when its rate
+  // or base amount differs from what it holds.
+  const current = new Map(postings.map((p) => [p.id, p]));
+  const writes = converted.filter((c) => {
+    if (c.fxRate === null) return false;
+    const p = current.get(c.id)!;
+    return (
+      p.fx_rate === null ||
+      p.amount_base_minor === null ||
+      !fxRatesEqual(p.fx_rate, c.fxRate) ||
+      BigInt(p.amount_base_minor) !== c.baseMinor
+    );
+  });
+
   // Provenance for the UI and for auditing a surprising number later.
   // `fx_rate` on the posting is the multiplier that was applied to the
   // minor amount; this says *which published rate* it came from, which is
@@ -227,6 +282,16 @@ export async function normalizeTransactionFx(
   const priorRates = Array.isArray(headerRow?.prior_rates)
     ? (headerRow.prior_rates as Array<Record<string, unknown>>)
     : [];
+
+  // Nothing to change and the provenance is already there: a true no-op.
+  // (A converted currency with no `metadata.fx` entry still gets one
+  // written, so every conversion this pass stands behind is explained.)
+  const explained = new Set(
+    priorRates.map((r) => r?.currency).filter((c) => typeof c === "string"),
+  );
+  if (writes.length === 0 && [...rates.keys()].every((c) => explained.has(c))) {
+    return NOOP;
+  }
   const heldCurrencies = new Set(
     postings.filter((p) => !rates.has(p.currency)).map((p) => p.currency),
   );
@@ -248,9 +313,53 @@ export async function normalizeTransactionFx(
     ],
   };
 
+  // Postings whose existing pair is being replaced, as opposed to
+  // converted for the first time: those are the re-derivation to log.
+  const rederived = writes.filter((c) => current.get(c.id)!.fx_rate !== null);
+  const gitSha = rederived.length > 0 ? await buildGitSha() : "";
+
   await db.transaction(async (tx) => {
-    for (const c of converted) {
-      if (c.fxRate === null) continue;
+    if (rederived.length > 0) {
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
+      for (const c of rederived) {
+        const p = current.get(c.id)!;
+        before[c.id] = {
+          currency: p.currency,
+          amount_minor: p.amount_minor,
+          fx_rate: p.fx_rate,
+          amount_base_minor: p.amount_base_minor,
+        };
+        after[c.id] = {
+          currency: p.currency,
+          amount_minor: p.amount_minor,
+          fx_rate: c.fxRate,
+          amount_base_minor: c.baseMinor.toString(),
+        };
+      }
+      // Before the UPDATE, in the same transaction, like every other
+      // derivation event. To roll a run back, write `before.postings`
+      // back onto the postings (all of them at once: the balance trigger
+      // checks the transaction as a whole) and `before.metadata_fx` onto
+      // `metadata.fx`.
+      await tx.execute(
+        sql`INSERT INTO derivation_events
+              (workspace_id, entity_type, entity_id, prompt_version,
+               prompt_git_sha, model, before, after, changed_keys)
+            VALUES (${workspaceId}::uuid, 'transaction', ${transactionId},
+                    ${PROMPT_VERSION}, ${gitSha}, ${FX_DERIVATION_MODEL},
+                    ${JSON.stringify({
+                      postings: before,
+                      metadata_fx: headerRow?.prior_fx ?? null,
+                    })}::jsonb,
+                    ${JSON.stringify({
+                      postings: after,
+                      metadata_fx: provenance,
+                    })}::jsonb,
+                    ARRAY['postings', 'metadata_fx'])`,
+      );
+    }
+    for (const c of writes) {
       await tx.execute(
         sql`UPDATE postings
                SET fx_rate = ${c.fxRate}::numeric,
@@ -313,13 +422,18 @@ export async function normalizeFxSafely(
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof FxRateNotPublishedError) {
         // Retrying cannot help: the source has no such rate. Say what
-        // will, since nothing sweeps this up later.
+        // will, since nothing sweeps this up later. Both remedies end in
+        // the backfill script: editing a transaction's date does not
+        // re-run this pass.
         console.warn(
           `[fx] transaction ${id} left unconverted: ${message}. ` +
-            `Retrying will not change that; correct the date, or supply ` +
-            `a rate with scripts/backfill-fx.ts --unconverted --currency ` +
-            `${err.base} --rate <1 ${err.base} in ${err.quote}>. Reports ` +
-            `disclose it as unconverted meanwhile.`,
+            `Retrying as it stands will not change that. Either supply ` +
+            `a rate: scripts/backfill-fx.ts --unconverted --currency ` +
+            `${err.base} --rate <1 ${err.base} in ${err.quote}>; or, if ` +
+            `the receipt's date is wrong, correct it and then run ` +
+            `scripts/backfill-fx.ts --unconverted (changing the date does ` +
+            `not convert it by itself). Reports disclose it as ` +
+            `unconverted meanwhile.`,
         );
       } else {
         console.warn(

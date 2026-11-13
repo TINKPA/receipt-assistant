@@ -234,6 +234,16 @@ export function toBaseMinor(
 }
 
 /**
+ * Whether two `fx_rate` values are the same number at the column's
+ * scale: `"0.645"` and the `"0.6450000000"` Postgres hands back are.
+ */
+export function fxRatesEqual(a: number | string, b: number | string): boolean {
+  return (
+    toScaled(a, FX_RATE_SCALE, "fx_rate") === toScaled(b, FX_RATE_SCALE, "fx_rate")
+  );
+}
+
+/**
  * A minor-unit amount as a plain decimal in the currency's whole units,
  * with thousands separators: `formatMinor(5000, "JPY")` is `"5,000"`,
  * `formatMinor(1234550, "CNY")` is `"12,345.50"`. For logs and script

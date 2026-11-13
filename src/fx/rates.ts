@@ -77,21 +77,82 @@ export interface ResolvedRate {
 }
 
 /**
+ * A rate every ECB feed has always carried, on a date long since
+ * published: the probe that tells "the source has no rate for this pair"
+ * from "this is not the source any more". See `sourceAnswersKnownRate`.
+ */
+const PROBE_PATH = "2024-01-02?base=EUR&symbols=USD";
+/** How long one successful probe vouches for the endpoint. */
+const PROBE_TTL_MS = 10 * 60_000;
+let probeOk: { apiBase: string; at: number } | null = null;
+
+/**
+ * Is the endpoint we are talking to really a rate source right now?
+ *
+ * Asked only after a 404. A 404 from a working source means "no rate for
+ * that currency or date" and is permanent. But a moved API (Frankfurter
+ * has already changed host and path once), a mistyped `FX_API_BASE`, or a
+ * proxy answering for a dead upstream also says 404, for every request,
+ * and treating that as permanent would leave every foreign receipt
+ * unconverted with a log line saying a retry cannot help. The two bodies
+ * are indistinguishable, so the question is put to the source itself: if
+ * it cannot produce EUR→USD for a settled date through the same URL
+ * scheme, the 404 says nothing about the pair that was asked for.
+ *
+ * A positive answer is remembered for a few minutes per base URL, so a
+ * batch of receipts in an unpublished currency costs one probe, not one
+ * each. A negative answer is never remembered.
+ */
+async function sourceAnswersKnownRate(): Promise<boolean> {
+  const apiBase = fxApiBase();
+  if (
+    probeOk !== null &&
+    probeOk.apiBase === apiBase &&
+    Date.now() - probeOk.at < PROBE_TTL_MS
+  ) {
+    return true;
+  }
+  try {
+    const res = await fetch(`${apiBase}/${PROBE_PATH}`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    lastFetchAt = Date.now();
+    if (!res.ok) return false;
+    const body = (await res.json()) as { rates?: Record<string, number> };
+    const rate = body.rates?.USD;
+    if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+      return false;
+    }
+    probeOk = { apiBase, at: Date.now() };
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The source answered, and the answer is that it has no such rate: a
  * currency ECB does not publish (TWD, VND, KWD, AED and others) or a date
  * outside its range (before 1999, or far in the future).
+ *
+ * Raised only for a 404 from an endpoint that is demonstrably still the
+ * rate source (`sourceAnswersKnownRate`). A 404 from one that cannot
+ * answer the probe is an ordinary failure: retried, then covered by a
+ * nearby cached rate, like a timeout.
  *
  * Kept apart from a timeout or a 5xx because the remedy is different.
  * Those are retried, and fall back to a nearby cached rate, since the
  * rate exists and the source is merely having a bad day. This one will
  * read the same tomorrow: retrying only delays the ingest, and a cached
  * rate from another day would be a guess presented as a publication. The
- * posting stays unconverted until the date is corrected or someone
- * supplies a rate: `scripts/backfill-fx.ts --unconverted --currency CUR
- * --rate N` records N in `fx_rates` with source `manual` for exactly the
- * dates the source refused, and converts at it. (The posting PATCH
- * endpoint cannot do this: it changes one leg per request, and a base
- * amount changed on one leg alone fails the balance trigger.)
+ * posting stays unconverted until someone runs `scripts/backfill-fx.ts`:
+ * with `--unconverted --currency CUR --rate N` to supply a rate (N is
+ * recorded in `fx_rates` with source `manual` for exactly the dates the
+ * source refused, and the postings convert at it), or with plain
+ * `--unconverted` after correcting a wrong date (editing the date does
+ * not re-run the FX pass). The posting PATCH endpoint cannot do either:
+ * it changes one leg per request, and a base amount changed on one leg
+ * alone fails the balance trigger.
  */
 export class FxRateNotPublishedError extends Error {
   readonly permanent = true;
@@ -190,7 +251,15 @@ async function fetchOnce(
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (res.status === 404) {
-    throw new FxRateNotPublishedError(base, quote, onDate, url);
+    if (await sourceAnswersKnownRate()) {
+      throw new FxRateNotPublishedError(base, quote, onDate, url);
+    }
+    throw new Error(
+      `FX source ${url} returned HTTP 404, and so did a rate it must ` +
+        `have (${PROBE_PATH}): the endpoint itself looks moved or ` +
+        `misconfigured (FX_API_BASE), which says nothing about ` +
+        `${base}→${quote}`,
+    );
   }
   if (!res.ok) {
     throw new Error(`FX source ${url} returned HTTP ${res.status}`);
@@ -240,8 +309,9 @@ async function fetchUpstream(
  * two cases, and callers leave the posting unconverted in both rather
  * than failing the ingest:
  *
- *  - `FxRateNotPublishedError`: the source has no such rate (HTTP 404).
- *    Permanent — not retried, and no stale-cache fallback.
+ *  - `FxRateNotPublishedError`: the source has no such rate (HTTP 404
+ *    from an endpoint that still answers its probe). Permanent — not
+ *    retried, and no stale-cache fallback.
  *  - any other error: all four steps missed, i.e. a pair with nothing
  *    cached nearby met an unreachable source. Worth retrying later.
  */
