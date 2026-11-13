@@ -1,8 +1,6 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import path from "path";
-import { fileURLToPath } from "url";
-import { AGENT_ROLE, RO_ROLE, roleDatabaseUrl } from "./db/agent-roles.js";
+import { AGENT_ROLE, roleDatabaseUrl } from "./db/agent-roles.js";
 
 /**
  * What one kind of `claude -p` child is allowed to have.
@@ -31,25 +29,6 @@ export interface AgentProfile {
   readonly databaseUrl: (() => string) | null;
 }
 
-/**
- * The one command the Ask agent may run: `src/insights/ledger-query.ts`,
- * which sends a single SQL string to Postgres and prints the rows.
- *
- * Not `psql`. psql is a shell of its own — `\!`, `\copy … to program`,
- * `\o |cmd`, `-f <any file>` — so "Bash, but only psql" still means
- * "Bash".
- *
- * Resolved next to this module so it is right in the image
- * (`node /app/dist/insights/ledger-query.js`) and under tsx on a laptop.
- */
-export function ledgerQueryCommand(): string {
-  const here = fileURLToPath(import.meta.url);
-  const dir = path.join(path.dirname(here), "insights");
-  return here.endsWith(".ts")
-    ? `npx tsx ${path.join(dir, "ledger-query.ts")}`
-    : `node ${path.join(dir, "ledger-query.js")}`;
-}
-
 export const AGENT_PROFILES = {
   /**
    * Ingest and re-extract. Bash for psql / curl / pdftotext / python3,
@@ -61,6 +40,13 @@ export const AGENT_PROFILES = {
    * pipelines, and would add nothing while Bash can run anything anyway.
    * What bounds this agent is the tool list, the environment below and
    * the `receipts_agent` database role.
+   *
+   * That bounds a mistake and an injection that goes through what the
+   * agent was handed. It is NOT a wall around an agent that has been
+   * turned: an unrestricted shell running as the server's own Unix user
+   * can read the server's environment, log in to Postgres as the owner,
+   * call the HTTP API and start another `claude` with every tool. See
+   * "What this does not bound" in CLAUDE.md before relying on it.
    */
   extraction: {
     tools: ["Bash", "Read", "Write", "Edit", "WebSearch"],
@@ -71,21 +57,28 @@ export const AGENT_PROFILES = {
     databaseUrl: () => roleDatabaseUrl(AGENT_ROLE),
   },
   /**
-   * Ask. One tool, one command. `dontAsk` denies anything that is not
-   * pre-approved instead of prompting, and the only approval is the
-   * ledger-query command prefix; the CLI checks every part of a compound
-   * command against it, so `… ; curl …` is refused.
+   * Ask. No tools and no database URL: the model writes SQL as text and
+   * the server runs it as `receipts_ro` (`src/insights/ask.ts`,
+   * `src/insights/ledger-query.ts`).
+   *
+   * It used to get Bash with an allowlist of one command under `dontAsk`.
+   * That is not a boundary on this CLI: 2.1.251 lets its built-in
+   * "read-only" commands (`id`, `cat`, `tac`, `du`, `stat`, …) run in
+   * every permission mode before any allow rule is consulted, so a
+   * question could have read the mounted credentials file and every
+   * transcript. A shell with a rule in front of it is still a shell; an
+   * empty tool list is not.
+   *
+   * `dontAsk` stays as a second line: should a future CLI offer a tool
+   * despite `--tools ""`, nothing that needs approval runs. It is not what
+   * the confinement rests on, and `check-agent-sandbox` fails if this
+   * profile is offered any tool at all.
    */
   ask: {
-    tools: ["Bash"],
-    permissionArgs: () => [
-      "--permission-mode",
-      "dontAsk",
-      "--allowedTools",
-      `Bash(${ledgerQueryCommand()}:*)`,
-    ],
+    tools: [],
+    permissionArgs: () => ["--permission-mode", "dontAsk"],
     env: [],
-    databaseUrl: () => roleDatabaseUrl(RO_ROLE),
+    databaseUrl: null,
   },
   /** Text in, text out: no tools and no database. Used by backfill scripts
    *  that only want a classification. */
@@ -155,7 +148,8 @@ export function buildClaudeEnv(profileName: AgentProfileName): NodeJS.ProcessEnv
 
 /**
  * The flags that make a profile what it is. Callers add only presentation
- * (`--output-format`) and `--model`.
+ * (`--output-format`, `--verbose`) and `--model`; `runClaude` refuses
+ * anything else.
  *
  * Verified against the pinned CLI, 2.1.251 (`claude --help` in the image):
  *
@@ -216,10 +210,9 @@ export interface RunClaudeOptions {
   /** Which tools, environment and database role the child gets. Required:
    *  there is no unrestricted spawn. */
   profile: AgentProfileName;
-  /** Presentation flags only (`--output-format`, `--model`), never payload
-   *  — the prompt goes on stdin — and never tool or permission flags,
-   *  which belong to the profile. `-p` and `--session-id` are supplied by
-   *  this function. */
+  /** `--output-format <v>`, `--model <v>` and `--verbose`, nothing else
+   *  (see `CALLER_FLAGS`). Never payload — the prompt goes on stdin. `-p`
+   *  and `--session-id` are supplied by this function. */
   args?: string[];
   timeoutMs: number;
   /** Pre-allocated session id. The ingest path mints its own before
@@ -229,26 +222,44 @@ export interface RunClaudeOptions {
   sessionId?: string;
 }
 
-/** Flags a caller must not smuggle in through `args`: each one would
- *  widen what the profile allows. */
-const PROFILE_OWNED_FLAGS = new Set([
-  "--tools",
-  "--allowedTools",
-  "--allowed-tools",
-  "--disallowedTools",
-  "--disallowed-tools",
-  "--dangerously-skip-permissions",
-  "--allow-dangerously-skip-permissions",
-  "--permission-mode",
-  "--mcp-config",
-  "--strict-mcp-config",
-  "--settings",
-  "--setting-sources",
-  "--add-dir",
-  "--agents",
-  "--plugin-dir",
-  "--plugin-url",
-]);
+/**
+ * The flags a caller may pass through `args`, and whether each takes a
+ * value. An allowlist, because the CLI keeps growing flags that widen a
+ * session — `--brief` adds a messaging tool, `--agent` and
+ * `--system-prompt` replace what the model is, `--resume` continues some
+ * other session — and a list of forbidden ones is out of date the day
+ * the CLI is bumped. Everything else a child gets is decided by its
+ * profile, so widening one is always a visible edit to `AGENT_PROFILES`.
+ */
+const CALLER_FLAGS: Readonly<Record<string, "value" | "bare">> = {
+  "--output-format": "value",
+  "--model": "value",
+  "--verbose": "bare",
+};
+
+/** Throws on anything in `args` that is not a `CALLER_FLAGS` flag or the
+ *  value of one. */
+export function assertCallerArgs(args: readonly string[], profile: string): void {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const eq = arg.indexOf("=");
+    const name = eq === -1 ? arg : arg.slice(0, eq);
+    const kind = Object.hasOwn(CALLER_FLAGS, name) ? CALLER_FLAGS[name] : undefined;
+    if (!kind || (kind === "bare" && eq !== -1)) {
+      throw new Error(
+        `runClaude: ${JSON.stringify(name)} cannot be passed in args (allowed: ` +
+          `${Object.keys(CALLER_FLAGS).join(", ")}). What a "${profile}" child may have is ` +
+          `decided by AGENT_PROFILES in src/claude.ts.`,
+      );
+    }
+    if (kind === "value" && eq === -1) {
+      const value = args[++i];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error(`runClaude: ${name} needs a value`);
+      }
+    }
+  }
+}
 
 /**
  * Run `claude -p` and return its stdout plus the session id used.
@@ -270,12 +281,7 @@ export function runClaude(
   prompt: string,
   { profile, args = [], timeoutMs, sessionId = randomUUID() }: RunClaudeOptions,
 ): Promise<{ stdout: string; sessionId: string }> {
-  const smuggled = args.find((a) => PROFILE_OWNED_FLAGS.has(a.split("=")[0]!));
-  if (smuggled) {
-    throw new Error(
-      `runClaude: ${smuggled} is set by the "${profile}" profile and cannot be passed in args`,
-    );
-  }
+  assertCallerArgs(args, profile);
   const fullArgs = ["-p", ...buildClaudeArgs(profile), ...args, "--session-id", sessionId];
   assertArgvSafe(fullArgs);
   return new Promise((resolve, reject) => {

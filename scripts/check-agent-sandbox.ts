@@ -20,16 +20,22 @@
  *
  * It fails (exit 1) if
  *   · a probe run is offered any tool outside its profile's allowlist, or
- *     any MCP tool or server;
+ *     any MCP tool or server (the Ask profile's allowlist is empty);
  *   · `receipts_agent` can DROP, TRUNCATE, COPY … PROGRAM, DELETE, update
  *     a column it was not granted, or read a table it was not granted;
  *   · `receipts_agent` is refused any statement the prompt templates issue;
- *   · `receipts_ro` can write anything, even after switching its session
- *     to read-write;
- *   · the Ask agent manages to run a command other than ledger-query.
+ *   · `receipts_ro` can write to a table, create anything or become
+ *     another role, even after switching its session to read-write;
+ *   · the Ask query runner lets through a write, a second statement, a
+ *     change to its own role, or a query that outlives its timeout;
+ *   · the extraction agent's own `$DATABASE_URL` does not log in as
+ *     `receipts_agent`, or the Ask agent manages to run any command;
+ *   · any of the above could not be checked (INCONCLUSIVE): a green run
+ *     means every claim was exercised. The usual cause is `claude` not
+ *     being able to authenticate in the sandbox container.
  *
  * Every database statement runs inside a transaction that is rolled back.
- * The agent half makes four short model calls on the subscription.
+ * The agent half makes about six short model calls on the subscription.
  *
  * Flags:
  *   --container=<name>   app container to run in (default receipt-assistant-test)
