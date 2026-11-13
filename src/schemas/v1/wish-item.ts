@@ -5,7 +5,7 @@
  * free-text wishes stand on `title` alone.
  */
 import { z } from "zod";
-import { IsoDate, IsoDateTime, Metadata, MetadataPatch, Uuid } from "./common.js";
+import { IsoDate, IsoDateTime, Metadata, Uuid } from "./common.js";
 
 export const WishUrgency = z.enum(["now", "soon", "someday"]);
 export const WishStatus = z.enum(["active", "converted", "declined"]);
@@ -63,8 +63,7 @@ export const UpdateWishItemRequest = z
      *  transaction id. Setting back to active un-decides. */
     status: WishStatus.optional(),
     converted_transaction_id: Uuid.nullable().optional(),
-    /** Merge patch, not a replacement — see `MetadataPatch`. */
-    metadata: MetadataPatch.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
   .openapi("UpdateWishItemRequest");

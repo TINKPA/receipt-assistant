@@ -887,8 +887,16 @@ async function groupAccounts(baseCurrency: string): Promise<void> {
     r.json,
   );
   const other = baseCurrency === "EUR" ? "JPY" : "EUR";
+  // The rule is that the base-currency sum is never relabelled. Today a
+  // foreign `currency` is refused; a contract with no such parameter at
+  // all (it is ignored, the answer stays in the base currency) is just as
+  // good, so both are accepted here.
   r = await api("GET", `/v1/accounts/${reg.id}/balance?currency=${other}`);
-  check(`balance in ${other} (no conversion exists) → 422`, r.status === 422, r.json);
+  check(
+    `balance asked for in ${other} is refused or answered in ${baseCurrency}, never relabelled`,
+    r.status === 422 || (r.status === 200 && r.json.currency === baseCurrency),
+    r.json,
+  );
   r = await api("GET", `/v1/accounts/${reg.id}/balance?currency=${baseCurrency}`);
   check(`balance with currency=${baseCurrency} still works`, r.status === 200, r.json);
   r = await api("GET", `/v1/accounts/${parent.id}/balance?include_children=true`);

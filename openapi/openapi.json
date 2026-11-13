@@ -2295,8 +2295,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
+            "additionalProperties": {}
           }
         },
         "additionalProperties": false
@@ -2531,8 +2530,7 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {},
-            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
+            "additionalProperties": {}
           }
         },
         "additionalProperties": false
