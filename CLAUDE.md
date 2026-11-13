@@ -1,5 +1,7 @@
 # Receipt Assistant: developer guide
 
+This codebase is yours: what it’s for and how it’s built are your call, and you’ll keep building on it.
+
 This file is for whoever is **developing** this repo: a person, or an AI working in the checkout. It is not the extraction agent's instructions, and the extraction agent never sees it.
 
 ## Two audiences, two sets of files
