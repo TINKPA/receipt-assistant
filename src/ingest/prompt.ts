@@ -22,7 +22,12 @@ import {
   agentHygiene,
   renderActiveLessons,
 } from "./prompt-contract.js";
-import { phase0DocumentRead } from "./document-read-prompt.js";
+import {
+  ingestScratchDir,
+  phase0DocumentRead,
+  renderDecodedSource,
+  type DecodedAttachment,
+} from "./document-read-prompt.js";
 import {
   ITEM_SCHEMA,
   LINE_TYPE_VOCAB_AND_NAMES,
@@ -58,6 +63,11 @@ export interface ExtractorPromptContext {
     transactionId: string;
     distance: number;
   }[];
+  /** Server-decoded text of an `.eml` / HTML upload (#261). NULL for
+   *  images and PDFs, which the agent reads itself. */
+  sourceText?: string | null;
+  /** PDF attachments of an `.eml`, already written to the scratch dir. */
+  attachments?: DecodedAttachment[];
 }
 
 /** Render the pHash-neighbor context block for Phase 4a.0. */
@@ -91,7 +101,7 @@ const PROPOSED_LESSONS_PATH =
   "/data/prompt-lessons/lessons.proposed.md";
 
 export function buildExtractorPrompt(ctx: ExtractorPromptContext): string {
-  const scratchDir = `/tmp/${ctx.ingestId}`;
+  const scratchDir = ingestScratchDir(ctx.ingestId);
   return `You are a v1 double-entry ledger extractor. You will classify a
 financial document, extract its fields, optionally geocode the merchant,
 and **write the result directly into Postgres** via the psql Bash tool.
@@ -120,7 +130,7 @@ query cannot tell you anything the prompt has not already told you.
 ${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest" })}
 ${renderActiveLessons()}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
-
+${renderDecodedSource(ctx.sourceText, ctx.attachments)}
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
 Follow the document-reading rules above FIRST — for a PDF that means

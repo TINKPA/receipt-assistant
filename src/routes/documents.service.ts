@@ -29,6 +29,10 @@ import {
   PROMPT_VERSION,
   EXTRACTION_MODEL,
 } from "../ingest/prompt-contract.js";
+import {
+  reExtractScratchDir,
+  type DecodedAttachment,
+} from "../ingest/document-read-prompt.js";
 import { buildInfo } from "../generated/build-info.js";
 
 export type DocumentKindValue =
@@ -898,13 +902,22 @@ export function htmlToPlainText(html: string): string {
 async function extractSourceText(
   doc: { kind: DocumentKindValue | null; mimeType: string | null },
   absPath: string,
-): Promise<string | null> {
+  attachmentDir?: string,
+): Promise<DecodedSource> {
   const baseMime = baseMimeType(doc.mimeType);
+  // Decided by MIME type first. `kind` alone is not enough: a saved
+  // `.html` page is filed as `receipt_pdf` by `guessDocumentKind` (#137)
+  // and must never be handed to the MIME parser.
   const isHtml =
     baseMime === "text/html" || baseMime === "application/xhtml+xml";
+  const isEmail =
+    !isHtml && (baseMime === "message/rfc822" || doc.kind === "receipt_email");
 
-  if (doc.kind === "receipt_email") {
+  if (isEmail) {
     const parsed = await simpleParser(await readFile(absPath));
+    const attachments = attachmentDir
+      ? await writePdfAttachments(parsed.attachments ?? [], attachmentDir)
+      : [];
     const fromHtml =
       typeof parsed.html === "string" && parsed.html.length > 0
         ? htmlToPlainText(parsed.html)
@@ -917,19 +930,94 @@ async function extractSourceText(
       parsed.date ? `Date (envelope): ${parsed.date.toISOString()}` : null,
     ].filter((l): l is string => l !== null);
     const joined = [headers.join("\n"), body].filter(Boolean).join("\n\n");
-    return joined.length > 0 ? joined : null;
+    return { text: joined.length > 0 ? joined : null, attachments };
   }
 
   if (isHtml) {
     const text = htmlToPlainText((await readFile(absPath)).toString("utf8"));
-    return text.length > 0 ? text : null;
+    return { text: text.length > 0 ? text : null, attachments: [] };
   }
 
-  return null;
+  return { text: null, attachments: [] };
+}
+
+/** What the server could decode from a source file before the agent runs. */
+export interface DecodedSource {
+  text: string | null;
+  attachments: DecodedAttachment[];
+}
+
+const MAX_ATTACHMENTS = 5;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Save an email's PDF attachments where the agent can open them (#261).
+ *
+ * PDFs only: every logo and tracking pixel in an HTML email is also an
+ * "attachment" to the MIME parser, and none of them is a receipt. Files
+ * are named by position, never by the sender's filename, which is
+ * untrusted input and would otherwise be a path on our disk.
+ */
+async function writePdfAttachments(
+  attachments: { contentType?: string; filename?: string; content: Buffer }[],
+  dir: string,
+): Promise<DecodedAttachment[]> {
+  const pdfs = attachments.filter(
+    (a) =>
+      (baseMimeType(a.contentType) === "application/pdf" ||
+        (a.filename ?? "").toLowerCase().endsWith(".pdf")) &&
+      a.content.length > 0 &&
+      a.content.length <= MAX_ATTACHMENT_BYTES,
+  );
+  if (pdfs.length === 0) return [];
+  await mkdir(dir, { recursive: true });
+  const out: DecodedAttachment[] = [];
+  for (const [i, a] of pdfs.slice(0, MAX_ATTACHMENTS).entries()) {
+    const target = path.join(dir, `attachment-${i + 1}.pdf`);
+    await writeFile(target, a.content);
+    out.push({
+      path: target,
+      filename: a.filename ?? `attachment-${i + 1}.pdf`,
+      bytes: a.content.length,
+    });
+  }
+  return out;
 }
 
 /**
- * Tail guard on the decoded source inlined into the re-extract prompt (#198).
+ * Decode an email / HTML document for the extraction agent, capped and
+ * never throwing: a document the server cannot decode is one the agent
+ * reads the slow way, not a failed run.
+ *
+ * `scratchDir` is the run's scratch directory; attachments land in
+ * `<scratchDir>/attachments/`.
+ */
+export async function decodeSourceForAgent(
+  doc: { id: string; kind: DocumentKindValue | null; mimeType: string | null },
+  absPath: string,
+  scratchDir: string,
+  label: "ingest" | "re-extract",
+): Promise<DecodedSource> {
+  try {
+    const decoded = await extractSourceText(
+      doc,
+      absPath,
+      path.join(scratchDir, "attachments"),
+    );
+    return {
+      text: capSourceText(decoded.text, doc.id, label),
+      attachments: decoded.attachments,
+    };
+  } catch (err) {
+    console.warn(
+      `[${label}] doc=${doc.id} source decode failed: ${(err as Error).message}`,
+    );
+    return { text: null, attachments: [] };
+  }
+}
+
+/**
+ * Tail guard on the decoded source inlined into the extraction prompts (#198).
  *
  * 65,536 B is 3.3x the p99 of the live corpus (19,875 B) and 1.24x the largest
  * real document (Home Depot, 52,852 B), so it fires on approximately nothing
@@ -958,6 +1046,7 @@ const REEXTRACT_SOURCE_TAIL_BYTES = 8_192;
 export function capSourceText(
   text: string | null,
   documentId: string,
+  label: "ingest" | "re-extract" = "re-extract",
 ): string | null {
   if (text === null) return null;
   const size = Buffer.byteLength(text, "utf8");
@@ -972,7 +1061,7 @@ export function capSourceText(
   // degradation this guard exists to prevent, so it must never be the thing
   // that becomes invisible.
   console.warn(
-    `[re-extract] doc=${documentId} decoded source ${size} B exceeds ` +
+    `[${label}] doc=${documentId} decoded source ${size} B exceeds ` +
       `${REEXTRACT_SOURCE_CAP_BYTES} B cap — kept head ${REEXTRACT_SOURCE_HEAD_BYTES} B ` +
       `+ tail ${REEXTRACT_SOURCE_TAIL_BYTES} B, elided ${elided} B`,
   );
@@ -1139,14 +1228,12 @@ export async function reExtractDocument(
   //     Deliberately NOT written to `documents.ocr_text` first: the
   //     agent has no `SELECT ocr_text` instruction, and its own psql
   //     block overwrites that column at the end of the run anyway.
-  let sourceText: string | null = null;
-  try {
-    sourceText = capSourceText(await extractSourceText(doc, absPath), documentId);
-  } catch (err) {
-    console.warn(
-      `[re-extract] doc=${documentId} source-text extraction failed: ${(err as Error).message}`,
-    );
-  }
+  const source = await decodeSourceForAgent(
+    doc,
+    absPath,
+    reExtractScratchDir(transactionId),
+    "re-extract",
+  );
 
   // 3) Spawn the agent. Errors here bubble to the route handler;
   //    nothing has been written yet so the DB state is untouched.
@@ -1157,7 +1244,8 @@ export async function reExtractDocument(
     documentId,
     transactionId,
     userId,
-    ocrText: sourceText,
+    ocrText: source.text,
+    attachments: source.attachments,
   });
 
   // 3c) The prompt's own contract: on an unreadable source the agent

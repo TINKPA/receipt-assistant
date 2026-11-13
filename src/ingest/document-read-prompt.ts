@@ -25,6 +25,90 @@
  *
  * Plain template literal, never `String.raw` — see `prompt-contract.ts`.
  */
+/** Per-run scratch directory of an ingest. The worker writes decoded
+ *  attachments under it before the agent starts, so the prompt and the
+ *  worker must agree on the path. */
+export function ingestScratchDir(ingestId: string): string {
+  return `/tmp/${ingestId}`;
+}
+
+/** Per-run scratch directory of a re-extract. */
+export function reExtractScratchDir(transactionId: string): string {
+  return `/tmp/reextract-${transactionId}`;
+}
+
+/** A file the server pulled out of an email before the agent started. */
+export interface DecodedAttachment {
+  /** Container-absolute path the agent can open. */
+  path: string;
+  /** Filename as the sender named it. Untrusted; shown for context only. */
+  filename: string;
+  bytes: number;
+}
+
+function renderAttachments(attachments: DecodedAttachment[]): string {
+  if (attachments.length === 0) return "";
+  const list = attachments
+    .map((a) => `  ${a.path}   (${a.bytes} bytes, sent as ${JSON.stringify(a.filename)})`)
+    .join("\n");
+  return `
+The email also carries PDF attachment(s), already saved for you:
+
+${list}
+
+An attached invoice or receipt PDF usually has the itemization the
+body only summarizes. Read each with the PDF recipe above (text layer
+first), then use whichever source is more complete and say which in
+metadata.raw_text. Do NOT decode attachments out of the .eml yourself.
+`;
+}
+
+/**
+ * The decoded-source block (#167 for re-extract, #261 for ingest).
+ *
+ * The server MIME-decodes an email and linearizes HTML before the agent
+ * starts, because the agent doing it costs 40 KB–1 MB of markup in
+ * context per email and it cannot reach attachments at all.
+ *
+ * Inlined into the prompt rather than pre-written to `documents.ocr_text`:
+ * the agent has no `SELECT ocr_text` instruction, and its own psql block
+ * overwrites that column at the end of the run anyway.
+ *
+ * Renders nothing for images and PDFs, which the agent reads itself.
+ */
+export function renderDecodedSource(
+  sourceText: string | null | undefined,
+  attachments: DecodedAttachment[] = [],
+): string {
+  const text = sourceText?.trim() ?? "";
+  if (text.length === 0 && attachments.length === 0) return "";
+  const body =
+    text.length === 0
+      ? ""
+      : `
+This document is an email / HTML file, so its body has ALREADY been
+MIME-decoded and linearized for you. Read it here; you do NOT need to
+decode the file yourself. Item tables are linearized one row per line,
+so a name and its price sit on the SAME line.
+
+Treat this as the receipt text. Open the original file only if this
+text is obviously truncated or contradicts itself — and if you do,
+follow the document-reading rules above.
+
+The \`Date (envelope)\` header, when present, is when the EMAIL was sent.
+It is NOT automatically \`occurred_on\`: use the transaction date printed
+in the body, and fall back to the envelope date only when the body
+prints none.
+
+<<<DECODED_SOURCE
+${text}
+DECODED_SOURCE
+`;
+  return `
+── Decoded source text (already extracted for you) ────────────────────
+${body}${renderAttachments(attachments)}`;
+}
+
 export function phase0DocumentRead(opts: {
   /** Container-absolute path of the file under extraction. */
   filePath: string;
@@ -65,7 +149,10 @@ and every later turn re-reads them from cache.
 
 Images (.jpg/.png/.heic) — Read the file directly. One Read.
 
-Email (.eml) — NEVER Read the raw \`.eml\` blindly and never Read it as
+Email (.eml) and saved web pages (.html) — when a "Decoded source
+text" block appears below, the server has already decoded the file:
+read that block and skip the rest of this paragraph. Without one,
+NEVER Read the raw \`.eml\` blindly and never Read it as
 a PDF. The body is MIME-encoded (quoted-printable or base64, sometimes
 with non-UTF-8 bytes), so a raw Read gives you a base64 blob. Do NOT
 improvise your own decoder. Run exactly this tested one-liner (stdlib
