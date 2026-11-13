@@ -15,275 +15,114 @@ Keep them apart:
 - **A rule for an agent goes in its prompt, never in this file.** Changing what the extraction agent does is a prompt change; see "When to bump `PROMPT_VERSION`".
 - **`CLAUDE.md` must not be in the runtime image.** Claude Code auto-loads a `CLAUDE.md` from its working directory, and both agents run with cwd `/app`. A copy there costs about 18.7K input tokens on every turn of every extraction (#227). The `Dockerfile` does not copy it and `.dockerignore` keeps it out of the build context.
 
-## Database Schema
+## Database schema
 
-Postgres (managed via Drizzle migrations in `drizzle/`). The receipt-as-flat-row SQLite layout that lived here in earlier eras has been replaced by a double-entry ledger. `src/schema/` is the source of truth for the table definitions; the high-level shape:
+Postgres, managed by Drizzle migrations in `drizzle/`. `src/schema/` is the source of truth for table definitions. The ledger is double-entry:
 
 | Table | Purpose |
 |---|---|
-| `documents` | Uploaded receipt images / PDFs. Content-deduped per workspace by `sha256`. Soft-delete column `deleted_at`. |
+| `documents` | Uploaded receipt images / PDFs / `.eml`. Content-deduped per workspace by `sha256`. Soft delete is `deleted_at`. |
 | `document_links` | Many-to-many between `documents` and `transactions`. |
-| `transactions` | Ledger header. Writable `status ∈ {draft, posted, reconciled, error}` — voids were removed in #170/#173 (`voided_by_id` dropped in `drizzle/0033`; the `voided` value survives in the `txn_status` PG enum only as a vestigial leftover, and nothing writes it). Soft delete is `deleted_at`. |
-| `postings` | The individual debit/credit lines under a transaction. Sum-to-zero is enforced by a deferred check trigger. |
-| `places` | Geocoded merchant location, FK from `transactions.place_id`. |
-| `transaction_events` | Append-only audit log. |
+| `transactions` | Ledger header. Writable `status ∈ {draft, posted, reconciled, error}`. `voided` survives in the `txn_status` enum only as a leftover (#170/#173); nothing writes it. Soft delete is `deleted_at`. |
+| `postings` | Debit/credit lines under a transaction. Sum-to-zero is enforced by a deferred check trigger. |
+| `transaction_items` | Line items under a transaction. |
+| `places`, `place_snapshots` | Geocoded merchant location (FK from `transactions.place_id`) and the append-only history of every raw response fetched for it. |
+| `merchants`, `brands`, `products`, `owned_items`, `wish_items` | Catalog. |
+| `transaction_events`, `derivation_events` | Append-only audit logs: user/agent edits, and re-derive / re-extract runs. |
 | `accounts`, `workspaces`, `users`, `workspace_members` | Multi-tenant scaffolding. |
-| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Operational tables for upload workers + idempotency + reconcile flow. |
+| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. |
 
-A "receipt" surfaces to the user as the pair `(documents row, linked transaction row(s))`. The agent extracts a `Document`, then writes a balanced `Transaction` + `postings` and a `document_links` row.
+A "receipt" surfaces to the user as the pair `(documents row, linked transaction row(s))`. The agent reads a document, then writes a balanced transaction with its postings and items, and a `document_links` row.
 
 ### Delete semantics
 
-Receipts can genuinely be wrong (mis-shot, wrong merchant, duplicate). Both soft and hard delete are supported on every layer; the user owns the call.
+Receipts can be wrong (mis-shot, wrong merchant, duplicate). Soft and hard delete are both supported on every layer; the user owns the call.
 
 **`DELETE /v1/documents/:id`**
-- default: soft delete (sets `deleted_at`). `GET` and link-creation hide the row; `?include_deleted=true` surfaces it. Re-uploading the same bytes resurrects via the sha256 dedup path.
-- `?hard=true`: removes the row + image file. Refuses with 409 if links exist (caller must add `?cascade=true`).
-- `?cascade=true`: in one DB transaction, also handles linked txns — `posted` → soft-deleted (`deleted_at`), `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **always aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge of every linked txn + the doc + the file.
+- default: soft delete (sets `deleted_at`). `GET` and link-creation hide the row; `?include_deleted=true` surfaces it. Re-uploading the same bytes resurrects it via the sha256 dedup path.
+- `?hard=true`: removes the row and the image file. Refuses with 409 if links exist, unless `?cascade=true`.
+- `?cascade=true`: in one DB transaction, also handles linked transactions: `posted` → soft-deleted, `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge.
 
-**`POST /v1/documents/:id/restore`** — clears `deleted_at`.
+**`POST /v1/documents/:id/restore`** clears `deleted_at`.
 
 **`DELETE /v1/transactions/:id`**
-- default: soft delete (sets `deleted_at`). The row drops out of every money query; `POST /v1/transactions/:id/restore` brings it back.
-- `?hard=true`: physical delete (postings + document_links cascade via FK).
+- default: soft delete. The row drops out of every money query; `POST /v1/transactions/:id/restore` brings it back.
+- `?hard=true`: physical delete (postings and document_links cascade via FK).
 - `reconciled` rejects both with 409.
 
-The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging — so we make the user click twice.
+The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging.
 
-## Extraction provenance — `metadata.extraction` (Phase 1 of #80)
+## The three-layer data model (#80)
 
-Every transaction the ingest agent writes stamps a `metadata.extraction` block recording the prompt/model under which it ran. Schema:
+Every derived value belongs to one of three layers, and the rule is that a lower layer can always be re-run without destroying a higher one.
+
+| Layer | What it is | Examples |
+|---|---|---|
+| 1. Raw | What we fetched or were given, kept verbatim | the document file, `places.raw_response`, `place_snapshots` |
+| 2. Projection | Derived from Layer 1 by a prompt or by code | `transactions.payee` / `occurred_on`, items, `places.display_name_*` |
+| 3. User truth | An explicit user decision | `places.custom_name`, `transactions.narration`, any field the user PATCHed |
+
+### Provenance: `metadata.extraction`
+
+Every transaction the agent writes carries the prompt and model it ran under:
 
 ```jsonc
 {
   "extraction": {
-    "prompt_version": "2.5",                    // see src/ingest/prompt.ts → PROMPT_VERSION
+    "prompt_version": "<PROMPT_VERSION>",       // src/ingest/prompt-contract.ts
     "prompt_git_sha": "<build-info gitSha>",
-    "model":          "<CLAUDE_MODEL env or 'sonnet'>",
+    "model":          "<EXTRACTION_MODEL>",     // CLAUDE_MODEL env, else "cli-default"
+    "source":         "ingest" | "re-extract",
     "ran_at":         "<wall-clock at COMMIT>"
   }
 }
 ```
 
-This is the gate for [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (`POST /v1/documents/:id/re-extract`) — rows whose `prompt_version` ≠ the current source-tree `PROMPT_VERSION` are eligible to be re-extracted. Phase 2 of the same epic ([#89](https://github.com/TINKPA/receipt-assistant/issues/89)) shipped re-derive for `places`; see the next section.
+Rows whose `prompt_version` differs from the source tree's are the ones worth re-extracting. Rows ingested before this existed have `metadata.extraction = NULL`; treat that as "unknown version, eligible". `documents.ocr_model_version` records the model that produced `ocr_text` (NULL on old rows; no backfill is possible). `places.metadata.derivation` is the same idea for a place row.
 
 ### When to bump `PROMPT_VERSION`
 
-Bump in the **same PR** as the prompt change. Guideline:
+Bump in the **same PR** as the prompt change. Ingest and re-extract share the one constant.
 
 | Change | Bump? |
 |---|---|
 | New self-check block, new required field, fundamentally different reasoning flow | **Yes** (minor or major) |
+| New tool exposure (e.g. the agent gains a new Bash command pattern) | **Yes** |
 | Wording polish, typo fix, whitespace, log-only edit | **No** |
-| New tool exposure (e.g. agent gains a new Bash command pattern) | **Yes** |
 | Reordering existing instructions without semantic change | **No** |
 
-The version is a flat string (`"2.5"` today; `"2.5.1"` for a small additive iteration, `"3.0"` for a clean break). Auto-bumping on every commit defeats the purpose — it floods the version field with noise and makes the re-extract eligibility filter useless.
+The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration, `"4.0"` for a clean break). Bumping on every commit floods the field with noise and makes the re-extract eligibility filter useless.
 
-Legacy rows ingested before Phase 1 shipped have `metadata.extraction = NULL`. Phase 2/Phase 4 treats NULL as "unknown version, eligible to be re-extracted."
+### Three ways to re-run a layer
 
-## Backfill / re-derivation — `places` (Phase 2 of #80)
+| Endpoint | Re-runs | Calls out to | Writes |
+|---|---|---|---|
+| `POST /v1/places/:id/re-derive`, `POST /v1/admin/re-derive?scope=places` | Layer 2 of a place, from the stored `raw_response` | nothing | `places` projection columns, one `derivation_events` row |
+| `POST /v1/places/:id/refresh` | Layer 1 of a place, then re-derive | Google Places v1 (en + zh-CN) | a `place_snapshots` row, `places.raw_response`, then as re-derive |
+| `POST /v1/documents/:id/re-extract` | Layer 2 of a transaction, from the document file | `claude -p` | `payee` / `occurred_on` / `occurred_at` / items on the linked transaction, `documents.ocr_text`, one `derivation_events` row |
 
-Phase 2 of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#89](https://github.com/TINKPA/receipt-assistant/issues/89)) ships two endpoints that re-run Layer 2 projection over the existing `places.raw_response` — no Google calls, no Anthropic calls in the hot path.
+**Re-derive** is pure TypeScript: `src/projection/derive.ts::projectPlace(rawResponse)` encodes the place-naming rules (CJK extraction, branch-suffix stripping, the `is_native` heuristic with its `GLOBAL_ENGLISH_BRANDS` allowlist). The rules are stable enough to encode once, and an LLM call per place would cost 5–15 s each on the batch path for no gain. When you change them, bump `PROJECTION_VERSION` in the same PR and run the admin batch endpoint after deploy.
 
-```
-POST /v1/places/{id}/re-derive          # single
-POST /v1/admin/re-derive?scope=places   # batch over every place
-```
+Re-derive **overwrites** projection columns (not COALESCE: NULL is a valid new value), with two exceptions kept in `src/routes/places.service.ts::reDerivePlace`:
+- `places.custom_name` is never in the UPDATE column list. A new Layer 3 column on `places` must be added to that allowlist.
+- zh names whose `display_name_zh_source` is `photo_ocr` or `receipt_ocr` are preserved. They came from a storefront photo or the receipt, which the projection never sees, so "Google has no Chinese name" must not erase them.
 
-### How the projection runs
+`lat`, `lng` and the legacy `formatted_address` are physical facts set at fetch time and are not touched.
 
-Pure TypeScript, deterministic. `src/projection/derive.ts ::projectPlace(rawResponse)` is the single source of truth — it ports the rules in `src/ingest/prompt.ts` Phase 3c (CJK extraction, branch-suffix stripping, `is_native` heuristic with a `GLOBAL_ENGLISH_BRANDS` allowlist) into a rule-encoded function. No `claude -p` invocation, no Anthropic SDK call. Rationale: the heuristics are stable enough to encode once; running them through an LLM per place would add 5–15 s of latency × N for the batch path with no judgment-call payoff the rules can't deliver. The "AI-native" principle still holds — initial extraction (OCR, payee + items, merchant aggregation) stays LLM-driven; only the cheap re-projection step is deterministic.
+It does not cascade to `merchants`: `merchants.canonical_name` / `brand_id` / `category` come from the agent reading the **receipt**, and `merchants.address` / `lat` / `lng` from `src/enrichment/merchants.ts`, so a change in a place's projection creates no inconsistency there.
 
-When you change the projection logic (e.g. add a brand to `GLOBAL_ENGLISH_BRANDS`, refine the CJK strip rules), bump `PROJECTION_VERSION` in `src/projection/derive.ts` in the same PR and run `POST /v1/admin/re-derive?scope=places` after deploy to roll the new logic across the corpus.
+**Refresh** (`src/google/places-fetch.ts::fetchPlaceV1Dual`) inserts the snapshot and updates `raw_response` in one transaction, then calls `reDerivePlace`, which opens its own. A crash between the two leaves Layer 2 stale until the next refresh, and one duplicate snapshot; both are harmless. It returns 503 when `GOOGLE_MAPS_API_KEY` is unset and 502 with the upstream status when Google answers non-2xx, so a caller can tell a dead place id from a bad day at Google. There is no Yelp client; the `yelp_*` columns are placeholders.
 
-### Field-write policy
+**Re-extract** (`src/routes/documents.service.ts::reExtractDocument`, prompt in `src/ingest/reextract-prompt.ts`) tells the agent to UPDATE the existing transaction, never INSERT. It needs exactly one linked transaction: zero is a 422, and more than one is a 422 unless the caller passes `?transaction_id=`. The service snapshots before and after, diffs, and writes the `derivation_events` row. The response carries `outcome` (`written` | `no_change`): key any tooling on that, never on a timestamp (#167). It does not touch postings (a re-run could change amounts and break sum-to-zero), `place_id`, `merchant_id` or `document_links`.
 
-Re-derive **overwrites** projection-domain fields with the new projection result (NOT COALESCE — re-derive is authoritative, NULL is a valid new value). Two narrow exceptions:
-
-- **Layer 3 user-truth** (`places.custom_name_zh`) is never in the UPDATE column list. Mirrors the existing pattern at `src/ingest/prompt.ts:712-713`. New Layer 3 fields must be added to the service-side allowlist in `src/routes/places.service.ts ::reDerivePlace`.
-- **OCR-sourced zh fields** (`display_name_zh_source IN ('photo_ocr', 'receipt_ocr')`) are preserved verbatim. The projection only consumes Google's response; a row whose Chinese name came from a storefront photo or the receipt's own letterhead is outside this projection's input domain and must not be reclassified to `NULL` just because Google has no Chinese.
-
-Physical facts (`lat`, `lng`, the legacy `formatted_address`) are also untouched — those were set at fetch time and don't change with projection logic.
-
-### Audit log — `derivation_events`
-
-Every re-derive INSERTs one row into `derivation_events` **before** the UPDATE lands, inside the same transaction. Schema is shared across entity types (Phase 2 only writes `entity_type='place'`; #91 will add `'document'` / `'merchant'`):
-
-```sql
-SELECT entity_id, prompt_version, prompt_git_sha, model, ran_at, changed_keys
-  FROM derivation_events
- WHERE entity_type = 'place' AND entity_id = $1
- ORDER BY ran_at DESC;
-```
-
-- **Diff a version bump after the fact**: `WHERE prompt_version = '2.6'` gives every row touched by that release.
-- **Roll back a bad re-derive**: write the `before` jsonb back to the entity, then INSERT a new event documenting the rollback.
-- **Audit no-op runs**: rows where `changed_keys = []` still get an event — so a version bump that happened to produce the same output is visible (and gives you a known-good checkpoint to compare future runs against).
-
-The `places.metadata.derivation` jsonb on the row itself answers "what produced *this* current row" without a join — equivalent to `transactions.metadata.extraction` from Phase 1.
-
-### Why no merchants cascade
-
-The user-facing question raised during planning was: when re-derive changes `places.display_name_en`, should `merchants.canonical_name` auto-update for the linked brand? The code says no — `merchants.canonical_name` / `brand_id` / `category` come from the LLM looking at the **receipt** at ingest time, not from `places` projection output. `merchants.address` / `lat` / `lng` come from `src/enrichment/merchants.ts` calling Google's `findPlaceFromText` endpoint, which is separate from `places.raw_response`. So a `places` projection change doesn't introduce any new inconsistency in `merchants`, and a cascade UPDATE would be dead code. The cascade architecture slot belongs to [#91](https://github.com/TINKPA/receipt-assistant/issues/91) (re-extract), where re-reading the receipt with new place data can plausibly change `canonical_name`.
-
-## Raw-response history — `place_snapshots` (Phase 3 of #80)
-
-Phase 3 of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#90](https://github.com/TINKPA/receipt-assistant/issues/90)) adds an append-only history of every Google / Yelp `raw_response` we've ever fetched for a place. `places.raw_response` becomes the *latest pointer*; `place_snapshots` is the full audit trail.
-
-### What the table records
-
-```sql
-SELECT place_id, source, fetched_at, fetched_by_sha
-  FROM place_snapshots
- WHERE place_id = $1
- ORDER BY fetched_at DESC;
-```
-
-One row per ingest that touched the place. `source` mirrors `places.source` (`'google_geocode' | 'google_places' | 'yelp'`). `fetched_by_sha` is `buildInfo.gitShortSha` at fetch time — NULL for rows produced by the migration backfill (provenance unknown for historical fetches). `raw_response` is the full body, identical to whatever was written to `places.raw_response` in the same transaction.
-
-### Ingest write path
-
-The CTE in `src/ingest/prompt.ts:704-727` inserts the new `place_snapshots` row in the **same statement** as the `places` upsert — `places` returns the (possibly-just-created) row id, `place_snapshots` reads it from the upsert CTE and inserts atomically. Both rows reflect the same fetch; if either fails the other rolls back. The snapshot insert is unconditional — even when the upsert is a no-op COALESCE round-trip on cached data, the visit is recorded.
-
-### Why a separate table instead of versioning `places`
-
-`places` is the hot read path: every transaction render joins it. Keeping it flat (one row per Google place_id) keeps that read cheap. Snapshot history is queried by hand or by the future refresh path (#91) — putting that cost into a sibling table that's only touched on writes and audit reads is the textbook split.
-
-The same principle drove [`derivation_events`](#audit-log--derivation_events) (Phase 2) — Layer 2 stays a flat snapshot, audit history lives in a separate append-only table. `place_snapshots` is the same shape applied to Layer 1.
-
-### Backfill
-
-The migration (`drizzle/0012_place_snapshots.sql`) does a one-time backfill: every existing `places` row with `raw_response IS NOT NULL` gets one snapshot row, using `last_seen_at` as a best-effort `fetched_at` and `fetched_by_sha = NULL`. The `count(snapshots) ≥ count(places with raw_response)` invariant holds from the moment the migration commits.
-
-### Hand-off to #91
-
-Phase 4 (refresh) will INSERT a new snapshot for every Google / Yelp re-fetch, then diff snapshot N vs N−1 to surface what changed (renamed merchant, moved address, closed business). Without this table refresh would be destructive; with it, every re-fetch is non-lossy from day one.
-
-## Refresh — `places` (Phase 4a of #80)
-
-Phase 4a of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), first of three sub-PRs).
-
-```
-POST /v1/places/{id}/refresh    # re-fetch Google v1 + re-derive in one step
-```
-
-### What it does
-
-1. Re-fetches `places/{google_place_id}` from Google v1 dual-language (en + zh-CN, `X-Goog-FieldMask: *`) via `src/google/places-fetch.ts ::fetchPlaceV1Dual` — a server-side TS port of the curl block that the ingest agent runs at `src/ingest/prompt.ts` Phase 3c.
-2. INSERTs a new `place_snapshots` row with the fresh body (Phase 3 / #90 plumbing).
-3. UPDATEs `places.raw_response` to the new envelope, bumps `last_seen_at`, increments `hit_count`.
-4. Delegates to `reDerivePlace(workspaceId, placeId)` (Phase 2 / #89). That step writes the `derivation_events` row, applies projection, and protects Layer 3 + OCR-sourced zh fields.
-
-The endpoint returns `{place_id, google_place_id, snapshot_id, derivation_event_id, changed_keys}`. `changed_keys=[]` is a successful no-op refresh — Google returned the same data, snapshot still landed for audit, no Layer-2 diff.
-
-### Why no Yelp call
-
-The issue body says "re-fetch Google + Yelp" but no Yelp client exists yet — `places.yelp_business_id`, `places.yelp_raw_response`, etc. are placeholder columns waiting on a Yelp ingest epic. Phase 4a is Google-only; when Yelp ingest lands, this endpoint will pick up the second fetch in the same `db.transaction` block.
-
-### Why not atomic across the whole refresh
-
-Snapshot insert + `places.raw_response` UPDATE happen in one transaction; `reDerivePlace` is a separate call (it opens its own transaction internally). A process crash between them leaves the new snapshot + new `raw_response` committed but Layer 2 columns stale. The next refresh re-projects correctly; the only artifact is one extra `place_snapshots` row with identical body to the previous. Acceptable — snapshot history is append-only by design and the duplicate is benign.
-
-### Error shapes
-
-| Condition | Status | `type` |
-|---|---|---|
-| Place not in DB | 404 | `errors/not-found` (matches existing convention) |
-| `GOOGLE_MAPS_API_KEY` unset on the server | 503 | `errors/google-places-unavailable` |
-| Google v1 returns non-2xx | 502 | `errors/google-places-upstream` (carries `upstream_status`, `google_place_id`, `language_code`) |
-
-The 503 is intentionally a server-side fault: callers should retry once the deployment is fixed. The 502 surfaces the upstream status so frontends can distinguish "this place_id is dead in Google" (404 from Google) from "Google is having a bad day" (5xx) without re-doing the call.
-
-### What's NOT included (deferred to 91b/91c)
-
-- `POST /v1/documents/:id/re-extract` — re-running `claude -p` against retained image bytes, UPDATE-in-place of an existing transaction, Layer 3 shielding on the transaction surface. Sub-PR 91b lays the schema groundwork (`documents.ocr_model_version` column + Layer-3 tx field allowlist); 91c implements the prompt variant.
-- Merchant cascade — if `places.display_name_en` changes, should `merchants.canonical_name` follow? Current answer: no (`merchants.canonical_name` comes from the LLM looking at the **receipt**, not from `places` projection — see "Why no merchants cascade" above). The cascade slot belongs to 91c (re-extract) when re-reading the receipt with new place data can plausibly change the merchant.
-
-## Re-extract prep — `transactions` Layer 3 contract (Phase 4b of #80)
-
-Phase 4b of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), second of three sub-PRs). Pure schema + contract — no endpoints. The point is to ship the surface that 91c (re-extract) reads from, isolated so 91c's PR is purely the prompt variant + UPDATE plumbing.
-
-### `documents.ocr_model_version` (new column)
-
-```sql
-ALTER TABLE documents ADD COLUMN ocr_model_version text;
-```
-
-Records which model produced the current `documents.ocr_text`. NULL on legacy rows (anything ingested before Phase 4b). Set by the ingest worker on new uploads; overwritten by re-extract (Phase 4c).
-
-Distinct from `transactions.metadata.extraction.model` (#88) because OCR text and transaction-structure extraction can in principle run under different models — today they share one call, so both end up equal, but the split matters once re-extract decouples them. Backfill is intentionally not attempted: we cannot reconstruct which model ran on each historical row.
+It is synchronous and bypasses `MAX_CLAUDE_CONCURRENCY`, so run calls strictly one at a time. Running it twice under the same prompt and model should leave the transaction unchanged apart from `metadata.extraction.ran_at`; `ocr_text` may differ slightly because vision OCR is not deterministic.
 
 ### Layer 3 on `transactions`
 
-`src/projection/layer3.ts` codifies which transaction columns re-extract MUST NOT overwrite. Two flavors:
+`src/projection/layer3.ts` lists the columns re-extract must not overwrite.
 
-**HARD Layer 3** — fields the ingest agent never writes from extraction. Any non-default value is by definition user state or system identity. Re-extract omits these from its UPDATE column list entirely (same pattern as `places.custom_name_zh`):
-
-```ts
-HARD_LAYER3_TX_FIELDS = [
-  "status",            // explicit user actions (reconcile/un-reconcile)
-  "deleted_at",        // soft delete/restore — never resurrected by extraction
-  "trip_id",           // user-assigned grouping
-  "narration",         // user notes
-  "id",                // immutable identity
-  "workspace_id",
-  "source_ingest_id",
-  "created_by",
-  "created_at",
-  "version",           // optimistic concurrency — re-extract sets `version + 1`, never an arbitrary value
-];
-```
-
-**SOFT Layer 3** — fields extraction DOES write but `PATCH /v1/transactions/:id` (via `UpdateTransactionRequest`) lets the user override. We can't distinguish "agent-written → user-accepted" from "agent-written → user-overrode" without a flag. Convention:
-
-```jsonc
-// transactions.metadata
-{
-  "user_edited": {
-    "payee": true,
-    "occurred_on": true
-  }
-}
-```
-
-`updateTransaction` will set the flag whenever a PATCH body specifies a value for one of `SOFT_LAYER3_TX_FIELDS` (`occurred_on`, `occurred_at`, `payee`). Re-extract reads via `isFieldUserEdited(metadata, field)` and skips flagged fields. The wire-up for both sides lands in 91c; 91b publishes the contract so both readers point at one source.
-
-### Why a flag set, not per-field timestamps
-
-Re-extract only needs to know *whether* the user has touched a field. The timestamp of the edit is recoverable from `transaction_events` if anyone asks — no need to duplicate it onto the row. Keeping `metadata.user_edited` boolean-shaped keeps the read cheap and the write path simple.
-
-### What 91c will add
-
-- `POST /v1/documents/:id/re-extract` — the actual endpoint
-- A new prompt variant (or a flag on the existing prompt) that knows to UPDATE the existing transaction by `source_ingest_id` lookup, instead of INSERT-ing a new one
-- Writer side of `metadata.user_edited` flagging in `updateTransaction`
-- `derivation_events` rows with `entity_type='document'` (the audit-table extension was already designed into #89's schema)
-
-## Re-extract — `documents` (Phase 4c of #80)
-
-Phase 4c of the 3-layer data-model rollout ([#80](https://github.com/TINKPA/receipt-assistant/issues/80) / [#91](https://github.com/TINKPA/receipt-assistant/issues/91), last sub-PR — closes #91).
-
-```
-POST /v1/documents/{id}/re-extract    # re-OCR + UPDATE linked transaction
-```
-
-### What it does
-
-1. Resolves the linked transaction via `document_links` (errors 422 on zero or >1 links — we don't pick).
-2. Snapshots Layer-2 transaction fields (`payee`, `occurred_on`, `occurred_at`, `metadata.extraction`) + `documents.ocr_text` + `documents.ocr_model_version` BEFORE.
-3. Spawns `claude -p` with `src/ingest/reextract-prompt.ts ::buildReExtractPrompt` — a narrow prompt that tells the agent to UPDATE the existing transaction by id, NOT INSERT a new one.
-4. Agent re-reads the receipt image and runs one psql block:
-   - `UPDATE transactions` with Layer-3 CASE shielding (see below)
-   - `UPDATE documents` setting `ocr_text` + `ocr_model_version`
-   - `INSERT INTO transaction_events` with `event_type='re_extracted'`
-5. Snapshots AFTER, computes diff, writes one `derivation_events` row with `entity_type='document'`.
-
-### Layer-3 shielding (the safety contract)
-
-**HARD Layer 3** (`HARD_LAYER3_TX_FIELDS` in `src/projection/layer3.ts`): `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. The prompt's UPDATE doesn't mention these columns at all (omission = perfect shielding). `version` is the lone exception — re-extract always bumps it via `version + 1` to advance optimistic-concurrency.
-
-**SOFT Layer 3** (`SOFT_LAYER3_TX_FIELDS`): `payee`, `occurred_on`, `occurred_at`. The agent generates new values but the SQL wraps them in CASE expressions:
+- **Hard**: `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. Extraction never writes these, so the re-extract UPDATE simply does not name them. `version` is the exception: always `version + 1`.
+- **Soft**: `payee`, `occurred_on`, `occurred_at`. Extraction writes them and the user may override them. `updateTransaction` sets `metadata.user_edited.<field> = true` whenever a PATCH names one, and the re-extract SQL wraps each in a CASE that keeps the current value when the flag is set:
 
 ```sql
 payee = CASE
@@ -292,30 +131,25 @@ payee = CASE
 END
 ```
 
-`metadata.user_edited.<field> = true` is set by `updateTransaction` (PATCH path) whenever the user changes that field. The flag survives re-extract; once flagged, the field is read-only to re-extract forever (the user can re-flag by PATCHing back to the new agent value if they want re-extract to take over again).
+Once flagged, a field is read-only to re-extract. The flag is a boolean, not a timestamp: when the edit happened is in `transaction_events`.
 
-### What's NOT included (deferred)
+### Audit queries
 
-- **Postings rewrite.** Re-extract does not DELETE+INSERT `postings` for the transaction. Reason: postings carry the sum-to-zero ledger invariant; re-running extraction could produce different categories / amounts and risk balance violations. If category drift matters, edit postings explicitly via the postings endpoints. A later scope (call it 91d) can extend re-extract to safely rewrite postings inside a balance-checking transaction.
-- **`place_id` / `merchant_id`.** Place refresh is `POST /v1/places/:id/refresh` (Phase 4a). Merchant aggregation has its own enrichment loop.
-- **`document_links` rebuild.** The link is already correct — re-extract doesn't change which document points to which transaction.
+```sql
+-- Every re-derive / re-extract of one entity ('place' or 'document')
+SELECT entity_id, prompt_version, prompt_git_sha, model, ran_at, changed_keys
+  FROM derivation_events
+ WHERE entity_type = 'place' AND entity_id = $1
+ ORDER BY ran_at DESC;
 
-### Error shapes
+-- Every raw response ever fetched for a place
+SELECT place_id, source, fetched_at, fetched_by_sha
+  FROM place_snapshots
+ WHERE place_id = $1
+ ORDER BY fetched_at DESC;
+```
 
-| Condition | Status | `type` |
-|---|---|---|
-| Document not found (or soft-deleted) | 404 | `errors/not-found` |
-| Document has no `file_path` | 422 | `errors/document-no-file-path` |
-| Document linked to zero transactions | 422 | `errors/document-no-transaction` |
-| Document linked to >1 transaction | 422 | `errors/document-multiple-transactions` (carries `transaction_ids[]`) |
-
-### Observability
-
-The `session_id` field in the response is the pre-allocated UUID passed to `claude -p`; its transcript is `~/Developer/receipt-assistant-data/claude/projects/-app/<session_id>.jsonl` on the host — the model's reasoning and every SQL statement it ran. See "Agent transcripts" below.
-
-### Idempotency, sort of
-
-Re-running re-extract on the same document with the same `PROMPT_VERSION` and model should produce no Layer-2 diff in the *transaction* (the agent should produce the same payee/date). It will always produce a `metadata.extraction` diff (the `ran_at` timestamp moves) and may produce an `ocr_text` diff (vision OCR is not 100% deterministic — punctuation, line-break differences). The `derivation_events` row is written every time regardless, so the audit trail tracks every re-run.
+A `derivation_events` row is written before the UPDATE, in the same transaction, even when `changed_keys = []`, so a no-op run is still a known-good checkpoint. To roll back a bad run, write the row's `before` jsonb back and insert a new event recording the rollback. The ingest prompt inserts a `place_snapshots` row in the same statement as the `places` upsert, on every visit, cached or not; `fetched_by_sha` is NULL on rows the original migration backfilled.
 
 ## Known Pitfalls
 
@@ -617,14 +451,17 @@ Why this replaced the per-container `/login` session (Era 5): that session self-
 
 **Operate this via the `setup` skill** — first-time bootstrap, 401 diagnosis, recovery procedures all live there.
 
-### Six-era timeline of OAuth approaches
+### What earlier auth setups taught us
 
-- **Era 1 (pre-2026-04-19) — `CLAUDE_CODE_OAUTH_TOKEN` env var + entrypoint-synthesized credentials file.** Broke because the env var overrides the file and disables self-refresh; the synthesized value was a *short-lived access token* with `refreshToken: ""`. Result: 24h 401 cycle. (Era 6 reuses the same env var but with a *long-lived setup-token* — see below — so this failure mode does not recur.)
-- **Era 2 (2026-04-19 → 2026-04-20) — host `~/.claude/.credentials.json` bind-mounted RW.** Broke because host and container shared a single OAuth session: host's `claude` CLI rotates the refresh token on every interactive use, invalidating the container's next call. Result: 401 every few hours.
-- **Era 3 (2026-04-20 → 2026-05-09) — Docker-managed named volume `claude-code-config`.** Worked operationally but vulnerable to volume wipes (and was wiped along with everything else on 2026-05-09).
-- **Era 4 (2026-05-09 → 2026-05-11) — host bind mount at `~/Developer/2026_Dev_ReceiptAssistant/data/claude/`.** Volume-reset-resilient but mixed runtime state into the outer project notebook, which complicated the 2026-05-11 outer-project iCloud migration.
-- **Era 5 (2026-05-11 → 2026-10-08) — host bind mount at `~/Developer/receipt-assistant-data/claude/`.** Sibling dir, deliberately outside this repo and outside iCloud. Same OAuth isolation, with the runtime-state-leaks-into-docs-notebook problem solved by physical separation. Retired because the per-container `/login` refresh token still lapsed/got invalidated and failed silently (8× Aug–Sep 2026).
-- **Era 6 (2026-10-08 onward) — long-lived `claude setup-token` via `CLAUDE_CODE_OAUTH_TOKEN`.** The token from personal-vault `anthropic/oauth-token` (the one OpenClaw already uses). **Not** Era 1 redux: Era 1 failed on a *short-lived access token* with an empty refresh (24h 401 cycle); a setup-token is a ~365-day credential designed to be used this way, so there is no refresh to lose. Sole auth gate when set; the Era-5 bind mount stays as an inert escape-hatch. Only new recurring cost: rotate before ~2027-07-31. See "Claude Code OAuth" above.
+The current setup is Era 6. Five approaches failed before it, and the hard rules below are what each cost us.
+
+| Era | When | Approach | How it failed |
+|---|---|---|---|
+| 1 | before 2026-04-19 | `CLAUDE_CODE_OAUTH_TOKEN` holding a short-lived *access* token | The env var disables refresh: 401 every 24 h |
+| 2 | 2026-04-19 → 04-20 | Host `~/.claude/.credentials.json` bind-mounted | Host CLI rotated the shared refresh token: 401 every few hours |
+| 3 | 2026-04-20 → 05-09 | Docker named volume | Wiped with every other volume on 2026-05-09 |
+| 4 | 2026-05-09 → 05-11 | Bind mount inside the iCloud project notebook | Runtime state mixed into synced docs |
+| 5 | 2026-05-11 → 10-08 | Bind mount at `~/Developer/receipt-assistant-data/claude/` with in-container `/login` | Refresh token lapsed silently, 8 times in Aug–Sep 2026 |
 
 ### Hard rules
 
@@ -643,7 +480,7 @@ Minimum label set (every issue):
 
 - one `kind/*` — `bug` · `feature` · `enhancement` · `docs` · `refactor` · `chore`
 - one `priority/*` — `p0` · `p1` · `p2` · `p3`
-- one `area/*` — `api` · `extraction` · `db` · `docker` · `langfuse` · `ops`
+- one `area/*` — `api` · `extraction` · `db` · `docker` · `ops`
 - one `status/*` — `needs-triage` · `confirmed` · `in-progress` · `blocked`
 - **bugs also require** one `severity/*` — `critical` · `major` · `minor` · `trivial`
 
