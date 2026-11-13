@@ -73,12 +73,31 @@ export const BASE_CURRENCY_DESCRIPTION =
   "The workspace base currency. Always an ISO 4217 code, never a " +
   "points-programme code.";
 
+/** Shared wording for the caveat on those figures: a leg the FX pass
+ *  never converted is summed at its native amount. */
+export const UNCONVERTED_COUNT_DESCRIPTION =
+  "Transactions counted above whose expense legs include a " +
+  "foreign-currency posting that was never converted (the rate source " +
+  "was unreachable, or does not publish that currency or date). Their " +
+  "native amount is in the spend figures at face value, so the figures " +
+  "are true base-currency amounts only when this is 0. The `fx` block of " +
+  "`/v1/reports/summary` lists the same postings per currency.";
+
+export const UNCONVERTED_ROW_DESCRIPTION =
+  "True when `total_minor` includes a foreign-currency posting that was " +
+  "never converted: that part is the receipt's native amount, not a " +
+  "base-currency amount.";
+
 /**
  * Aggregated KPIs computed by the merchant detail endpoint. Both spend
  * figures are sums of base-currency amounts, so a merchant with receipts
  * in several currencies (or paid partly in points) still adds up to one
  * meaningful number, and it matches the merchant's row in
  * `/v1/reports/summary?group_by=payee`.
+ *
+ * `unconverted_transaction_count` is the caveat the reports carry in
+ * their `fx` block: how many of those transactions have a foreign leg
+ * that was never converted and so sits in the sums at its native amount.
  */
 export const MerchantStats = z
   .object({
@@ -93,6 +112,11 @@ export const MerchantStats = z
       .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
     last_transaction_date: z.string().nullable(),
     currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
+    unconverted_transaction_count: z
+      .number()
+      .int()
+      .nonnegative()
+      .openapi({ description: UNCONVERTED_COUNT_DESCRIPTION }),
   })
   .openapi("MerchantStats");
 
@@ -123,6 +147,9 @@ export const MerchantTransactionRow = z
         BASE_AMOUNT_DESCRIPTION,
     }),
     currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
+    unconverted: z
+      .boolean()
+      .openapi({ description: UNCONVERTED_ROW_DESCRIPTION }),
     document_id: Uuid.nullable(),
   })
   .openapi("MerchantTransactionRow");

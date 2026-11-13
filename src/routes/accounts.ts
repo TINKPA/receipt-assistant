@@ -387,7 +387,6 @@ export interface BalanceArgs {
   workspaceId: string;
   accountId: string;
   asOf?: string; // YYYY-MM-DD
-  currency?: string;
   includeChildren?: boolean;
 }
 
@@ -399,8 +398,13 @@ export async function getBalanceService(
 
   const asOf =
     args.asOf ?? new Date().toISOString().slice(0, 10); // today in UTC
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  // The balance is a sum of `amount_base_minor`, so it is in the
+  // workspace base currency whatever the account itself is denominated
+  // in, and that is the only label it may carry. A `currency` query
+  // parameter used to be accepted here and written next to the same sum
+  // (`?currency=CNY` returned the dollar total labelled CNY); it is gone
+  // from the contract, like the one on the reports.
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
 
   // Gather relevant account IDs: either just this one, or the subtree.
   const result = await db.execute(
@@ -758,7 +762,6 @@ accountsRouter.get(
       workspaceId: req.ctx.workspaceId,
       accountId: id,
       asOf: q.as_of,
-      currency: q.currency,
       includeChildren: q.include_children,
     });
     res.json(out);
@@ -910,6 +913,10 @@ export function registerAccountsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/accounts/{id}/balance",
     summary: "Account balance as of a date",
+    description:
+      "The balance is the sum of the account's postings in the workspace " +
+      "base currency, named by `currency` in the response. There is no " +
+      "parameter to ask for another currency.",
     tags: ["accounts"],
     request: { params: IdParam, query: BalanceQuery },
     responses: {

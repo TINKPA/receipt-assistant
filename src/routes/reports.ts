@@ -62,6 +62,7 @@ import {
 } from "../schemas/v1/report.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
 import { POINTS_CURRENCY_SQL_RE } from "../points/codes.js";
+import { unconvertedLegSql } from "../fx/unconverted.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -285,8 +286,9 @@ async function getAccountPointsDisclosure(args: {
 // the unconverted legs inside its own scope and returns them per
 // currency, next to what they are currently counted as.
 //
-// Zero-amount legs are skipped. They convert to zero at any rate, so they
-// distort nothing, and old rows have a few that no pass ever visited.
+// What counts as unconverted is defined once, in `src/fx/unconverted.ts`
+// (zero-amount legs are not: they convert to zero at any rate). The
+// merchant and brand KPIs count the same legs.
 
 const FX_POLICY =
   "Foreign-currency postings are converted to the base currency at the " +
@@ -338,10 +340,7 @@ async function getFxDisclosure(args: {
        WHERE p.workspace_id = ${args.workspaceId}::uuid
          AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
          AND a.type::text IN (${types})
-         AND p.currency <> ${args.baseCurrency}
-         AND p.currency !~ ${POINTS_CURRENCY_SQL_RE}
-         AND p.fx_rate IS NULL
-         AND p.amount_minor <> 0
+         AND ${unconvertedLegSql("p", sql`${args.baseCurrency}`)}
          ${openFilter}
          ${fromFilter}
          ${toFilter}

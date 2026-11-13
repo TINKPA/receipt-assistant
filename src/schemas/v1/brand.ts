@@ -12,6 +12,8 @@ import { IsoDateTime, Metadata, Uuid } from "./common.js";
 import {
   BASE_AMOUNT_DESCRIPTION,
   BASE_CURRENCY_DESCRIPTION,
+  UNCONVERTED_COUNT_DESCRIPTION,
+  UNCONVERTED_ROW_DESCRIPTION,
   Merchant,
   MerchantStats,
 } from "./merchant.js";
@@ -113,6 +115,11 @@ export const BrandRollupStats = z
       .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
     last_transaction_date: z.string().nullable(),
     currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
+    unconverted_transaction_count: z
+      .number()
+      .int()
+      .nonnegative()
+      .openapi({ description: UNCONVERTED_COUNT_DESCRIPTION }),
   })
   .openapi("BrandRollupStats");
 
@@ -140,6 +147,9 @@ export const BrandRollupRecentRow = z
         BASE_AMOUNT_DESCRIPTION,
     }),
     currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
+    unconverted: z
+      .boolean()
+      .openapi({ description: UNCONVERTED_ROW_DESCRIPTION }),
     document_id: Uuid.nullable(),
     merchant_id: Uuid,
     merchant_canonical_name: z.string(),

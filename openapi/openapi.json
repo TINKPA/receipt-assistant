@@ -430,7 +430,8 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
+            "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. `balance_minor` is a sum of base amounts, whatever currency the account itself is denominated in (a CNY or points account still reports its balance in this one).",
             "example": "USD"
           },
           "posting_count": {
@@ -635,7 +636,9 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": [
@@ -2980,6 +2983,11 @@
           "currency": {
             "type": "string",
             "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -2988,7 +2996,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "Merchant": {
@@ -3129,6 +3138,11 @@
           "currency": {
             "type": "string",
             "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -3136,7 +3150,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "BrandRollupLocation": {
@@ -3188,6 +3203,10 @@
             "type": "string",
             "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
           },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
+          },
           "document_id": {
             "type": [
               "string",
@@ -3218,6 +3237,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id",
           "merchant_id",
           "merchant_canonical_name",
@@ -4777,6 +4797,10 @@
             "type": "string",
             "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
           },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
+          },
           "document_id": {
             "type": [
               "string",
@@ -4793,6 +4817,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id"
         ]
       },
@@ -4849,11 +4874,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Required, together with `amount_base_minor`, on a foreign-currency cash posting: the pair is stored as sent and is not checked against a published rate, so send the minor-unit multiplier, not the quoted rate. Omit both on a points posting to have the server apply the programme valuation.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -5103,11 +5130,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Stored as sent and not checked against a published rate, so send the minor-unit multiplier, not the quoted rate.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -5648,6 +5677,7 @@
     "/v1/accounts/{id}/balance": {
       "get": {
         "summary": "Account balance as of a date",
+        "description": "The balance is the sum of the account's postings in the workspace base currency, named by `currency` in the response. There is no parameter to ask for another currency.",
         "tags": [
           "accounts"
         ],
@@ -5671,16 +5701,6 @@
             },
             "required": false,
             "name": "as_of",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
             "in": "query"
           },
           {
