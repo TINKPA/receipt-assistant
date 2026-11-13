@@ -104,10 +104,7 @@ export const places = pgTable(
      *  `display_name_*` field in the UI fallback chain. Language-
      *  agnostic: the user may type Chinese, English, or anything
      *  else — the field is "the user's name for this place", not
-     *  Chinese specifically. Renamed from `custom_name_zh` in #79.
-     *  PATCH body still accepts `custom_name_zh` as a deprecated
-     *  alias for one release; clients should migrate to
-     *  `custom_name`. */
+     *  Chinese specifically. Renamed from `custom_name_zh` in #79. */
     customName: text("custom_name"),
 
     // ── typing ────────────────────────────────────────────────────
