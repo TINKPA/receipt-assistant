@@ -3,7 +3,6 @@
  */
 import { z } from "zod";
 import {
-  QueryBoolean,
   AmountMinor,
   LedgerCurrencyCode,
   IsoDate,
@@ -13,6 +12,7 @@ import {
 } from "./common.js";
 import { Place } from "./place.js";
 import { MerchantBrandId } from "./merchant.js";
+import { QueryBoolean } from "./common.js";
 
 /**
  * Compact merchant reference embedded in transaction responses so the

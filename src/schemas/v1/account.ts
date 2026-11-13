@@ -3,7 +3,6 @@
  */
 import { z } from "zod";
 import {
-  QueryBoolean,
   AmountMinor,
   LedgerCurrencyCode,
   IsoDate,
@@ -11,6 +10,7 @@ import {
   Metadata,
   Uuid,
 } from "./common.js";
+import { QueryBoolean } from "./common.js";
 
 export const AccountType = z.enum([
   "asset",
@@ -136,7 +136,7 @@ export const ListAccountsQuery = z.object({
 export const BalanceQuery = z.object({
   as_of: IsoDate.optional(),
   currency: LedgerCurrencyCode.optional(),
-  include_children: QueryBoolean.optional(),
+  include_children: z.coerce.boolean().optional(),
 });
 
 export const RegisterQuery = z.object({
