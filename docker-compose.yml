@@ -51,7 +51,20 @@ services:
     ports:
       - "3000:3000"
     environment:
+      # The SERVER's connection: the role that owns the schema. The two
+      # `claude -p` agents never see this value. Each child is spawned with
+      # a DATABASE_URL of its own that logs in as a restricted role on the
+      # same host and database (src/claude.ts, src/db/agent-roles.ts).
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
+      # Passwords for those two roles: `receipts_agent` (extraction and
+      # re-extract; may write only the tables and columns the prompts
+      # write) and `receipts_ro` (Ask; SELECT only). The server sets them
+      # on the roles at every boot and builds the agents' connection
+      # strings from them, so changing one is: edit .env, `up -d`. Unset
+      # falls back to a built-in development password and a boot warning —
+      # set both in .env (`openssl rand -hex 24`).
+      RECEIPTS_AGENT_DB_PASSWORD: ${RECEIPTS_AGENT_DB_PASSWORD:-}
+      RECEIPTS_RO_DB_PASSWORD: ${RECEIPTS_RO_DB_PASSWORD:-}
       # Tell the `claude` CLI explicitly where its config + credentials live.
       # Matches the Anthropic-official devcontainer convention and pairs with
       # the ./data/claude bind-mount below.
@@ -66,9 +79,10 @@ services:
       # -> paste into .env -> up -d -> update vault + `openclaw models auth
       # paste-token`. Full rationale in CLAUDE.md 'Claude Code OAuth'.
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
-      # Google Maps API key reachable by the in-container `claude -p` agent
-      # via its Bash tool (for Phase 3 geocoding during extraction). Empty
-      # is fine — the prompt instructs the agent to skip geocoding.
+      # Google Maps API key. Passed on to the EXTRACTION agent only (its
+      # Bash tool uses it for Phase 3 geocoding); the Ask agent does not
+      # get it. Also used by the server's own merchant-enrichment loop.
+      # Empty is fine — the prompt instructs the agent to skip geocoding.
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
       # Worker concurrency for `claude -p` extraction. PRODUCTION RUNS
       # SERIALIZED (1) ON PURPOSE — this is a correctness setting, not a
@@ -86,12 +100,14 @@ services:
       # 6 for exactly that, on throwaway data where dedup doesn't matter.
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-1}
       # logo.dev API keys for #101 Phase 2 brand-icon acquisition. The
-      # publishable key (pk_…) is embedded in img.logo.dev URLs the agent
-      # follows; the secret key (sk_…) authorizes api.logo.dev/search,
-      # which Phase 4b uses search-first to avoid the letter-fallback bug
-      # (blind GET against img.logo.dev/<anydomain> returns a generated
-      # first-letter PNG for unknown domains — silent wrong-icon). Empty
-      # is fine — the agent skips the logo.dev tier when unset.
+      # secret key (sk_…) authorizes api.logo.dev/search, which Phase 4b
+      # uses search-first to avoid the letter-fallback bug (blind GET
+      # against img.logo.dev/<anydomain> returns a generated first-letter
+      # PNG for unknown domains — silent wrong-icon). It is passed on to
+      # the extraction agent only. The publishable key (pk_…) is NOT
+      # passed to any agent: no prompt references it — the search response
+      # already carries a signed logo URL. Empty is fine — the agent skips
+      # the logo.dev tier when the secret key is unset.
       LOGODEV_PUBLISHABLE_KEY: ${LOGODEV_PUBLISHABLE_KEY:-}
       LOGODEV_SECRET_KEY: ${LOGODEV_SECRET_KEY:-}
     volumes:

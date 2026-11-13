@@ -70,16 +70,19 @@ export type Extractor = (input: ExtractorInput) => Promise<ExtractorResult>;
  * Spawn `claude -p` for the two extraction prompts.
  *
  * The shared `runClaude` in `src/claude.ts` owns the mechanics — prompt
- * on stdin (never argv, see #194), argv-size guard, env scrubbing,
- * timeout. This wrapper adds only the flags both extraction prompts
- * want and forwards the caller's pre-allocated session id.
+ * on stdin (never argv, see #194), argv-size guard, timeout — and the
+ * `extraction` profile there owns what the child may have: five tools,
+ * no MCP servers, an allowlisted environment, and a `DATABASE_URL` that
+ * logs in as `receipts_agent` instead of the server's own role. This
+ * wrapper adds only the output format and the model, and forwards the
+ * caller's pre-allocated session id.
  */
 async function runExtractorClaude(
   prompt: string,
   sessionId: string,
   timeoutMs: number,
 ): Promise<string> {
-  const args = ["--output-format", "text", "--dangerously-skip-permissions"];
+  const args = ["--output-format", "text"];
   // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
   // mini today) means the CLI picks its own default, and the prompt
   // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
@@ -88,7 +91,12 @@ async function runExtractorClaude(
   if (process.env.CLAUDE_MODEL) {
     args.push("--model", process.env.CLAUDE_MODEL);
   }
-  const { stdout } = await runClaude(prompt, { args, sessionId, timeoutMs });
+  const { stdout } = await runClaude(prompt, {
+    profile: "extraction",
+    args,
+    sessionId,
+    timeoutMs,
+  });
   return stdout;
 }
 

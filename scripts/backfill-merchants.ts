@@ -200,10 +200,12 @@ async function main() {
     );
     // Spawning goes through src/claude.ts so this script cannot drift from
     // the production path — in particular the prompt travels on stdin, not
-    // argv (#194), and the child env is scrubbed of CLAUDECODE /
-    // ANTHROPIC_API_KEY. This used to be a local copy that shadowed the
-    // shared export and did none of that.
+    // argv (#194), and the child env is an allowlist with no
+    // ANTHROPIC_API_KEY in it. This used to be a local copy that shadowed
+    // the shared export and did none of that.
     const { stdout: raw } = await runClaude(prompt, {
+      // Classification from the payee string alone: no tools, no database.
+      profile: "text",
       args: ["--model", "sonnet"],
       timeoutMs: CLAUDE_TIMEOUT_MS,
     });

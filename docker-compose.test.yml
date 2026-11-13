@@ -70,6 +70,11 @@ services:
       - "3001:3000"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
+      # Passwords for the agents' database roles (receipts_agent,
+      # receipts_ro). Same wiring as production; unset uses the built-in
+      # development password, which is fine for a sandbox.
+      RECEIPTS_AGENT_DB_PASSWORD: ${RECEIPTS_AGENT_DB_PASSWORD:-}
+      RECEIPTS_RO_DB_PASSWORD: ${RECEIPTS_RO_DB_PASSWORD:-}
       CLAUDE_CONFIG_DIR: /home/node/.claude
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}

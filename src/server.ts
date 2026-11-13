@@ -10,6 +10,15 @@
 import "dotenv/config";
 import { buildApp } from "./app.js";
 import { runMigrations } from "./db/migrate.js";
+import { pool } from "./db/client.js";
+import {
+  AGENT_GRANTS,
+  AGENT_ROLE,
+  RO_ROLE,
+  auditAgentRoles,
+  rolePasswordEnvName,
+  syncAgentRoles,
+} from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
@@ -53,10 +62,53 @@ function logPromptSize(): void {
   }
 }
 
+/**
+ * Bring the two agent database roles in line with `src/db/agent-roles.ts`:
+ * passwords from the environment, privileges from `AGENT_GRANTS`.
+ *
+ * Non-fatal. If this throws, the HTTP API and everything that does not
+ * spawn an agent still work, and the next extraction fails on its first
+ * psql call with a login or permission error that names the role — which
+ * is a better outage than a server that will not boot. The error line
+ * below is what to look for.
+ */
+async function syncAgentDbRoles(): Promise<void> {
+  try {
+    const report = await syncAgentRoles(pool);
+    console.log(
+      `🔐 Agent DB roles synced: ${AGENT_ROLE} on ${Object.keys(AGENT_GRANTS).length} tables, ` +
+        `${RO_ROLE} read-only on all`,
+    );
+    for (const role of report.defaultPasswords) {
+      console.warn(
+        `⚠️  ${role} is using the built-in development password — set ${rolePasswordEnvName(role)} in .env.`,
+      );
+    }
+    for (const what of report.skipped) {
+      console.error(
+        `❌ AGENT_GRANTS names ${what}, which the schema does not have — the grant was skipped. ` +
+          `Fix src/db/agent-roles.ts.`,
+      );
+    }
+    // Printed so a table added later is never invisible to the extraction
+    // agent without anyone having been told.
+    console.log(`🔐 ${AGENT_ROLE} has no access to: ${report.agentCannotSee.join(", ") || "(none)"}`);
+    const drift = await auditAgentRoles(pool);
+    for (const line of drift) console.error(`❌ Agent DB role drift: ${line}`);
+  } catch (err) {
+    console.error(
+      "❌ Agent DB role sync FAILED — extraction and Ask will not be able to reach the database:",
+      (err as Error).message,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   console.log("🗄️  Running Drizzle migrations…");
   await runMigrations();
   console.log("✅ Migrations complete");
+
+  await syncAgentDbRoles();
 
   logPromptSize();
 

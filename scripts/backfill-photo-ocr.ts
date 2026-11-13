@@ -152,7 +152,9 @@ Read all three, judge, then print the single JSON object.`;
  */
 async function askClaude(prompt: string, timeoutMs: number): Promise<string> {
   const { stdout } = await runClaude(prompt, {
-    args: ["--output-format", "text", "--dangerously-skip-permissions"],
+    // curl with $GOOGLE_MAPS_API_KEY, then Read: the extraction tool set.
+    profile: "extraction",
+    args: ["--output-format", "text"],
     timeoutMs,
   });
   return stdout;

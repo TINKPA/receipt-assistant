@@ -204,7 +204,8 @@ async function runClaudeOnImage(
   // the production path — in particular the prompt travels on stdin, not
   // argv (#194).
   const { stdout: raw, sessionId } = await runClaude(buildPrompt(absImagePath), {
-    args: ["--output-format", "text", "--dangerously-skip-permissions"],
+    profile: "extraction",
+    args: ["--output-format", "text"],
     timeoutMs,
   });
 
