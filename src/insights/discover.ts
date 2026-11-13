@@ -137,14 +137,39 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
   }
 
   // ── owned-milestone ───────────────────────────────────────────────
+  //
+  // `paid_minor` is what the line cost in its OWN currency and is used
+  // only as "a price is known". The $/day figure is printed as base
+  // currency, so it is computed from `paid_base_minor`: the line at the
+  // rate its transaction's posting was converted at, the same expression
+  // `/v1/owned-items?expand=product` serves (#216). It was computed from
+  // `paid_minor`, which put yuan per day behind a dollar sign for an item
+  // bought in CNY. NULL means the conversion is unknown, and the card
+  // then says how long the item has been held instead of guessing.
   const milestones = await db.execute(sql`
     SELECT o.id, COALESCE(p.custom_name, p.canonical_name) AS name,
            (CURRENT_DATE - o.acquired_on) AS days_held,
            o.target_days,
-           COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor
+           COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor,
+           CASE
+             WHEN fx.rate IS NOT NULL
+               THEN ROUND(COALESCE(ti.effective_total_minor, ti.line_total_minor) * fx.rate)
+             WHEN ti.currency = w.base_currency
+               THEN COALESCE(ti.effective_total_minor, ti.line_total_minor)
+             ELSE NULL
+           END AS paid_base_minor
     FROM owned_items o
     LEFT JOIN products p ON p.id = o.product_id
     LEFT JOIN transaction_items ti ON ti.id = o.transaction_item_id
+    LEFT JOIN workspaces w ON w.id = o.workspace_id
+    LEFT JOIN LATERAL (
+      SELECT po.fx_rate AS rate
+        FROM postings po
+       WHERE po.transaction_id = ti.transaction_id
+         AND po.currency = ti.currency
+         AND po.fx_rate IS NOT NULL
+       LIMIT 1
+    ) fx ON TRUE
     WHERE o.workspace_id = ${workspaceId}::uuid
       AND o.retired_at IS NULL AND o.acquired_on IS NOT NULL
   `);
@@ -154,7 +179,9 @@ export async function discoverInsights(workspaceId: string): Promise<number> {
     const mark = MARKS.find((m) => days >= m && days < m + 30);
     if (mark) {
       const perDay =
-        r.paid_minor != null ? (Number(r.paid_minor) / 100 / days).toFixed(2) : null;
+        r.paid_base_minor != null
+          ? (Number(r.paid_base_minor) / 100 / days).toFixed(2)
+          : null;
       seeds.push({
         kind: "milestone",
         title: `${r.name ?? "An item"} hit ${mark.toLocaleString()} days held.`,

@@ -30,10 +30,16 @@ export const postings = pgTable(
     // loyalty redemption — widened from char(3) in 0038 (#206). The two
     // namespaces are disjoint by shape; see `src/points/codes.ts`.
     currency: varchar("currency", { length: 16 }).notNull(),
-    // Rate from posting currency → workspace base currency at occurrence,
-    // in minor units. Null when no conversion was needed (same currency).
-    // For a points leg this is the programme valuation resolved by
-    // `src/points/valuation.ts`, never a published FX rate.
+    // Multiplier from this posting's minor units to base-currency minor
+    // units at occurrence: amount_base_minor = round(amount_minor ×
+    // fx_rate). Null when no conversion was needed (same currency).
+    //
+    // For cash it is NOT the published rate whenever the two currencies
+    // have different decimals: JPY→USD published at 0.0065 is stored as
+    // 0.65 (cents per yen). `postingFxRate` in `src/ledger/money.ts`
+    // derives it; the rate as published is in `metadata.fx.rates[].rate`
+    // on the transaction. For a points leg it is the programme valuation
+    // resolved by `src/points/valuation.ts`, never a published FX rate.
     fxRate: numeric("fx_rate", { precision: 20, scale: 10 }),
     // Base-currency amount persisted so the balance trigger and reports
     // don't need to re-derive FX. Nullable during insert; app fills it

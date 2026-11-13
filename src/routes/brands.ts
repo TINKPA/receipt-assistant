@@ -605,6 +605,11 @@ brandsRouter.get(
       // see the same rule and its cost in `merchants.ts` / `reports.ts`
       // (#221). `total_minor` on the recent-transaction rows below is
       // likewise signed: negative means refund.
+      //
+      // Every sum here is over `amount_base_minor` and is labelled with
+      // the workspace base currency. The native column is in each
+      // receipt's own currency and unit, so summing it adds yuan to
+      // dollars to loyalty points; see the same note in `merchants.ts`.
       const perMerchantStats = new Map<
         string,
         { txnCount: number; lifetime: number; currentMonth: number; lastDate: string | null }
@@ -619,12 +624,12 @@ brandsRouter.get(
           SELECT
             t.merchant_id::text AS merchant_id,
             COUNT(DISTINCT t.id)::bigint AS txn_count,
-            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime,
+            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_base_minor ELSE 0 END), 0)::bigint AS lifetime,
             COALESCE(SUM(CASE
               WHEN a.type = 'expense'
                AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
                AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-              THEN p.amount_minor ELSE 0
+              THEN p.amount_base_minor ELSE 0
             END), 0)::bigint AS current_month,
             MAX(t.occurred_on)::text AS last_date
           FROM transactions t
@@ -669,14 +674,11 @@ brandsRouter.get(
             m.canonical_name AS merchant_canonical_name,
             m.custom_name AS merchant_custom_name,
             (
-              SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
+              SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint
               FROM postings p
               JOIN accounts a ON a.id = p.account_id
               WHERE p.transaction_id = t.id AND a.type = 'expense'
             ) AS total_minor,
-            (
-              SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
-            ) AS row_currency,
             (
               SELECT dl.document_id
               FROM document_links dl
@@ -698,7 +700,7 @@ brandsRouter.get(
           payee: r.payee,
           status: r.status,
           total_minor: toInt(r.total_minor),
-          currency: r.row_currency ?? currency,
+          currency,
           document_id: r.document_id,
           merchant_id: r.merchant_id,
           merchant_canonical_name: r.merchant_canonical_name,

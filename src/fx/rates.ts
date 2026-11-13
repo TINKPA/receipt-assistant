@@ -6,6 +6,12 @@
  * writes `postings.fx_rate` / `postings.amount_base_minor` goes through
  * here so the whole ledger shares one rate policy and one audit trail.
  *
+ * The rate is quoted the way the source quotes it: **whole units to whole
+ * units** (1 JPY = 0.0065 USD). It is NOT what `postings.fx_rate` holds
+ * and must never be multiplied into a minor-unit amount directly — yen
+ * have no cents and dinars have a thousand fils. `postingFxRate` in
+ * `src/ledger/money.ts` turns it into the posting's multiplier.
+ *
  * Source is the ECB reference rates via Frankfurter (no API key, has
  * history, publishes the date it actually served). ECB quotes against EUR
  * and Frankfurter does the cross-rate; for CNY→USD that is two ECB legs,
@@ -68,6 +74,39 @@ export interface ResolvedRate {
   /** Publication date actually used (<= the requested date). */
   asOfActual: string;
   source: string;
+}
+
+/**
+ * The source answered, and the answer is that it has no such rate: a
+ * currency ECB does not publish (TWD, VND, KWD, AED and others) or a date
+ * outside its range (before 1999, or far in the future).
+ *
+ * Kept apart from a timeout or a 5xx because the remedy is different.
+ * Those are retried, and fall back to a nearby cached rate, since the
+ * rate exists and the source is merely having a bad day. This one will
+ * read the same tomorrow: retrying only delays the ingest, and a cached
+ * rate from another day would be a guess presented as a publication. The
+ * posting stays unconverted until the date is corrected or someone
+ * supplies a rate: `scripts/backfill-fx.ts --unconverted --currency CUR
+ * --rate N` records N in `fx_rates` with source `manual` for exactly the
+ * dates the source refused, and converts at it. (The posting PATCH
+ * endpoint cannot do this: it changes one leg per request, and a base
+ * amount changed on one leg alone fails the balance trigger.)
+ */
+export class FxRateNotPublishedError extends Error {
+  readonly permanent = true;
+  constructor(
+    readonly base: string,
+    readonly quote: string,
+    readonly onDate: string,
+    url: string,
+  ) {
+    super(
+      `FX source publishes no ${base}→${quote} rate for ${onDate} ` +
+        `(${url} returned HTTP 404)`,
+    );
+    this.name = "FxRateNotPublishedError";
+  }
 }
 
 /** Days between two ISO dates (a - b), calendar days, UTC-safe. */
@@ -137,6 +176,7 @@ async function readNearestCache(
 
 async function fetchOnce(
   url: string,
+  base: string,
   quote: string,
   onDate: string,
 ): Promise<ResolvedRate> {
@@ -149,6 +189,9 @@ async function fetchOnce(
   const res = await fetch(url, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
+  if (res.status === 404) {
+    throw new FxRateNotPublishedError(base, quote, onDate, url);
+  }
   if (!res.ok) {
     throw new Error(`FX source ${url} returned HTTP ${res.status}`);
   }
@@ -172,8 +215,10 @@ async function fetchUpstream(
   let lastErr: unknown;
   for (let attempt = 0; attempt < FETCH_ATTEMPTS; attempt++) {
     try {
-      return await fetchOnce(url, quote, onDate);
+      return await fetchOnce(url, base, quote, onDate);
     } catch (err) {
+      // "Not published" is an answer, not a failure to get one.
+      if (err instanceof FxRateNotPublishedError) throw err;
       lastErr = err;
       const backoff = RETRY_BACKOFF_MS[attempt];
       if (backoff === undefined) break;
@@ -191,10 +236,14 @@ async function fetchUpstream(
 /**
  * Resolve `base` → `quote` on `onDate` (ISO `YYYY-MM-DD`).
  *
- * Order: identity → cache → upstream (+cache) → stale cache. Throws only
- * when all four miss, which means a brand-new currency pair encountered
- * while offline; callers treat that as "leave the posting unconverted and
- * retry later" rather than failing the ingest.
+ * Order: identity → cache → upstream (+cache) → stale cache. Throws in
+ * two cases, and callers leave the posting unconverted in both rather
+ * than failing the ingest:
+ *
+ *  - `FxRateNotPublishedError`: the source has no such rate (HTTP 404).
+ *    Permanent — not retried, and no stale-cache fallback.
+ *  - any other error: all four steps missed, i.e. a pair with nothing
+ *    cached nearby met an unreachable source. Worth retrying later.
  */
 export async function getRate(
   base: string,
@@ -228,6 +277,7 @@ export async function getRate(
   try {
     resolved = await fetchUpstream(base, quote, onDate);
   } catch (err) {
+    if (err instanceof FxRateNotPublishedError) throw err;
     const stale = await readNearestCache(base, quote, onDate);
     if (stale) {
       console.warn(

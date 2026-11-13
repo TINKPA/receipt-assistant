@@ -9,7 +9,12 @@
  */
 import { z } from "zod";
 import { IsoDateTime, Metadata, Uuid } from "./common.js";
-import { Merchant, MerchantStats } from "./merchant.js";
+import {
+  BASE_AMOUNT_DESCRIPTION,
+  BASE_CURRENCY_DESCRIPTION,
+  Merchant,
+  MerchantStats,
+} from "./merchant.js";
 
 export const BrandAssetTier = z.enum([
   "itunes",
@@ -91,16 +96,23 @@ export const UpdateBrandRequest = z
  * Brand-level rollup stats for `GET /v1/brands/:id/rollup`. Aggregates
  * across every merchant row sharing this brand_id within the workspace.
  * Voided transactions excluded from the money sums; still counted in
- * `location_count`.
+ * `location_count`. The money sums are base-currency amounts, like
+ * `MerchantStats`.
  */
 export const BrandRollupStats = z
   .object({
     location_count: z.number().int().nonnegative(),
     transaction_count: z.number().int().nonnegative(),
-    lifetime_spend_minor: z.number().int(),
-    current_month_spend_minor: z.number().int(),
+    lifetime_spend_minor: z
+      .number()
+      .int()
+      .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
+    current_month_spend_minor: z
+      .number()
+      .int()
+      .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
     last_transaction_date: z.string().nullable(),
-    currency: z.string(),
+    currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
   })
   .openapi("BrandRollupStats");
 
@@ -122,8 +134,12 @@ export const BrandRollupRecentRow = z
     occurred_on: z.string(),
     payee: z.string().nullable(),
     status: z.enum(["draft", "posted", "reconciled", "error"]),
-    total_minor: z.number().int(),
-    currency: z.string(),
+    total_minor: z.number().int().openapi({
+      description:
+        "Signed expense total (negative for a refund). " +
+        BASE_AMOUNT_DESCRIPTION,
+    }),
+    currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
     document_id: Uuid.nullable(),
     merchant_id: Uuid,
     merchant_canonical_name: z.string(),

@@ -125,6 +125,16 @@ merchantsRouter.use(
  * simply deleted. The join stays out of the row filter (the type test
  * lives in the CASE) so `COUNT(DISTINCT t.id)` keeps counting every
  * transaction, including any with no expense leg at all.
+ *
+ * They sum `amount_base_minor`, never `amount_minor`. The native column
+ * is in the receipt's own currency and unit, so adding it up across a
+ * merchant's history adds yuan to dollars to whole loyalty points and
+ * then labels the result with the base currency: a purchase of 50,000
+ * yuan read as $50,000.00 of lifetime spend, and an award stay as its
+ * points count and its cash charges in cents, added together. Base
+ * amounts are what `/v1/reports/summary` sums, so a merchant's lifetime
+ * figure now matches its row there. A points leg counts at its programme
+ * valuation, as it does in the reports.
  */
 merchantsRouter.get(
   "/:id",
@@ -137,12 +147,12 @@ merchantsRouter.get(
       WITH s AS (
         SELECT
           COUNT(DISTINCT t.id)::bigint AS txn_count,
-          COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
+          COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_base_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
           COALESCE(SUM(CASE
             WHEN a.type = 'expense'
              AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
              AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-            THEN p.amount_minor ELSE 0
+            THEN p.amount_base_minor ELSE 0
           END), 0)::bigint AS current_month_spend,
           MAX(t.occurred_on)::text AS last_date
         FROM transactions t
@@ -188,6 +198,14 @@ merchantsRouter.get(
  * `total_minor` is the expense leg, signed (#221): positive for a
  * purchase, NEGATIVE for a refund. Clients render the sign; they must
  * not `Math.abs()` it, or a return reads as a second purchase.
+ *
+ * It is in the workspace base currency, and `currency` says so on every
+ * row. Both used to be native: the sum of the expense legs' own amounts,
+ * labelled with whichever posting's currency a `LIMIT 1` without an
+ * ORDER BY happened to return. On a stay paid partly in points that
+ * added points to cents and could label the sum `HYATT_PT`, which is not
+ * a code a currency formatter accepts, so the merchant page threw. What
+ * the receipt said in its own currency is on `/v1/transactions/:id`.
  */
 merchantsRouter.get(
   "/:id/transactions",
@@ -213,13 +231,13 @@ merchantsRouter.get(
         t.payee,
         t.status::text AS status,
         (
-          SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
+          SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint
           FROM postings p
           JOIN accounts a ON a.id = p.account_id
           WHERE p.transaction_id = t.id AND a.type = 'expense'
         ) AS total_minor,
         (
-          SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
+          SELECT base_currency FROM workspaces WHERE id = t.workspace_id
         ) AS currency,
         (
           SELECT dl.document_id

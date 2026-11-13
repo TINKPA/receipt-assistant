@@ -61,18 +61,38 @@ export const UpdateMerchantRequest = z
   .strict()
   .openapi("UpdateMerchantRequest");
 
+/** Shared wording: every money figure on the merchant and brand
+ *  endpoints is a base-currency amount, whatever the receipt was in. */
+export const BASE_AMOUNT_DESCRIPTION =
+  "In the workspace base currency (`currency`), summed from the " +
+  "postings' base amounts. A receipt in another currency counts at the " +
+  "rate it was converted at, and a loyalty-points leg at its programme " +
+  "valuation, exactly as in `/v1/reports/summary`.";
+
+export const BASE_CURRENCY_DESCRIPTION =
+  "The workspace base currency. Always an ISO 4217 code, never a " +
+  "points-programme code.";
+
 /**
- * Aggregated KPIs computed by the merchant detail endpoint. Currency is
- * the workspace's base currency; cross-currency rollups are out of scope
- * for this iteration.
+ * Aggregated KPIs computed by the merchant detail endpoint. Both spend
+ * figures are sums of base-currency amounts, so a merchant with receipts
+ * in several currencies (or paid partly in points) still adds up to one
+ * meaningful number, and it matches the merchant's row in
+ * `/v1/reports/summary?group_by=payee`.
  */
 export const MerchantStats = z
   .object({
     transaction_count: z.number().int().nonnegative(),
-    lifetime_spend_minor: z.number().int(),
-    current_month_spend_minor: z.number().int(),
+    lifetime_spend_minor: z
+      .number()
+      .int()
+      .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
+    current_month_spend_minor: z
+      .number()
+      .int()
+      .openapi({ description: BASE_AMOUNT_DESCRIPTION }),
     last_transaction_date: z.string().nullable(),
-    currency: z.string(),
+    currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
   })
   .openapi("MerchantStats");
 
@@ -85,15 +105,24 @@ export const MerchantDetail = z
 
 /** Compact transaction shape returned by `/v1/merchants/:id/transactions`.
  *  Mirrors the fields the merchant page list rows need; the full
- *  transaction shape is still reachable via `/v1/transactions/:id`. */
+ *  transaction shape is still reachable via `/v1/transactions/:id`.
+ *
+ *  `total_minor` is the signed expense total in the workspace base
+ *  currency and `currency` is that base currency on every row. The
+ *  amount and currency the receipt itself was in are on the full
+ *  transaction's postings. */
 export const MerchantTransactionRow = z
   .object({
     id: Uuid,
     occurred_on: z.string(),
     payee: z.string().nullable(),
     status: z.enum(["draft", "posted", "reconciled", "error"]),
-    total_minor: z.number().int(),
-    currency: z.string(),
+    total_minor: z.number().int().openapi({
+      description:
+        "Signed expense total (negative for a refund). " +
+        BASE_AMOUNT_DESCRIPTION,
+    }),
+    currency: z.string().openapi({ description: BASE_CURRENCY_DESCRIPTION }),
     document_id: Uuid.nullable(),
   })
   .openapi("MerchantTransactionRow");

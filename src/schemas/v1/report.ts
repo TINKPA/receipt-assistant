@@ -7,6 +7,15 @@
  *
  * Voided transactions are excluded from every report at the service
  * layer — the schema does not model `status`.
+ *
+ * Every amount is in the workspace base currency, and the `currency`
+ * field of each response names it. None of the four queries takes a
+ * `currency` parameter. One was declared here until the money-exponents
+ * fix, and it did the worst thing a parameter can do: `?currency=CNY`
+ * returned the same base-currency sums with "CNY" written next to them.
+ * Converting a report for real means re-pricing every posting at its own
+ * date into a third currency, which nothing needs yet; until something
+ * does, the contract does not offer it.
  */
 import { z } from "zod";
 import {
@@ -64,13 +73,71 @@ export const PointsDisclosure = z
   })
   .openapi("PointsDisclosure");
 
+// ── Unconverted foreign currency ───────────────────────────────────────
+
+/**
+ * Foreign-currency legs in the report's scope that were never converted
+ * to the base currency, one row per currency.
+ */
+export const FxUnconvertedCurrency = z
+  .object({
+    currency: CurrencyCode.openapi({ example: "TWD" }),
+    amount_minor: AmountMinor.openapi({
+      description:
+        "The unconverted legs, summed in that currency's own minor units " +
+        "(yen, fen, fils).",
+    }),
+    // The placeholder an unconverted leg holds is its native amount, so
+    // this is the same digits as `amount_minor` wearing the base
+    // currency's label.
+    counted_base_minor: AmountMinor.openapi({
+      description:
+        "What the report's totals contain for those legs today: their " +
+        "native amount read as base-currency minor units. The totals are " +
+        "wrong by the difference between this and the real converted value.",
+    }),
+    transaction_count: z.number().int(),
+  })
+  .openapi("FxUnconvertedCurrency");
+
+/**
+ * The cash counterpart of `PointsDisclosure.unvalued_transaction_count`.
+ *
+ * A foreign-currency posting is converted after extraction, at the
+ * receipt's date. When no rate could be resolved (the source was down, or
+ * it does not publish that currency or date) the posting is left with no
+ * `fx_rate` and a base amount equal to its native amount, and it is
+ * still summed into every total. A report cannot fix that, but it must
+ * not hide it: an empty `unconverted` list is what makes the totals
+ * trustworthy as base-currency amounts.
+ */
+export const FxDisclosure = z
+  .object({
+    /** States what an unconverted leg does to the totals. */
+    policy: z.string(),
+    unconverted_transaction_count: z.number().int().openapi({
+      description:
+        "Transactions in the report's scope with at least one " +
+        "foreign-currency posting that was never converted. 0 means every " +
+        "amount in the report is a true base-currency amount.",
+    }),
+    unconverted: z.array(FxUnconvertedCurrency),
+  })
+  .openapi("FxDisclosure");
+
+/** The `currency` field every report returns. */
+const ReportCurrency = CurrencyCode.openapi({
+  description:
+    "The workspace base currency. Every amount in the report is in it; " +
+    "there is no parameter to ask for another.",
+});
+
 // ── Summary ────────────────────────────────────────────────────────────
 
 export const SummaryQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
   group_by: SummaryGroupBy.optional(),
-  currency: CurrencyCode.optional(),
 });
 
 export const SummaryItem = z
@@ -87,10 +154,11 @@ export const SummaryReport = z
     from: IsoDate.nullable(),
     to: IsoDate.nullable(),
     group_by: SummaryGroupBy,
-    currency: CurrencyCode,
+    currency: ReportCurrency,
     items: z.array(SummaryItem),
     grand_total_minor: AmountMinor,
     points: PointsDisclosure,
+    fx: FxDisclosure,
   })
   .openapi("SummaryReport");
 
@@ -101,7 +169,6 @@ export const TrendsQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
   group_by: TrendsGroupBy.optional(),
-  currency: CurrencyCode.optional(),
 });
 
 export const TrendsItem = z
@@ -126,9 +193,10 @@ export const TrendsReport = z
     to: IsoDate.nullable(),
     period: TrendsPeriod,
     group_by: TrendsGroupBy,
-    currency: CurrencyCode,
+    currency: ReportCurrency,
     buckets: z.array(TrendsBucket),
     points: PointsDisclosure,
+    fx: FxDisclosure,
   })
   .openapi("TrendsReport");
 
@@ -136,7 +204,6 @@ export const TrendsReport = z
 
 export const NetWorthQuery = z.object({
   as_of: IsoDate.optional(),
-  currency: CurrencyCode.optional(),
 });
 
 export const NetWorthAccount = z
@@ -151,13 +218,14 @@ export const NetWorthAccount = z
 export const NetWorthReport = z
   .object({
     as_of: IsoDate,
-    currency: CurrencyCode,
+    currency: ReportCurrency,
     assets_minor: AmountMinor,
     liabilities_minor: AmountMinor,
     equity_minor: AmountMinor,
     net_worth_minor: AmountMinor,
     by_account: z.array(NetWorthAccount),
     points: PointsDisclosure,
+    fx: FxDisclosure,
   })
   .openapi("NetWorthReport");
 
@@ -166,7 +234,6 @@ export const NetWorthReport = z
 export const CashflowQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
-  currency: CurrencyCode.optional(),
 });
 
 export const CashflowBucket = z
@@ -182,11 +249,12 @@ export const CashflowReport = z
   .object({
     from: IsoDate.nullable(),
     to: IsoDate.nullable(),
-    currency: CurrencyCode,
+    currency: ReportCurrency,
     income_minor: AmountMinor,
     expense_minor: AmountMinor,
     net_minor: AmountMinor,
     buckets: z.array(CashflowBucket),
     points: PointsDisclosure,
+    fx: FxDisclosure,
   })
   .openapi("CashflowReport");

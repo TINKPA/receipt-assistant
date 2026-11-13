@@ -153,6 +153,48 @@ SELECT place_id, source, fetched_at, fetched_by_sha
 
 A `derivation_events` row is written before the UPDATE, in the same transaction, even when `changed_keys = []`, so a no-op run is still a known-good checkpoint. To roll back a bad run, write the row's `before` jsonb back and insert a new event recording the rollback. The ingest prompt inserts a `place_snapshots` row in the same statement as the `places` upsert, on every visit, cached or not; `fetched_by_sha` is NULL on rows the original migration backfilled.
 
+## Money: minor units, exponents and base amounts
+
+Three columns on `postings` carry every amount, and `src/ledger/money.ts` is the only place that relates them.
+
+| Column | Unit |
+|---|---|
+| `amount_minor` | The posting's own currency, in that currency's own minor unit: cents for USD, fen for CNY, whole yen for JPY, fils (1/1000) for KWD, whole points for `HYATT_PT`. |
+| `fx_rate` | The multiplier from that to base-currency minor units. NULL on a base-currency posting. |
+| `amount_base_minor` | Workspace base currency, minor units. This is what every total sums. |
+
+One equation holds for every converted posting, cash or points: `amount_base_minor = round(amount_minor × fx_rate)` (the leg that absorbs a transaction's rounding residual may be off by a unit or two).
+
+- **`fx_rate` is not the published exchange rate when the two currencies have different decimals.** A rate source quotes whole units (1 JPY = 0.0065 USD); the posting needs cents per yen, 0.65. `postingFxRate(currency, base, publishedRate)` shifts it by the exponent difference, using the ISO 4217 table behind `currencyExponent()` (0 for JPY, KRW, VND and a dozen others, 3 for KWD and BHD, 2 for anything unlisted, 0 for a points code). The rate as published stays in `fx_rates.rate` and in `transactions.metadata.fx.rates[].rate`; that is the number to show a person.
+- **`toBaseMinor(amountMinor, fxRate)` is the only native-to-base conversion.** The FX pass, the points pass, and `createTransaction` / `addPosting` all call it. It works in integers and rounds half away from zero, so opposite legs convert to opposite amounts. Do not write `amount * rate` anywhere else: multiplying a minor amount by a published rate is the bug that booked a yen receipt at a hundredth of its value (¥5,000 at 0.0065 came out as 33 cents instead of $32.50).
+- **Sum `amount_base_minor`, label with the workspace base currency.** Reports, merchant and brand KPIs, account balances and dedup all do. `amount_minor` may only be summed within one currency (the points disclosure groups by programme). A new endpoint that sums it across rows adds yuan to dollars to points.
+- **The reports take no `currency` parameter.** The response's `currency` is always the base currency.
+
+Who converts: the extraction agent writes the receipt's own numbers with `amount_base_minor = amount_minor` as a placeholder, and the worker then runs `valuePointsSafely` and `normalizeFxSafely` (`src/ingest/worker.ts`). Neither can fail the ingest. When the FX pass cannot resolve a rate the posting stays **unconverted**: `fx_rate` NULL, base amount still the native number. Every report counts those legs in its `fx` block (`unconverted_transaction_count`, per-currency amounts), the same way `points` counts unvalued programmes; an empty list is what makes a total trustworthy.
+
+Two different failures leave a posting unconverted, and `src/fx/rates.ts` tells them apart:
+
+| Failure | Meaning | Handling |
+|---|---|---|
+| timeout, 5xx, network | The rate exists, the source is having a bad day | 3 attempts, then a cached rate within 10 days, else unconverted. Retry later. |
+| HTTP 404 (`FxRateNotPublishedError`) | The source has no rate for that currency (TWD, VND, KWD, AED …) or date (before 1999, far future) | One request, no retry, no stale fallback. Needs a rate supplied by hand or the date corrected. |
+
+`scripts/backfill-fx.ts` is the only thing that revisits a posting after ingest:
+
+```bash
+# Inside the app container (it has DATABASE_URL). Always --dry-run first.
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --dry-run            # every foreign posting, forced
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --exponent-mismatch  # only JPY/KRW/KWD…: rows booked at the wrong magnitude before exponents were respected
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --unconverted        # retry failed conversions, touch nothing that converted
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --unconverted --currency TWD --rate 0.0312   # supply a rate the source does not publish
+```
+
+`--rate` is used only for a date the source answered 404 for, and is recorded in `fx_rates` with source `manual`. The posting PATCH endpoint cannot set a rate by hand: it changes one leg per request, and a base amount changed on one leg fails the balance trigger.
+
+Regression checks, each against a throwaway Postgres (usage in the file header): `scripts/smoke-fx.ts` (includes the JPY and KWD magnitude cases, the 404 case and the targeted re-derive) and `scripts/smoke-points.ts`.
+
+Not done in this repo: the frontend formats every amount as hundredths, so a JPY receipt's own amount renders as ¥50.00 for ¥5,000, and its detail page shows `postings.fx_rate` as "the rate" where `metadata.fx.rates[].rate` is the published one.
+
 ## Known Pitfalls
 
 0. **Never pass a prompt (or any payload) as a `claude` CLI *argument* —

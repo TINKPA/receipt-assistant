@@ -32,6 +32,7 @@ import {
   type SoftLayer3TxField,
 } from "../projection/layer3.js";
 import { resolvePointsValuation } from "../points/valuation.js";
+import { toBaseMinor } from "../ledger/money.js";
 
 import { newId } from "../http/uuid.js";
 import {
@@ -626,7 +627,7 @@ export async function createTransaction(
       } else {
         const rate = pointsRates.get(currency) ?? 0;
         fxRate = String(rate);
-        amountBaseMinor = BigInt(Math.round(Number(p.amount_minor) * rate));
+        amountBaseMinor = toBaseMinor(p.amount_minor, rate);
       }
     } else if (currency === baseCurrency) {
       if (p.fx_rate !== undefined && p.fx_rate !== "1" && p.fx_rate !== "1.0") {
@@ -1674,7 +1675,7 @@ export async function addPosting(
       );
       const rate = v?.minorPerPoint ?? 0;
       fxRate = String(rate);
-      amountBaseMinor = BigInt(Math.round(Number(body.amount_minor) * rate));
+      amountBaseMinor = toBaseMinor(body.amount_minor, rate);
     }
   } else if (currency === baseCurrency) {
     amountBaseMinor = BigInt(body.amount_base_minor ?? body.amount_minor);
