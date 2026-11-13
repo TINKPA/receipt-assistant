@@ -2,20 +2,25 @@
  * smoke-ledger-api-safety.ts — real HTTP requests proving that an
  * ordinary API call cannot silently destroy ledger data.
  *
- * Four groups, each building its own fixtures through the public API:
+ * Five groups, each building its own fixtures through the public API:
  *
  *   A  PATCH /v1/transactions/:id treats `metadata` as a JSON Merge Patch
  *      (RFC 7396): the exact body the web client's Edit modal sends
  *      (`{"metadata":{}, …}`) leaves metadata intact, nested objects
  *      merge, `null` removes, and server-owned keys cannot be changed.
  *   B  DELETE /v1/documents/:id?cascade=true only deletes a transaction
- *      when that document is its last live evidence.
+ *      when that document is its last live evidence, and its 200 body
+ *      says which transactions were deleted and which were kept.
  *   C  Posting mutations refuse a reconciled or soft-deleted transaction
  *      and keep `amount_minor` / `amount_base_minor` consistent; two
- *      PATCHes with the same If-Match cannot both win.
+ *      PATCHes with the same If-Match cannot both win; a posting PATCH or
+ *      DELETE queues behind an FX-pass-shaped writer instead of
+ *      deadlocking with it.
  *   D  Account routes: merge-patch body parsing, metadata merge, cycle
- *      rejection, base-currency balance labelling, register running
- *      balance across a `from` filter.
+ *      rejection (also when two re-parents race), base-currency balance
+ *      labelling, register running balance across a `from` filter.
+ *   E  The other PATCH routes that take `metadata` (wish items, owned
+ *      items) merge it too.
  *
  * It WRITES: transactions, documents and accounts named `smoke-<nonce>`
  * are created and left behind (deleted or closed where the API allows).
@@ -27,8 +32,12 @@
  *     --base=http://127.0.0.1:<port> \
  *     --pg=postgresql://postgres:postgres@127.0.0.1:<pgport>/receipts
  *
- * `--pg` is read-only here: it is used to look at `transaction_events`,
- * which has no API. Exit code 0 = every check passed.
+ * `--pg` is used read-only to look at `transaction_events`, which has no
+ * API. One check in group C opens a second, writing connection: it
+ * replays the FX pass's two statements (postings, then the transaction's
+ * metadata) on a fixture transaction this script created, because that
+ * interleaving cannot be produced through the API. Exit code 0 = every
+ * check passed.
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
@@ -389,12 +398,33 @@ async function groupCascade(): Promise<void> {
   // Soft.
   const [d1, d2] = [await uploadDoc("b-soft-1"), await uploadDoc("b-soft-2")];
   const t1 = await createTx({ label: "cascade soft", documentIds: [d1, d2] });
+  // What a cascade reports, as { kept, soft_deleted, hard_deleted, skipped }.
+  const reportOf = (res: ApiResult): unknown => ({
+    kept: res.json?.transactions_kept,
+    soft_deleted: res.json?.transactions_soft_deleted,
+    hard_deleted: res.json?.transactions_hard_deleted,
+    skipped: res.json?.transactions_skipped,
+  });
+  const reports = (
+    res: ApiResult,
+    hard: boolean,
+    want: { kept?: string[]; soft_deleted?: string[]; hard_deleted?: string[]; skipped?: string[] },
+  ): boolean =>
+    res.status === 200 &&
+    res.json?.hard === hard &&
+    same(reportOf(res), { kept: [], soft_deleted: [], hard_deleted: [], skipped: [], ...want });
+
   let r = await api("DELETE", `/v1/documents/${d1}?cascade=true`);
   let tx = await getTx(t1.id);
   check(
-    "soft cascade of 1 of 2 documents → 204, transaction still live",
-    r.status === 204 && tx.deleted_at === null,
+    "soft cascade of 1 of 2 documents → 200, transaction still live",
+    r.status === 200 && tx.deleted_at === null,
     { status: r.status, deleted_at: tx.deleted_at },
+  );
+  check(
+    "…and the response says the transaction was KEPT, not deleted",
+    r.json?.document_id === d1 && reports(r, false, { kept: [t1.id] }),
+    r.json,
   );
   check(
     "…the document is tombstoned and still linked (restorable association)",
@@ -407,8 +437,15 @@ async function groupCascade(): Promise<void> {
   r = await api("DELETE", `/v1/documents/${d2}?cascade=true`);
   tx = await getTx(t1.id);
   check(
-    "soft cascade of the last live document → transaction soft-deleted",
-    r.status === 204 && tx.deleted_at !== null,
+    "soft cascade of the last live document → transaction soft-deleted, and reported so",
+    tx.deleted_at !== null && reports(r, false, { soft_deleted: [t1.id] }),
+    r.json,
+  );
+  r = await api("DELETE", `/v1/documents/${d2}?cascade=true`);
+  check(
+    "repeating it reports the already-deleted transaction as skipped",
+    reports(r, false, { skipped: [t1.id] }),
+    r.json,
   );
 
   // Hard.
@@ -417,9 +454,12 @@ async function groupCascade(): Promise<void> {
   r = await api("DELETE", `/v1/documents/${d3}?cascade=true&hard=true`);
   tx = await getTx(t2.id);
   check(
-    "hard cascade of 1 of 2 documents → 204, transaction survives with the other",
-    r.status === 204 && tx.deleted_at === null && tx.documents.length === 1 && tx.documents[0].id === d4,
-    tx.documents,
+    "hard cascade of 1 of 2 documents → 200 reporting it kept; transaction survives with the other",
+    reports(r, true, { kept: [t2.id] }) &&
+      tx.deleted_at === null &&
+      tx.documents.length === 1 &&
+      tx.documents[0].id === d4,
+    { body: r.json, documents: tx.documents },
   );
   check("…postings untouched", tx.postings.length === 2);
   const gone = await api("GET", `/v1/documents/${d3}?include_deleted=true`);
@@ -432,7 +472,11 @@ async function groupCascade(): Promise<void> {
   );
   r = await api("DELETE", `/v1/documents/${d4}?cascade=true&hard=true`);
   const t2gone = await api("GET", `/v1/transactions/${t2.id}`);
-  check("hard cascade of the last document → transaction hard-deleted", r.status === 204 && t2gone.status === 404);
+  check(
+    "hard cascade of the last document → transaction hard-deleted, and reported so",
+    reports(r, true, { hard_deleted: [t2.id] }) && t2gone.status === 404,
+    r.json,
+  );
   const hardDeleted = await events(t2.id, "hard_deleted");
   check(
     "…its hard_deleted event carries transaction_id in the payload (column is NULL)",
@@ -450,8 +494,10 @@ async function groupCascade(): Promise<void> {
   const draftEvents = await events(t3.id, "hard_deleted");
   check(
     "soft cascade hard-deletes a draft; event payload carries transaction_id",
-    r.status === 204 && draftEvents.length === 1 && draftEvents[0].payload.transaction_id === t3.id,
-    draftEvents,
+    reports(r, false, { hard_deleted: [t3.id] }) &&
+      draftEvents.length === 1 &&
+      draftEvents[0].payload.transaction_id === t3.id,
+    { body: r.json, events: draftEvents },
   );
 
   // Reconciled: blocks only when it would be deleted.
@@ -460,7 +506,7 @@ async function groupCascade(): Promise<void> {
   r = await api("POST", `/v1/transactions/${t4.id}/reconcile`, { headers: { "If-Match": etagOf(t4.version) } });
   check("fixture reconciled", r.status === 200 && r.json.status === "reconciled", r.json);
   r = await api("DELETE", `/v1/documents/${d6}?cascade=true`);
-  check("cascade that keeps a reconciled transaction is allowed", r.status === 204, r.json);
+  check("cascade that keeps a reconciled transaction is allowed", reports(r, false, { kept: [t4.id] }), r.json);
   r = await api("DELETE", `/v1/documents/${d7}?cascade=true`);
   tx = await getTx(t4.id);
   const d7row = await api("GET", `/v1/documents/${d7}`);
@@ -479,6 +525,11 @@ async function groupCascade(): Promise<void> {
     headers: { "If-Match": etagOf(tx.version) },
   });
   await api("DELETE", `/v1/transactions/${t4.id}`, { headers: { "If-Match": etagOf(r.json.version) } });
+
+  // Without cascade nothing is reported: still 204, no body.
+  const d8 = await uploadDoc("b-plain");
+  r = await api("DELETE", `/v1/documents/${d8}`);
+  check("plain soft delete (no cascade) is still 204 with no body", r.status === 204 && r.json === null, r.json);
 }
 
 // ── C. posting mutations ───────────────────────────────────────────────
@@ -534,6 +585,10 @@ async function groupPostings(): Promise<void> {
   await attempt("currency change without fx_rate + amount_base_minor", { currency: "EUR" }, "required");
   await attempt("fx_rate without amount_base_minor", { currency: "EUR", fx_rate: "1.1" }, "required");
   await attempt("non-numeric fx_rate", { currency: "EUR", fx_rate: "abc", amount_base_minor: 1650 }, "invalid");
+  // numeric(20,10): these two pass a shape check and used to reach the
+  // column, one as an overflow (500), the other stored as a zero rate.
+  await attempt("fx_rate too large for the column", { currency: "EUR", fx_rate: "1e30", amount_base_minor: 1650 }, "invalid");
+  await attempt("cash fx_rate that would be stored as zero", { currency: "EUR", fx_rate: "1e-30", amount_base_minor: 0 }, "invalid");
   await attempt("opposite-sign base amount", { currency: "EUR", fx_rate: "1.1", amount_base_minor: -1650 }, "sign_mismatch");
   await attempt("account outside the workspace", { account_id: randomUUID() }, "not_found");
   const unchanged = await getTx(draft.id);
@@ -625,6 +680,88 @@ async function groupPostings(): Promise<void> {
   const still = await getTx(posted.id);
   check("…and the guarded transaction's postings are unchanged", same(still.postings, posted.postings));
 
+  // An unbalancing edit is refused by the deferred trigger at COMMIT; the
+  // 422 carries the trigger's sentence and nothing of the driver's.
+  const balanced = await createTx({ label: "imbalance" });
+  r = await api("PATCH", postingUrl(balanced), {
+    body: { amount_minor: 1234 },
+    headers: { "If-Match": etagOf(balanced.version) },
+  });
+  check(
+    "update that unbalances a posted transaction → 422 postings-imbalance, detail is the trigger's sentence only",
+    r.status === 422 &&
+      String(r.json?.type).endsWith("/postings-imbalance") &&
+      /^Postings for transaction \S+ do not balance/.test(String(r.json?.detail)) &&
+      !/Failed query|params:/.test(JSON.stringify(r.json)),
+    r.json,
+  );
+  await api("DELETE", `/v1/transactions/${balanced.id}`, { headers: { "If-Match": etagOf(balanced.version) } });
+
+  // Lock order against the FX / points passes. Those write a
+  // transaction's postings first and its metadata second, in one DB
+  // transaction. Replay exactly that from a second connection, and send
+  // the posting mutation while the "pass" sits between its two
+  // statements. It must queue behind the pass and then answer 412 (the
+  // pass bumped the version) — not deadlock with it, which shows up as a
+  // 500 here or as a deadlock error on the pass, about a second later.
+  const passLike = async (
+    label: string,
+    mutate: (tx: any, postingId: string) => Promise<ApiResult>,
+  ): Promise<void> => {
+    const fixture = await createTx({ label: `lock order ${label}`, status: "draft" });
+    const postingId = fixture.postings.find((p: any) => p.amount_minor > 0).id as string;
+    const pass = new pg.Client({ connectionString: PG_URL! });
+    await pass.connect();
+    let passError: string | null = null;
+    let res: ApiResult;
+    try {
+      await pass.query("BEGIN");
+      await pass.query(
+        "UPDATE postings SET fx_rate = fx_rate, amount_base_minor = amount_base_minor WHERE id = $1::uuid",
+        [postingId],
+      );
+      const pending = mutate(fixture, postingId);
+      // Long enough for the request to reach its first lock.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      try {
+        await pass.query(
+          `UPDATE transactions
+              SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{fx}', $2::jsonb, true)
+            WHERE id = $1::uuid`,
+          [fixture.id, JSON.stringify({ applied_at: new Date().toISOString(), base_currency: "USD", rates: [] })],
+        );
+        await pass.query("COMMIT");
+      } catch (err) {
+        passError = err instanceof Error ? err.message : String(err);
+        await pass.query("ROLLBACK").catch(() => undefined);
+      }
+      res = await pending;
+    } finally {
+      await pass.end();
+    }
+    const after = await getTx(fixture.id);
+    check(
+      `${label} sent while an FX-pass-shaped writer holds the posting → waits, then 412; the pass commits`,
+      passError === null &&
+        res.status === 412 &&
+        "fx" in after.metadata &&
+        after.postings.some((p: any) => p.id === postingId && p.memo === null),
+      { status: res.status, body: res.json, passError },
+    );
+    await api("DELETE", `/v1/transactions/${fixture.id}?hard=true`, { headers: { "If-Match": etagOf(after.version) } });
+  };
+  await passLike("posting PATCH", (tx, postingId) =>
+    api("PATCH", `/v1/transactions/${tx.id}/postings/${postingId}`, {
+      body: { memo: "raced" },
+      headers: { "If-Match": etagOf(tx.version) },
+    }),
+  );
+  await passLike("posting DELETE", (tx, postingId) =>
+    api("DELETE", `/v1/transactions/${tx.id}/postings/${postingId}`, {
+      headers: { "If-Match": etagOf(tx.version) },
+    }),
+  );
+
   // The two mutations whose write and audit event used to be separate
   // autocommitted statements.
   const itemsTx = await createTx({
@@ -713,6 +850,30 @@ async function groupAccounts(baseCurrency: string): Promise<void> {
     r.json,
   );
 
+  // The same rule when two re-parents race: "X under Y" and "Y under X"
+  // sent together must not both pass a check made against the other's
+  // old parent.
+  const pairs: Array<[any, any]> = [];
+  for (let i = 0; i < 6; i++) pairs.push([await mk(`cross ${i}a`), await mk(`cross ${i}b`)]);
+  const outcomes = await Promise.all(
+    pairs.map(async ([x, y]) => {
+      const [rx, ry] = await Promise.all([
+        api("PATCH", `/v1/accounts/${x.id}`, { body: { parent_id: y.id }, headers: { "If-Match": etagOf(x.version) } }),
+        api("PATCH", `/v1/accounts/${y.id}`, { body: { parent_id: x.id }, headers: { "If-Match": etagOf(y.version) } }),
+      ]);
+      const [ax, ay] = [await api("GET", `/v1/accounts/${x.id}`), await api("GET", `/v1/accounts/${y.id}`)];
+      return {
+        statuses: [rx.status, ry.status].sort(),
+        cycle: ax.json.parent_id === y.id && ay.json.parent_id === x.id,
+      };
+    }),
+  );
+  check(
+    "6 concurrent cross re-parents → one 200 and one 422 each, no two-node cycle",
+    outcomes.every((o) => same(o.statuses, [200, 422]) && !o.cycle),
+    outcomes,
+  );
+
   // Balance + register on a fresh account with two dated postings.
   const reg = await mk("register");
   const regTxns = [
@@ -751,13 +912,66 @@ async function groupAccounts(baseCurrency: string): Promise<void> {
   for (const t of regTxns) {
     await api("DELETE", `/v1/transactions/${t.id}`, { headers: { "If-Match": etagOf(t.version) } });
   }
-  for (const a of [grandchild, child, parent, reg]) {
+  for (const a of [grandchild, child, parent, reg, ...pairs.flat()]) {
     const cur = await api("GET", `/v1/accounts/${a.id}`);
     await api("PATCH", `/v1/accounts/${a.id}`, {
       body: { closed_at: new Date().toISOString() },
       headers: { "If-Match": etagOf(cur.json.version) },
     });
   }
+}
+
+// ── E. the other metadata PATCH routes ─────────────────────────────────
+async function groupCatalogMetadata(): Promise<void> {
+  console.log("\nE. PATCH metadata on wish items and owned items");
+
+  let r = await api("POST", "/v1/wish-items", {
+    body: { title: `smoke-${NONCE} wish`, metadata: { k1: 1, k2: 2, nested: { a: 1 } } },
+  });
+  if (r.status !== 201) throw new Error(`create wish item → ${r.status} ${JSON.stringify(r.json)}`);
+  const wish = r.json;
+  r = await api("PATCH", `/v1/wish-items/${wish.id}`, {
+    body: { notes: "n", metadata: { k2: null, k3: 3, nested: { b: 2 } } },
+    headers: MERGE,
+  });
+  check(
+    "wish item: metadata merges (null removes, nested objects merge) alongside a field change",
+    r.status === 200 && r.json.notes === "n" && same(r.json.metadata, { k1: 1, k3: 3, nested: { a: 1, b: 2 } }),
+    r.json,
+  );
+  const stamped = r.json.updated_at;
+  r = await api("PATCH", `/v1/wish-items/${wish.id}`, { body: { metadata: {} }, headers: MERGE });
+  check(
+    "wish item: metadata:{} alone → 200, nothing changes",
+    r.status === 200 && same(r.json.metadata, { k1: 1, k3: 3, nested: { a: 1, b: 2 } }) && r.json.updated_at === stamped,
+    r.json,
+  );
+  r = await api("PATCH", `/v1/wish-items/${wish.id}`, { body: {}, headers: MERGE });
+  check("wish item: a patch with no fields is still 400", r.status === 400, r.json);
+  await api("DELETE", `/v1/wish-items/${wish.id}`);
+
+  // Owned items hang off a product, and products cannot be deleted
+  // through the API, so this borrows an existing item instead of leaving
+  // a catalog row behind: one key is added and removed again.
+  const listed = await api("GET", "/v1/owned-items?limit=1");
+  const owned = listed.json?.items?.[0];
+  if (!owned) {
+    console.log("  - owned item: none in this database, skipped");
+    return;
+  }
+  const key = `smoke_${NONCE}`;
+  r = await api("PATCH", `/v1/owned-items/${owned.id}`, { body: { metadata: { [key]: { a: 1 } } }, headers: MERGE });
+  check(
+    "owned item: a metadata patch adds its key and keeps the rest",
+    r.status === 200 && same(r.json.metadata, { ...owned.metadata, [key]: { a: 1 } }),
+    r.json?.metadata,
+  );
+  r = await api("PATCH", `/v1/owned-items/${owned.id}`, { body: { metadata: { [key]: null } }, headers: MERGE });
+  check(
+    "owned item: null removes the key again; metadata is back as it was",
+    r.status === 200 && same(r.json.metadata, owned.metadata),
+    r.json?.metadata,
+  );
 }
 
 // ── main ───────────────────────────────────────────────────────────────
@@ -784,6 +998,7 @@ async function main(): Promise<void> {
   await groupCascade();
   await groupPostings();
   await groupAccounts(baseCurrency);
+  await groupCatalogMetadata();
 
   console.log(`\n${passed} passed, ${failures.length} failed`);
   if (failures.length > 0) {

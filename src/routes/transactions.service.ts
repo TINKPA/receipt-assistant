@@ -236,14 +236,21 @@ function pgCode(err: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * The message of the Postgres error itself — the first error in the
+ * `cause` chain that carries a SQLSTATE. Drizzle wraps it in an error
+ * whose own message is the failed statement and its parameters
+ * ("Failed query: commit\nparams: "); that wrapper is not for a client.
+ */
 function pgMessage(err: unknown): string {
-  const parts: string[] = [];
   let cur: any = err;
   while (cur) {
-    if (typeof cur.message === "string") parts.push(cur.message);
+    if (typeof cur.code === "string" && typeof cur.message === "string") {
+      return cur.message;
+    }
     cur = cur.cause;
   }
-  return parts.join(" | ");
+  return "";
 }
 
 /**
@@ -553,6 +560,11 @@ type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
  * column: with the lock held, such a pass either lands first (and the
  * `bump_version` trigger turns the PATCH into a 412) or waits and
  * applies on top of the committed row. Neither side's write is lost.
+ *
+ * LOCK ORDER: postings before the head row. A mutation that writes or
+ * deletes EXISTING posting rows takes their locks first (`lockPostingRow`
+ * for one posting, `lockPostingRowsOf` for whole transactions), then
+ * this one. See `lockPostingRow` for why.
  */
 async function lockTransactionRow(tx: DbTx, workspaceId: string, id: string) {
   const rows = await tx
@@ -564,6 +576,73 @@ async function lockTransactionRow(tx: DbTx, workspaceId: string, id: string) {
     .for("update");
   if (rows.length === 0) throw new NotFoundProblem("Transaction", id);
   return rows[0]!;
+}
+
+/**
+ * Load one posting of a transaction and take its row lock. Call it
+ * BEFORE `lockTransactionRow` — the order is the point.
+ *
+ * The FX and points passes (`src/fx/normalize.ts`,
+ * `src/points/valuation.ts`) write a transaction's postings first, in id
+ * order, and its `metadata` second, in one DB transaction. A posting
+ * PATCH or DELETE that held the head row and then reached for the
+ * posting would meet such a pass head-on: each holds the row the other
+ * needs, and Postgres ends it by aborting one of them after
+ * `deadlock_timeout` — a 500 for the API call, or a silently unconverted
+ * foreign leg when the pass is the one aborted (`normalizeFxSafely`
+ * swallows the error). Taking the posting first puts both writers in the
+ * same order, so one simply waits: the pass lands, its metadata write
+ * bumps the version, and the PATCH answers 412 against the row it can
+ * now see.
+ *
+ * The whole file follows the one rule so no pair of writers can cross:
+ * postings (in id order) before the head row. A hard delete removes the
+ * postings through the FK cascade, which would take them AFTER the head
+ * row, so the delete paths lock them explicitly first
+ * (`lockPostingRowsOf`). Adding a posting takes only the head row: the
+ * new row is nobody else's to wait for.
+ *
+ * Returns null when the transaction has no such posting; the caller
+ * reports that after the head-row checks, so a missing transaction or a
+ * stale If-Match is still what the client hears first.
+ */
+async function lockPostingRow(
+  tx: DbTx,
+  workspaceId: string,
+  txId: string,
+  postingId: string,
+) {
+  const rows = await tx
+    .select()
+    .from(postings)
+    .where(
+      and(
+        eq(postings.id, postingId),
+        eq(postings.transactionId, txId),
+        eq(postings.workspaceId, workspaceId),
+      ),
+    )
+    .for("update");
+  return rows[0] ?? null;
+}
+
+/**
+ * Lock every posting of the given transactions, in id order. For the
+ * paths that delete whole transactions (`deleteTransaction` here, the
+ * cascade in documents.service.ts): call it BEFORE locking the head
+ * rows. See `lockPostingRow` for the rule this keeps.
+ */
+export async function lockPostingRowsOf(
+  tx: DbTx,
+  transactionIds: string[],
+): Promise<void> {
+  if (transactionIds.length === 0) return;
+  await tx
+    .select({ id: postings.id })
+    .from(postings)
+    .where(inArray(postings.transactionId, transactionIds))
+    .orderBy(postings.id)
+    .for("update");
 }
 
 /**
@@ -615,6 +694,11 @@ interface PostingMoneyInput {
 }
 
 const FX_RATE_SHAPE = /^\d+(\.\d+)?([eE][+-]?\d+)?$/;
+/** `postings.fx_rate` is numeric(20,10): ten integer digits, ten
+ *  decimals. A larger value overflows the column; a smaller positive one
+ *  is stored as zero. */
+const FX_RATE_LIMIT = 1e10;
+const FX_RATE_DECIMALS = 10;
 
 /**
  * The one place a posting's base-currency side is decided, shared by
@@ -714,15 +798,19 @@ function resolvePostingMoney(
   }
 
   const rate = FX_RATE_SHAPE.test(fxRate) ? Number(fxRate) : NaN;
-  // A points programme may be unvalued (rate 0); a cash rate may not.
-  if (!Number.isFinite(rate) || (!points && rate === 0)) {
+  // Judge the rate as the column will hold it. A points programme may be
+  // unvalued (rate 0); a cash rate may not, and that includes one so
+  // small it rounds to zero at the column's ten decimals.
+  const inRange = Number.isFinite(rate) && rate < FX_RATE_LIMIT;
+  const storedAsZero = inRange && Number(rate.toFixed(FX_RATE_DECIMALS)) === 0;
+  if (!inRange || (!points && storedAsZero)) {
     throw new ValidationProblem([
       {
         path: at("fx_rate"),
         code: "invalid",
         message: points
-          ? "fx_rate must be a non-negative decimal number"
-          : "fx_rate must be a positive decimal number",
+          ? "fx_rate must be a non-negative decimal number below 10^10"
+          : "fx_rate must be a positive decimal number below 10^10, and at least 10^-10",
       },
     ]);
   }
@@ -1673,6 +1761,9 @@ export async function deleteTransaction(
   opts: { userId?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
+    // The DELETE below takes the postings through the FK cascade; lock
+    // them first so the order is postings, then head row (`lockPostingRow`).
+    await lockPostingRowsOf(tx, [id]);
     const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
@@ -1901,9 +1992,12 @@ export async function unreconcileTransaction(
 //
 // All three take the head row's lock, check If-Match under it, refuse a
 // reconciled or soft-deleted transaction (`assertPostingsMutable`), and
-// decide the base-currency side in `resolvePostingMoney`. Their audit
-// events carry the values that changed, old and new — a removed
-// posting's amount used to survive nowhere.
+// decide the base-currency side in `resolvePostingMoney`. Update and
+// delete take the posting's own lock before the head row's
+// (`lockPostingRow`) so they queue behind the FX and points passes
+// instead of deadlocking with them. Their audit events carry the values
+// that changed, old and new — a removed posting's amount used to
+// survive nowhere.
 
 export async function addPosting(
   workspaceId: string,
@@ -1998,20 +2092,14 @@ export async function updatePosting(
 
   return await mapBalanceErrors(async () => {
     return await db.transaction(async (tx) => {
+      // Posting first, head row second: see `lockPostingRow`.
+      const existing = await lockPostingRow(tx, workspaceId, txId, postingId);
       const current = await lockTransactionRow(tx, workspaceId, txId);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);
       }
       assertPostingsMutable(current);
-
-      const existingRows = await tx
-        .select()
-        .from(postings)
-        .where(eq(postings.id, postingId));
-      const existing = existingRows[0];
-      if (!existing || existing.transactionId !== txId) {
-        throw new NotFoundProblem("Posting", postingId);
-      }
+      if (!existing) throw new NotFoundProblem("Posting", postingId);
 
       const next = {
         accountId: existing.accountId,
@@ -2123,6 +2211,8 @@ export async function deletePosting(
 ): Promise<void> {
   await mapBalanceErrors(async () => {
     await db.transaction(async (tx) => {
+      // Posting first, head row second: see `lockPostingRow`.
+      await lockPostingRow(tx, workspaceId, txId, postingId);
       const current = await lockTransactionRow(tx, workspaceId, txId);
       if (Number(current.version) !== expectedVersion) {
         throw new VersionMismatchProblem(Number(current.version), expectedVersion);

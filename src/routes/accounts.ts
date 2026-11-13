@@ -17,12 +17,7 @@ import {
 import { db } from "../db/client.js";
 import { accounts, workspaces } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
-import {
-  mergePatch,
-  metadataDelta,
-  metadataDeltaSql,
-  type JsonObject,
-} from "../projection/metadata-patch.js";
+import { metadataPatchSet } from "../projection/metadata-patch.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   setEtag,
@@ -331,32 +326,8 @@ export async function updateAccountService(
         [{ path: "parent_id", code: "self_parent", message: "Cannot parent under self" }],
       );
     }
-    // …or under any descendant. Walk UP from the proposed parent; meeting
-    // this account on the way means the new parent sits inside its own
-    // subtree. `UNION` (not `UNION ALL`) so the walk terminates even if a
-    // cycle already exists in the data.
-    const loop = await db.execute(sql`
-      WITH RECURSIVE ancestors(id, parent_id) AS (
-        SELECT id, parent_id FROM accounts
-         WHERE workspace_id = ${workspaceId}::uuid AND id = ${patch.parent_id}::uuid
-        UNION
-        SELECT a.id, a.parent_id FROM accounts a
-          JOIN ancestors c ON a.id = c.parent_id
-         WHERE a.workspace_id = ${workspaceId}::uuid
-      )
-      SELECT 1 FROM ancestors WHERE id = ${id}::uuid LIMIT 1`);
-    if (loop.rows.length > 0) {
-      throw new ValidationProblem(
-        [
-          {
-            path: "parent_id",
-            code: "cycle",
-            message: `Account ${patch.parent_id} is a descendant of ${id}; re-parenting under it would create a cycle`,
-          },
-        ],
-        "Cannot parent an account under its own descendant",
-      );
-    }
+    // …or under any descendant: checked below, in the same DB
+    // transaction as the write.
   }
 
   const updateVals: Partial<typeof accounts.$inferInsert> = {};
@@ -374,12 +345,8 @@ export async function updateAccountService(
   // Written as a jsonb expression naming only the keys that moved; the
   // version predicate below pins it to the row read above.
   if (patch.metadata !== undefined) {
-    const before = (current.metadata ?? {}) as JsonObject;
-    const delta = metadataDelta(
-      before,
-      mergePatch(before, patch.metadata) as JsonObject,
-    );
-    if (delta) updateVals.metadata = metadataDeltaSql(accounts.metadata, delta);
+    const set = metadataPatchSet(accounts.metadata, current.metadata, patch.metadata);
+    if (set !== undefined) updateVals.metadata = set;
   }
 
   if (Object.keys(updateVals).length === 0) {
@@ -387,21 +354,63 @@ export async function updateAccountService(
     return rowToDto(current);
   }
 
-  // The version predicate makes check-and-write one statement: of two
-  // PATCHes carrying the same If-Match, the second matches no row (the
-  // trigger has bumped `version`) and gets a 412 instead of silently
-  // overwriting the first.
-  const written = await db
-    .update(accounts)
-    .set(updateVals)
-    .where(
-      and(
-        eq(accounts.workspaceId, workspaceId),
-        eq(accounts.id, id),
-        eq(accounts.version, args.ifMatchVersion),
-      ),
-    )
-    .returning({ id: accounts.id });
+  const newParentId = patch.parent_id ?? null;
+  const written = await db.transaction(async (tx) => {
+    if (newParentId !== null) {
+      // One re-parent at a time per workspace. The descendant check reads
+      // other accounts' parent pointers, and the version predicate on the
+      // write only pins THIS row: without the lock, "put X under Y" and
+      // "put Y under X" sent together each pass the check against the
+      // other's old parent, and both commit — a two-node cycle. The lock
+      // is released at commit, so the second request walks the tree the
+      // first one left and is refused.
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`accounts.reparent:${workspaceId}`}, 0))`,
+      );
+      // Walk UP from the proposed parent; meeting this account on the way
+      // means the new parent sits inside its own subtree. `UNION` (not
+      // `UNION ALL`) so the walk terminates even if a cycle already
+      // exists in the data.
+      const loop = await tx.execute(sql`
+        WITH RECURSIVE ancestors(id, parent_id) AS (
+          SELECT id, parent_id FROM accounts
+           WHERE workspace_id = ${workspaceId}::uuid AND id = ${newParentId}::uuid
+          UNION
+          SELECT a.id, a.parent_id FROM accounts a
+            JOIN ancestors c ON a.id = c.parent_id
+           WHERE a.workspace_id = ${workspaceId}::uuid
+        )
+        SELECT 1 FROM ancestors WHERE id = ${id}::uuid LIMIT 1`);
+      if (loop.rows.length > 0) {
+        throw new ValidationProblem(
+          [
+            {
+              path: "parent_id",
+              code: "cycle",
+              message: `Account ${newParentId} is a descendant of ${id}; re-parenting under it would create a cycle`,
+            },
+          ],
+          "Cannot parent an account under its own descendant",
+        );
+      }
+    }
+
+    // The version predicate makes check-and-write one statement: of two
+    // PATCHes carrying the same If-Match, the second matches no row (the
+    // trigger has bumped `version`) and gets a 412 instead of silently
+    // overwriting the first.
+    return await tx
+      .update(accounts)
+      .set(updateVals)
+      .where(
+        and(
+          eq(accounts.workspaceId, workspaceId),
+          eq(accounts.id, id),
+          eq(accounts.version, args.ifMatchVersion),
+        ),
+      )
+      .returning({ id: accounts.id });
+  });
 
   const updated = await fetchAccount(workspaceId, id);
   if (!updated) throw new NotFoundProblem("Account", id);

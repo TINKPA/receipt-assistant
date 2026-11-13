@@ -35,6 +35,7 @@ import {
   CreateDocumentLinkRequest,
   UploadDocumentForm,
   ReExtractDocumentResponse,
+  CascadeDeleteReport,
 } from "../schemas/v1/document.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
 import { NotFoundProblem, ValidationProblem } from "../http/problem.js";
@@ -314,6 +315,9 @@ documentsRouter.delete(
 //                              document is the LAST live evidence of;
 //                              ones another live document supports stay
 //   ?cascade=true&hard=true  — full purge (those txns + links + doc + file)
+//
+// Without cascade the answer is 204. With it, 200 and a
+// `CascadeDeleteReport` naming what happened to each linked transaction.
 
 const DeleteQuery = z.object({
   hard: BoolFlag.optional(),
@@ -333,13 +337,24 @@ documentsRouter.delete(
     const cascade = flagTrue(q.cascade);
 
     if (cascade) {
-      await cascadeDeleteDocument({
+      const report = await cascadeDeleteDocument({
         workspaceId: req.ctx.workspaceId,
         userId: req.ctx.userId,
         documentId: id,
         hard,
       });
-      res.status(204).end();
+      // 200 with a report, not 204: a cascade keeps any transaction that
+      // another live document still supports, and the caller has to be
+      // able to see that "delete this receipt" left the receipt standing.
+      const body: z.infer<typeof CascadeDeleteReport> = {
+        document_id: id,
+        hard,
+        transactions_kept: report.txns_kept,
+        transactions_soft_deleted: report.txns_soft_deleted,
+        transactions_hard_deleted: report.txns_hard_deleted,
+        transactions_skipped: report.txns_skipped,
+      };
+      res.status(200).json(body);
       return;
     }
 
@@ -570,7 +585,8 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       "Of the transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, already-deleted ones are left intact, and a reconciled one aborts the whole operation with 409 (unreconcile first). " +
       "The document itself is soft-deleted and its link rows stay, so restoring it restores the association. " +
       "?cascade=true&hard=true: the transactions that are not kept are hard-deleted (postings cascade); kept transactions are only unlinked from this document (a `document_unlinked` event records it). " +
-      "The document row is removed and the image file is moved to .trash/ (never unlinked).",
+      "The document row is removed and the image file is moved to .trash/ (never unlinked). " +
+      "A cascade answers 200 with a report of what happened to each linked transaction; check `transactions_kept` before telling a user the receipt is gone.",
     tags: ["documents"],
     request: {
       params: z.object({ id: Uuid }),
@@ -588,7 +604,12 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       }),
     },
     responses: {
-      204: { description: "Deleted" },
+      200: {
+        description:
+          "Cascade (`?cascade=true`) done. The body says which linked transactions were deleted and which were kept.",
+        content: { "application/json": { schema: CascadeDeleteReport } },
+      },
+      204: { description: "Deleted (no cascade requested)" },
       404: { description: "Not found", content: problemContent },
       409: {
         description:

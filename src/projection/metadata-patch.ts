@@ -23,6 +23,10 @@
  *   - a value sent back exactly as stored is left as stored (see
  *     `mergePatch` for why this is spelled out)
  *
+ * The same contract holds on every PATCH route that takes `metadata`:
+ * transactions here, and accounts, owned items and wish items through
+ * `metadataPatchSet`.
+ *
  * ## Server-owned keys
  *
  * Most of `transactions.metadata` is free-form: the extraction agent adds
@@ -257,6 +261,28 @@ export function metadataDelta(
  */
 export function metadataDeltaSql(column: AnyColumn, delta: MetadataDelta): SQL {
   return sql`(${column} - ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(delta.removedKeys)}::jsonb))) || ${JSON.stringify(delta.newValues)}::jsonb`;
+}
+
+/**
+ * What to SET a `metadata` column to when a client merge-patches it, or
+ * `undefined` when the patch changes nothing. For the tables with no
+ * server-owned keys (accounts, owned_items, wish_items); transactions go
+ * through `applyClientTxMetadataPatch` below.
+ *
+ * `stored` is the column's current value. As with `metadataDeltaSql`,
+ * the caller must hold the row or pin the UPDATE to the version it read.
+ */
+export function metadataPatchSet(
+  column: AnyColumn,
+  stored: unknown,
+  patch: JsonObject,
+): SQL | JsonObject | undefined {
+  const before = isPlainObject(stored) ? stored : {};
+  const after = mergePatch(before, patch) as JsonObject;
+  const delta = metadataDelta(before, after);
+  if (!delta) return undefined;
+  // A stored value that is not an object has no keys to keep; replace it.
+  return isPlainObject(stored) ? metadataDeltaSql(column, delta) : after;
 }
 
 export interface TxMetadataPatchResult {

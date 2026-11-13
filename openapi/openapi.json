@@ -2295,7 +2295,8 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {}
+            "additionalProperties": {},
+            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
           }
         },
         "additionalProperties": false
@@ -2530,7 +2531,8 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": {}
+            "additionalProperties": {},
+            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
           }
         },
         "additionalProperties": false
@@ -5034,6 +5036,64 @@
           }
         },
         "additionalProperties": false
+      },
+      "CascadeDeleteReport": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "hard": {
+            "type": "boolean",
+            "description": "true: the document row was removed (`?hard=true`). false: it was soft-deleted."
+          },
+          "transactions_kept": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Linked transactions left in the ledger because another non-deleted document still supports them. Non-empty means the receipt is NOT gone: delete the remaining document(s) with cascade, or the transaction itself, to remove it."
+          },
+          "transactions_soft_deleted": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Posted transactions this call soft-deleted (restorable)."
+          },
+          "transactions_hard_deleted": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Transactions this call removed for good: every non-kept one under `?hard=true`, and draft/error ones in soft mode."
+          },
+          "transactions_skipped": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Soft mode only: transactions that were already soft-deleted and were left as they were."
+          }
+        },
+        "required": [
+          "document_id",
+          "hard",
+          "transactions_kept",
+          "transactions_soft_deleted",
+          "transactions_hard_deleted",
+          "transactions_skipped"
+        ]
       },
       "ReExtractDocumentResponse": {
         "type": "object",
@@ -7669,6 +7729,7 @@
       },
       "patch": {
         "summary": "Patch serial / location / warranty / condition / notes",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
         "tags": [
           "owned-items"
         ],
@@ -7919,6 +7980,7 @@
       },
       "patch": {
         "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
         "tags": [
           "wish-items"
         ],
@@ -8857,7 +8919,7 @@
       },
       "delete": {
         "summary": "Delete a document. Soft-deletes by default; ?hard=true removes the row and quarantines the file under .trash/; ?cascade=true also handles linked transactions.",
-        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. Of the transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, already-deleted ones are left intact, and a reconciled one aborts the whole operation with 409 (unreconcile first). The document itself is soft-deleted and its link rows stay, so restoring it restores the association. ?cascade=true&hard=true: the transactions that are not kept are hard-deleted (postings cascade); kept transactions are only unlinked from this document (a `document_unlinked` event records it). The document row is removed and the image file is moved to .trash/ (never unlinked).",
+        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. Of the transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, already-deleted ones are left intact, and a reconciled one aborts the whole operation with 409 (unreconcile first). The document itself is soft-deleted and its link rows stay, so restoring it restores the association. ?cascade=true&hard=true: the transactions that are not kept are hard-deleted (postings cascade); kept transactions are only unlinked from this document (a `document_unlinked` event records it). The document row is removed and the image file is moved to .trash/ (never unlinked). A cascade answers 200 with a report of what happened to each linked transaction; check `transactions_kept` before telling a user the receipt is gone.",
         "tags": [
           "documents"
         ],
@@ -8904,8 +8966,18 @@
           }
         ],
         "responses": {
+          "200": {
+            "description": "Cascade (`?cascade=true`) done. The body says which linked transactions were deleted and which were kept.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CascadeDeleteReport"
+                }
+              }
+            }
+          },
           "204": {
-            "description": "Deleted"
+            "description": "Deleted (no cascade requested)"
           },
           "404": {
             "description": "Not found",

@@ -7,7 +7,7 @@
  * `transaction_item_id = NULL`.
  */
 import { z } from "zod";
-import { IsoDate, IsoDateTime, Metadata, Uuid } from "./common.js";
+import { IsoDate, IsoDateTime, Metadata, MetadataPatch, Uuid } from "./common.js";
 
 export const OwnedItem = z
   .object({
@@ -100,7 +100,8 @@ export const UpdateOwnedItemRequest = z
     retired_at: IsoDateTime.nullable().optional(),
     /** Achievement-plan horizon in days; null clears the plan. */
     target_days: z.number().int().positive().nullable().optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
+    /** Merge patch, not a replacement — see `MetadataPatch`. */
+    metadata: MetadataPatch.optional(),
   })
   .strict()
   .openapi("UpdateOwnedItemRequest");

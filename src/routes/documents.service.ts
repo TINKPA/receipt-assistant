@@ -16,6 +16,7 @@ import { transactions, transactionEvents } from "../schema/index.js";
 import { derivationEvents } from "../schema/derivation_events.js";
 import { computePhash, isHashableImageMime } from "../images/phash.js";
 import { newId } from "../http/uuid.js";
+import { lockPostingRowsOf } from "./transactions.service.js";
 import {
   DocumentHasLinksProblem,
   HttpProblem,
@@ -645,6 +646,20 @@ export async function cascadeDeleteDocument(params: {
       .for("update");
     if (docRows.length === 0) throw new NotFoundProblem("Document", documentId);
     const doc = docRows[0]!;
+
+    // A cascade may hard-delete linked transactions, and the FK takes
+    // their postings with them. Lock those postings before the head rows:
+    // every writer of a transaction's postings goes postings first, head
+    // row second (see `lockPostingRow` in transactions.service.ts), and a
+    // delete that went the other way round could deadlock with one.
+    const linkedIds = await tx
+      .select({ transactionId: documentLinks.transactionId })
+      .from(documentLinks)
+      .where(eq(documentLinks.documentId, documentId));
+    await lockPostingRowsOf(
+      tx,
+      linkedIds.map((l) => l.transactionId),
+    );
 
     // Find all linked transactions with their current state. Locked in
     // id order so concurrent cascades take the rows in the same sequence.
