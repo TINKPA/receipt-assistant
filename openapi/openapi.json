@@ -775,12 +775,6 @@
               "null"
             ]
           },
-          "custom_name_zh": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "primary_type": {
             "type": [
               "string",
@@ -925,7 +919,6 @@
           "display_name_zh_source",
           "display_name_zh_is_native",
           "custom_name",
-          "custom_name_zh",
           "primary_type",
           "primary_type_display_zh",
           "maps_type_label_zh",
@@ -5100,12 +5093,6 @@
         "type": "object",
         "properties": {
           "custom_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "custom_name_zh": {
             "type": [
               "string",
               "null"

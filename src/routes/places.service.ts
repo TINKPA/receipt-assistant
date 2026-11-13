@@ -8,9 +8,7 @@
  * Writes still happen agent-side during ingest — the extractor issues
  * `INSERT ... ON CONFLICT (google_place_id) DO UPDATE` inline inside
  * its BEGIN/COMMIT block. The only writer-side helper here is the
- * user-facing PATCH that sets `custom_name` (renamed from
- * `custom_name_zh` in #79; the old name still works as a deprecated
- * alias for one release).
+ * user-facing PATCH that sets `custom_name`.
  */
 import { and, eq, inArray, sql, isNotNull } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -64,8 +62,6 @@ export interface PlaceRow {
   /** User-supplied name override. Wins over every derived
    *  `display_name_*` in the UI fallback chain. */
   custom_name: string | null;
-  /** @deprecated Alias for `custom_name`. Removed in a follow-up. */
-  custom_name_zh: string | null;
 
   primary_type: string | null;
   primary_type_display_zh: string | null;
@@ -117,12 +113,7 @@ function rowToApi(r: typeof places.$inferSelect): Omit<PlaceRow, "photos"> {
     display_name_zh_source:
       (r.displayNameZhSource as PlaceRow["display_name_zh_source"]) ?? null,
     display_name_zh_is_native: r.displayNameZhIsNative,
-    // Emit BOTH for one release: `custom_name` is the new field;
-    // `custom_name_zh` is the deprecated alias from #79 and just
-    // mirrors `custom_name` so existing clients keep rendering the
-    // override without an immediate update.
     custom_name: r.customName,
-    custom_name_zh: r.customName,
     primary_type: r.primaryType,
     primary_type_display_zh: r.primaryTypeDisplayZh,
     maps_type_label_zh: r.mapsTypeLabelZh,
@@ -206,20 +197,14 @@ export async function loadPlaceById(id: string): Promise<PlaceRow | null> {
 /**
  * Update the user-overridable field. Returns the new full row, or null
  * if the place doesn't exist.
- *
- * Accepts both `custom_name` (preferred, post-#79) and
- * `custom_name_zh` (deprecated alias from before the column rename).
- * If both keys appear in the patch, `custom_name` wins.
  */
 export async function updatePlace(
   id: string,
-  patch: { custom_name?: string | null; custom_name_zh?: string | null },
+  patch: { custom_name?: string | null },
 ): Promise<PlaceRow | null> {
   const set: Partial<typeof places.$inferInsert> = {};
   if ("custom_name" in patch) {
     set.customName = patch.custom_name ?? null;
-  } else if ("custom_name_zh" in patch) {
-    set.customName = patch.custom_name_zh ?? null;
   }
   if (Object.keys(set).length === 0) {
     return loadPlaceById(id);
