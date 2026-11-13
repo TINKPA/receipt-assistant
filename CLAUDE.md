@@ -10,7 +10,7 @@ This file is for whoever is **developing** this repo: a person, or an AI working
 |---|---|---|
 | Developer (you) | How the project is built, deployed and debugged | This file, `README.md`, `docs/` |
 | Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract |
-| Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger, read-only | `src/insights/ask.ts` |
+| Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger. It has no tools: it writes SQL and the server runs it as a read-only role | `src/insights/ask.ts` |
 
 Keep them apart:
 
@@ -155,7 +155,7 @@ It is synchronous and bypasses `MAX_CLAUDE_CONCURRENCY`, so run calls strictly o
 
 `src/projection/layer3.ts` lists the columns re-extract must not overwrite.
 
-- **Hard**: `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. Extraction never writes these, so the re-extract UPDATE simply does not name them. `version` is the exception: always `version + 1`.
+- **Hard**: `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. Extraction never writes these, so the re-extract UPDATE simply does not name them. `version` is the exception: always `version + 1`. Since migration 0041 the agent's database role also has no UPDATE privilege on any of them except `version` (see "Agent sandbox"), so nothing that goes through the agent's own `$DATABASE_URL` can write them, whatever the prompt says.
 - **Soft**: `payee`, `occurred_on`, `occurred_at`. Extraction writes them and the user may override them. `updateTransaction` sets `metadata.user_edited.<field> = true` whenever a PATCH names one, and the re-extract SQL wraps each in a CASE that keeps the current value when the flag is set:
 
 ```sql
@@ -268,6 +268,98 @@ Not done:
 - `products.total_spent_minor` is still a sum of native line amounts (`transaction_items.effective_total_minor`), shown as dollars. It is written in three places that must agree: `recomputeProductStats` and the merge handler in `src/routes/products.ts`, and the ingest-time SQL in `src/ingest/items-sql.ts`, which is prompt text.
 - A points leg whose valuation pass never ran (`fx_rate` NULL, as opposed to valued at 0) sits in the totals at its points count and is in neither disclosure block.
 
+## Agent sandbox: what the two agents can reach
+
+Both agents are `claude -p` children of the server, and both read text a stranger wrote. The extraction agent has a forwarded email pasted into its prompt. The Ask agent takes a question from whoever can reach the API, then reads `ocr_text`. So what they can do is decided by what they are handed, not by what a prompt asks of them.
+
+`src/claude.ts` is the only place a child is spawned, and every spawn names a profile:
+
+| | `extraction` (ingest, re-extract) | `ask` | `text` (backfill scripts) |
+|---|---|---|---|
+| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | none | none |
+| Permissions | bypassed: Bash is unrestricted here anyway | `dontAsk`, with nothing to approve | none needed |
+| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: the server runs its SQL, as `receipts_ro` | unset |
+| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | none | none |
+
+Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`.
+
+The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` (below) with every bump.
+
+### Database roles
+
+Migration 0041 creates two roles. `src/db/agent-roles.ts` says what each may do, and the server re-applies that file at every boot (`syncAgentRoles`), along with the role passwords from `RECEIPTS_AGENT_DB_PASSWORD` and `RECEIPTS_RO_DB_PASSWORD`. The server's own pool keeps using `DATABASE_URL`, which is not in either child's environment.
+
+- **`receipts_agent`** holds exactly `AGENT_GRANTS`: SELECT on the 17 tables the prompt templates touch, INSERT where they insert, and UPDATE **per column**. No DELETE, no TRUNCATE, no DDL, no temp tables, no large objects, and no access at all to the remaining tables (`users`, `workspaces`, `idempotency_keys` and the rest). The column lists are what makes Layer 3 a server-side rule: `transactions.status` / `deleted_at` / `narration`, `places.custom_name`, `brands.user_chose_at`, `products.custom_name` and `documents.file_path` are not in them. Postings are insert-only.
+- **`receipts_ro`** holds SELECT on every table and view in `public`, and nothing else.
+
+To let the extraction agent do something new, edit `AGENT_GRANTS` in the same change as the prompt. No migration is needed, because boot applies the file.
+
+**Tables added later.** `receipts_ro` can read a new table as soon as it exists (a default privilege, re-asserted at boot) and can never write to it. `receipts_agent` cannot see a new table or view until `AGENT_GRANTS` lists it. Three things keep that from failing quietly:
+
+1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template.
+2. Boot logs the tables the role cannot touch, and logs an error for every difference between the live privileges and the file.
+3. `check-agent-sandbox` fails on the same differences.
+
+A table neither agent may read, such as a credential store, goes in `RO_DENY_TABLES` and stays out of `AGENT_GRANTS`.
+
+**What boot does, and what its log lines mean.** After migrations, `syncAgentDbRoles` in `src/server.ts` applies the file and then logs in as each role with the URL an agent would be handed. None of it can stop the server from starting:
+
+- `🔐 Agent DB roles synced` is the normal line. `⚠️ … built-in development password` means a password variable is unset.
+- `❌ Agent DB role sync was blocked by another session` means a session held a lock the sync needs for more than ten seconds. Any role may take an advisory lock, and Postgres keeps a backend alive while it sleeps even after its client was killed, so an agent can leave such a session behind. Boot ends the sessions logged in as the two agent roles (no agent of this server exists yet) and tries once more.
+- `❌ Agent DB role drift` is a privilege that differs from the file after the sync; `❌ Agent DB login check` means an agent started now could not log in. Either one is a reason not to trust extraction until it is understood.
+
+Postgres lets any role change its own password and its own session defaults; no privilege controls that. The extraction agent can therefore lock `receipts_agent` out (`ALTER ROLE receipts_agent PASSWORD …`), and extraction then fails at its first psql call until the next restart puts the password back. The Ask path cannot do this (see below).
+
+Roles belong to the cluster, not to a database dump. After restoring a dump into a fresh Postgres the restore prints "role does not exist" for the GRANT lines; that is harmless, and the first boot recreates both roles with their grants. `scripts/tx-restore.sh` needs `session_replication_role` and keeps using the owner connection. Migration 0041 needs a connection that may create roles (the compose files connect as the `postgres` superuser).
+
+### How Ask reaches the database
+
+The Ask model has no tools. `askLedger` (`src/insights/ask.ts`) calls `claude -p` with the question; the model replies with SQL in fenced blocks; the server runs each one with `runLedgerQuery` (`src/insights/ledger-query.ts`) and calls the model again with the rows, until it replies `ANSWER:` or five model calls are spent. `session_id` in the response names the last call, whose prompt carries every query and result.
+
+`runLedgerQuery` logs in as `receipts_ro`, opens a read-only transaction, and sends the model's text as a single prepared statement, wrapped as the body of a cursor over `SELECT … FROM (<text>) q`. Only one query can parse there. It fetches at most 200 rows, each cut to 4000 characters by Postgres, under a 30 s statement timeout, and closes the connection afterwards. The read-only transaction is what stops the two things privileges do not: a role altering itself, and creating large objects.
+
+Ask used to have Bash with an allowlist of one command under `--permission-mode dontAsk`. On CLI 2.1.251 that mode still runs the CLI's built-in "read-only" commands (`id`, `cat`, `tac`, `du`, `stat` and others) without consulting any allow rule, so it was never one command. If a later change gives Ask a tool again, that is the fact to re-check first.
+
+### Checking it — `scripts/check-agent-sandbox.ts`
+
+Sandbox only; it refuses the production container. Run it after changing a profile, `AGENT_GRANTS`, the pinned CLI version or the SQL in a prompt, and before that change is deployed:
+
+```bash
+# sandbox up first: docker compose -f docker-compose.test.yml up -d --build
+npx tsx scripts/check-agent-sandbox.ts             # runs inside receipt-assistant-test
+npx tsx scripts/check-agent-sandbox.ts --db-only   # database half only, no model calls
+```
+
+It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Every database statement is inside a transaction that is rolled back.
+
+A check that could not be carried out (usually because `claude` cannot authenticate in the sandbox) is reported as INCONCLUSIVE and fails the run. A green run means every claim was exercised.
+
+### What this does not bound
+
+Know these before treating the sandbox as a wall. Ask is confined by construction: it has nothing to run. **The extraction agent is not confined.** Its limits stop a mistake and an injection that works through what the agent was handed. They do not stop a hostile receipt that tells it to go around them, because it has an unrestricted shell running as the server's own Unix user:
+
+- **It can log in to Postgres as the owner.** The owner is a superuser, and until `RECEIPTS_DB_OWNER_PASSWORD` is set its password is the `postgres` printed in `docker-compose.yml` in a public repository, on the host named in the agent's own `$DATABASE_URL`. `psql postgresql://postgres:postgres@receipts-postgres/receipts` skips every grant above. Rotating the password (see below) removes the version of this that needs no looking; it does not remove the next one.
+- **It can read the server's environment.** A process can read `/proc/<pid>/environ` of another process of its own user, which holds the owner `DATABASE_URL`, the API keys and the OAuth token whatever they are set to.
+- **It can rewrite the server.** `/app`, `dist` included, is owned by the user the agent runs as. A change there lasts until the container is recreated.
+- **It can start another `claude`** with every tool, because `CLAUDE_CODE_OAUTH_TOKEN` is in its environment (the CLI needs it there).
+- **It can call the HTTP API**, which has no credential and will hard-delete on request, and it has outbound network because the prompts need `curl`. Whatever it can read (the receipt files, the tables in its grant list, the transcripts under `~/.claude`) it can send out.
+- **Within its grants it is not scoped to one receipt.** It may UPDATE the granted columns (`payee`, `metadata`, …) on every transaction and add postings to any of them, as long as the result balances.
+
+Closing the first four means running the agent as a different Unix user, or in a different container, from the server; the fifth is the API token and loopback ports of the next wave. None of that is in place.
+
+**Rotating the owner password.** `POSTGRES_PASSWORD` only applies when the data directory is first created, so change the role first, then the variable:
+
+```bash
+PW=$(openssl rand -hex 24)   # hex: it is pasted into a URL
+docker exec receipts-postgres psql -U postgres -qc "ALTER ROLE postgres PASSWORD '$PW'"
+echo "RECEIPTS_DB_OWNER_PASSWORD=$PW" >> .env
+docker compose up -d receipt-assistant
+```
+
+`docker exec receipts-postgres psql -U postgres` keeps working without it (local socket), so backups and `tx-restore.sh` are unaffected.
+
+For Ask, what remains: the model reads the whole ledger, including `ocr_text` written by strangers, and what it reads can steer what it answers; and every question costs up to five model calls from whoever can reach the API.
+
 ## Known Pitfalls
 
 0. **Never pass a prompt (or any payload) as a `claude` CLI *argument* —
@@ -294,9 +386,9 @@ Not done:
    Guard rails now in place, do not remove them:
    - `src/claude.ts::assertArgvSafe()` runs before every spawn and
      throws a message naming the offending argument and its byte size.
-   - Both `src/claude.ts::runClaude` and
-     `src/ingest/extractor.ts::runClaude` take `prompt` as a separate
-     parameter and write it to stdin. `stdio[0]` must be `"pipe"`, and
+   - `src/claude.ts::runClaude` is the only spawn site (the extractor's
+     `runExtractorClaude` calls it). It takes `prompt` as a separate
+     parameter and writes it to stdin. `stdio[0]` must be `"pipe"`, and
      the `child.stdin.on("error", …)` handler must stay — the child can
      exit before draining stdin (auth failure, bad flag) and the
      resulting `EPIPE` would otherwise crash the worker instead of
@@ -328,8 +420,8 @@ Not done:
    whole v1 ledger transaction to Postgres via `psql` tool calls —
    **no JSON-schema coercion anywhere in the flow**. The pre-v1
    `src/claude.ts::processReceipt` that used to own this was deleted
-   in #164; `src/claude.ts` now only exports `runClaude` /
-   `detectPsqlCommand` for `src/insights/ask.ts`.
+   in #164; `src/claude.ts` now owns only how a child is spawned:
+   `runClaude` and the agent profiles (see "Agent sandbox").
 
    An earlier two-phase variant (Phase 1: image → plain-text OCR;
    Phase 2: separate `claude -p` call structuring the text into JSON
@@ -628,7 +720,7 @@ Bind mounts move the failure boundary: a container or volume reset no longer tou
 
 ### Claude Code OAuth — long-lived setup-token (Era 6, 2026-10-08 onward)
 
-Auth is a **long-lived `claude setup-token`** supplied via the `CLAUDE_CODE_OAUTH_TOKEN` env var (read from `.env`), **not** an interactive `/login` session and **not** an API key (`src/claude.ts` deletes `ANTHROPIC_API_KEY` to force subscription auth; it passes `CLAUDE_CODE_OAUTH_TOKEN` through). The token is the SSOT-stored `anthropic/oauth-token` in personal-vault — a setup-token on the Max-subscription quota, ~365-day TTL, fp `632c964f037d` — **the same token OpenClaw (agents `main` + `autotrader`) already runs on**. One line in `.env`:
+Auth is a **long-lived `claude setup-token`** supplied via the `CLAUDE_CODE_OAUTH_TOKEN` env var (read from `.env`), **not** an interactive `/login` session and **not** an API key (the child's environment is an allowlist built in `src/claude.ts::buildClaudeEnv`: `CLAUDE_CODE_OAUTH_TOKEN` is on it and `ANTHROPIC_API_KEY` is not, which is what forces subscription auth). The token is the SSOT-stored `anthropic/oauth-token` in personal-vault — a setup-token on the Max-subscription quota, ~365-day TTL, fp `632c964f037d` — **the same token OpenClaw (agents `main` + `autotrader`) already runs on**. One line in `.env`:
 
 ```
 CLAUDE_CODE_OAUTH_TOKEN=<setup-token from personal-vault anthropic/oauth-token>

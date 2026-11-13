@@ -25,6 +25,8 @@ An open-source, AI-native receipt parsing backend that extracts structured data 
 
 `--json-schema` mode constrains Claude's output format and **degrades OCR accuracy** (4/10 dates wrong vs 0/10 with plain text), because it skips chain-of-thought reasoning. The current flow (`src/ingest/prompt.ts::buildExtractorPrompt`, spawned by `src/ingest/extractor.ts`) is a **single `claude -p` invocation** that reads the image, reasons about ambiguous characters in plain text, and writes the whole balanced transaction directly to Postgres via `psql` tool calls — no JSON-schema coercion anywhere. Node never parses fields; it seeds the `ingests` row and waits for the agent to close it. Full A/B rationale and the prior two-phase variant (kept around for anyone benchmarking a return) live in [`CLAUDE.md`](CLAUDE.md#known-pitfalls).
 
+The agent is handed only what its job needs: five tools (Bash, Read, Write, Edit, WebSearch), no MCP servers, an allowlisted environment, and a `DATABASE_URL` that logs in as a Postgres role (`receipts_agent`) which can read, insert into and update only the tables and columns the prompt writes, with no DELETE and no DDL. That stops mistakes and simple injections. It is not a wall: the agent has an unrestricted shell running as the server's own user, and a hostile receipt that tells it to go around the role can. The natural-language Ask agent is confined properly: it has no tools at all, and the server runs the SQL it writes as a SELECT-only role (`receipts_ro`) in a read-only transaction. The details, and the list of what is still open, are in [`CLAUDE.md`](CLAUDE.md#agent-sandbox-what-the-two-agents-can-reach).
+
 The rules the agent is given are **not** duplicated per prompt: `src/ingest/prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts` and `items-sql.ts` hold the single copy that both the ingest prompt and `reextract-prompt.ts` interpolate (#164).
 
 ### Quality & Business Flags
@@ -91,7 +93,9 @@ claude setup-token          # prints a token valid for about a year
 cp .env.example .env        # then set CLAUDE_CODE_OAUTH_TOKEN=<that token>
 ```
 
-When the variable is set it is the only credential the container uses, and it does not refresh itself: when it expires or is revoked, extraction returns 401 until you mint a new one. Rotation, 401 diagnosis and the reasons behind this design are in [`CLAUDE.md`](CLAUDE.md#claude-code-oauth--long-lived-setup-token-era-6-2026-10-08-onward).
+While you are in `.env`, set `RECEIPTS_AGENT_DB_PASSWORD` and `RECEIPTS_RO_DB_PASSWORD` (`openssl rand -hex 24` each). They are the passwords of the two restricted database roles: the extraction agent logs in as one, and the server runs the Ask model's queries as the other. The server sets them on the roles at every boot. Left unset, a built-in development password is used and boot prints a warning. On a new install also set `RECEIPTS_DB_OWNER_PASSWORD` (hex) before the first `up`, so the database owner does not keep the default password; on an existing database follow "Rotating the owner password" in `CLAUDE.md` instead. The server must connect as a role that may create roles (the compose files use the `postgres` superuser): migration 0041 creates the two restricted ones.
+
+When the token variable is set it is the only credential the container uses, and it does not refresh itself: when it expires or is revoked, extraction returns 401 until you mint a new one. Rotation, 401 diagnosis and the reasons behind this design are in [`CLAUDE.md`](CLAUDE.md#claude-code-oauth--long-lived-setup-token-era-6-2026-10-08-onward).
 
 ### 3. After changing source code
 
@@ -175,6 +179,8 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
 | `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
+| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
+| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
 | `npm run measure:turns` | Turns and billed tokens per extraction, from session JSONL |
 | `npm run eval:dates` | Date-accuracy eval against the fixture set (`scripts/eval-dates.md`) |
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
