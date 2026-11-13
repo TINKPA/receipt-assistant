@@ -16,10 +16,16 @@ import express, { Router, type Request, type Response, type NextFunction } from 
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull, inArray } from "drizzle-orm";
-import { createReadStream } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { join, dirname } from "path";
-import { resolveStoredFile, setStoredImageHeaders } from "../http/files.js";
+import {
+  resolveStoredFile,
+  sendStoredFile,
+  setStoredAssetGuards,
+  setStoredImageHeaders,
+  storedImageEtag,
+} from "../http/files.js";
+import { ifNoneMatchSatisfied } from "../http/etag.js";
 import { createHash } from "crypto";
 import multer from "multer";
 import { db } from "../db/client.js";
@@ -541,20 +547,23 @@ productsRouter.get(
           `preferred_asset_id=${preferredId} has no file on disk for product=${id}`,
         );
       }
-      // Strong ETag is the asset's content_hash. The URL stays stable
-      // (`/products/<id>/image`) while the underlying bytes flip whenever
-      // the user re-picks `preferred_asset_id` — so `immutable` would be
-      // wrong. `max-age=0, must-revalidate` makes every request a
-      // conditional GET; the 304 path is cheap.
-      const etag = `"${asset.contentHash}"`;
+      // Strong ETag is the asset's content_hash plus the generation of
+      // the headers it is served under (`storedImageEtag`). The URL
+      // stays stable (`/products/<id>/image`) while the underlying bytes
+      // flip whenever the user re-picks `preferred_asset_id` — so
+      // `immutable` would be wrong. `max-age=0, must-revalidate` makes
+      // every request a conditional GET; the 304 path is cheap.
+      const etag = storedImageEtag(asset.contentHash);
       res.setHeader("ETag", etag);
       res.setHeader("Cache-Control", "public, max-age=0, must-revalidate");
-      if (req.headers["if-none-match"] === etag) {
+      // Before the 304, so the revalidated copy is sandboxed too.
+      setStoredAssetGuards(res);
+      if (ifNoneMatchSatisfied(req, etag)) {
         res.status(304).end();
         return;
       }
       setStoredImageHeaders(res, asset.contentType);
-      createReadStream(absPath).pipe(res);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }
@@ -792,7 +801,7 @@ productsRouter.get(
       }
       setStoredImageHeaders(res, asset.contentType);
       res.setHeader("Cache-Control", "public, max-age=86400, immutable");
-      createReadStream(absPath).pipe(res);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }

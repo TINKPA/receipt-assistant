@@ -25,7 +25,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import multer from "multer";
 import * as path from "path";
-import { createReadStream } from "fs";
 import { z } from "zod";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import {
@@ -42,7 +41,7 @@ import {
   representationEtag,
   sendWithRepresentationEtag,
 } from "../http/etag.js";
-import { resolveStoredFile } from "../http/files.js";
+import { resolveStoredFile, sendStoredFile } from "../http/files.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   getDocumentById,
@@ -231,7 +230,7 @@ documentsRouter.get(
       res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
     }
     res.setHeader("ETag", `"${doc.sha256}"`);
-    createReadStream(absPath).pipe(res);
+    await sendStoredFile(res, absPath);
   }),
 );
 

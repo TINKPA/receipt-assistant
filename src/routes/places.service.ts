@@ -23,7 +23,7 @@ import {
 } from "../projection/derive.js";
 import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
 import { buildInfo } from "../generated/build-info.js";
-import { NoRawResponseProblem } from "../http/problem.js";
+import { NoRawResponseProblem, publicErrorMessage } from "../http/problem.js";
 import { placeSnapshots } from "../schema/place_snapshots.js";
 import { fetchPlaceV1Dual } from "../google/places-fetch.js";
 
@@ -587,8 +587,12 @@ export async function reDeriveAllPlaces(
         result.updated += 1;
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      result.errors.push({ id: r.id, message });
+      // `errors[]` goes out in a 200 body, so it gets the caller-safe
+      // sentence — `err.message` of a failed query is the statement and
+      // its bound values, which here are the place's own data. The full
+      // error stays in the log, next to the place id.
+      console.error(`[re-derive] place=${r.id} failed:`, err);
+      result.errors.push({ id: r.id, message: publicErrorMessage(err) });
     }
   }
 

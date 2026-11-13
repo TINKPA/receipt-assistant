@@ -142,8 +142,8 @@ Every error is an RFC 7807 `application/problem+json` document. Branch on `type`
 
 | Status | `type` (after `https://receipts.dev/errors/`) | When |
 |--------|-----------------------------------------------|------|
-| 400 | `invalid-id` | An id in the path or query string is not a UUID |
-| 400 | `malformed-body`, `malformed-upload`, `invalid-cursor`, `invalid-parameter` | Body is not JSON / not parseable multipart; cursor was not issued by this API; a value cannot be read as its type |
+| 400 | `invalid-id` | An id in the path or query string is not a UUID (`/v1/places/{id}` also takes a Google place id, `/v1/merchants/{id}` a brand slug) |
+| 400 | `malformed-body`, `malformed-upload`, `invalid-cursor`, `invalid-parameter`, `invalid-idempotency-key` | Body is not JSON / not parseable multipart; cursor was not issued by this API; a value cannot be read as its type; `Idempotency-Key` is over 255 characters |
 | 404 | `not-found` · `route-not-found` | The record does not exist · no such URL or method |
 | 409 | `conflict`, `still-referenced`, `idempotency-conflict`, `idempotency-in-progress`, … | The request collides with current state |
 | 412 / 428 | `version-mismatch` / `precondition-required` | `If-Match` is stale / missing |

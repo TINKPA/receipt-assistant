@@ -58,10 +58,17 @@ import { buildInfo } from "./generated/build-info.js";
  *
  *   - `:brandId` (brands, parties) is a kebab-case slug;
  *   - `/v1/merchants/:id` accepts a brand slug or a UUID;
+ *   - `/v1/places/:id` accepts a `places.id` UUID or Google's place id
+ *     (`ChIJ…`), which is what `merchants.place_id` holds and what the
+ *     merchant page looks a place up by. The two place handlers that
+ *     can only take the UUID (PATCH, photo content) hand a Google id to
+ *     a uuid column, and Postgres' 22P02 becomes a 400 in
+ *     `problemHandler`;
  *   - `:rank` (place photos) is an integer.
  *
  * When you add a route with a new UUID path parameter name, add the
- * name here.
+ * name here. Listing a parameter that is NOT always a UUID breaks every
+ * caller that sends the other form, so check the service first.
  */
 const UUID_PATH_PARAMS: ReadonlyArray<readonly [Router, readonly string[]]> = [
   [accountsRouter, ["id"]],
@@ -77,7 +84,6 @@ const UUID_PATH_PARAMS: ReadonlyArray<readonly [Router, readonly string[]]> = [
   [reconcileRouter, ["id"]],
   [batchesRouter, ["id"]],
   [ingestsRouter, ["id"]],
-  [placesRouter, ["id"]],
 ];
 
 // Param callbacks live on the router objects, which are module

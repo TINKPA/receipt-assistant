@@ -118,8 +118,9 @@ const SHARED_RESPONSES = {
       "Malformed request: an id in the path or query string is not a UUID " +
       "(`errors/invalid-id`), the body is not valid JSON " +
       "(`errors/malformed-body`), the cursor is not one this endpoint " +
-      "issued (`errors/invalid-cursor`), or a value cannot be read as its " +
-      "type (`errors/invalid-parameter`).",
+      "issued (`errors/invalid-cursor`), a value cannot be read as its " +
+      "type (`errors/invalid-parameter`), or the `Idempotency-Key` is too " +
+      "long (`errors/invalid-idempotency-key`).",
   },
 } as const;
 

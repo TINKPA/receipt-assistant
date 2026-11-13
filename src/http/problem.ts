@@ -317,6 +317,19 @@ export class IdempotencyInProgressProblem extends HttpProblem {
   }
 }
 
+/** 400 for an `Idempotency-Key` that cannot be stored as one. */
+export class InvalidIdempotencyKeyProblem extends HttpProblem {
+  constructor(maxLength: number) {
+    super(
+      400,
+      "invalid-idempotency-key",
+      "Invalid Idempotency-Key",
+      `Idempotency-Key must be at most ${maxLength} characters. A UUID is the usual choice.`,
+      { max_length: maxLength },
+    );
+  }
+}
+
 // ── Translating errors we did not throw ────────────────────────────────
 
 /**
@@ -541,6 +554,31 @@ export function renderProblem(err: unknown, req: Request): RenderedProblem {
 }
 
 /**
+ * What may be said about `err` in a place `renderProblem` does not reach:
+ * a per-item `message` inside a 200 body, a status column a later GET
+ * returns. Use it wherever the temptation is `err.message`.
+ *
+ * It follows the same rules as `renderProblem`, minus the request: a
+ * problem we threw speaks for itself, a Postgres error the caller caused
+ * gets its mapped sentence, and anything else gets a fixed one — for a
+ * failed query `err.message` is the statement and its bound values. It
+ * does not log; the caller logs the full error next to whatever
+ * identifies the item, so the sentence can point at the log.
+ */
+export function publicErrorMessage(err: unknown): string {
+  if (err instanceof HttpProblem) return scrubText(err.detail ?? err.title);
+  if (err instanceof ZodError) return "Failed validation.";
+  const pg = findPgError(err);
+  if (pg) {
+    return (
+      classifyPgError(pg)?.detail ??
+      `Database error (SQLSTATE ${pg.code}). The cause is in the server log.`
+    );
+  }
+  return "Unexpected error. The cause is in the server log.";
+}
+
+/**
  * Terminal handler for a request no router claimed. Register it after
  * every router and before `problemHandler`; without it Express answers
  * with its own HTML page.
@@ -552,6 +590,18 @@ export function routeNotFoundHandler(
 ): void {
   next(new RouteNotFoundProblem(req.method, req.path));
 }
+
+/** Headers that belong to a successful representation, never to the
+ *  error that replaced it. (`Retry-After`, set on purpose for a 409, is
+ *  not one of them.) */
+const SUCCESS_ONLY_HEADERS = [
+  "Cache-Control",
+  "ETag",
+  "Last-Modified",
+  "Expires",
+  "Content-Disposition",
+  "X-Cache",
+] as const;
 
 /**
  * Final Express error handler — must be registered AFTER all routes.
@@ -572,6 +622,12 @@ export function problemHandler(
     next(err);
     return;
   }
+  // A handler can fail after staging headers for the success it
+  // expected (a file route sets its cache lifetime and ETag, then the
+  // file will not open). They describe a representation that is not
+  // being sent; left in place, a browser would cache this error for as
+  // long as the image was meant to live.
+  for (const name of SUCCESS_ONLY_HEADERS) res.removeHeader(name);
   const { status, body } = renderProblem(err, req);
   res.status(status).type("application/problem+json").json(body);
 }

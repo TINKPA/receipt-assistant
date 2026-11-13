@@ -82,6 +82,7 @@ const MALFORMED_VALUE_CODES = new Set([
   "22003", // numeric_value_out_of_range
   "22001", // string_data_right_truncation
   "22021", // character_not_in_repertoire — e.g. a NUL byte in a text value
+  "22P05", // untranslatable_character — e.g. the escape \u0000 inside a jsonb value
   "2201W", // invalid_row_count_in_limit_clause
   "2201X", // invalid_row_count_in_result_offset_clause
 ]);

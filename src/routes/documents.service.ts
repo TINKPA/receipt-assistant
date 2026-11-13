@@ -5,7 +5,7 @@
  * under `UPLOAD_DIR`, insert into `documents`, etc.
  */
 import { createHash } from "crypto";
-import { mkdir, writeFile, rename, readFile, stat } from "fs/promises";
+import { mkdir, writeFile, rename, readFile } from "fs/promises";
 import * as path from "path";
 import { simpleParser } from "mailparser";
 import sanitizeHtml from "sanitize-html";
@@ -21,6 +21,7 @@ import {
   HttpProblem,
   NotFoundProblem,
 } from "../http/problem.js";
+import { resolveStoredFile } from "../http/files.js";
 import {
   defaultClaudeReExtractor,
   type ReExtractor,
@@ -376,12 +377,12 @@ export async function renderDocumentHtml(
     );
   }
   if (!doc.file_path) return null;
-  const absPath = resolveUploadPath(doc.file_path);
-  try {
-    await stat(absPath);
-  } catch {
-    return null;
-  }
+  // Same containment as GET /content: only a regular file under the
+  // uploads dir is read, whatever the row's `file_path` says. The
+  // sanitizer passes plain text through, so without this a row pointed
+  // at any file the server can read would be returned as "HTML".
+  const absPath = await resolveStoredFile(getUploadDir(), doc.file_path);
+  if (!absPath) return null;
   const raw = await readFile(absPath);
   if (isEmail) {
     const parsed = await simpleParser(raw);
@@ -1165,11 +1166,12 @@ export async function reExtractDocument(
   //     every one of them used to burn a full agent run and come back as
   //     a misleading `200 {}` with empty `changed_keys`, which reads as
   //     "the agent produced the same output" rather than "there was no
-  //     file". Same `stat` guard `renderDocumentHtml` already uses.
+  //     file". Same guard `renderDocumentHtml` uses, and it is also
+  //     the containment check (`resolveStoredFile`): a `file_path` that
+  //     leaves the uploads dir is "no file" here too, so the agent is
+  //     never handed a path outside it to read.
   const absPath = resolveUploadPath(doc.filePath);
-  try {
-    await stat(absPath);
-  } catch {
+  if (!(await resolveStoredFile(getUploadDir(), doc.filePath))) {
     throw new HttpProblem(
       422,
       "document-file-missing",

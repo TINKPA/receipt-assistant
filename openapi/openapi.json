@@ -20,7 +20,7 @@
     },
     "responses": {
       "BadRequest": {
-        "description": "Malformed request: an id in the path or query string is not a UUID (`errors/invalid-id`), the body is not valid JSON (`errors/malformed-body`), the cursor is not one this endpoint issued (`errors/invalid-cursor`), or a value cannot be read as its type (`errors/invalid-parameter`).",
+        "description": "Malformed request: an id in the path or query string is not a UUID (`errors/invalid-id`), the body is not valid JSON (`errors/malformed-body`), the cursor is not one this endpoint issued (`errors/invalid-cursor`), a value cannot be read as its type (`errors/invalid-parameter`), or the `Idempotency-Key` is too long (`errors/invalid-idempotency-key`).",
         "content": {
           "application/problem+json": {
             "schema": {
@@ -5277,10 +5277,7 @@
         "parameters": [
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "flat",
@@ -5288,10 +5285,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_closed",
@@ -5630,10 +5624,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_children",
@@ -5708,10 +5699,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -5943,10 +5931,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "has_document",
@@ -5954,10 +5939,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -6928,10 +6910,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -7556,10 +7535,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -10623,7 +10599,7 @@
     "/v1/places/{id}": {
       "get": {
         "summary": "Get a place by id (full multilingual record).",
-        "description": "Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
+        "description": "`{id}` is the place's UUID or its Google place id. Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
         "tags": [
           "places"
         ],
@@ -10631,8 +10607,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10744,8 +10721,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10800,8 +10778,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10866,8 +10845,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",

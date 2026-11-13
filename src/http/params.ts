@@ -38,8 +38,9 @@ export function isUuid(value: unknown): value is string {
  * whose value is not one never reaches the route's handler.
  *
  * Express keeps param callbacks per router, so this is called once per
- * router, from `buildApp()`. Leave out any parameter that is not a UUID
- * (`:brandId` is a slug; `/v1/merchants/:id` accepts a slug or a UUID).
+ * router, from `buildApp()`. Leave out any parameter that is not always
+ * a UUID (`:brandId` is a slug; `/v1/merchants/:id` accepts a slug or a
+ * UUID; `/v1/places/:id` a UUID or a Google place id).
  */
 export function requireUuidParams(
   router: Router,

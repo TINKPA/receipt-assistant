@@ -10,16 +10,23 @@
 import express, { Router, type Request, type Response, type NextFunction } from "express";
 import { and, eq, sql } from "drizzle-orm";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
-import { createReadStream } from "fs";
 import * as path from "path";
 
 import { db } from "../db/client.js";
 import { merchants } from "../schema/merchants.js";
 import { places, placePhotos } from "../schema/places.js";
 import { parseOrThrow } from "../http/validate.js";
-import { resolveStoredFile, setStoredImageHeaders } from "../http/files.js";
+import {
+  resolveStoredFile,
+  sendStoredFile,
+  setStoredImageHeaders,
+} from "../http/files.js";
 import { getUploadDir } from "./documents.service.js";
-import { HttpProblem, NotFoundProblem } from "../http/problem.js";
+import {
+  HttpProblem,
+  InvalidCursorProblem,
+  NotFoundProblem,
+} from "../http/problem.js";
 import {
   MerchantDetail,
   MerchantPathParams,
@@ -202,10 +209,13 @@ merchantsRouter.get(
     const limit = q.limit ?? 50;
     let cursorClause = sql``;
     if (q.cursor) {
-      const [cDate, cId] = q.cursor.split("|");
-      if (cDate && cId) {
-        cursorClause = sql`AND (t.occurred_on, t.id) < (${cDate}::date, ${cId}::uuid)`;
-      }
+      // "<date>|<id>". Anything else is not a cursor this endpoint
+      // issued: say so, rather than quietly serve page one again. (A
+      // well-shaped cursor with an unreadable date or id is Postgres'
+      // 22007 / 22P02, which `problemHandler` also answers with a 400.)
+      const [cDate, cId, ...rest] = q.cursor.split("|");
+      if (!cDate || !cId || rest.length > 0) throw new InvalidCursorProblem();
+      cursorClause = sql`AND (t.occurred_on, t.id) < (${cDate}::date, ${cId}::uuid)`;
     }
 
     const result = await db.execute(sql`
@@ -319,7 +329,7 @@ merchantsRouter.get(
 
     setStoredImageHeaders(res, photo.mimeType ?? "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    createReadStream(absPath).pipe(res);
+    await sendStoredFile(res, absPath);
   }),
 );
 

@@ -8,20 +8,27 @@
  *
  * What it covers (the shared layer in `src/http/` plus `src/app.ts`):
  *   id    malformed UUIDs in the path and query string → 400, everywhere
+ *         — and ids that are not UUIDs by design (a Google place id, a
+ *         brand slug) still reach their handler
  *   route unknown URLs and methods → problem+json 404, not Express HTML
  *   body  malformed JSON, oversized bodies, broken multipart → 400 / 413
+ *   bool  `?flag=false` means false
  *   cur   pagination cursors that this API did not issue → 400
  *   pg    Postgres constraint and data errors → 400 / 409 / 422
  *   500   an unexpected error → fixed sentence + trace id; the detail
- *         goes to the server log under that id, never to the client
+ *         goes to the server log under that id, never to the client —
+ *         including per-item errors reported inside a 200
  *   idem  Idempotency-Key: replay, conflict, concurrent duplicates,
- *         a key reused after its row expired
+ *         a key reused after its row expired, a key too long to store
  *   etag  document metadata ETag moves when the document does
- *   file  asset endpoints refuse a stored path outside their directory
- *         and never serve SVG / HTML able to run script on our origin
+ *   file  asset and document endpoints refuse a stored path outside
+ *         their directory, never serve SVG / HTML able to run script on
+ *         our origin (a 304 included), and survive a file that cannot
+ *         be opened
  *
  * It WRITES to the database it is given — products, a transaction,
- * documents, brand / asset / place rows — and never cleans them up.
+ * documents, brand / asset / place rows — and never cleans them up. One
+ * case adds a trigger to `derivation_events` for a moment and drops it.
  * Point it only at a throwaway Postgres (or the sandbox), never at the
  * ledger:
  *
@@ -45,7 +52,7 @@
  *
  * Exit status is 0 when every expectation holds, 1 otherwise.
  */
-import { mkdtemp, mkdir, rm, symlink, writeFile, stat } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, symlink, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -208,6 +215,7 @@ const { pool } = await import("../src/db/client.js");
 const express = (await import("express")).default;
 const problemModule: any = await import("../src/http/problem.js");
 const contextModule: any = await import("../src/http/context.js");
+const filesModule: any = await import("../src/http/files.js");
 
 const server = buildApp().listen(0, "127.0.0.1");
 await new Promise((r) => server.once("listening", r));
@@ -302,12 +310,6 @@ if (wants("id")) {
     ["POST", `/v1/batches/${BAD}/reconcile/reject`],
     ["GET", `/v1/ingests/${BAD}`],
     ["POST", `/v1/ingests/${BAD}/retry`],
-    ["GET", `/v1/places/${BAD}`],
-    ["PATCH", `/v1/places/${BAD}`],
-    ["POST", `/v1/places/${BAD}/re-derive`],
-    ["POST", `/v1/places/${BAD}/refresh`],
-    ["GET", `/v1/places/${BAD}/map`],
-    ["GET", `/v1/places/${BAD}/photos/0/content`],
   ];
   for (const [method, p] of paths) {
     const init = method === "GET" || method === "DELETE" ? {} : { json: {} };
@@ -351,6 +353,55 @@ if (wants("id")) {
     status: 200,
   });
   record(G, "GET /v1/brands/%00 (NUL byte in a text id)", await call("GET", "/v1/brands/%00"), {
+    status: 400,
+    type: "invalid-parameter",
+  });
+
+  // `/v1/places/:id` takes the place's UUID or Google's place id — the
+  // value `merchants.place_id` holds and the merchant page looks a place
+  // up by. Requiring a UUID there breaks that page.
+  const gid = `ChIJcheck${NONCE}`;
+  const placeUuid = (
+    await q<{ id: string }>(
+      `INSERT INTO places (google_place_id, formatted_address, lat, lng, source)
+       VALUES ($1, 'nowhere', 1, 1, 'check') RETURNING id`,
+      [gid],
+    )
+  )[0]!.id;
+  record(G, "GET /v1/places/<google place id>", await call("GET", `/v1/places/${gid}`), {
+    status: 200,
+    also: (o) => (o.json?.id === placeUuid ? null : "did not resolve to the place row"),
+  });
+  record(G, "GET /v1/places/<its uuid>", await call("GET", `/v1/places/${placeUuid}`), {
+    status: 200,
+    also: (o) => (o.json?.google_place_id === gid ? null : "wrong place"),
+  });
+  record(G, "GET /v1/places/<google place id>/map (no Google key here)", await call("GET", `/v1/places/${gid}/map`), {
+    status: 503,
+    type: "google-places-unavailable",
+  });
+  record(G, "POST /v1/places/<google place id>/re-derive (no raw_response)", await call("POST", `/v1/places/${gid}/re-derive`, { json: {} }), {
+    status: 422,
+    type: "place-no-raw-response",
+  });
+  for (const [method, p] of [
+    ["GET", `/v1/places/${BAD}`],
+    ["GET", `/v1/places/${BAD}/map`],
+    ["POST", `/v1/places/${BAD}/re-derive`],
+    ["POST", `/v1/places/${BAD}/refresh`],
+  ] as const) {
+    record(G, `${method} ${p} (an id that matches no place)`, await call(method, p, method === "GET" ? {} : { json: {} }), {
+      status: 404,
+      type: "not-found",
+    });
+  }
+  // The two place handlers that only take the UUID hand a Google id to a
+  // uuid column; Postgres' complaint is the 400.
+  record(G, "PATCH /v1/places/<google place id>  (UUID-only handler)", await call("PATCH", `/v1/places/${gid}`, { json: { custom_name: "x" } }), {
+    status: 400,
+    type: "invalid-parameter",
+  });
+  record(G, "GET /v1/places/<google place id>/photos/0/content  (UUID-only handler)", await call("GET", `/v1/places/${gid}/photos/0/content`), {
     status: 400,
     type: "invalid-parameter",
   });
@@ -438,6 +489,48 @@ if (wants("body")) {
   );
 }
 
+// ── bool: boolean query flags ──────────────────────────────────────────
+// `z.coerce.boolean()` read "false" as true. `flat` is the flag whose
+// effect shows on the seeded chart alone: the default list is the tree's
+// roots, `flat=true` is every account.
+if (wants("bool")) {
+  const G = "bool";
+  const count = async (qs: string): Promise<{ o: Obs; n: number }> => {
+    const o = await call("GET", `/v1/accounts${qs}`);
+    return { o, n: Array.isArray(o.json?.items) ? o.json.items.length : Array.isArray(o.json) ? o.json.length : -1 };
+  };
+  const dflt = await count("");
+  const on = await count("?flat=true");
+  record(G, "GET /v1/accounts?flat=true", on.o, {
+    status: 200,
+    also: () => (on.n > dflt.n ? null : `flat list (${on.n}) is not longer than the tree roots (${dflt.n}); fixture cannot tell the two apart`),
+  });
+  for (const v of ["false", "0", "FALSE", ""]) {
+    const off = await count(`?flat=${v}`);
+    record(G, `GET /v1/accounts?flat=${v || "<empty>"}`, off.o, {
+      status: 200,
+      also: () => (off.n === dflt.n ? null : `returned ${off.n} rows — the flat list (${on.n}), not the default (${dflt.n})`),
+    });
+  }
+  const one = await count("?flat=1");
+  record(G, "GET /v1/accounts?flat=1", one.o, {
+    status: 200,
+    also: () => (one.n === on.n ? null : `returned ${one.n} rows, not the flat list (${on.n})`),
+  });
+  record(G, "GET /v1/accounts?flat=maybe", await call("GET", "/v1/accounts?flat=maybe"), { status: 422, type: "validation" });
+  for (const p of [
+    "/v1/owned-items?include_retired=false&limit=1",
+    "/v1/products?include_retired=0&limit=1",
+    "/v1/transactions?include_deleted=false&has_document=false&limit=1",
+  ]) {
+    record(G, `GET ${p}`, await call("GET", p), { status: 200 });
+  }
+  record(G, "GET /v1/owned-items?include_retired=nope", await call("GET", "/v1/owned-items?include_retired=nope"), {
+    status: 422,
+    type: "validation",
+  });
+}
+
 // ── cur: pagination cursors ────────────────────────────────────────────
 if (wants("cur")) {
   const G = "cur";
@@ -484,6 +577,35 @@ if (wants("cur")) {
     await call("GET", `/v1/transactions?cursor=${enc({ sort: "created_at", value: "x", id: "x" })}`),
     { status: 400, type: "invalid-parameter" },
   );
+  // /v1/merchants/:id/transactions has its own "<date>|<id>" cursor.
+  const curBrand = `check-cur-${NONCE}`;
+  await q(`INSERT INTO brands (brand_id, name) VALUES ($1, $1)`, [curBrand]);
+  const curMerchant = (
+    await q<{ id: string }>(
+      `INSERT INTO merchants (workspace_id, brand_id, canonical_name) VALUES ($1, $2, $2) RETURNING id`,
+      [SEED_WORKSPACE_ID, curBrand],
+    )
+  )[0]!.id;
+  const mt = `/v1/merchants/${curMerchant}/transactions`;
+  for (const [label, cursor] of [
+    ["<no separator>", "garbage"],
+    ["<date only>", "2026-01-01|"],
+    ["<three parts>", `2026-01-01|${NOBODY}|x`],
+  ] as const) {
+    record(G, `GET /v1/merchants/:id/transactions?cursor=${label}`, await call("GET", `${mt}?cursor=${encodeURIComponent(cursor)}`), {
+      status: 400,
+      type: "invalid-cursor",
+    });
+  }
+  record(G, "GET /v1/merchants/:id/transactions?cursor=<x|y>", await call("GET", `${mt}?cursor=${encodeURIComponent("x|y")}`), {
+    status: 400,
+    type: "invalid-parameter",
+  });
+  record(G, "GET /v1/merchants/:id/transactions?cursor=<date|uuid>", await call("GET", `${mt}?cursor=${encodeURIComponent(`2026-01-01|${NOBODY}`)}`), {
+    status: 200,
+    also: (o) => (Array.isArray(o.json?.items) ? null : "no items array"),
+  });
+
   // And a real cursor still pages.
   const first = await call("GET", "/v1/transactions?limit=1");
   if (first.json?.next_cursor) {
@@ -519,6 +641,8 @@ if (wants("500") || wants("pg")) {
     string: () => "a thrown string with select x from y",
     uuid: () => drizzle(pgErr("22P02", 'invalid input syntax for type uuid: "hunter2"', { routine: "string_to_uuid" })),
     date: () => drizzle(pgErr("22008", 'date/time field value out of range: "2026-13-45"')),
+    nul_escape: () =>
+      drizzle(pgErr("22P05", "unsupported Unicode escape sequence", { detail: "\\u0000 cannot be converted to text. hunter2" })),
     unique: () =>
       drizzle(pgErr("23505", 'duplicate key value violates unique constraint "owned_items_tx_item_instance_uq"', {
         constraint: "owned_items_tx_item_instance_uq",
@@ -555,6 +679,13 @@ if (wants("500") || wants("pg")) {
       throw make();
     });
   }
+  // A file route that staged its success headers, then found the file
+  // gone (moved to .trash between the check and the read).
+  mini.get("/file/vanished", (_req: any, res: any, next: any) => {
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+    res.setHeader("ETag", '"abc"');
+    filesModule.sendStoredFile(res, path.join(tmp, "no-such-file.png")).catch(next);
+  });
   mini.use(problemModule.problemHandler);
   const miniServer = mini.listen(0, "127.0.0.1");
   await new Promise((r) => miniServer.once("listening", r));
@@ -598,6 +729,7 @@ if (wants("500") || wants("pg")) {
     const cases: Array<[string, number, string, ((o: Obs) => string | null)?]> = [
       ["uuid", 400, "invalid-parameter", (o) => (o.json?.value_type === "uuid" ? null : "value_type missing")],
       ["date", 400, "invalid-parameter"],
+      ["nul_escape", 400, "invalid-parameter"],
       ["unique", 409, "conflict", (o) => (o.json?.constraint === "owned_items_tx_item_instance_uq" ? null : "constraint name missing")],
       ["fk_insert", 422, "invalid-reference"],
       ["fk_delete", 409, "still-referenced"],
@@ -614,7 +746,80 @@ if (wants("500") || wants("pg")) {
       });
     }
   }
+  if (wants("500")) {
+    record("500", "file route: file vanished after its headers were staged", await call("GET", "/file/vanished", { base: MINI }), {
+      status: 404,
+      type: "not-found",
+      // (Express tags the JSON body with an ETag of its own; the one
+      // that must not survive is the image's.)
+      also: (o) =>
+        o.headers.get("cache-control") || o.headers.get("etag") === '"abc"'
+          ? "the error kept the image's Cache-Control / ETag and would be cached as the image"
+          : null,
+    });
+  }
+  // `publicErrorMessage` is the same mapping for the places a problem
+  // document does not reach: a per-item message inside a 200, a stored
+  // status. Whatever is thrown, the query and its values stay out.
+  if (wants("500")) {
+    const G = "500";
+    for (const name of ["syntax", "plain", "string", "uuid", "unique", "joined"]) {
+      const message: string = problemModule.publicErrorMessage(thrown[name]!());
+      const bad = /hunter2|secret_|credentials|Failed query|params:/.test(message);
+      rows.push({
+        group: G,
+        request: `publicErrorMessage(${name})`,
+        status: 0,
+        shape: JSON.stringify(message).slice(0, 56),
+        expect: "a sentence, no SQL or values",
+        ok: !bad && message.length > 0,
+        why: bad ? "carries the query, a parameter or a path" : undefined,
+      });
+    }
+  }
   await new Promise((r) => miniServer.close(r));
+}
+
+// ── 500 (live): per-item errors reported inside a 200 ──────────────────
+// POST /v1/admin/re-derive catches each place's failure and lists it in
+// the 200 body. Make every re-derive fail in the database and read what
+// the list says.
+if (wants("500")) {
+  const G = "500";
+  const gid = `ChIJrederive${NONCE}`;
+  const placeId = (
+    await q<{ id: string }>(
+      `INSERT INTO places (google_place_id, formatted_address, lat, lng, source, raw_response)
+       VALUES ($1, 'nowhere', 1, 1, 'check', '{}'::jsonb) RETURNING id`,
+      [gid],
+    )
+  )[0]!.id;
+  await q(`CREATE OR REPLACE FUNCTION check_http_errors_boom() RETURNS trigger LANGUAGE plpgsql AS
+           $$ BEGIN RAISE EXCEPTION 'check-http-errors: forced failure'; END $$`);
+  await q(`CREATE TRIGGER check_http_errors_boom BEFORE INSERT ON derivation_events
+           FOR EACH ROW EXECUTE FUNCTION check_http_errors_boom()`);
+  const before = logged.length;
+  let o: Obs;
+  try {
+    o = await call("POST", "/v1/admin/re-derive?scope=places", { json: {} });
+  } finally {
+    await q(`DROP TRIGGER IF EXISTS check_http_errors_boom ON derivation_events`);
+    await q(`DROP FUNCTION IF EXISTS check_http_errors_boom()`);
+  }
+  const lines = logged.slice(before).join("\n");
+  record(G, "POST /v1/admin/re-derive  every place fails in the database", o, {
+    status: 200,
+    also: (x) => {
+      const errors: Array<{ id: string; message: string }> = x.json?.errors ?? [];
+      const mine = errors.find((e) => e.id === placeId);
+      if (!mine) return "the failing place is not in errors[]";
+      const leaking = errors.filter((e) => LEAK_RE.test(e.message) || e.message.includes(gid));
+      if (leaking.length) return `${leaking.length} of ${errors.length} errors[].message carry SQL or parameters`;
+      return lines.includes(placeId) && lines.includes("Failed query")
+        ? null
+        : "the full error was not logged next to the place id";
+    },
+  });
 }
 
 // ── Fixtures shared by the write groups ────────────────────────────────
@@ -663,6 +868,13 @@ if (wants("pg")) {
   record(G, "POST /v1/transactions  occurred_on 2026-13-45", await call("POST", "/v1/transactions", {
     headers: { "Idempotency-Key": `date-${NONCE}` },
     json: txnBody("baddate", a, b, "2026-13-45"),
+  }), { status: 400, type: "invalid-parameter" });
+
+  // The JSON escape \u0000 parses as JSON but jsonb cannot hold it.
+  const nulMeta = { ...txnBody("nulmeta", a, b), metadata: { k: "a\u0000b" } };
+  record(G, "POST /v1/transactions  metadata value containing \\u0000", await call("POST", "/v1/transactions", {
+    headers: { "Idempotency-Key": `nul-${NONCE}` },
+    json: nulMeta,
   }), { status: 400, type: "invalid-parameter" });
 
   // The ledger's own trigger: its sentence should reach the caller, the
@@ -806,6 +1018,18 @@ if (wants("idem")) {
   await q(`UPDATE idempotency_keys SET expires_at = NOW() - interval '1 second' WHERE workspace_id = $1 AND key = $2`, [SEED_WORKSPACE_ID, k4]);
   record(G, "…and after that claim's lease ran out", await post(k4, held), { status: 201 });
 
+  // A key the unique index cannot hold is the caller's 400, not a 500.
+  record(G, "Idempotency-Key of 3000 characters", await post(`long-${NONCE}-${randomUUID().repeat(90)}`.slice(0, 3000), txnBody("longkey", a, b)), {
+    status: 400,
+    type: "invalid-idempotency-key",
+    also: () => null,
+  });
+  const madeLong = await countTxns("longkey");
+  record(G, "Idempotency-Key of 255 characters", await post(`max-${NONCE}-${randomUUID().repeat(8)}`.slice(0, 255), txnBody("maxkey", a, b)), {
+    status: 201,
+    also: () => (madeLong === 0 ? null : `${madeLong} transaction(s) created by the rejected request`),
+  });
+
   // A failed request must not burn the key.
   const k5 = `k5-${NONCE}`;
   await post(k5, { occurred_on: "nope" });
@@ -929,6 +1153,61 @@ if (wants("file")) {
     also: (o) => (o.text.includes(BRAND_ROOT) ? "404 detail discloses the absolute path on disk" : null),
   });
 
+  // A file that passes the containment check but cannot be opened used
+  // to end the process (an unhandled stream 'error'). Root can open
+  // anything, so the case only exists for an ordinary user.
+  if (process.getuid?.() !== 0) {
+    const locked = path.join(BRAND_ROOT, brand, "t", "locked.png");
+    await writeFile(locked, PNG);
+    await chmod(locked, 0o000);
+    record(G, "brand asset: file exists but cannot be opened", await icon(await asset(`${brand}/t/locked.png`, "image/png")), {
+      status: 500,
+      type: "internal",
+      also: (o) => (o.headers.get("cache-control") ? "the error kept the image's Cache-Control" : null),
+    });
+    await chmod(locked, 0o600);
+    record(G, "…and the server is still up", await call("GET", "/health"), { status: 200 });
+  }
+
+  // The two routes that revalidate. A 304 tells the browser to keep the
+  // headers it stored, so (a) the 304 itself carries the sandbox, and
+  // (b) the ETag is not the bare content hash it was before the sandbox
+  // existed — a copy cached back then must be fetched again, not kept.
+  const sandboxed = (o: Obs): string | null =>
+    o.headers.get("x-content-type-options") !== "nosniff"
+      ? "no nosniff"
+      : !/sandbox/.test(o.headers.get("content-security-policy") ?? "")
+        ? "no CSP sandbox"
+        : null;
+  const iconHash = createHash("sha256").update(SVG).digest("hex");
+  const iconAsset = (
+    await q<{ id: string }>(
+      `INSERT INTO brand_assets (brand_id, tier, local_path, content_hash, content_type)
+       VALUES ($1, 'manual_url', $2, $3, 'image/svg+xml') RETURNING id`,
+      [brand, `${brand}/t/icon.svg`, iconHash],
+    )
+  )[0]!.id;
+  await q(`UPDATE brands SET preferred_asset_id = $2 WHERE brand_id = $1`, [brand, iconAsset]);
+  const iconUrl = `/v1/brands/${brand}/icon`;
+  const fresh = await call("GET", iconUrl);
+  const iconTag = fresh.headers.get("etag") ?? "";
+  record(G, "GET /v1/brands/:id/icon  (SVG)", fresh, {
+    status: 200,
+    also: (o) => sandboxed(o) ?? (iconTag && iconTag !== `"${iconHash}"` ? null : `ETag is ${iconTag || "(missing)"} — the bare content hash`),
+  });
+  record(G, "…If-None-Match: <its ETag>", await call("GET", iconUrl, { headers: { "If-None-Match": iconTag } }), {
+    status: 304,
+    also: sandboxed,
+  });
+  record(G, "…If-None-Match: W/<its ETag>  (weakened by a proxy)", await call("GET", iconUrl, { headers: { "If-None-Match": `W/${iconTag}` } }), {
+    status: 304,
+    also: sandboxed,
+  });
+  record(G, "…If-None-Match: <bare content hash>  (cached before the sandbox)", await call("GET", iconUrl, { headers: { "If-None-Match": `"${iconHash}"` } }), {
+    status: 200,
+    also: sandboxed,
+  });
+
   await q(`UPDATE brands SET preferred_asset_id = $2 WHERE brand_id = $1`, [brand, await asset(secret, "image/png")]);
   record(G, "GET /v1/brands/:id/icon  preferred asset points outside", await call("GET", `/v1/brands/${brand}/icon`), {
     status: 404,
@@ -941,6 +1220,32 @@ if (wants("file")) {
     json: { product_key: `check-file-${NONCE}`, canonical_name: `Check file ${NONCE}`, item_class: "other" },
   });
   const pid: string = prod.json?.id;
+  const pHash = createHash("sha256").update(PNG).digest("hex");
+  await mkdir(path.join(PRODUCT_ROOT, pid), { recursive: true });
+  await writeFile(path.join(PRODUCT_ROOT, pid, "pixel.png"), PNG);
+  const pGood = (
+    await q<{ id: string }>(
+      `INSERT INTO product_assets (product_id, tier, local_path, content_hash, content_type)
+       VALUES ($1, 'manual_seed', $2, $3, 'image/png') RETURNING id`,
+      [pid, `${pid}/pixel.png`, pHash],
+    )
+  )[0]!.id;
+  await q(`UPDATE products SET preferred_asset_id = $2 WHERE id = $1`, [pid, pGood]);
+  const imageUrl = `/v1/products/${pid}/image`;
+  const pFresh = await call("GET", imageUrl);
+  const pTag = pFresh.headers.get("etag") ?? "";
+  record(G, "GET /v1/products/:id/image", pFresh, {
+    status: 200,
+    also: (o) => sandboxed(o) ?? (o.contentType.startsWith("image/png") ? null : `content-type ${o.contentType}`),
+  });
+  record(G, "…If-None-Match: <its ETag>", await call("GET", imageUrl, { headers: { "If-None-Match": pTag } }), {
+    status: 304,
+    also: sandboxed,
+  });
+  record(G, "…If-None-Match: <bare content hash>  (cached before the sandbox)", await call("GET", imageUrl, { headers: { "If-None-Match": `"${pHash}"` } }), {
+    status: 200,
+    also: sandboxed,
+  });
   const pAsset = (
     await q<{ id: string }>(
       `INSERT INTO product_assets (product_id, tier, local_path, content_hash, content_type)
@@ -1004,6 +1309,28 @@ if (wants("file")) {
     also: notServed,
   });
 
+  // Static map: the cache directory is named after `google_place_id`.
+  // (With no Google key a well-named place answers 503 — the id group
+  // has that case — so a 404 here is the directory check, not the key.)
+  const mapEscape = `escaped-map-${NONCE}`;
+  const evilPlace = (
+    await q<{ id: string }>(
+      `INSERT INTO places (google_place_id, formatted_address, lat, lng, source)
+       VALUES ($1, 'nowhere', 1, 1, 'check') RETURNING id`,
+      [`../../${mapEscape}`],
+    )
+  )[0]!.id;
+  const mapOut = await call("GET", `/v1/places/${evilPlace}/map`);
+  const mapWrote = await stat(path.join(tmp, mapEscape)).then(
+    () => true,
+    () => false,
+  );
+  record(G, "place map: google_place_id is a path out of the cache", mapOut, {
+    status: 404,
+    type: "not-found",
+    also: () => (mapWrote ? "a directory was created outside the place cache" : null),
+  });
+
   // Document content.
   if (uploadedDocId) {
     await q(`UPDATE documents SET file_path = $2 WHERE id = $1`, [uploadedDocId, secret]);
@@ -1012,6 +1339,37 @@ if (wants("file")) {
       type: "not-found",
       also: notServed,
     });
+  }
+
+  // /rendered and re-extract read the same column. (Re-extract stops at
+  // its file preflight here; a document with no linked transaction could
+  // not reach the agent in any case.)
+  const htmlForm = new FormData();
+  htmlForm.append("file", new Blob([`<p>rendered ${NONCE}</p>`], { type: "text/html" }), "page.html");
+  htmlForm.append("kind", "other");
+  const htmlDoc: string | undefined = (await call("POST", "/v1/documents", { body: htmlForm })).json?.id;
+  if (htmlDoc) {
+    record(G, "GET /v1/documents/:id/rendered  (file inside uploads)", await call("GET", `/v1/documents/${htmlDoc}/rendered`), {
+      status: 200,
+      also: (o) => (o.text.includes(`rendered ${NONCE}`) ? null : "did not render the document"),
+    });
+    for (const [label, stored] of [
+      ["absolute path OUTSIDE uploads", secret],
+      ["../ path out of uploads", "../outside/secret.txt"],
+    ] as const) {
+      await q(`UPDATE documents SET file_path = $2 WHERE id = $1`, [htmlDoc, stored]);
+      record(G, `document rendered: ${label}`, await call("GET", `/v1/documents/${htmlDoc}/rendered`), {
+        status: 404,
+        type: "not-found",
+        also: notServed,
+      });
+    }
+    record(G, "POST /v1/documents/:id/re-extract  file_path points OUTSIDE uploads", await call("POST", `/v1/documents/${htmlDoc}/re-extract`), {
+      status: 422,
+      type: "document-file-missing",
+    });
+  } else {
+    rows.push({ group: G, request: "GET /v1/documents/:id/rendered", status: 0, shape: "(fixture: could not upload an HTML document)", expect: "200", ok: false });
   }
 
   // Upload under a brand id that is a path.

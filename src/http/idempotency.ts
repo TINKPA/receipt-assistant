@@ -9,6 +9,8 @@
  *     (Enforcement — "POST must carry the header" — is route-specific;
  *     add `throw new PreconditionRequiredProblem("Idempotency-Key")` to
  *     handlers that mandate it.)
+ *   - Key longer than 255 characters → 400
+ *     `errors/invalid-idempotency-key`.
  *   - Key never seen, or its row has expired → this request CLAIMS the
  *     key before the handler runs, then stores the handler's response.
  *   - Key claimed by a request that is still running → 409
@@ -50,6 +52,7 @@ import { db } from "../db/client.js";
 import {
   IdempotencyConflictProblem,
   IdempotencyInProgressProblem,
+  InvalidIdempotencyKeyProblem,
 } from "./problem.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000; // 24h — how long a stored response replays
@@ -60,6 +63,14 @@ const TTL_MS = 24 * 60 * 60 * 1000; // 24h — how long a stored response replay
  * that a crash mid-request does not lock a key for the full TTL.
  */
 const LEASE_MS = 2 * 60 * 1000;
+
+/**
+ * Longest key accepted (Stripe's limit). The key is claimed by inserting
+ * it under the unique index on (workspace_id, key), and a btree entry
+ * cannot exceed about 2.7 kB: without a cap, a longer key fails that
+ * insert and the caller gets a 500 for a header it chose.
+ */
+const MAX_KEY_LENGTH = 255;
 
 /** `response_status` of a claim whose handler has not finished. Not a
  *  real HTTP status, so it can never collide with a stored response. */
@@ -131,6 +142,9 @@ export function idempotencyMiddleware(): (
   return async (req, res, next) => {
     const key = req.header("Idempotency-Key");
     if (!key) return next();
+    if (key.length > MAX_KEY_LENGTH) {
+      return next(new InvalidIdempotencyKeyProblem(MAX_KEY_LENGTH));
+    }
 
     const workspaceId = req.ctx.workspaceId;
     const requestHash = hashBody(req.body);

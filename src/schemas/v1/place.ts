@@ -2,6 +2,20 @@ import { z } from "zod";
 import { Uuid } from "./common.js";
 
 /**
+ * How a place is named in a path. Lookups (`GET /v1/places/{id}`, its
+ * `/map`, `/re-derive`, `/refresh`) accept our own UUID or Google's
+ * place id: `merchants.place_id` holds the Google one, and that is what
+ * the merchant page looks the place up by. So this is deliberately NOT
+ * `Uuid`, and `/v1/places` is deliberately absent from the UUID path
+ * check in `app.ts`.
+ */
+export const PlaceRef = z.string().min(1).openapi({
+  description:
+    "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+  example: "ChIJN1t_tDeuEmsRUsoyG83frY4",
+});
+
+/**
  * Google Places entry. Shared resource keyed by `google_place_id` —
  * the same merchant visited across workspaces is one row.
  *

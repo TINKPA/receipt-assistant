@@ -3,6 +3,7 @@
  */
 import { z } from "zod";
 import {
+  QueryBoolean,
   AmountMinor,
   LedgerCurrencyCode,
   IsoDate,
@@ -357,9 +358,9 @@ export const ListTransactionsQuery = z.object({
   q: z.string().optional(),
   status: TxnStatus.optional(),
   trip_id: Uuid.optional(),
-  has_document: z.coerce.boolean().optional(),
+  has_document: QueryBoolean.optional(),
   /** Include soft-deleted (e.g. deduped) rows. Default false. #171 */
-  include_deleted: z.coerce.boolean().optional(),
+  include_deleted: QueryBoolean.optional(),
   source_ingest_id: Uuid.optional(),
   /** flagged=near_dup → only transactions whose extraction recorded
    *  metadata.near_dup_check.flagged_for_review=true (#134 branch 4:
