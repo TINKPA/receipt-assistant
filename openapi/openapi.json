@@ -5892,10 +5892,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_children",

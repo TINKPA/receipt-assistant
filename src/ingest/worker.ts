@@ -35,6 +35,7 @@ import {
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
+import { publicErrorMessage } from "../http/problem.js";
 import {
   decodeSourceForAgent,
   resolveUploadPath,
@@ -154,12 +155,25 @@ async function markProcessing(ingestId: string, workspaceId: string): Promise<vo
     .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
 }
 
+/**
+ * The text of a failure as it may be stored on the ingest row and sent
+ * on the SSE stream. A failed query's message is the statement plus its
+ * bound values, so that one is replaced by the caller-safe sentence; the
+ * full error is already in the server log. Everything else (timeouts,
+ * auth failures, guard messages) is kept, because `category` and
+ * `retryable` are derived from it at read time.
+ */
+function ingestErrorText(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("Failed query:") ? publicErrorMessage(err) : message;
+}
+
 async function markError(
   ingestId: string,
   workspaceId: string,
   err: unknown,
 ): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = ingestErrorText(err);
   await db
     .update(ingests)
     .set({
@@ -380,7 +394,7 @@ async function runOne(item: QueueItem): Promise<void> {
     busEmit("job.error", {
       batchId,
       ingestId,
-      error: err instanceof Error ? err.message : String(err),
+      error: ingestErrorText(err),
     });
     await onBatchChildTerminated(batchId, workspaceId);
     return;

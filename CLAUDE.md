@@ -494,7 +494,7 @@ The SQLSTATE table is `src/http/pg-error.ts`. A mapped Postgres error logs one `
 
 **Malformed ids are a 400 `errors/invalid-id`, decided in one place.** `src/app.ts::UUID_PATH_PARAMS` lists, per router, the path parameters that are UUIDs; `src/http/params.ts::UUID_QUERY_PARAMS` lists the query-string ones. A request with a malformed one never reaches its handler. When you add a route with a new UUID parameter name, or a UUID filter to a `*Query` schema, add the name there. `:brandId` (a slug), `/v1/merchants/:id` (slug or UUID), `/v1/places/:id` (UUID or Google place id) and `:rank` are deliberately absent. The places one matters: `merchants.place_id` holds Google's `ChIJ…` id and the merchant page fetches `GET /v1/places/<that>`, so listing `placesRouter` turns every linked place into a 400. Before adding a parameter to either list, read the service and confirm it only ever takes a UUID. The `parseOrThrow(IdParam, req.params)` calls still in the route files are now redundant for this check.
 
-**Boolean query flags use `QueryBoolean`** (`src/schemas/v1/common.ts`), never `z.coerce.boolean()`, which reads the string `"false"` as true. `true` / `1` / `false` / `0` are accepted; anything else is a 422. One `z.coerce.boolean()` is left, `include_children` on `BalanceQuery` (`GET /v1/accounts/:id/balance`); convert it when that schema is next edited.
+**Boolean query flags use `QueryBoolean`** (`src/schemas/v1/common.ts`), never `z.coerce.boolean()`, which reads the string `"false"` as true. `true` / `1` / `false` / `0` are accepted; anything else is a 422.
 
 **An unknown URL or method** is a 404 `errors/route-not-found`, distinct from `errors/not-found` (the record does not exist).
 

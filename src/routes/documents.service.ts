@@ -22,7 +22,7 @@ import {
   HttpProblem,
   NotFoundProblem,
 } from "../http/problem.js";
-import { resolveStoredFile } from "../http/files.js";
+import { resolveInside, resolveStoredFile } from "../http/files.js";
 import {
   defaultClaudeReExtractor,
   type ReExtractor,
@@ -530,6 +530,14 @@ export async function restoreDocument(params: {
  * source-of-truth state; quarantining is a recoverability bonus.
  */
 async function quarantineFile(filePath: string): Promise<string | null> {
+  // `file_path` is a database value. Only ever move a file that lives
+  // under the upload dir, whatever the row says.
+  if (!resolveInside(getUploadDir(), filePath)) {
+    console.warn(
+      `[documents] refusing to quarantine a path outside the upload dir: ${JSON.stringify(filePath)}`,
+    );
+    return null;
+  }
   try {
     const dir = path.dirname(filePath);
     const base = path.basename(filePath);

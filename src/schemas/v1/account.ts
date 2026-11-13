@@ -145,7 +145,7 @@ export const ListAccountsQuery = z.object({
 // labelled as one. See `getBalanceService`.
 export const BalanceQuery = z.object({
   as_of: IsoDate.optional(),
-  include_children: z.coerce.boolean().optional(),
+  include_children: QueryBoolean.optional(),
 });
 
 export const RegisterQuery = z.object({
