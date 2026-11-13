@@ -63,6 +63,13 @@
 # real extraction fails on auth; stub uploads still work. From a worktree:
 #   docker compose --env-file ~/Developer/receipt-assistant/.env \
 #     -f docker-compose.test.yml up -d --build
+#
+# A worktree build is also stamped `unknown`. The Dockerfile copies `.git`
+# to read the commit, and in a worktree `.git` is a one-line pointer to a
+# host path the builder cannot follow. `/version` and every
+# `metadata.extraction.prompt_git_sha` written by that image say `unknown`.
+# To tie an eval run to its commit, check the branch out in the main
+# checkout and build there.
 
 name: receipts-test
 
