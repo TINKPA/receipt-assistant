@@ -64,11 +64,6 @@ export const Metadata = z
 
 export const IdParam = z.object({ id: Uuid }).openapi({ title: "IdParam" });
 
-export const CursorQuery = z.object({
-  cursor: z.string().optional().openapi({ description: "Opaque pagination cursor from a previous Link header" }),
-  limit: z.coerce.number().int().min(1).max(500).default(50).optional(),
-});
-
 // ── Error envelope (RFC 7807) ──────────────────────────────────────────
 
 export const Violation = z

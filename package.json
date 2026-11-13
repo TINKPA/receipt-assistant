@@ -22,7 +22,6 @@
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "express": "^5.1.0",
-    "heic-convert": "^2.1.0",
     "mailparser": "^3.9.8",
     "multer": "^2.0.0",
     "pg": "^8.20.0",

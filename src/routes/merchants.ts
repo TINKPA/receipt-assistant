@@ -10,7 +10,6 @@
 import express, { Router, type Request, type Response, type NextFunction } from "express";
 import { and, eq, sql } from "drizzle-orm";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
-import { z } from "zod";
 import { createReadStream } from "fs";
 import { stat } from "fs/promises";
 

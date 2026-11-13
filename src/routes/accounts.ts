@@ -15,11 +15,10 @@ import {
 } from "@asteasolutions/zod-to-openapi";
 
 import { db } from "../db/client.js";
-import { accounts, postings, workspaces } from "../schema/index.js";
+import { accounts, workspaces } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
-  formatEtag,
   setEtag,
   requireIfMatch,
   handleIfNoneMatch,

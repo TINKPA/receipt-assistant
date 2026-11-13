@@ -18,7 +18,6 @@
  */
 import { type Request, type Response, type NextFunction, Router } from "express";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
-import { z } from "zod";
 
 import { parseOrThrow } from "../http/validate.js";
 import { reDeriveAllPlaces } from "./places.service.js";
