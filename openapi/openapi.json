@@ -3,7 +3,7 @@
   "info": {
     "title": "Receipt Assistant API",
     "version": "2.0.0-alpha",
-    "description": "Double-entry ledger backend. The v1 resources (transactions, postings, accounts, documents) are under active construction — see issues #33 (schema), #35 (transactions API), #36 (accounts API)."
+    "description": "Double-entry ledger backend. The v1 resources (transactions, postings, accounts, documents) are under active construction — see issues #33 (schema), #35 (transactions API), #36 (accounts API).\n\nEvery error is an RFC 7807 `application/problem+json` document with a `trace_id`; branch on `type`, not on `title` or `detail`. A URL or method no route claims is a 404 `errors/route-not-found`. Database constraint failures surface as 409 (`errors/conflict`, `errors/still-referenced`) or 422 (`errors/invalid-reference`, `errors/constraint-violation`). An unexpected failure is a 500 `errors/internal` whose body is a fixed sentence plus the `trace_id`; the cause is only in the server log, under that id."
   },
   "servers": [
     {
@@ -16,6 +16,18 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer"
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request: an id in the path or query string is not a UUID (`errors/invalid-id`), the body is not valid JSON (`errors/malformed-body`), the cursor is not one this endpoint issued (`errors/invalid-cursor`), a value cannot be read as its type (`errors/invalid-parameter`), or the `Idempotency-Key` is too long (`errors/invalid-idempotency-key`).",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -5541,10 +5553,7 @@
         "parameters": [
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "flat",
@@ -5552,10 +5561,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_closed",
@@ -5575,6 +5581,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -5614,6 +5623,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Parent account not found",
@@ -5677,6 +5689,9 @@
           "304": {
             "description": "Not Modified (If-None-Match matched)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Account not found",
             "content": {
@@ -5733,6 +5748,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Account not found",
@@ -5796,6 +5814,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Account not found",
@@ -5892,6 +5913,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Account not found",
             "content": {
@@ -5957,10 +5981,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -6002,6 +6023,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Account not found",
@@ -6051,6 +6075,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Idempotency conflict",
@@ -6186,10 +6213,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "has_document",
@@ -6197,10 +6221,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -6299,6 +6320,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6334,6 +6358,9 @@
           },
           "304": {
             "description": "Not Modified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -6392,6 +6419,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "412": {
             "description": "Version mismatch",
@@ -6470,6 +6500,9 @@
           "204": {
             "description": "Deleted"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "409": {
             "description": "Transaction is reconciled — unreconcile first.",
             "content": {
@@ -6520,6 +6553,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found / not deleted",
@@ -6572,6 +6608,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found or not flagged",
             "content": {
@@ -6621,6 +6660,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6671,6 +6713,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Transaction is not in reconciled state",
@@ -6730,6 +6775,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6780,6 +6828,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Transaction is reconciled or soft-deleted",
@@ -6842,6 +6893,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Transaction not found",
@@ -6933,6 +6987,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "409": {
             "description": "Transaction is reconciled or soft-deleted",
             "content": {
@@ -6993,6 +7050,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Transaction is reconciled or soft-deleted",
@@ -7185,10 +7245,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -7241,6 +7298,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -7280,6 +7340,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed (bad item_class, unknown merchant_id)",
@@ -7322,6 +7385,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7377,6 +7443,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7412,6 +7481,9 @@
         "responses": {
           "200": {
             "description": "Image bytes"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Product or image unavailable",
@@ -7472,6 +7544,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7534,6 +7609,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Product not found",
             "content": {
@@ -7589,6 +7667,9 @@
         "responses": {
           "200": {
             "description": "Asset bytes"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7745,6 +7826,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7786,10 +7870,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -7853,6 +7934,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -7880,6 +7964,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -7922,6 +8009,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7978,6 +8068,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -8010,6 +8103,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8104,6 +8200,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -8131,6 +8230,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -8173,6 +8275,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8229,6 +8334,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -8261,6 +8369,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8302,6 +8413,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8322,6 +8436,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8354,6 +8471,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8394,6 +8514,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -8447,6 +8570,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8477,6 +8603,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8515,6 +8644,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8545,6 +8677,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8597,6 +8732,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8655,6 +8793,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8715,6 +8856,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Brand not found",
             "content": {
@@ -8767,6 +8911,9 @@
           "200": {
             "description": "Asset bytes"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -8800,6 +8947,9 @@
         "responses": {
           "200": {
             "description": "Icon bytes"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Brand or icon unavailable",
@@ -8841,6 +8991,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Brand not found",
@@ -8951,6 +9104,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8983,6 +9139,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -9045,6 +9204,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -9112,6 +9274,9 @@
           },
           "304": {
             "description": "Not modified (If-None-Match matched)"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found",
@@ -9187,6 +9352,9 @@
           "204": {
             "description": "Deleted (no cascade requested)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -9240,6 +9408,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -9281,6 +9452,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found / no file / empty render",
@@ -9337,6 +9511,9 @@
           "204": {
             "description": "Linked (or already linked — idempotent)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Document or transaction not found",
             "content": {
@@ -9392,6 +9569,9 @@
           "204": {
             "description": "Unlinked"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Link not found",
             "content": {
@@ -9433,6 +9613,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Document not found or not deleted",
@@ -9487,6 +9670,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Document not found or soft-deleted",
@@ -9544,6 +9730,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "No files / validation failed",
@@ -9620,6 +9809,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -9652,6 +9844,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -9695,6 +9890,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -9783,6 +9981,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -9852,6 +10053,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "422": {
             "description": "Unknown status token in filter",
             "content": {
@@ -9893,6 +10097,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Ingest not found",
@@ -9942,6 +10149,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Ingest not found",
@@ -10025,6 +10235,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Batch not found",
             "content": {
@@ -10074,6 +10287,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -10125,6 +10341,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -10187,6 +10406,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Batch not found",
             "content": {
@@ -10247,6 +10469,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -10325,6 +10550,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -10405,6 +10633,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Workspace not found",
             "content": {
@@ -10448,6 +10679,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -10504,6 +10738,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Workspace not found",
             "content": {
@@ -10545,6 +10782,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Merchant not found",
@@ -10653,6 +10893,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Merchant or photo not found",
             "content": {
@@ -10712,6 +10955,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Merchant not found",
             "content": {
@@ -10728,7 +10974,7 @@
     "/v1/places/{id}": {
       "get": {
         "summary": "Get a place by id (full multilingual record).",
-        "description": "Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
+        "description": "`{id}` is the place's UUID or its Google place id. Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
         "tags": [
           "places"
         ],
@@ -10736,8 +10982,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10761,6 +11008,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found",
@@ -10819,6 +11069,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -10843,8 +11096,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10861,6 +11115,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Place not found",
@@ -10896,8 +11153,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10914,6 +11172,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Place not found",
@@ -10959,8 +11220,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -11091,6 +11353,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -11135,6 +11400,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Invalid scope",

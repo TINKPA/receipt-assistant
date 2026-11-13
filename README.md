@@ -140,6 +140,23 @@ The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1)
 | Insights | `GET /v1/insights`, `POST /v1/insights/ask` | Generated insights; natural-language questions about spending |
 | Meta | `GET /health`, `GET /version`, `POST /v1/admin/re-derive` | Health check, build info, batch re-projection |
 
+### Errors
+
+Every error is an RFC 7807 `application/problem+json` document. Branch on `type`; `trace_id` is the handle for finding the cause in the server log (`docker logs receipt-assistant 2>&1 | grep trace_id=<id>`).
+
+| Status | `type` (after `https://receipts.dev/errors/`) | When |
+|--------|-----------------------------------------------|------|
+| 400 | `invalid-id` | An id in the path or query string is not a UUID (`/v1/places/{id}` also takes a Google place id, `/v1/merchants/{id}` a brand slug) |
+| 400 | `malformed-body`, `malformed-upload`, `invalid-cursor`, `invalid-parameter`, `invalid-idempotency-key` | Body is not JSON / not parseable multipart; cursor was not issued by this API; a value cannot be read as its type; `Idempotency-Key` is over 255 characters |
+| 404 | `not-found` · `route-not-found` | The record does not exist · no such URL or method |
+| 409 | `conflict`, `still-referenced`, `idempotency-conflict`, `idempotency-in-progress`, … | The request collides with current state |
+| 412 / 428 | `version-mismatch` / `precondition-required` | `If-Match` is stale / missing |
+| 413 | `payload-too-large` | Body or upload over the endpoint's limit |
+| 422 | `validation`, `invalid-reference`, `constraint-violation`, … | The body is well-formed but not acceptable |
+| 500 | `internal` | Unexpected. The body is a fixed sentence plus `trace_id`; nothing from the error itself is returned |
+
+`scripts/check-http-errors.ts` asserts this contract over real HTTP against a throwaway database (usage in its header). See [`CLAUDE.md` → HTTP error contract](CLAUDE.md#http-error-contract) for how the server side is put together.
+
 ### OpenAPI contract (for client codegen)
 
 The frontend, and any future client, generates typed bindings from `openapi/openapi.json` instead of hand-writing `fetch` calls.

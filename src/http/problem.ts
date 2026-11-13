@@ -11,11 +11,17 @@
  *     throw new ValidationProblem(zodIssues);
  *
  * The final Express middleware (`problemHandler`) catches all errors
- * and emits the correct status + headers. Uncaught / non-problem
- * errors surface as 500 with `type=errors/internal`.
+ * and emits the correct status + headers. What it does with an error
+ * that is not an `HttpProblem` is `renderProblem` below: a request the
+ * framework or Postgres rejected as malformed becomes a 4xx, and
+ * anything else a 500 `errors/internal` whose body is a fixed sentence
+ * plus the `trace_id` the full error was logged under.
  */
 import type { Request, Response, NextFunction } from "express";
+import { randomUUID } from "crypto";
+import { STATUS_CODES } from "http";
 import { ZodError } from "zod";
+import { classifyPgError, findPgError } from "./pg-error.js";
 
 const TYPE_BASE = "https://receipts.dev/errors";
 
@@ -247,43 +253,381 @@ export class DocumentHasLinksProblem extends HttpProblem {
 }
 
 /**
+ * 400 for an id that is not a UUID, in the path or the query string.
+ * Raised before any handler runs by `http/params.ts`. The `violations`
+ * entry has the shape zod produced when these were per-route 422s, so a
+ * client that reads `violations[0].path` keeps working.
+ */
+export class MalformedIdProblem extends HttpProblem {
+  constructor(where: "path" | "query", name: string) {
+    super(
+      400,
+      "invalid-id",
+      "Malformed identifier",
+      `${where === "path" ? "Path" : "Query"} parameter '${name}' must be a UUID.`,
+      {
+        violations: [
+          { path: name, code: "invalid_string", message: "Invalid uuid", in: where },
+        ],
+      },
+    );
+  }
+}
+
+/** 400 for a `cursor` that is not one this API issued. */
+export class InvalidCursorProblem extends HttpProblem {
+  constructor() {
+    super(
+      400,
+      "invalid-cursor",
+      "Invalid pagination cursor",
+      "The cursor is not one this endpoint issued. Omit it to start from the first page.",
+    );
+  }
+}
+
+/**
+ * 404 for a URL no router claims. Its own `type` so a client can tell
+ * "wrong URL or method" from "that record does not exist" (`not-found`).
+ */
+export class RouteNotFoundProblem extends HttpProblem {
+  constructor(method: string, path: string) {
+    super(
+      404,
+      "route-not-found",
+      "No such endpoint",
+      `${method} ${path.slice(0, 200)} is not part of this API. See /openapi.json.`,
+    );
+  }
+}
+
+/**
+ * 409 for a request that arrives while an earlier one carrying the same
+ * `Idempotency-Key` is still running. Retrying once the first settles
+ * replays its stored response.
+ */
+export class IdempotencyInProgressProblem extends HttpProblem {
+  constructor() {
+    super(
+      409,
+      "idempotency-in-progress",
+      "A request with this Idempotency-Key is still in progress",
+      "Retry shortly; the first request's response is replayed once it completes.",
+    );
+  }
+}
+
+/** 400 for an `Idempotency-Key` that cannot be stored as one. */
+export class InvalidIdempotencyKeyProblem extends HttpProblem {
+  constructor(maxLength: number) {
+    super(
+      400,
+      "invalid-idempotency-key",
+      "Invalid Idempotency-Key",
+      `Idempotency-Key must be at most ${maxLength} characters. A UUID is the usual choice.`,
+      { max_length: maxLength },
+    );
+  }
+}
+
+// ── Translating errors we did not throw ────────────────────────────────
+
+/**
+ * Errors raised by the framework rather than by our code, which carry
+ * their own verdict that the request was at fault:
+ *
+ *   - body-parser (`express.json`), built on `http-errors`: a 4xx
+ *     `status`, `expose === true`, and a `type` such as
+ *     `entity.parse.failed` or `entity.too.large`;
+ *   - Express decoding a path parameter: a `URIError` with `status = 400`;
+ *   - multer: a `MulterError` with a `LIMIT_*` code, and busboy's bare
+ *     `Error`s for a multipart body it cannot parse.
+ *
+ * `status` is honoured from those sources only. An error that merely
+ * has a `.status` — a failed upstream fetch, say — is not the caller's
+ * 4xx.
+ */
+function frameworkProblem(err: unknown, req: Request): HttpProblem | null {
+  if (!err || typeof err !== "object") return null;
+  const e = err as {
+    name?: unknown;
+    code?: unknown;
+    type?: unknown;
+    field?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+    expose?: unknown;
+    message?: unknown;
+  };
+
+  if (e.name === "MulterError" && typeof e.code === "string") {
+    if (e.code === "LIMIT_UNEXPECTED_FILE" || e.code === "MISSING_FIELD_NAME") {
+      const field = typeof e.field === "string" ? e.field.slice(0, 80) : undefined;
+      return new HttpProblem(
+        400,
+        "malformed-upload",
+        "Malformed multipart upload",
+        field
+          ? `Unexpected multipart field '${field}'.`
+          : "The multipart body has a field this endpoint does not accept.",
+        { code: e.code },
+      );
+    }
+    return new HttpProblem(
+      413,
+      "payload-too-large",
+      "Payload Too Large",
+      "The upload exceeds this endpoint's size or part-count limit.",
+      { code: e.code },
+    );
+  }
+
+  // busboy and multer report an unparseable or cut-off multipart body
+  // as a bare Error, recognisable only by its text. Believe that text
+  // only on a request that actually was multipart.
+  if (
+    e.name === "Error" &&
+    typeof e.message === "string" &&
+    /^multipart\//i.test(req.header("content-type") ?? "") &&
+    /^(Multipart: |Malformed part header|Malformed content type|Unexpected end of (form|file)|Request (aborted|closed))/.test(
+      e.message,
+    )
+  ) {
+    return new HttpProblem(
+      400,
+      "malformed-upload",
+      "Malformed multipart upload",
+      "The multipart body could not be parsed.",
+    );
+  }
+
+  const status =
+    typeof e.status === "number"
+      ? e.status
+      : typeof e.statusCode === "number"
+        ? e.statusCode
+        : undefined;
+  const fromFramework = e.expose === true || err instanceof URIError;
+  if (status === undefined || status < 400 || status > 499 || !fromFramework) {
+    return null;
+  }
+
+  if (e.type === "entity.parse.failed") {
+    return new HttpProblem(
+      400,
+      "malformed-body",
+      "Malformed request body",
+      "The request body is not valid JSON.",
+    );
+  }
+  if (err instanceof URIError) {
+    return new HttpProblem(
+      400,
+      "bad-request",
+      "Bad Request",
+      "The request URL contains an invalid percent-encoding.",
+    );
+  }
+  // Anything else the framework rejects (413 too large, 415 unsupported
+  // charset or encoding, …): its status, the standard phrase for it, and
+  // none of its message.
+  const title = STATUS_CODES[status] ?? "Bad Request";
+  return new HttpProblem(
+    status,
+    title.toLowerCase().replace(/[^a-z]+/g, "-"),
+    title,
+    status === 413
+      ? "The request body exceeds this endpoint's size limit."
+      : undefined,
+  );
+}
+
+/**
+ * Last line of defence for an `HttpProblem` whose text was built from a
+ * caught error's message. Drizzle's message is
+ * `Failed query: <sql>\nparams: <values>`, and code that joins a cause
+ * chain into `detail` carries it straight out. Cut it, keeping only what
+ * follows the final ` | ` separator (the driver's own sentence) when
+ * there is one.
+ */
+function scrubText(text: string): string {
+  const at = text.indexOf("Failed query:");
+  if (at === -1) return text;
+  const sep = text.lastIndexOf(" | ");
+  const tail = sep > at ? text.slice(sep + 3).trim() : "";
+  const head = text.slice(0, at).replace(/[\s|]+$/, "");
+  return (
+    [head, tail].filter(Boolean).join(" | ") ||
+    "Details withheld; see the server log."
+  );
+}
+
+function scrub<T>(value: T): T {
+  if (typeof value === "string") return scrubText(value) as T;
+  if (Array.isArray(value)) return value.map(scrub) as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = scrub(v);
+    return out as T;
+  }
+  return value;
+}
+
+export interface RenderedProblem {
+  status: number;
+  body: ProblemBody;
+}
+
+/**
+ * Turn anything thrown into the problem document a client may see, and
+ * log what it may not.
+ *
+ * This is the one mapping behind `problemHandler`. It is exported for
+ * the single handler that reports per-item failures inside a 200 (bulk).
+ *
+ *   HttpProblem / ZodError  → as thrown
+ *   framework 4xx           → 400 / 413 / 415 (malformed JSON, oversize, …)
+ *   Postgres client faults  → 400 / 409 / 422 (see `pg-error.ts`)
+ *   everything else         → 500, a fixed sentence and the trace id
+ *
+ * A 500 body never carries `err.message`: for a failed query that is the
+ * SQL text and its parameters. The full error, with its stack and cause
+ * chain, goes to the server log under the `trace_id` the body returns.
+ */
+export function renderProblem(err: unknown, req: Request): RenderedProblem {
+  const traceId: string = req.traceId ?? randomUUID();
+  const instance = req.originalUrl;
+  const where = `${req.method} ${req.originalUrl}`;
+
+  let problem: HttpProblem | null = null;
+  if (err instanceof HttpProblem) {
+    problem = err;
+  } else if (err instanceof ZodError) {
+    problem = ValidationProblem.fromZod(err);
+  } else {
+    problem = frameworkProblem(err, req);
+    if (!problem) {
+      const pg = findPgError(err);
+      const spec = pg ? classifyPgError(pg) : null;
+      if (pg && spec) {
+        problem = new HttpProblem(
+          spec.status,
+          spec.type,
+          spec.title,
+          spec.detail,
+          spec.extras,
+        );
+        // One line, not a stack: this is the caller's mistake (or a
+        // validation we have yet to write), and the SQLSTATE plus the
+        // driver's sentence is all it takes to find it.
+        console.warn(
+          `[http] trace_id=${traceId} ${where} → ${spec.status} ${spec.type} ` +
+            `sqlstate=${pg.code}` +
+            (pg.constraint ? ` constraint=${pg.constraint}` : "") +
+            (pg.table ? ` table=${pg.table}` : "") +
+            ` pg=${JSON.stringify(pg.message)}`,
+        );
+      }
+    }
+  }
+
+  if (problem) {
+    return {
+      status: problem.status,
+      body: scrub(problem.toBody(instance, traceId)),
+    };
+  }
+
+  console.error(`[http] trace_id=${traceId} ${where} → 500 unhandled:`, err);
+  return {
+    status: 500,
+    body: {
+      type: `${TYPE_BASE}/internal`,
+      title: "Internal Server Error",
+      status: 500,
+      detail:
+        "Unexpected server error. The cause is in the server log under this trace_id.",
+      ...(instance ? { instance } : {}),
+      trace_id: traceId,
+    },
+  };
+}
+
+/**
+ * What may be said about `err` in a place `renderProblem` does not reach:
+ * a per-item `message` inside a 200 body, a status column a later GET
+ * returns. Use it wherever the temptation is `err.message`.
+ *
+ * It follows the same rules as `renderProblem`, minus the request: a
+ * problem we threw speaks for itself, a Postgres error the caller caused
+ * gets its mapped sentence, and anything else gets a fixed one — for a
+ * failed query `err.message` is the statement and its bound values. It
+ * does not log; the caller logs the full error next to whatever
+ * identifies the item, so the sentence can point at the log.
+ */
+export function publicErrorMessage(err: unknown): string {
+  if (err instanceof HttpProblem) return scrubText(err.detail ?? err.title);
+  if (err instanceof ZodError) return "Failed validation.";
+  const pg = findPgError(err);
+  if (pg) {
+    return (
+      classifyPgError(pg)?.detail ??
+      `Database error (SQLSTATE ${pg.code}). The cause is in the server log.`
+    );
+  }
+  return "Unexpected error. The cause is in the server log.";
+}
+
+/**
+ * Terminal handler for a request no router claimed. Register it after
+ * every router and before `problemHandler`; without it Express answers
+ * with its own HTML page.
+ */
+export function routeNotFoundHandler(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void {
+  next(new RouteNotFoundProblem(req.method, req.path));
+}
+
+/** Headers that belong to a successful representation, never to the
+ *  error that replaced it. (`Retry-After`, set on purpose for a 409, is
+ *  not one of them.) */
+const SUCCESS_ONLY_HEADERS = [
+  "Cache-Control",
+  "ETag",
+  "Last-Modified",
+  "Expires",
+  "Content-Disposition",
+  "X-Cache",
+] as const;
+
+/**
  * Final Express error handler — must be registered AFTER all routes.
  */
 export function problemHandler(
   err: unknown,
   req: Request,
   res: Response,
-  _next: NextFunction,
+  next: NextFunction,
 ): void {
-  const traceId: string | undefined = req.traceId;
-  const instance = req.originalUrl;
-
-  if (err instanceof HttpProblem) {
-    res
-      .status(err.status)
-      .type("application/problem+json")
-      .json(err.toBody(instance, traceId));
+  if (res.headersSent) {
+    // A stream failed mid-response. The status line has gone out; all
+    // that is left is to log it and let Express tear the connection down.
+    console.error(
+      `[http] trace_id=${req.traceId ?? "-"} ${req.method} ${req.originalUrl} failed after headers were sent:`,
+      err,
+    );
+    next(err);
     return;
   }
-
-  if (err instanceof ZodError) {
-    const p = ValidationProblem.fromZod(err);
-    res
-      .status(p.status)
-      .type("application/problem+json")
-      .json(p.toBody(instance, traceId));
-    return;
-  }
-
-  // Unknown error — log and return generic 500. Never leak internals.
-  console.error("[problemHandler] unhandled:", err);
-  const message = err instanceof Error ? err.message : String(err);
-  res.status(500).type("application/problem+json").json({
-    type: `${TYPE_BASE}/internal`,
-    title: "Internal Server Error",
-    status: 500,
-    detail: message,
-    ...(instance ? { instance } : {}),
-    ...(traceId ? { trace_id: traceId } : {}),
-  });
+  // A handler can fail after staging headers for the success it
+  // expected (a file route sets its cache lifetime and ETag, then the
+  // file will not open). They describe a representation that is not
+  // being sent; left in place, a browser would cache this error for as
+  // long as the image was meant to live.
+  for (const name of SUCCESS_ONLY_HEADERS) res.removeHeader(name);
+  const { status, body } = renderProblem(err, req);
+  res.status(status).type("application/problem+json").json(body);
 }

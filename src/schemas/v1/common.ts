@@ -84,6 +84,26 @@ export const MetadataPatch = z.record(z.string(), z.unknown()).openapi({
 
 export const IdParam = z.object({ id: Uuid }).openapi({ title: "IdParam" });
 
+/**
+ * A boolean in the query string. Use this, never `z.coerce.boolean()`:
+ * that is `Boolean(value)`, and every non-empty string is truthy —
+ * `"false"` and `"0"` included — so `?include_retired=false` returned
+ * exactly the rows it asked to leave out.
+ *
+ * Accepts `true` / `1` and `false` / `0` in any case; an empty value is
+ * false, as it always was. Anything else is a 422 instead of a silent
+ * `true`.
+ */
+export const QueryBoolean = z
+  .preprocess((value) => {
+    if (typeof value !== "string") return value;
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "1") return true;
+    if (v === "false" || v === "0" || v === "") return false;
+    return value;
+  }, z.boolean())
+  .openapi({ type: "boolean" });
+
 // ── Error envelope (RFC 7807) ──────────────────────────────────────────
 
 export const Violation = z

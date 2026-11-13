@@ -7,7 +7,13 @@
  * `transaction_item_id = NULL`.
  */
 import { z } from "zod";
-import { IsoDate, IsoDateTime, Metadata, Uuid } from "./common.js";
+import {
+  IsoDate,
+  IsoDateTime,
+  Metadata,
+  QueryBoolean,
+  Uuid,
+} from "./common.js";
 
 export const OwnedItem = z
   .object({
@@ -109,7 +115,7 @@ export const ListOwnedItemsQuery = z.object({
   product_id: Uuid.optional(),
   location: z.string().optional(),
   /** Default: false → only currently-owned rows. */
-  include_retired: z.coerce.boolean().optional(),
+  include_retired: QueryBoolean.optional(),
   /** `product` joins catalog + purchase context (OwnedItemExpanded rows). */
   expand: z.enum(["product"]).optional(),
   cursor: z.string().optional(),

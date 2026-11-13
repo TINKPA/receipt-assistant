@@ -12,10 +12,18 @@ import express, { Router, type Request, type Response, type NextFunction } from 
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull } from "drizzle-orm";
-import { createReadStream } from "fs";
-import { mkdir, stat, writeFile } from "fs/promises";
-import { join, isAbsolute, dirname } from "path";
+import { mkdir, writeFile } from "fs/promises";
+import { dirname } from "path";
 import { createHash } from "crypto";
+import {
+  resolveInside,
+  resolveStoredFile,
+  sendStoredFile,
+  setStoredAssetGuards,
+  setStoredImageHeaders,
+  storedImageEtag,
+} from "../http/files.js";
+import { ifNoneMatchSatisfied } from "../http/etag.js";
 import multer from "multer";
 import { db } from "../db/client.js";
 import { brands, brandAssets } from "../schema/index.js";
@@ -299,7 +307,19 @@ brandsRouter.post(
       const sha = createHash("sha256").update(bytes).digest("hex");
       const ext = extensionForMime(mime);
       const relPath = `${brandId}/user-upload/${sha}.${ext}`;
-      const absPath = join(BRAND_ASSETS_ROOT, relPath);
+      // `brandId` is a free-text slug (any string can be minted through
+      // POST /v1/products), and here it becomes a directory name. Refuse
+      // one that would put the file outside the assets root.
+      const absPath = resolveInside(BRAND_ASSETS_ROOT, relPath);
+      if (!absPath) {
+        throw new ValidationProblem([
+          {
+            path: "brandId",
+            code: "unsafe_path",
+            message: "This brand id cannot be used as a storage directory",
+          },
+        ]);
+      }
 
       // Dedup: if (brand_id, content_hash) already exists, surface that row.
       // Whether or not we just wrote the bytes (race-safe: writeFile is
@@ -415,21 +435,16 @@ brandsRouter.get(
           `asset_id=${assetId} is retired`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand asset",
-          `File missing on disk: ${absPath}`,
+          `asset_id=${assetId} has no file on disk`,
         );
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       res.setHeader("Cache-Control", "public, max-age=86400, immutable");
-      createReadStream(absPath).pipe(res);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }
@@ -487,33 +502,32 @@ brandsRouter.get(
           `preferred_asset_id=${preferredId} is retired for brand=${brandId}`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand icon",
-          `File missing on disk: ${absPath}`,
+          `preferred_asset_id=${preferredId} has no file on disk for brand=${brandId}`,
         );
       }
-      // Strong ETag is the asset's content_hash. The URL stays stable
-      // (`/brands/<id>/icon`) while the underlying bytes flip whenever
-      // a user re-picks `preferred_asset_id` — so `immutable` would be
-      // wrong here. `max-age=0, must-revalidate` makes every request a
-      // conditional GET; the 304 path is cheap (no read) and the user's
-      // Pick takes effect the next time anything renders the icon.
-      const etag = `"${asset.contentHash}"`;
+      // Strong ETag is the asset's content_hash plus the generation of
+      // the headers it is served under (`storedImageEtag`). The URL
+      // stays stable (`/brands/<id>/icon`) while the underlying bytes
+      // flip whenever a user re-picks `preferred_asset_id` — so
+      // `immutable` would be wrong here. `max-age=0, must-revalidate`
+      // makes every request a conditional GET; the 304 path is cheap
+      // (no read) and the user's Pick takes effect the next time
+      // anything renders the icon.
+      const etag = storedImageEtag(asset.contentHash);
       res.setHeader("ETag", etag);
       res.setHeader("Cache-Control", "public, max-age=0, must-revalidate");
-      if (req.headers["if-none-match"] === etag) {
+      // Before the 304, so the revalidated copy is sandboxed too.
+      setStoredAssetGuards(res);
+      if (ifNoneMatchSatisfied(req, etag)) {
         res.status(304).end();
         return;
       }
-      res.setHeader("Content-Type", asset.contentType);
-      createReadStream(absPath).pipe(res);
+      setStoredImageHeaders(res, asset.contentType);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }

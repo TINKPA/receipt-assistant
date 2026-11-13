@@ -28,12 +28,28 @@ declare module "express-serve-static-core" {
   }
 }
 
+/**
+ * A caller may supply its own `X-Trace-Id` to correlate our log lines
+ * with its own. The value is written into the server log and echoed in
+ * every problem body, so only a short token of id-like characters is
+ * taken as given; anything else (control characters, a megabyte of
+ * text) is replaced with a fresh id.
+ */
+const TRACE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+/**
+ * Mounted FIRST in `buildApp()` — before the body parser — so that a
+ * request rejected while its body is being read still has a trace id to
+ * log and to return.
+ */
 export function contextMiddleware(
   req: Request,
   _res: Response,
   next: NextFunction,
 ): void {
-  const traceId = req.header("x-trace-id") ?? randomUUID();
+  const supplied = req.header("x-trace-id");
+  const traceId =
+    supplied && TRACE_ID_RE.test(supplied) ? supplied : randomUUID();
   req.traceId = traceId;
   req.ctx = {
     workspaceId: SEED_WORKSPACE_ID,

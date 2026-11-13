@@ -125,6 +125,7 @@ ownedItemsRouter.get(
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
       const cursor = decodeCursor<OwnedItemsCursor>(
         query.cursor ?? undefined,
+        ["updated_at", "id"],
       );
 
       const conditions: ReturnType<typeof sql>[] = [];

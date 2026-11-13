@@ -12,6 +12,7 @@ import {
   MetadataPatch,
   Uuid,
 } from "./common.js";
+import { QueryBoolean } from "./common.js";
 
 export const AccountType = z.enum([
   "asset",
@@ -136,8 +137,8 @@ export const AccountRegister = z
   .openapi("AccountRegister");
 
 export const ListAccountsQuery = z.object({
-  flat: z.coerce.boolean().optional(),
-  include_closed: z.coerce.boolean().optional(),
+  flat: QueryBoolean.optional(),
+  include_closed: QueryBoolean.optional(),
 });
 
 // No `currency` parameter: the balance is a base-currency sum and is
@@ -150,7 +151,7 @@ export const BalanceQuery = z.object({
 export const RegisterQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
-  include_deleted: z.coerce.boolean().optional(),
+  include_deleted: QueryBoolean.optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });
