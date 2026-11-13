@@ -26,6 +26,7 @@ import {
 import { ifNoneMatchSatisfied } from "../http/etag.js";
 import multer from "multer";
 import { db } from "../db/client.js";
+import { liveTransactions } from "../db/live.js";
 import { brands, brandAssets } from "../schema/index.js";
 import { merchants } from "../schema/merchants.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -584,8 +585,9 @@ brandsRouter.patch(
 // across every merchant under this brand, the locations list with
 // per-merchant stats, recent transactions across the brand, and any
 // sibling brands sharing the same `parent_id` (Costco group case).
-// Voided transactions excluded from money sums; location_count is the
-// raw merchant row count (independent of activity).
+// Only live transactions (posted or reconciled, not deleted) are summed
+// or listed; location_count is the raw merchant row count (independent
+// of activity).
 
 brandsRouter.get(
   "/:brandId/rollup",
@@ -695,6 +697,12 @@ brandsRouter.get(
       }
 
       // 5. Recent transactions across the brand (top 20)
+      //
+      // Live rows only, read through the view. This query used to read
+      // `transactions` with no status or deleted_at filter, so a receipt
+      // the user had deleted dropped out of the stats above and stayed in
+      // this list, with status `posted` and its total, and nothing on the
+      // row to say it was gone.
       let recentTxns: any[] = [];
       if (merchantRows.length > 0) {
         const recentResult = await db.execute(sql`
@@ -726,7 +734,7 @@ brandsRouter.get(
               ORDER BY dl.created_at ASC
               LIMIT 1
             ) AS document_id
-          FROM transactions t
+          FROM ${liveTransactions} t
           JOIN merchants m ON m.id = t.merchant_id
           WHERE t.workspace_id = ${workspaceId}::uuid
             AND m.brand_id = ${brandId}
@@ -957,7 +965,8 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
     summary: "Brand-level rollup — locations, recent transactions, sibling brands",
     description:
       "Aggregates across every merchant row sharing this brand_id within the workspace. " +
-      "Powers the BrandPage UI (#XXX). Voided transactions excluded from money sums. " +
+      "Powers the BrandPage UI (#XXX). Only live transactions (posted or reconciled, not deleted) " +
+      "are counted in the stats or listed in recent_transactions. " +
       "Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
     tags: ["brands"],
     request: { params: z.object({ brandId: z.string() }) },

@@ -3308,7 +3308,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BrandRollupRecentRow"
-            }
+            },
+            "description": "The 20 most recent live transactions across the brand's merchants (posted or reconciled, not deleted), drawn from the set the stats count."
           },
           "sibling_brands": {
             "type": "array",
@@ -8964,7 +8965,7 @@
     "/v1/brands/{brandId}/rollup": {
       "get": {
         "summary": "Brand-level rollup — locations, recent transactions, sibling brands",
-        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Voided transactions excluded from money sums. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
+        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Only live transactions (posted or reconciled, not deleted) are counted in the stats or listed in recent_transactions. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
         "tags": [
           "brands"
         ],

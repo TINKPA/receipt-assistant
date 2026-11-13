@@ -118,10 +118,10 @@ merchantsRouter.use(
 /**
  * GET /v1/merchants/:id — single merchant + KPIs.
  *
- * `:id` accepts uuid or brand_id. Voided transactions are excluded from
- * KPIs (lifetime/current-month spend); they remain visible in the
- * companion `/transactions` endpoint so the merchant page can render
- * them with strikethrough.
+ * `:id` accepts uuid or brand_id. Only live transactions (posted or
+ * reconciled, not deleted) count toward the KPIs, and the companion
+ * `/transactions` endpoint lists that same set: a deleted receipt is in
+ * neither.
  *
  * Spend sums pick the expense leg by ACCOUNT TYPE, via the `accounts`
  * join (#221). They used to pick it by sign (`amount_minor > 0`), which
