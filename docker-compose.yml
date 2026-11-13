@@ -17,7 +17,14 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      # The owner (superuser) password. The default is public, and the
+      # extraction agent's shell can reach this server: set
+      # RECEIPTS_DB_OWNER_PASSWORD in .env. Postgres reads this variable
+      # only when the data directory is first created, so on an existing
+      # database change the role first (ALTER ROLE postgres PASSWORD …),
+      # then the variable — steps in CLAUDE.md, "Rotating the owner
+      # password". Hex only: the value is pasted into DATABASE_URL below.
+      POSTGRES_PASSWORD: ${RECEIPTS_DB_OWNER_PASSWORD:-postgres}
       POSTGRES_DB: receipts           # auto-created on first boot
       TZ: UTC
       PGTZ: UTC
@@ -51,15 +58,18 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # The SERVER's connection: the role that owns the schema. The two
-      # `claude -p` agents never see this value. Each child is spawned with
-      # a DATABASE_URL of its own that logs in as a restricted role on the
-      # same host and database (src/claude.ts, src/db/agent-roles.ts).
-      DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
+      # The SERVER's connection: the role that owns the schema. It is not
+      # in either `claude -p` child's environment. The extraction child is
+      # spawned with a DATABASE_URL of its own that logs in as a restricted
+      # role on the same host and database; the Ask child gets none, and
+      # the server runs its SQL as a read-only role (src/claude.ts,
+      # src/db/agent-roles.ts). "Not in its environment" is not "cannot
+      # find it": see "What this does not bound" in CLAUDE.md.
+      DATABASE_URL: postgresql://postgres:${RECEIPTS_DB_OWNER_PASSWORD:-postgres}@receipts-postgres:5432/receipts
       # Passwords for those two roles: `receipts_agent` (extraction and
       # re-extract; may write only the tables and columns the prompts
-      # write) and `receipts_ro` (Ask; SELECT only). The server sets them
-      # on the roles at every boot and builds the agents' connection
+      # write) and `receipts_ro` (Ask's queries; SELECT only). The server
+      # sets them on the roles at every boot and builds its connection
       # strings from them, so changing one is: edit .env, `up -d`. Unset
       # falls back to a built-in development password and a boot warning —
       # set both in .env (`openssl rand -hex 24`).
