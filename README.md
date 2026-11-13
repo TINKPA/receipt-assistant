@@ -164,6 +164,8 @@ grep -l "<ingest-id>" ~/Developer/receipt-assistant-data/claude/projects/-app/*.
 
 See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-jsonl) for live tailing.
 
+The sandbox stack keeps its own transcripts in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`.
+
 ## Scripts
 
 Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, for `.sh`). The ones with an npm alias:
@@ -178,6 +180,8 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
 
 The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
+
+The sandbox is a second stack (`docker-compose.test.yml`: API on 3001, its own image tag, database and data directories) that shares no state with production. `scripts/sandbox-reset.sh` returns it to an empty ledger without a restart. See [`CLAUDE.md` → Sandbox stack](CLAUDE.md#sandbox-stack-docker-composetestyml).
 
 ## Tech Stack
 

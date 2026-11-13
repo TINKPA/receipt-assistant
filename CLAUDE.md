@@ -282,6 +282,8 @@ host:      ~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.
 
 Pre-removal history: every Langfuse trace (May–Oct 2026, 1300 traces / 21,826 observations, fields truncated) is exported to `~/Developer/receipt-assistant-data/langfuse-export/{traces,observations}.jsonl`. It is the only copy of runs older than the 30-day window that had already been swept.
 
+Sandbox runs (`docker-compose.test.yml`) are kept apart, in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`; everything below works the same with `test-claude` in the path and `receipt-assistant-test` as the container. Until that directory existed the sandbox mounted production's, so the production directory also holds older sandbox sessions. They can be told apart by the ingest id in the prompt: nothing deletes `ingests` rows, so an id production's table does not have came from the sandbox.
+
 ### Finding a run
 
 ```bash
@@ -413,6 +415,51 @@ curl -sS --max-time 1000 -X POST "$BASE/v1/documents/$DOC/re-extract" | jq .
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
+## Sandbox stack (`docker-compose.test.yml`)
+
+A second copy of the app and its database, for evals, the dedup matrix and frontend test runs. API on 3001, Postgres on 5433.
+
+```bash
+docker compose -f docker-compose.test.yml up -d --build   # builds receipt-assistant:sandbox from this checkout
+./scripts/sandbox-reset.sh                                # empty ledger, about a second, no restart
+```
+
+It shares no state with production. Everything the sandbox can write is its own:
+
+| | Production | Sandbox |
+|---|---|---|
+| Compose project | `receipt-assistant` | `receipts-test` |
+| Image | `receipt-assistant:local` | `receipt-assistant:sandbox` |
+| Containers | `receipt-assistant`, `receipts-postgres` | `receipt-assistant-test`, `receipts-test-postgres` |
+| Postgres data | `receipt-assistant-data/postgres/` | `receipt-assistant-data/test-postgres/` |
+| `/data` | four mounts: uploads (iCloud), `brand-assets/`, `product-assets/`, `prompt-lessons/` | one directory, `receipt-assistant-data/test-uploads/`, holding all four |
+| `/home/node/.claude` | `receipt-assistant-data/claude/` | `receipt-assistant-data/test-claude/` |
+
+Three rules keep it that way; the compose file's header explains each.
+
+- **`name:` is pinned.** Both files declare the same service names, so without it Compose treats the running production containers as stale instances of the sandbox's and removes them (#193).
+- **The image tag is the sandbox's own.** A tag is a pointer. While both files said `receipt-assistant:local`, building the sandbox from a branch moved the tag production runs, and the next `docker compose up -d receipt-assistant` on production would have started that branch build and run its migrations against the real ledger.
+- **No production path is mounted, not even read-only.** Every bind source in the sandbox file is a `test-*` directory. The sandbox used to mount production's Claude directory and `brand-assets/` read-write.
+
+What the two stacks do share is the account behind the keys: `.env` gives both the same `CLAUDE_CODE_OAUTH_TOKEN`, Google Maps key and logo.dev keys, so sandbox agent runs spend the same subscription quota. Compose reads `.env` from the directory the compose file is in. A git worktree has none, so there the token renders empty and every real extraction fails on auth (stub uploads still work); pass `--env-file ~/Developer/receipt-assistant/.env`. After rotating the token, run `docker compose -f docker-compose.test.yml up -d` so the sandbox picks up the new value.
+
+### What `scripts/sandbox-reset.sh` does
+
+It clears every table in the `public` schema except boot scaffolding, in one transaction, and moves everything under `test-uploads/` to the Trash. The table list comes from the catalog at run time, so a table added by a later migration is cleared without editing the script.
+
+Scaffolding is what a boot leaves in an empty database. The app creates it only at boot, so clearing it would break the running stack:
+
+| Kept | Written by |
+|---|---|
+| `users`, `workspaces`, `workspace_members`, `accounts`, `points_valuations` | `src/db/seed.ts`, which does nothing once the seed workspace exists |
+| `points_programmes` | `drizzle/0039_points_seed.sql`; a migration never runs twice |
+
+Rows of any other workspace or user are deleted from those tables too. **A migration that seeds reference rows into a new table must add that table to `keep` in the script**, or the reset will empty it and nothing will put the rows back.
+
+Two limits. It cannot tell a seeded account from one a test or an agent added to the seed workspace, so those survive (the script's header has the rebuild recipe for a factory-fresh database). And it does not wait for extractions in flight: it warns when it sees queued or processing ingests, and an agent still running will write rows after the reset.
+
+It refuses to run against production three ways: the container name `receipts-postgres`, the compose project `receipt-assistant`, and any container or data directory that resolves to a production path.
+
 ## Persistent data — three locations by category
 
 App state is split across three host locations by data type. Each location is chosen to defeat a specific failure mode; do not collapse them back into one.
@@ -424,6 +471,8 @@ App state is split across three host locations by data type. Each location is ch
 | `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials — now an inert escape-hatch; live auth is the `CLAUDE_CODE_OAUTH_TOKEN` setup-token, see below) + every agent session transcript (`projects/-app/*.jsonl`, the only trace store) | Same reason: `.credentials.json` is sensitive and transcripts carry receipt PII; keep both far from `git add -f` and never on iCloud. |
 
 `docker-compose.yml` uses absolute `${HOME}/...` paths so they resolve identically for any local user. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
+
+The sandbox stack mounts none of these. It has its own `test-postgres/`, `test-uploads/` and `test-claude/` beside them in `~/Developer/receipt-assistant-data/`; see "Sandbox stack".
 
 ### Why three locations (the four failure modes)
 
