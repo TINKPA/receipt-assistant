@@ -27,6 +27,7 @@ import {
   UpdateMerchantRequest,
 } from "../schemas/v1/merchant.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
+import { unconvertedLegSql } from "../fx/unconverted.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -125,6 +126,23 @@ merchantsRouter.use(
  * simply deleted. The join stays out of the row filter (the type test
  * lives in the CASE) so `COUNT(DISTINCT t.id)` keeps counting every
  * transaction, including any with no expense leg at all.
+ *
+ * They sum `amount_base_minor`, never `amount_minor`. The native column
+ * is in the receipt's own currency and unit, so adding it up across a
+ * merchant's history adds yuan to dollars to whole loyalty points and
+ * then labels the result with the base currency: a purchase of 50,000
+ * yuan read as $50,000.00 of lifetime spend, and an award stay as its
+ * points count and its cash charges in cents, added together. Base
+ * amounts are what `/v1/reports/summary` sums, so a merchant's lifetime
+ * figure now matches its row there. A points leg counts at its programme
+ * valuation, as it does in the reports.
+ *
+ * One kind of leg is in those sums without being a base amount: a
+ * foreign cash posting the FX pass could not convert, which still holds
+ * its native amount (`src/fx/unconverted.ts`). The reports list such legs
+ * in their `fx` block; here `unconverted_transaction_count` says how many
+ * of the merchant's transactions carry one, so a lifetime figure that
+ * contains yen counted as cents does not pass for a clean total.
  */
 merchantsRouter.get(
   "/:id",
@@ -137,15 +155,20 @@ merchantsRouter.get(
       WITH s AS (
         SELECT
           COUNT(DISTINCT t.id)::bigint AS txn_count,
-          COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
+          COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_base_minor ELSE 0 END), 0)::bigint AS lifetime_spend,
           COALESCE(SUM(CASE
             WHEN a.type = 'expense'
              AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
              AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-            THEN p.amount_minor ELSE 0
+            THEN p.amount_base_minor ELSE 0
           END), 0)::bigint AS current_month_spend,
-          MAX(t.occurred_on)::text AS last_date
+          MAX(t.occurred_on)::text AS last_date,
+          COUNT(DISTINCT t.id) FILTER (
+            WHERE a.type = 'expense'
+              AND ${unconvertedLegSql("p", sql`w.base_currency`)}
+          )::bigint AS unconverted_txn_count
         FROM transactions t
+        JOIN workspaces w ON w.id = t.workspace_id
         JOIN postings p ON p.transaction_id = t.id
         JOIN accounts a ON a.id = p.account_id
         WHERE t.workspace_id = ${req.ctx.workspaceId}::uuid
@@ -154,6 +177,7 @@ merchantsRouter.get(
       )
       SELECT
         s.txn_count, s.lifetime_spend, s.current_month_spend, s.last_date,
+        s.unconverted_txn_count,
         (SELECT base_currency FROM workspaces WHERE id = ${req.ctx.workspaceId}::uuid) AS currency
       FROM s
     `);
@@ -162,6 +186,7 @@ merchantsRouter.get(
       lifetime_spend: string | number;
       current_month_spend: string | number;
       last_date: string | null;
+      unconverted_txn_count: string | number;
       currency: string | null;
     };
 
@@ -173,6 +198,7 @@ merchantsRouter.get(
         current_month_spend_minor: toInt(row.current_month_spend),
         last_transaction_date: row.last_date,
         currency: row.currency ?? "USD",
+        unconverted_transaction_count: toInt(row.unconverted_txn_count),
       },
     };
     res.json(body);
@@ -188,6 +214,16 @@ merchantsRouter.get(
  * `total_minor` is the expense leg, signed (#221): positive for a
  * purchase, NEGATIVE for a refund. Clients render the sign; they must
  * not `Math.abs()` it, or a return reads as a second purchase.
+ *
+ * It is in the workspace base currency, and `currency` says so on every
+ * row. Both used to be native: the sum of the expense legs' own amounts,
+ * labelled with whichever posting's currency a `LIMIT 1` without an
+ * ORDER BY happened to return. On a stay paid partly in points that
+ * added points to cents and could label the sum `HYATT_PT`, which is not
+ * a code a currency formatter accepts, so the merchant page threw. What
+ * the receipt said in its own currency is on `/v1/transactions/:id`.
+ * `unconverted` marks a row whose total still contains a native amount
+ * (see the note on the stats endpoint above).
  */
 merchantsRouter.get(
   "/:id/transactions",
@@ -213,14 +249,24 @@ merchantsRouter.get(
         t.payee,
         t.status::text AS status,
         (
-          SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
+          SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint
           FROM postings p
           JOIN accounts a ON a.id = p.account_id
           WHERE p.transaction_id = t.id AND a.type = 'expense'
         ) AS total_minor,
         (
-          SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
+          SELECT base_currency FROM workspaces WHERE id = t.workspace_id
         ) AS currency,
+        EXISTS (
+          SELECT 1
+          FROM postings p
+          JOIN accounts a ON a.id = p.account_id
+          WHERE p.transaction_id = t.id AND a.type = 'expense'
+            AND ${unconvertedLegSql(
+              "p",
+              sql`(SELECT base_currency FROM workspaces WHERE id = t.workspace_id)`,
+            )}
+        ) AS unconverted,
         (
           SELECT dl.document_id
           FROM document_links dl
@@ -244,6 +290,7 @@ merchantsRouter.get(
       status: "draft" | "posted" | "reconciled" | "error";
       total_minor: string | number;
       currency: string | null;
+      unconverted: boolean;
       document_id: string | null;
     }>;
 
@@ -255,6 +302,7 @@ merchantsRouter.get(
       status: r.status,
       total_minor: toInt(r.total_minor),
       currency: r.currency ?? "USD",
+      unconverted: r.unconverted === true,
       document_id: r.document_id,
     }));
     const next_cursor =

@@ -29,6 +29,7 @@ import {
   UploadBrandAssetForm,
 } from "../schemas/v1/brand.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
+import { unconvertedLegSql } from "../fx/unconverted.js";
 import {
   HttpProblem,
   NotFoundProblem,
@@ -605,28 +606,49 @@ brandsRouter.get(
       // see the same rule and its cost in `merchants.ts` / `reports.ts`
       // (#221). `total_minor` on the recent-transaction rows below is
       // likewise signed: negative means refund.
+      //
+      // Every sum here is over `amount_base_minor` and is labelled with
+      // the workspace base currency. The native column is in each
+      // receipt's own currency and unit, so summing it adds yuan to
+      // dollars to loyalty points; see the same note in `merchants.ts`.
+      //
+      // `unconverted` counts the transactions whose expense legs include
+      // a foreign posting the FX pass never converted: those are in the
+      // sums at their native amount (`src/fx/unconverted.ts`), and the
+      // rollup says so instead of presenting them as base currency.
       const perMerchantStats = new Map<
         string,
-        { txnCount: number; lifetime: number; currentMonth: number; lastDate: string | null }
+        {
+          txnCount: number;
+          lifetime: number;
+          currentMonth: number;
+          lastDate: string | null;
+          unconverted: number;
+        }
       >();
       let brandTxnCount = 0;
       let brandLifetime = 0;
       let brandCurrentMonth = 0;
       let brandLastDate: string | null = null;
+      let brandUnconverted = 0;
 
       if (merchantRows.length > 0) {
         const statsResult = await db.execute(sql`
           SELECT
             t.merchant_id::text AS merchant_id,
             COUNT(DISTINCT t.id)::bigint AS txn_count,
-            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime,
+            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_base_minor ELSE 0 END), 0)::bigint AS lifetime,
             COALESCE(SUM(CASE
               WHEN a.type = 'expense'
                AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
                AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-              THEN p.amount_minor ELSE 0
+              THEN p.amount_base_minor ELSE 0
             END), 0)::bigint AS current_month,
-            MAX(t.occurred_on)::text AS last_date
+            MAX(t.occurred_on)::text AS last_date,
+            COUNT(DISTINCT t.id) FILTER (
+              WHERE a.type = 'expense'
+                AND ${unconvertedLegSql("p", sql`${currency}`)}
+            )::bigint AS unconverted_txn_count
           FROM transactions t
           JOIN postings p ON p.transaction_id = t.id
           JOIN accounts a ON a.id = p.account_id
@@ -645,8 +667,10 @@ brandsRouter.get(
             lifetime: toInt(r.lifetime),
             currentMonth: toInt(r.current_month),
             lastDate: r.last_date,
+            unconverted: toInt(r.unconverted_txn_count),
           };
           perMerchantStats.set(r.merchant_id, s);
+          brandUnconverted += s.unconverted;
           brandTxnCount += s.txnCount;
           brandLifetime += s.lifetime;
           brandCurrentMonth += s.currentMonth;
@@ -669,14 +693,18 @@ brandsRouter.get(
             m.canonical_name AS merchant_canonical_name,
             m.custom_name AS merchant_custom_name,
             (
-              SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
+              SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint
               FROM postings p
               JOIN accounts a ON a.id = p.account_id
               WHERE p.transaction_id = t.id AND a.type = 'expense'
             ) AS total_minor,
-            (
-              SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
-            ) AS row_currency,
+            EXISTS (
+              SELECT 1
+              FROM postings p
+              JOIN accounts a ON a.id = p.account_id
+              WHERE p.transaction_id = t.id AND a.type = 'expense'
+                AND ${unconvertedLegSql("p", sql`${currency}`)}
+            ) AS unconverted,
             (
               SELECT dl.document_id
               FROM document_links dl
@@ -698,7 +726,8 @@ brandsRouter.get(
           payee: r.payee,
           status: r.status,
           total_minor: toInt(r.total_minor),
-          currency: r.row_currency ?? currency,
+          currency,
+          unconverted: r.unconverted === true,
           document_id: r.document_id,
           merchant_id: r.merchant_id,
           merchant_canonical_name: r.merchant_canonical_name,
@@ -747,6 +776,7 @@ brandsRouter.get(
             current_month_spend_minor: s?.currentMonth ?? 0,
             last_transaction_date: s?.lastDate ?? null,
             currency,
+            unconverted_transaction_count: s?.unconverted ?? 0,
           },
         };
       });
@@ -765,6 +795,7 @@ brandsRouter.get(
           current_month_spend_minor: brandCurrentMonth,
           last_transaction_date: brandLastDate,
           currency,
+          unconverted_transaction_count: brandUnconverted,
         },
         locations,
         recent_transactions: recentTxns,

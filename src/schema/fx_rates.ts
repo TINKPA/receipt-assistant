@@ -25,9 +25,13 @@ import { sql } from "drizzle-orm";
  * lookups a single point-read — the alternative ("newest rate <= date")
  * silently returns a stale cached row when a fresher upstream one exists.
  *
- * `rate` is base → quote, matching `postings.fx_rate` (posting currency →
- * workspace base currency). numeric(20,10) mirrors that column exactly so
- * a rate round-trips through both without precision loss.
+ * `rate` is base → quote in the direction `postings.fx_rate` runs
+ * (posting currency → workspace base currency), quoted the way the source
+ * quotes it: one whole unit to whole units. `postings.fx_rate` is the
+ * same rate moved onto minor units, so the two are equal only when both
+ * currencies have the same number of decimals; `postingFxRate` in
+ * `src/ledger/money.ts` is the bridge. numeric(20,10) mirrors that
+ * column's scale.
  *
  * The table is workspace-agnostic: an FX rate is a property of the world,
  * not of a tenant. It is also append-mostly — a published historical rate

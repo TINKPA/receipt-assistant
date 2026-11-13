@@ -4,6 +4,7 @@
 import { z } from "zod";
 import {
   AmountMinor,
+  CurrencyCode,
   LedgerCurrencyCode,
   IsoDate,
   IsoDateTime,
@@ -84,7 +85,12 @@ export const AccountBalance = z
     account_id: Uuid,
     as_of: IsoDate,
     balance_minor: AmountMinor,
-    currency: LedgerCurrencyCode,
+    currency: CurrencyCode.openapi({
+      description:
+        "The workspace base currency. `balance_minor` is a sum of base " +
+        "amounts, whatever currency the account itself is denominated in " +
+        "(a CNY or points account still reports its balance in this one).",
+    }),
     posting_count: z.number().int(),
     includes_children: z.boolean(),
   })
@@ -134,9 +140,10 @@ export const ListAccountsQuery = z.object({
   include_closed: z.coerce.boolean().optional(),
 });
 
+// No `currency` parameter: the balance is a base-currency sum and is
+// labelled as one. See `getBalanceService`.
 export const BalanceQuery = z.object({
   as_of: IsoDate.optional(),
-  currency: LedgerCurrencyCode.optional(),
   include_children: z.coerce.boolean().optional(),
 });
 

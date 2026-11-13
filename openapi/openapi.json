@@ -429,7 +429,8 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
+            "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. `balance_minor` is a sum of base amounts, whatever currency the account itself is denominated in (a CNY or points account still reports its balance in this one).",
             "example": "USD"
           },
           "posting_count": {
@@ -634,7 +635,9 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": [
@@ -2963,10 +2966,12 @@
             "minimum": 0
           },
           "lifetime_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "current_month_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "last_transaction_date": {
             "type": [
@@ -2975,7 +2980,13 @@
             ]
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -2984,7 +2995,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "Merchant": {
@@ -3109,10 +3121,12 @@
             "minimum": 0
           },
           "lifetime_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "current_month_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "last_transaction_date": {
             "type": [
@@ -3121,7 +3135,13 @@
             ]
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -3129,7 +3149,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "BrandRollupLocation": {
@@ -3174,10 +3195,16 @@
             ]
           },
           "total_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Signed expense total (negative for a refund). In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
           },
           "document_id": {
             "type": [
@@ -3209,6 +3236,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id",
           "merchant_id",
           "merchant_canonical_name",
@@ -4412,6 +4440,58 @@
           "programmes"
         ]
       },
+      "FxUnconvertedCurrency": {
+        "type": "object",
+        "properties": {
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$",
+            "example": "TWD"
+          },
+          "amount_minor": {
+            "type": "integer",
+            "description": "The unconverted legs, summed in that currency's own minor units (yen, fen, fils).",
+            "example": 14723
+          },
+          "counted_base_minor": {
+            "type": "integer",
+            "description": "What the report's totals contain for those legs today: their native amount read as base-currency minor units. The totals are wrong by the difference between this and the real converted value.",
+            "example": 14723
+          },
+          "transaction_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "currency",
+          "amount_minor",
+          "counted_base_minor",
+          "transaction_count"
+        ]
+      },
+      "FxDisclosure": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string"
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "description": "Transactions in the report's scope with at least one foreign-currency posting that was never converted. 0 means every amount in the report is a true base-currency amount."
+          },
+          "unconverted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FxUnconvertedCurrency"
+            }
+          }
+        },
+        "required": [
+          "policy",
+          "unconverted_transaction_count",
+          "unconverted"
+        ]
+      },
       "SummaryReport": {
         "type": "object",
         "properties": {
@@ -4444,6 +4524,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "items": {
@@ -4459,6 +4540,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4468,7 +4552,8 @@
           "currency",
           "items",
           "grand_total_minor",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "TrendsItem": {
@@ -4554,6 +4639,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "buckets": {
@@ -4564,6 +4650,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4573,7 +4662,8 @@
           "group_by",
           "currency",
           "buckets",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "NetWorthAccount": {
@@ -4622,6 +4712,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "assets_minor": {
@@ -4652,6 +4743,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4662,7 +4756,8 @@
           "equity_minor",
           "net_worth_minor",
           "by_account",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "CashflowBucket": {
@@ -4718,6 +4813,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "income_minor": {
@@ -4743,6 +4839,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4753,7 +4852,8 @@
           "expense_minor",
           "net_minor",
           "buckets",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "MerchantDetail": {
@@ -4798,10 +4898,16 @@
             ]
           },
           "total_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Signed expense total (negative for a refund). In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
           },
           "document_id": {
             "type": [
@@ -4819,6 +4925,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id"
         ]
       },
@@ -4875,11 +4982,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Required, together with `amount_base_minor`, on a foreign-currency cash posting: the pair is stored as sent and is not checked against a published rate, so send the minor-unit multiplier, not the quoted rate. Omit both on a points posting to have the server apply the programme valuation.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -5128,11 +5237,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Stored as sent and not checked against a published rate, so send the minor-unit multiplier, not the quoted rate.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -5732,7 +5843,7 @@
     "/v1/accounts/{id}/balance": {
       "get": {
         "summary": "Account balance as of a date",
-        "description": "Sum of `amount_base_minor` over the account's live postings, so `balance_minor` is always in the workspace base currency and `currency` says which that is. There is no conversion on this path: `?currency=` is accepted only when it equals the base currency.",
+        "description": "The balance is the sum of the account's postings in the workspace base currency, named by `currency` in the response. There is no parameter to ask for another currency.",
         "tags": [
           "accounts"
         ],
@@ -5756,16 +5867,6 @@
             },
             "required": false,
             "name": "as_of",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
             "in": "query"
           },
           {
@@ -10173,6 +10274,7 @@
     "/v1/reports/summary": {
       "get": {
         "summary": "Spend aggregated by category / account / payee",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10211,16 +10313,6 @@
             "required": false,
             "name": "group_by",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -10250,6 +10342,7 @@
     "/v1/reports/trends": {
       "get": {
         "summary": "Time-series trend (MoM / YoY) of expense spend",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10299,16 +10392,6 @@
             "required": false,
             "name": "group_by",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -10338,6 +10421,7 @@
     "/v1/reports/net_worth": {
       "get": {
         "summary": "Assets - liabilities at a point in time",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10351,16 +10435,6 @@
             },
             "required": false,
             "name": "as_of",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
             "in": "query"
           }
         ],
@@ -10391,6 +10465,7 @@
     "/v1/reports/cashflow": {
       "get": {
         "summary": "Inflows vs outflows over a range, bucketed by month",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10415,16 +10490,6 @@
             },
             "required": false,
             "name": "to",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
             "in": "query"
           }
         ],

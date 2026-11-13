@@ -38,6 +38,7 @@ import {
   type JsonObject,
 } from "../projection/metadata-patch.js";
 import { resolvePointsValuation } from "../points/valuation.js";
+import { toBaseMinor } from "../ledger/money.js";
 
 import { newId } from "../http/uuid.js";
 import {
@@ -793,7 +794,7 @@ function resolvePostingMoney(
     const rate = pointsRate ?? 0;
     return {
       fxRate: String(rate),
-      amountBaseMinor: BigInt(Math.round(amountMinor * rate)),
+      amountBaseMinor: toBaseMinor(amountMinor, rate),
     };
   }
 
