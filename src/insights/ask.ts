@@ -47,19 +47,44 @@ import { runLedgerQuery, MAX_ROWS, type LedgerQueryResult } from "./ledger-query
 /** A column, or a column with the annotation the digest prints after it. */
 type DigestColumn = string | readonly [name: string, annotation: string];
 
-interface DigestTable {
+export interface DigestTable {
+  /** A table in `src/schema`; with `viewOf`, a view from a migration. */
   table: string;
+  /**
+   * Set when `table` is a view: the table whose columns it carries. The
+   * digest prints it as having that table's columns, so `columns` stays
+   * empty.
+   */
+  viewOf?: string;
   columns: readonly DigestColumn[];
   /** Printed after the column list. */
   note?: string;
 }
 
 /**
- * The schema the agent is told about. Data, not prose, so
- * `scripts/check-agent-grants.ts` can check every name against
- * `src/schema` at build time: the hand-written version listed
- * `transaction_items.description` and `places.locality`, neither of which
- * exists, and each wrong guess cost the agent a failed query and a turn.
+ * The schema the Ask model is told about. Since the model lost its tools
+ * this is ALL it knows of the database: it cannot look a table up, so a
+ * table that is missing here does not exist for it. A question about who
+ * sold an order was answered "no seller is recorded" while the seller sat
+ * in `transaction_parties`, which this list did not have.
+ *
+ * So it covers every table a question about the ledger can reasonably
+ * need, and says in a few words what a name does not say for itself. It
+ * is also sent on every model call (up to `MAX_ROUNDS` per question): add
+ * the column a question needs, not every column a table has.
+ *
+ * Left out on purpose: `products.purchase_count`, `total_spent_minor` and
+ * the two `*_purchased_on` dates. They are cached aggregates over line
+ * items that add native amounts across currencies ("Not done" in
+ * CLAUDE.md's Money section) and still count the lines of deleted
+ * receipts; the model is told to aggregate `transaction_items` instead.
+ *
+ * Data, not prose, so two checks can read it. `scripts/check-agent-grants.ts`
+ * (in `npm run build`) checks every name against `src/schema` and the
+ * migrations: the hand-written version listed `transaction_items.description`
+ * and `places.locality`, neither of which exists, and each wrong guess
+ * cost the model a failed query and a turn. `check-agent-sandbox` then
+ * selects every column from a real database as `receipts_ro`.
  */
 export const ASK_SCHEMA_DIGEST: readonly DigestTable[] = [
   {
@@ -68,34 +93,64 @@ export const ASK_SCHEMA_DIGEST: readonly DigestTable[] = [
       "id",
       "workspace_id",
       ["occurred_on", " DATE"],
+      ["occurred_at", " TIMESTAMPTZ NULL"],
       "payee",
       "narration",
       ["status", "[draft|posted|reconciled|error]"],
       ["deleted_at", " TIMESTAMPTZ NULL"],
       "merchant_id",
       "place_id",
-      "metadata",
+      ["metadata", " JSONB"],
+      "created_at",
     ],
+    note: "every receipt, INCLUDING drafts and deleted ones. occurred_on = receipt date, created_at = when it was recorded. metadata = extras printed on the receipt; keys vary (order_number, payment_method, card_last4, …)",
+  },
+  {
+    table: "ledger_live_transactions",
+    viewOf: "transactions",
+    columns: [],
+    note: "VIEW: the transactions that count (posted or reconciled, not deleted). Read it instead of transactions unless the question is about deleted or draft rows",
   },
   {
     table: "postings",
-    columns: ["id", "transaction_id", "account_id", "amount_minor", "amount_base_minor", "currency"],
-    note: "double-entry; expense side is POSITIVE amount_base_minor",
+    columns: [
+      "id",
+      "workspace_id",
+      "transaction_id",
+      "account_id",
+      "amount_minor",
+      "currency",
+      "fx_rate",
+      "amount_base_minor",
+      "memo",
+    ],
+    note: "double-entry legs; per transaction they sum to zero in amount_base_minor, expense side POSITIVE. Which amount to use: see MONEY",
   },
   {
     table: "accounts",
-    columns: ["id", "name", ["type", "[asset|liability|equity|income|expense]"]],
-    note: "expense account name IS the spending category (e.g. 'Food & Drinks','Services','Travel','Transportation','Entertainment','Shopping','Groceries')",
+    columns: [
+      "id",
+      "workspace_id",
+      "parent_id",
+      "name",
+      ["type", "[asset|liability|equity|income|expense]"],
+      ["subtype", "[NULL|cash|checking|savings|credit_card|points|…]"],
+      "currency",
+    ],
+    note: "an expense account's name IS the spending category ('Food & Drinks','Transportation','Shopping','Travel','Entertainment','Health','Services'); asset and liability accounts are what paid (cash, bank, card); subtype 'points' = a loyalty programme's balance, currency = its code",
   },
   {
     table: "transaction_items",
     columns: [
       "id",
+      "workspace_id",
       "transaction_id",
       "product_id",
       "raw_name",
       "normalized_name",
+      "product_variant",
       ["line_type", "['product' for goods; tax, tip, discount and fees are rows of their own]"],
+      ["item_class", "[durable|consumable|food_drink|service|other]"],
       "quantity",
       "unit_price_minor",
       "line_total_minor",
@@ -103,65 +158,157 @@ export const ASK_SCHEMA_DIGEST: readonly DigestTable[] = [
       "currency",
       ["retired_at", " TIMESTAMPTZ NULL"],
     ],
-    note: "a re-extract retires the previous lines instead of deleting them: ALWAYS filter retired_at IS NULL",
+    note: "receipt lines, in the receipt's own currency. A re-extract retires the previous lines instead of deleting them: ALWAYS filter retired_at IS NULL. A deleted receipt keeps its lines, so join to ledger_live_transactions",
   },
   {
-    table: "products",
+    table: "transaction_parties",
     columns: [
       "id",
-      "canonical_name",
-      "custom_name",
-      ["item_class", "[durable|consumable|food_drink|service|other]"],
-      "purchase_count",
-      "total_spent_minor",
+      "workspace_id",
+      "transaction_id",
+      ["transaction_item_id", "[NULL = the whole receipt, else that one line]"],
+      ["role", "[channel|seller|maker|acquirer]"],
+      "display_name",
+      "brand_id",
     ],
+    note: 'who was involved, as printed. channel = the platform or store that charged; seller = who actually sold it when that is someone else ("Sold by …", the restaurant behind a delivery order); maker = the product\'s brand; acquirer = the payment processor. Sellers and makers are HERE, not in metadata',
   },
-  { table: "merchants", columns: ["id", "canonical_name", "brand_id"] },
-  { table: "brands", columns: [["brand_id", " TEXT PK"], "name"] },
+  {
+    table: "merchants",
+    columns: ["id", "workspace_id", "canonical_name", "custom_name", "brand_id", "address"],
+    note: "the business behind transactions.merchant_id; custom_name, when set, is the user's own name for it",
+  },
+  {
+    table: "brands",
+    columns: [["brand_id", " TEXT PK"], "name", "parent_id", "domain"],
+    note: "registry behind every brand_id column; parent_id links a sub-brand to its parent",
+  },
   {
     table: "places",
     columns: [
       "id",
       "display_name_en",
+      "display_name_zh",
       "custom_name",
       "formatted_address",
       "postal_code",
       "country_code",
+      "lat",
+      "lng",
+      "primary_type",
     ],
+    note: "the location behind transactions.place_id (NULL when the receipt had no address); custom_name as on merchants",
+  },
+  {
+    table: "products",
+    columns: [
+      "id",
+      "workspace_id",
+      "canonical_name",
+      "custom_name",
+      "item_class",
+      "brand_id",
+      "merchant_id",
+    ],
+    note: "catalog entry behind transaction_items.product_id (NULL on tax, tip and unbranded lines). Count purchases and spend from transaction_items",
   },
   {
     table: "owned_items",
     columns: [
       "id",
+      "workspace_id",
       "product_id",
       "transaction_item_id",
+      "serial_number",
+      "location",
       "acquired_on",
+      "warranty_until",
       "condition",
-      "retired_at",
+      ["retired_at", " TIMESTAMPTZ NULL"],
       "target_days",
+      "notes",
     ],
+    note: "things the user owns, one row per unit. HERE retired_at = sold, broken or given away (NULL = still owned). Its cost is the transaction_items row it points at (NULL for a gift); target_days = how long the user plans to keep it",
   },
   {
     table: "wish_items",
-    columns: ["id", "title", "target_price_minor", "planned_days", "urgency", "status"],
+    columns: [
+      "id",
+      "workspace_id",
+      "product_id",
+      "title",
+      "target_price_minor",
+      "currency",
+      "planned_days",
+      ["urgency", "[now|soon|someday]"],
+      "snoozed_until",
+      ["status", "[active|converted|declined]"],
+      "converted_transaction_id",
+    ],
+    note: "things the user may buy; converted = bought (converted_transaction_id)",
   },
-  { table: "documents", columns: ["id", "kind", "ocr_text"] },
+  {
+    table: "documents",
+    columns: [
+      "id",
+      "workspace_id",
+      ["kind", "[receipt_image|receipt_email|receipt_pdf|statement_pdf|other]"],
+      "ocr_text",
+      ["source_meta", " JSONB"],
+      ["deleted_at", " TIMESTAMPTZ NULL"],
+      "created_at",
+    ],
+    note: "the uploaded file behind a transaction: ocr_text is its full text, source_meta an email's sender, subject and received_at. Filter deleted_at IS NULL",
+  },
   { table: "document_links", columns: ["document_id", "transaction_id"] },
+  {
+    table: "workspaces",
+    columns: ["id", "base_currency"],
+    note: "base_currency = the currency of every amount_base_minor",
+  },
+  {
+    table: "fx_rates",
+    columns: [["as_of", " DATE"], "base", "quote", "rate"],
+    note: "published exchange rates by receipt date: 1 whole unit of base = rate whole units of quote",
+  },
+  {
+    table: "points_programmes",
+    columns: ["code", "name", "issuer_brand_id"],
+    note: "loyalty programmes; code (like HYATT_PT) is the currency of a points leg",
+  },
+  {
+    table: "points_valuations",
+    columns: [
+      "workspace_id",
+      "currency",
+      "quote",
+      ["effective_from", " DATE"],
+      "minor_per_point",
+      "confirmed_at",
+    ],
+    note: "from effective_from on, one point of currency is worth minor_per_point minor units of quote (1.7 = 1.7 cents); confirmed_at NULL = provisional, not yet confirmed by the user",
+  },
 ];
 
 function renderDigest(): string {
   return ASK_SCHEMA_DIGEST.map((t) => {
-    const cols = t.columns
-      .map((c) => (typeof c === "string" ? c : `${c[0]}${c[1]}`))
-      .join(", ");
+    const cols = t.viewOf
+      ? `same columns as ${t.viewOf}`
+      : t.columns.map((c) => (typeof c === "string" ? c : `${c[0]}${c[1]}`)).join(", ");
     return `- ${t.table}(${cols})${t.note ? ` — ${t.note}` : ""}`;
   }).join("\n");
 }
 
 const SCHEMA_DIGEST = `
-LEDGER SCHEMA (PostgreSQL; amounts in MINOR units — divide by 100 for dollars):
+LEDGER SCHEMA (PostgreSQL):
 ${renderDigest()}
-CONVENTIONS: spending total for a period = SUM(p.amount_base_minor) joined to expense accounts (a.type = 'expense') with t.status IN ('posted','reconciled') AND t.deleted_at IS NULL. Do NOT add an amount_base_minor > 0 filter: a refund is booked as a negative expense leg against the category it reverses, and excluding it overstates spend. Income sits on a.type = 'income' with a NEGATIVE amount, so report income as -SUM(p.amount_base_minor). Dates are local; occurred_on is the receipt date.`;
+MONEY: a *_minor column is an integer in the minor unit of ITS OWN currency: hundredths for USD, CNY, EUR and most others (divide by 100), whole units for JPY, KRW, VND (do not divide), thousandths for KWD, BHD, whole points for a points code (it ends in _PT).
+- postings.amount_base_minor is the leg in the workspace base currency: US dollar cents, unless workspaces.base_currency says otherwise. Every total is a SUM of it, labelled with the base currency, NEVER with postings.currency.
+- postings.amount_minor with postings.currency is the same leg as the receipt stated it (yuan, yen, points). Add it up only within one currency. To show a foreign or points amount, give amount_minor under its own currency and amount_base_minor as its value, each under its own label.
+- postings.fx_rate multiplies amount_minor into amount_base_minor, minor unit to minor unit (NULL on a base-currency leg). It is not the published rate when the decimals differ (a yen leg carries 0.65 where fx_rates.rate is 0.0065); on a points leg it is points_valuations.minor_per_point.
+- A foreign cash leg with fx_rate IS NULL was never converted, and its amount_base_minor still holds the native number: say so if a total contains one.
+- transaction_items and wish_items amounts are in the row's own currency, never converted.
+CONVENTIONS: spending for a period = SUM(p.amount_base_minor) FROM ledger_live_transactions t JOIN postings p ON p.transaction_id = t.id JOIN accounts a ON a.id = p.account_id WHERE a.type = 'expense'. One transaction's total is that sum over its own expense legs, and its category is the name of that expense account. Do NOT add an amount_base_minor > 0 filter: a refund is booked as a negative expense leg against the category it reverses, and excluding it overstates spend. Income sits on a.type = 'income' with a NEGATIVE amount, so report income as -SUM(p.amount_base_minor). Dates are local; occurred_on is the receipt date.`;
 
 /** Model calls per question, the last of which must be the answer. */
 export const MAX_ROUNDS = 5;

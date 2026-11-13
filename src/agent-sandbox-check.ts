@@ -24,6 +24,8 @@
  *              · the Ask query runner: answers a SELECT, and refuses a
  *                write, a second statement, a change to its own role, a
  *                query that outlives its timeout, and the owner connection
+ *              · every table, view and column the Ask prompt's schema
+ *                digest names, selected as `receipts_ro`
  *              · the Ask loop with a scripted model: SQL in, rows back,
  *                answer out
  *   agent      · one tiny run per profile with the production flags; the
@@ -60,7 +62,14 @@ import {
   roleDatabaseUrl,
   verifyAgentLogins,
 } from "./db/agent-roles.js";
-import { MAX_ROUNDS, askLedger, buildAskPrompt, parseAskReply } from "./insights/ask.js";
+import {
+  ASK_SCHEMA_DIGEST,
+  MAX_ROUNDS,
+  askLedger,
+  buildAskPrompt,
+  parseAskReply,
+  type DigestTable,
+} from "./insights/ask.js";
 import { MAX_ROWS, MAX_ROW_CHARS, runLedgerQuery } from "./insights/ledger-query.js";
 import {
   brandFkGuard,
@@ -881,6 +890,46 @@ async function checkLedgerQuery(admin: pg.Client): Promise<void> {
   );
 }
 
+/**
+ * The schema digest in the Ask prompt is all the model knows of the
+ * database, so every name in it has to resolve for the role its queries
+ * run as. The build checks the names against `src/schema`
+ * (`scripts/check-agent-grants.ts`). Only a database can say the rest:
+ * that a view carries the columns the digest promises (a view's
+ * `SELECT *` is frozen when the view is created, so a column added to
+ * the table later is not in it), and that `receipts_ro` may read each.
+ */
+async function checkAskDigest(): Promise<void> {
+  console.log("\nThe Ask prompt's schema digest, against this database");
+  const namesOf = (t: DigestTable) => t.columns.map((c) => (typeof c === "string" ? c : c[0]));
+  let columns = 0;
+  let failed = 0;
+  for (const entry of ASK_SCHEMA_DIGEST) {
+    // A view is printed as "same columns as <table>": select exactly those.
+    const source = entry.viewOf ? ASK_SCHEMA_DIGEST.find((t) => t.table === entry.viewOf) : entry;
+    const names = source ? namesOf(source) : [];
+    const r =
+      names.length === 0
+        ? { ok: false, text: "the digest names no columns for it" }
+        : await runLedgerQuery(
+            `SELECT ${names.map((n) => `"${n}"`).join(", ")} FROM "${entry.table}" LIMIT 0`,
+          );
+    columns += names.length;
+    if (!r.ok) {
+      failed++;
+      record("fail", "db", `the digest's ${entry.table} cannot be selected as ${RO_ROLE}`, firstLine(r.text));
+    }
+  }
+  if (failed === 0) {
+    record(
+      "pass",
+      "db",
+      `every relation and column the digest names can be selected as ${RO_ROLE}`,
+      `${ASK_SCHEMA_DIGEST.length} relations, ${columns} columns`,
+    );
+  }
+}
+
 async function checkAskLoop(admin: pg.Client): Promise<void> {
   console.log("\nThe Ask loop, with a scripted model (no model call)");
   const expect = (ok: boolean, name: string, detail?: string) =>
@@ -1213,6 +1262,7 @@ export async function runAgentSandboxCheck(argv: string[]): Promise<number> {
     await checkRefusals();
     await checkTemplateReplay(admin);
     await checkLedgerQuery(admin);
+    await checkAskDigest();
     await checkAskLoop(admin);
 
     if (dbOnly) {

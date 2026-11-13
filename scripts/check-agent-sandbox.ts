@@ -28,6 +28,8 @@
  *     another role, even after switching its session to read-write;
  *   · the Ask query runner lets through a write, a second statement, a
  *     change to its own role, or a query that outlives its timeout;
+ *   · the Ask prompt's schema digest names a table, view or column that
+ *     `receipts_ro` cannot select in this database;
  *   · the extraction agent's own `$DATABASE_URL` does not log in as
  *     `receipts_agent`, or the Ask agent manages to run any command;
  *   · any of the above could not be checked (INCONCLUSIVE): a green run
