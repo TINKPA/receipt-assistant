@@ -51,7 +51,12 @@ import {
   agentHygiene,
   renderActiveLessons,
 } from "./prompt-contract.js";
-import { phase0DocumentRead } from "./document-read-prompt.js";
+import {
+  phase0DocumentRead,
+  reExtractScratchDir,
+  renderDecodedSource,
+  type DecodedAttachment,
+} from "./document-read-prompt.js";
 import {
   ITEM_SCHEMA,
   LINE_TYPE_VOCAB_AND_NAMES,
@@ -84,43 +89,12 @@ export interface ReExtractPromptContext {
   /** Pre-decoded plain text of the source (#167), inlined below. Set for
    *  `.eml` and raw-HTML documents, NULL for images and PDFs. */
   ocrText?: string | null;
-}
-
-/**
- * The decoded-source block (#167).
- *
- * Inlined into the prompt rather than pre-written to `documents.ocr_text`:
- * the agent has no `SELECT ocr_text` instruction, and its own psql block
- * overwrites that column at the end of the run anyway, so pre-populating
- * it would be a write the agent never reads and then destroys.
- */
-function renderDecodedSource(ocrText: string | null | undefined): string {
-  if (!ocrText || ocrText.trim().length === 0) return "";
-  return `
-── Decoded source text (already extracted for you) ────────────────────
-
-This document is an email / HTML file, so its body has ALREADY been
-MIME-decoded and linearized for you. Read it here; you do NOT need to
-decode the file yourself. Item tables are linearized one row per line,
-so a name and its price sit on the SAME line.
-
-Treat this as the receipt text. Open the original file only if this
-text is obviously truncated or contradicts itself — and if you do,
-follow the document-reading rules above.
-
-The \`Date (envelope)\` header, when present, is when the EMAIL was sent.
-It is NOT automatically \`occurred_on\`: use the transaction date printed
-in the body, and fall back to the envelope date only when the body
-prints none.
-
-<<<DECODED_SOURCE
-${ocrText.trim()}
-DECODED_SOURCE
-`;
+  /** PDF attachments of an `.eml`, already written to the scratch dir. */
+  attachments?: DecodedAttachment[];
 }
 
 export function buildReExtractPrompt(ctx: ReExtractPromptContext): string {
-  const scratchDir = `/tmp/reextract-${ctx.transactionId}`;
+  const scratchDir = reExtractScratchDir(ctx.transactionId);
   const merchantIdExpr = `(SELECT merchant_id FROM transactions WHERE id = '${ctx.transactionId}')`;
   return `You are re-running extraction on a previously-ingested receipt.
 The transaction row already exists; your job is to refresh the
@@ -146,7 +120,7 @@ ${PSQL_DISCIPLINE}
 ${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "re-extract" })}
 ${renderActiveLessons()}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
-${renderDecodedSource(ctx.ocrText)}
+${renderDecodedSource(ctx.ocrText, ctx.attachments)}
 ── Phase 1 — Extract ──────────────────────────────────────────────────
 
 Read the file at the path above (same image / pdf / .eml the original

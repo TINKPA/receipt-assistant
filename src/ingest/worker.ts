@@ -34,7 +34,12 @@ import {
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
-import { resolveUploadPath } from "../routes/documents.service.js";
+import {
+  decodeSourceForAgent,
+  resolveUploadPath,
+  type DocumentKindValue,
+} from "../routes/documents.service.js";
+import { ingestScratchDir } from "./document-read-prompt.js";
 import { phashDistance } from "../images/phash.js";
 import { isStubFile, stubFileExtractor } from "./stub-extractor.js";
 
@@ -289,7 +294,7 @@ async function runOne(item: QueueItem): Promise<void> {
   const userId = ownerId;
 
   const docRows = await db
-    .select({ id: documentsTable.id })
+    .select({ id: documentsTable.id, kind: documentsTable.kind })
     .from(documentsTable)
     .where(
       and(
@@ -325,13 +330,30 @@ async function runOne(item: QueueItem): Promise<void> {
   // hash. Full scan is fine at corpus scale (~hundreds of rows).
   const phashNeighbors = await findPhashNeighbors(workspaceId, documentId);
 
-  const extractor = await pickExtractor(resolveUploadPath(filePath));
+  // Queue items carry the stored (uploads-relative, #128) path; the
+  // agent needs a container-absolute path it can open.
+  const absPath = resolveUploadPath(filePath);
+
+  // #261: decode an email / HTML upload before the agent starts, as
+  // re-extract always has. Never throws; images and PDFs come back empty.
+  const source = await decodeSourceForAgent(
+    {
+      id: documentId,
+      kind: (docRows[0]?.kind ?? null) as DocumentKindValue | null,
+      mimeType,
+    },
+    absPath,
+    ingestScratchDir(ingestId),
+    "ingest",
+  );
+
+  const extractor = await pickExtractor(absPath);
   let result: ExtractorResult;
   try {
     result = await extractor({
-      // Queue items carry the stored (uploads-relative, #128) path; the
-      // agent needs a container-absolute path it can open.
-      filePath: resolveUploadPath(filePath),
+      filePath: absPath,
+      sourceText: source.text,
+      attachments: source.attachments,
       mimeType,
       filename: item.filename,
       ingestId,

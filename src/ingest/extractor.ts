@@ -10,6 +10,7 @@ import { randomUUID } from "crypto";
 import { runClaude } from "../claude.js";
 import { getSessionJsonlPath } from "../session-transcript.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
+import type { DecodedAttachment } from "./document-read-prompt.js";
 import {
   buildReExtractPrompt,
   type ReExtractPromptContext,
@@ -47,6 +48,11 @@ export interface ExtractorInput {
     transactionId: string;
     distance: number;
   }[];
+  /** Server-decoded text of an `.eml` / HTML upload (#261); NULL for
+   *  images and PDFs. */
+  sourceText?: string | null;
+  /** PDF attachments of an `.eml`, already written to the scratch dir. */
+  attachments?: DecodedAttachment[];
 }
 
 export interface ExtractorResult {
@@ -100,6 +106,8 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     documentId: input.documentId,
     userId: input.userId,
     phashNeighbors: input.phashNeighbors,
+    sourceText: input.sourceText,
+    attachments: input.attachments,
   };
   const prompt = buildExtractorPrompt(ctx);
   // Log the live-transcript path BEFORE spawn so an operator can
@@ -130,6 +138,8 @@ export interface ReExtractorInput {
    *  the itemization usually only in the `text/html` part) and raw HTML
    *  files (#167). NULL for images and PDFs, which the agent reads. */
   ocrText?: string | null;
+  /** PDF attachments of an `.eml`, already written to the scratch dir. */
+  attachments?: DecodedAttachment[];
 }
 
 export interface ReExtractorResult {
@@ -154,6 +164,7 @@ export const defaultClaudeReExtractor: ReExtractor = async (input) => {
     transactionId: input.transactionId,
     userId: input.userId,
     ocrText: input.ocrText ?? null,
+    attachments: input.attachments,
   };
   const prompt = buildReExtractPrompt(ctx);
   console.log(
