@@ -17,8 +17,9 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull, inArray } from "drizzle-orm";
 import { createReadStream } from "fs";
-import { mkdir, stat, writeFile } from "fs/promises";
-import { join, isAbsolute, dirname } from "path";
+import { mkdir, writeFile } from "fs/promises";
+import { join, dirname } from "path";
+import { resolveStoredFile, setStoredImageHeaders } from "../http/files.js";
 import { createHash } from "crypto";
 import multer from "multer";
 import { db } from "../db/client.js";
@@ -217,7 +218,10 @@ productsRouter.get(
     try {
       const query = parseOrThrow(ListProductsQuery, req.query);
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
-      const cursor = decodeCursor<ProductsCursor>(query.cursor ?? undefined);
+      const cursor = decodeCursor<ProductsCursor>(query.cursor ?? undefined, [
+        "updated_at",
+        "id",
+      ]);
 
       const conditions: ReturnType<typeof sql>[] = [];
       conditions.push(sql`p.workspace_id = ${req.ctx.workspaceId}::uuid`);
@@ -530,16 +534,11 @@ productsRouter.get(
           `preferred_asset_id=${preferredId} is retired for product=${id}`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(PRODUCT_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(PRODUCT_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Product image",
-          `File missing on disk: ${absPath}`,
+          `preferred_asset_id=${preferredId} has no file on disk for product=${id}`,
         );
       }
       // Strong ETag is the asset's content_hash. The URL stays stable
@@ -554,7 +553,7 @@ productsRouter.get(
         res.status(304).end();
         return;
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       createReadStream(absPath).pipe(res);
     } catch (err) {
       next(err);
@@ -784,19 +783,14 @@ productsRouter.get(
           `asset_id=${assetId} is retired`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(PRODUCT_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(PRODUCT_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Product asset",
-          `File missing on disk: ${absPath}`,
+          `asset_id=${assetId} has no file on disk`,
         );
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       res.setHeader("Cache-Control", "public, max-age=86400, immutable");
       createReadStream(absPath).pipe(res);
     } catch (err) {
@@ -873,12 +867,12 @@ productsRouter.post(
       // interpolated into the `IN (...)` predicate below, so a quote in
       // the path terminated the literal (injection); it also meant a
       // merely-malformed id surfaced as a Postgres uuid cast error —
-      // a 500 — rather than a validation failure. This handler now
-      // rejects a non-uuid `:id` up front with the standard 422 problem.
-      // Most other handlers in this file still read `String(req.params
-      // .id)` unchecked and do 500 on a malformed uuid; they are safe
-      // from injection because they go through drizzle's `eq()`, not a
-      // raw fragment.
+      // a 500 — rather than a validation failure. A non-uuid `:id` is
+      // now a 400 for every route on this router before any handler
+      // runs (`UUID_PATH_PARAMS` in app.ts); this parse is kept as the
+      // local guarantee for the raw fragment below. The other handlers
+      // here read `String(req.params.id)` and go through drizzle's
+      // `eq()`, never a raw fragment.
       const { id: sourceId } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(MergeProductRequest, req.body);
       if (sourceId === body.target_id) {

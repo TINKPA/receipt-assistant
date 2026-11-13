@@ -267,6 +267,38 @@ When you change a schema or add a new endpoint:
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
 
+## HTTP error contract
+
+Every error leaves through `src/http/problem.ts::problemHandler` as `application/problem+json` carrying a `trace_id`. Clients branch on `type`.
+
+**Throw, never format.** A handler throws an `HttpProblem` (or lets a zod error escape) and stops. Do not build an error body by hand and do not put `err.message` in one: for a failed query that message is Drizzle's `Failed query: <sql> params: <values>`. `renderProblem` is the one mapping from "anything thrown" to a response:
+
+| Thrown | Response |
+|---|---|
+| `HttpProblem`, `ZodError` | as thrown (a body that fails its schema is 422 `errors/validation`) |
+| body-parser / multer / Express rejecting the request | 400 `malformed-body`, `malformed-upload`, `bad-request`; 413 `payload-too-large` |
+| Postgres `22P02` and the other "that value cannot be that type" codes | 400 `invalid-parameter` |
+| Postgres `23505` unique, `23P01` exclusion | 409 `conflict` |
+| Postgres `23503` foreign key | 422 `invalid-reference` when the request names a row that does not exist, 409 `still-referenced` when it removes one something points at |
+| Postgres `23514` check, `23502` not-null | 422 `constraint-violation` (a ledger trigger's own sentence is passed through as `detail`) |
+| anything else | 500 `internal`: a fixed sentence and the `trace_id`, nothing from the error |
+
+The SQLSTATE table is `src/http/pg-error.ts`. A mapped Postgres error logs one `[http] trace_id=… sqlstate=…` line; a 500 logs the full error, stack and cause chain under the same id, so `docker logs receipt-assistant 2>&1 | grep trace_id=<id>` is how you get from a user's error to its cause.
+
+**Malformed ids are a 400 `errors/invalid-id`, decided in one place.** `src/app.ts::UUID_PATH_PARAMS` lists, per router, the path parameters that are UUIDs; `src/http/params.ts::UUID_QUERY_PARAMS` lists the query-string ones. A request with a malformed one never reaches its handler. When you add a route with a new UUID parameter name, or a UUID filter to a `*Query` schema, add the name there. `:brandId` (a slug), `/v1/merchants/:id` (slug or UUID) and `:rank` are deliberately absent. The `parseOrThrow(IdParam, req.params)` calls still in the route files are now redundant for this check.
+
+**An unknown URL or method** is a 404 `errors/route-not-found`, distinct from `errors/not-found` (the record does not exist).
+
+**Cursors.** `decodeCursor(cursor, requiredKeys)` throws 400 `errors/invalid-cursor` for anything this API could not have issued; pass `requiredKeys`, or a cursor from another endpoint reaches the SQL with fields missing. Where a service decodes the cursor, its route calls `assertCursorShape` first.
+
+**ETags.** A resource with a `version` column uses `setEtag` / `requireIfMatch`. One without (documents) uses `sendWithRepresentationEtag`, a digest of the body. Never a constant: a tag that cannot move answers every revalidation with 304.
+
+**`Idempotency-Key`** (`src/http/idempotency.ts`, mounted on `POST /v1/transactions`). The first request claims the key in `idempotency_keys` before the handler runs, so a concurrent duplicate gets 409 `errors/idempotency-in-progress` instead of running too. A row with `response_status = 0` is such a claim, held for a 2-minute lease; a completed request rewrites it with the real response and a 24 h expiry, a failed one deletes it. Expired rows are replaced on reuse and swept hourly.
+
+**Files whose path is a database value.** `brand_assets.local_path`, `product_assets.local_path` and `place_photos.file_path` are written by the extraction agent. Serve them only through `src/http/files.ts`: `resolveStoredFile(root, stored)` returns a path only for a regular file inside `root` (symlinks followed), and `setStoredImageHeaders` sends `nosniff` plus a `sandbox` CSP and downgrades any non-image type to a download — an SVG opened at its own URL is a document on the app's origin. Never `isAbsolute(p) ? p : join(root, p)`.
+
+**Check:** `npx tsx scripts/check-http-errors.ts --disposable --db=<url of a throwaway Postgres>` boots the app in-process and asserts all of the above over real HTTP. It writes test rows and leaves them; never give it the ledger's URL. Run it after touching `src/http/`, `src/app.ts`, or how a route fails.
+
 ## Agent transcripts (session JSONL)
 
 There is no observability stack. Langfuse was removed; it only ever re-read the file below and truncated each field to 2–5K characters. Claude Code writes the full transcript of every `claude -p` run itself — prompt, thinking, every tool call and result, per-turn `usage` — to:

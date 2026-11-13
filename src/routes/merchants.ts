@@ -11,12 +11,14 @@ import express, { Router, type Request, type Response, type NextFunction } from 
 import { and, eq, sql } from "drizzle-orm";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { createReadStream } from "fs";
-import { stat } from "fs/promises";
+import * as path from "path";
 
 import { db } from "../db/client.js";
 import { merchants } from "../schema/merchants.js";
 import { places, placePhotos } from "../schema/places.js";
 import { parseOrThrow } from "../http/validate.js";
+import { resolveStoredFile, setStoredImageHeaders } from "../http/files.js";
+import { getUploadDir } from "./documents.service.js";
 import { HttpProblem, NotFoundProblem } from "../http/problem.js";
 import {
   MerchantDetail,
@@ -305,18 +307,19 @@ merchantsRouter.get(
       throw new NotFoundProblem("MerchantPhoto", id);
     }
 
-    // Sanity-check the file is still on disk — hard delete moves
-    // files into .trash/ rather than unlinking (#73).
-    try {
-      const st = await stat(photo.filePath);
-      if (!st.isFile()) throw new Error("not a file");
-    } catch {
-      throw new NotFoundProblem("MerchantPhoto", id);
-    }
+    // `file_path` is written by the extraction agent: serve it only if
+    // it is a file under the place-photo cache. That also covers the
+    // file having gone — hard delete moves files into .trash/ rather
+    // than unlinking (#73).
+    const absPath = await resolveStoredFile(
+      path.join(getUploadDir(), "places"),
+      photo.filePath,
+    );
+    if (!absPath) throw new NotFoundProblem("MerchantPhoto", id);
 
-    res.setHeader("Content-Type", photo.mimeType ?? "image/jpeg");
+    setStoredImageHeaders(res, photo.mimeType ?? "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    createReadStream(photo.filePath).pipe(res);
+    createReadStream(absPath).pipe(res);
   }),
 );
 

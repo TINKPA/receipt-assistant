@@ -13,9 +13,14 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull } from "drizzle-orm";
 import { createReadStream } from "fs";
-import { mkdir, stat, writeFile } from "fs/promises";
-import { join, isAbsolute, dirname } from "path";
+import { mkdir, writeFile } from "fs/promises";
+import { dirname } from "path";
 import { createHash } from "crypto";
+import {
+  resolveInside,
+  resolveStoredFile,
+  setStoredImageHeaders,
+} from "../http/files.js";
 import multer from "multer";
 import { db } from "../db/client.js";
 import { brands, brandAssets } from "../schema/index.js";
@@ -298,7 +303,19 @@ brandsRouter.post(
       const sha = createHash("sha256").update(bytes).digest("hex");
       const ext = extensionForMime(mime);
       const relPath = `${brandId}/user-upload/${sha}.${ext}`;
-      const absPath = join(BRAND_ASSETS_ROOT, relPath);
+      // `brandId` is a free-text slug (any string can be minted through
+      // POST /v1/products), and here it becomes a directory name. Refuse
+      // one that would put the file outside the assets root.
+      const absPath = resolveInside(BRAND_ASSETS_ROOT, relPath);
+      if (!absPath) {
+        throw new ValidationProblem([
+          {
+            path: "brandId",
+            code: "unsafe_path",
+            message: "This brand id cannot be used as a storage directory",
+          },
+        ]);
+      }
 
       // Dedup: if (brand_id, content_hash) already exists, surface that row.
       // Whether or not we just wrote the bytes (race-safe: writeFile is
@@ -414,19 +431,14 @@ brandsRouter.get(
           `asset_id=${assetId} is retired`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand asset",
-          `File missing on disk: ${absPath}`,
+          `asset_id=${assetId} has no file on disk`,
         );
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       res.setHeader("Cache-Control", "public, max-age=86400, immutable");
       createReadStream(absPath).pipe(res);
     } catch (err) {
@@ -486,16 +498,11 @@ brandsRouter.get(
           `preferred_asset_id=${preferredId} is retired for brand=${brandId}`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand icon",
-          `File missing on disk: ${absPath}`,
+          `preferred_asset_id=${preferredId} has no file on disk for brand=${brandId}`,
         );
       }
       // Strong ETag is the asset's content_hash. The URL stays stable
@@ -511,7 +518,7 @@ brandsRouter.get(
         res.status(304).end();
         return;
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       createReadStream(absPath).pipe(res);
     } catch (err) {
       next(err);

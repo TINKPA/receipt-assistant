@@ -14,10 +14,11 @@
  */
 import { type Request, type Response, type NextFunction, Router } from "express";
 import { createReadStream } from "fs";
-import { stat } from "fs/promises";
+import * as path from "path";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 
 import { parseOrThrow } from "../http/validate.js";
+import { resolveStoredFile, setStoredImageHeaders } from "../http/files.js";
 import { NotFoundProblem } from "../http/problem.js";
 import {
   loadPlaceById,
@@ -202,19 +203,19 @@ placesRouter.get(
     const photo = await loadPlacePhotoForStream(id, rank);
     if (!photo) throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
 
-    // Sanity: ensure the file is still on disk. Hard delete moves files
-    // into .trash/ rather than unlinking (#73), but the place row may
-    // outlive a manual cleanup.
-    try {
-      const st = await stat(photo.file_path);
-      if (!st.isFile()) throw new Error("not a file");
-    } catch {
-      throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
-    }
+    // `file_path` is written by the extraction agent: serve it only if
+    // it is a file under the place-photo cache. That also covers the
+    // file having gone — hard delete moves files into .trash/ rather
+    // than unlinking (#73), but the row may outlive a manual cleanup.
+    const absPath = await resolveStoredFile(
+      path.join(getUploadDir(), "places"),
+      photo.file_path,
+    );
+    if (!absPath) throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
 
-    res.setHeader("Content-Type", photo.mime_type ?? "image/jpeg");
+    setStoredImageHeaders(res, photo.mime_type ?? "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    createReadStream(photo.file_path).pipe(res);
+    createReadStream(absPath).pipe(res);
   }),
 );
 

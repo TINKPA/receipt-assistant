@@ -91,7 +91,10 @@ wishItemsRouter.get(
     try {
       const query = parseOrThrow(ListWishItemsQuery, req.query);
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
-      const cursor = decodeCursor<WishItemsCursor>(query.cursor ?? undefined);
+      const cursor = decodeCursor<WishItemsCursor>(query.cursor ?? undefined, [
+        "updated_at",
+        "id",
+      ]);
 
       const conditions: ReturnType<typeof sql>[] = [];
       conditions.push(sql`w.workspace_id = ${req.ctx.workspaceId}::uuid`);

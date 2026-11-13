@@ -19,7 +19,7 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 
 import { parseOrThrow } from "../http/validate.js";
 import { ValidationProblem } from "../http/problem.js";
-import { emitNextLink } from "../http/pagination.js";
+import { assertCursorShape, emitNextLink } from "../http/pagination.js";
 import { IdParam, ProblemDetails, Uuid, paginated } from "../schemas/v1/common.js";
 import {
   Batch,
@@ -127,6 +127,7 @@ batchesRouter.get(
   "/",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(ListBatchesQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listBatches({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,
@@ -266,6 +267,7 @@ ingestsRouter.get(
   "/",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(ListIngestsQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listIngests({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,
@@ -287,6 +289,7 @@ ingestsRouter.get(
   "/problems",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(IngestProblemsQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listIngests({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,

@@ -73,7 +73,10 @@ itemsRouter.get(
     try {
       const query = parseOrThrow(ListItemsQuery, req.query);
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
-      const cursor = decodeCursor<ItemsCursor>(query.cursor ?? undefined);
+      const cursor = decodeCursor<ItemsCursor>(query.cursor ?? undefined, [
+        "created_at",
+        "id",
+      ]);
 
       const conditions: ReturnType<typeof sql>[] = [];
       conditions.push(sql`ti.workspace_id = ${req.ctx.workspaceId}::uuid`);

@@ -104,11 +104,42 @@ export function buildRegistry(): OpenAPIRegistry {
   return registry;
 }
 
+/**
+ * Responses every `/v1` operation can produce without its handler ever
+ * running, because they come from the shared layer in `src/http/`
+ * (`params.ts`, `problem.ts`). They are declared once here and attached
+ * to each operation below, so the spec says what the server does
+ * without 100 route registrations repeating it.
+ */
+const SHARED_RESPONSES = {
+  BadRequest: {
+    status: "400",
+    description:
+      "Malformed request: an id in the path or query string is not a UUID " +
+      "(`errors/invalid-id`), the body is not valid JSON " +
+      "(`errors/malformed-body`), the cursor is not one this endpoint " +
+      "issued (`errors/invalid-cursor`), or a value cannot be read as its " +
+      "type (`errors/invalid-parameter`).",
+  },
+} as const;
+
 export function buildOpenApiDocument() {
   const registry = buildRegistry();
+
+  for (const [name, r] of Object.entries(SHARED_RESPONSES)) {
+    registry.registerComponent("responses", name, {
+      description: r.description,
+      content: {
+        "application/problem+json": {
+          schema: { $ref: "#/components/schemas/ProblemDetails" },
+        },
+      },
+    });
+  }
+
   const generator = new OpenApiGeneratorV31(registry.definitions);
 
-  return generator.generateDocument({
+  const doc = generator.generateDocument({
     openapi: "3.1.0",
     info: {
       title: "Receipt Assistant API",
@@ -116,8 +147,31 @@ export function buildOpenApiDocument() {
       description:
         "Double-entry ledger backend. The v1 resources (transactions, " +
         "postings, accounts, documents) are under active construction — see " +
-        "issues #33 (schema), #35 (transactions API), #36 (accounts API).",
+        "issues #33 (schema), #35 (transactions API), #36 (accounts API).\n\n" +
+        "Every error is an RFC 7807 `application/problem+json` document " +
+        "with a `trace_id`; branch on `type`, not on `title` or `detail`. " +
+        "A URL or method no route claims is a 404 `errors/route-not-found`. " +
+        "Database constraint failures surface as 409 (`errors/conflict`, " +
+        "`errors/still-referenced`) or 422 (`errors/invalid-reference`, " +
+        "`errors/constraint-violation`). An unexpected failure is a 500 " +
+        "`errors/internal` whose body is a fixed sentence plus the " +
+        "`trace_id`; the cause is only in the server log, under that id.",
     },
     servers: [{ url: "http://localhost:3000", description: "Local dev" }],
   });
+
+  // A route that documents its own 400 keeps it.
+  for (const [path, item] of Object.entries(doc.paths ?? {})) {
+    if (!path.startsWith("/v1/")) continue;
+    for (const op of Object.values(item as Record<string, unknown>)) {
+      const responses = (op as { responses?: Record<string, unknown> } | null)
+        ?.responses;
+      if (!responses) continue;
+      for (const [name, r] of Object.entries(SHARED_RESPONSES)) {
+        responses[r.status] ??= { $ref: `#/components/responses/${name}` };
+      }
+    }
+  }
+
+  return doc;
 }

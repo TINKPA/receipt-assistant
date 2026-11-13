@@ -476,7 +476,10 @@ export async function getRegisterService(
   if (!account) throw new NotFoundProblem("Account", args.accountId);
 
   const limit = clampLimit(args.limit);
-  const cursor = decodeCursor<RegisterCursor>(args.cursor);
+  const cursor = decodeCursor<RegisterCursor>(args.cursor, [
+    "occurred_on",
+    "posting_id",
+  ]);
 
   // Step 1: fetch candidate postings window via keyset pagination. We
   // query ONE extra row to know if there's a "next" page. The window

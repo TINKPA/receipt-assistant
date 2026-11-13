@@ -43,13 +43,11 @@ partiesRouter.get(
   "/transactions/:id/parties",
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      // Validate before the query, not after: `${id}::uuid` hands the
-      // raw param straight to Postgres, which raises SQLSTATE 22P02 on
-      // anything non-uuid. That is neither an `HttpProblem` nor a
-      // `ZodError`, so `problemHandler` can only render it as a generic
-      // 500 — while the OpenAPI registration below already promises the
-      // caller `params: { id: Uuid }`. Same idiom as transactions.ts /
-      // postings.ts: 422 with violations.
+      // `${id}::uuid` hands the raw param straight to Postgres, which
+      // raises SQLSTATE 22P02 on anything non-uuid. A malformed `:id`
+      // no longer gets this far — it is a 400 before the handler runs
+      // (`UUID_PATH_PARAMS` in app.ts) — and this parse keeps the
+      // guarantee next to the cast that depends on it.
       const { id } = parseOrThrow(z.object({ id: Uuid }), req.params);
       const result = await db.execute(sql`
         SELECT * FROM transaction_parties

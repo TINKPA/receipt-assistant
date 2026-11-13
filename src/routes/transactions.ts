@@ -45,9 +45,10 @@ import {
   NotFoundProblem,
   HttpProblem,
   VersionMismatchProblem,
+  renderProblem,
 } from "../http/problem.js";
 import { idempotencyMiddleware } from "../http/idempotency.js";
-import { emitNextLink } from "../http/pagination.js";
+import { assertCursorShape, emitNextLink } from "../http/pagination.js";
 import {
   createTransaction,
   getTransaction,
@@ -133,6 +134,9 @@ transactionsRouter.get(
         else if (lower === "true" || lower === "1") raw.has_document = true;
       }
       const query = parseOrThrow(ListTransactionsQuery, raw);
+      // Current cursors are { sort, value, at?, id }; ones issued before
+      // sort was recorded are { occurred_on, id }.
+      assertCursorShape(query.cursor, ["sort", "value", "id"], ["occurred_on", "id"]);
       const result = await listTransactions(req.ctx.workspaceId, query);
       emitNextLink(req, res, result.next_cursor);
       res.json(result);
@@ -185,24 +189,9 @@ transactionsRouter.post(
             results.push({ index: i, status: 200, body: out });
           }
         } catch (err) {
-          if (err instanceof HttpProblem) {
-            results.push({
-              index: i,
-              status: err.status,
-              body: err.toBody(),
-            });
-          } else {
-            results.push({
-              index: i,
-              status: 500,
-              body: {
-                type: "https://receipts.dev/errors/internal",
-                title: "Internal Server Error",
-                status: 500,
-                detail: err instanceof Error ? err.message : String(err),
-              },
-            });
-          }
+          // Same mapping (and the same logging) as a top-level failure:
+          // a per-item error must not carry SQL out inside a 200 either.
+          results.push({ index: i, ...renderProblem(err, req) });
         }
       }
 
