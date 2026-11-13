@@ -23,6 +23,9 @@
  *   "write_transaction": {            // optional ledger seed
  *     "payee": "...", "occurred_on": "YYYY-MM-DD",
  *     "total_minor": 1234, "currency": "USD",
+ *     "pl_account_type": "expense",   // optional: "income" books the
+ *                                     // total_minor leg on an income
+ *                                     // account instead (default expense)
  *     "metadata": { ... },            // merged over {source:'stub'}
  *     "link_document": true           // document_links row to $DOC
  *   },
@@ -49,6 +52,7 @@ interface StubInstructions {
     occurred_on: string;
     total_minor: number;
     currency?: string;
+    pl_account_type?: "expense" | "income";
     metadata?: Record<string, unknown>;
     link_document?: boolean;
   };
@@ -85,11 +89,17 @@ export const stubFileExtractor: Extractor = async (input) => {
   if (ins.write_transaction) {
     const w = ins.write_transaction;
     const currency = w.currency ?? "USD";
-    // Resolve one expense + one liability account; the sandbox seed
-    // workspace always has both.
+    // Which kind of account carries the `total_minor` leg. Anything but
+    // the two known values is rejected rather than interpolated.
+    const plType = w.pl_account_type ?? "expense";
+    if (plType !== "expense" && plType !== "income") {
+      throw new Error(`stub-extractor: unknown pl_account_type ${String(plType)}`);
+    }
+    // Resolve one P&L + one liability account; the sandbox seed
+    // workspace always has an expense and a liability account.
     const acct = await db.execute(
       sql`SELECT
-            (SELECT id FROM accounts WHERE workspace_id = ${input.workspaceId}::uuid AND type = 'expense'  ORDER BY name LIMIT 1) AS expense,
+            (SELECT id FROM accounts WHERE workspace_id = ${input.workspaceId}::uuid AND type = ${plType}::account_type ORDER BY name LIMIT 1) AS expense,
             (SELECT id FROM accounts WHERE workspace_id = ${input.workspaceId}::uuid AND type = 'liability' ORDER BY name LIMIT 1) AS liability`,
     );
     const { expense, liability } = acct.rows[0] as {
@@ -97,7 +107,7 @@ export const stubFileExtractor: Extractor = async (input) => {
       liability: string | null;
     };
     if (!expense || !liability) {
-      throw new Error("stub-extractor: workspace has no expense/liability accounts");
+      throw new Error(`stub-extractor: workspace has no ${plType}/liability accounts`);
     }
     seededTxId = newId();
     const metadata = { source: "stub", ...(w.metadata ?? {}) };

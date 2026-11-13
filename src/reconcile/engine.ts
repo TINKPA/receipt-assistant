@@ -30,7 +30,9 @@
  *     proposal exactly which links moved (`payload.applied`). It refuses
  *     unless both rows are live and the money moved the same way.
  *   - UNDO is the inverse, driven by that record: restore the duplicate,
- *     move its links back, mark the proposal `reverted`.
+ *     move its links back, mark the proposal `reverted`. Applies that
+ *     built on each other (C folded into B, then B into A) are undone
+ *     newest first; undo refuses the inner one until the outer is undone.
  *   - REJECT and STALE never touch the ledger.
  *
  * Auto-apply and a person's apply run the same function, so a duplicate
@@ -43,7 +45,7 @@ import { liveTransactions } from "../db/live.js";
 import { batches, reconcileProposals } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { NotFoundProblem } from "../http/problem.js";
-import { detectDedupPairs } from "./dedup.js";
+import { detectDedupPairs, directionLateral, flowsDisagree } from "./dedup.js";
 import {
   paymentLinkStub,
   inventoryStub,
@@ -107,6 +109,9 @@ const DEFAULT_AUTO_APPLY_THRESHOLD = 0.95;
  *  which case nothing was added there and undo must not remove it. */
 export interface MovedLink {
   document_id: string;
+  /** `document_links.created_at` of the link that was taken off the
+   *  duplicate, as Postgres printed it (microseconds kept), so undo puts
+   *  back the same row and not one rounded to the millisecond. */
   linked_at: string | null;
   canonical_had_link: boolean;
 }
@@ -231,51 +236,74 @@ export type DedupApplyResult =
   /** Nothing changed and the proposal keeps its status. */
   | { outcome: "refused"; reason: string };
 
+interface TxDirection {
+  id: string;
+  /** Which P&L legs the row has: expense, income, mixed or none. */
+  plClass: string;
+  total: number;
+  flow: string | null;
+  refund_of: string | null;
+}
+
 /**
  * Money direction of each named transaction, read inside the apply
- * transaction. Same leg selection as the detector (`dedup.ts`): the
- * expense/income leg by ACCOUNT TYPE, signed, so a refund is negative.
+ * transaction through the detector's own leg selection
+ * (`directionLateral` in `dedup.ts`): the class of the row's P&L legs and
+ * their signed total, so a refund booked as a negative expense is
+ * negative and one booked through an income account is a different
+ * class from the purchase.
  */
 async function loadDirections(
   tx: DbTx,
   ids: string[],
-): Promise<
-  Map<string, { hasPl: boolean; total: number; flow: string | null; refundOf: string | null }>
-> {
+): Promise<Map<string, TxDirection>> {
   const res = await tx.execute(sql`
     SELECT t.id,
            t.metadata->>'flow'      AS flow,
            t.metadata->>'refund_of' AS refund_of,
-           s.has_pl, s.total
+           s.pl_class, s.total
       FROM transactions t
-     CROSS JOIN LATERAL (
-           SELECT COUNT(*) FILTER (WHERE a.type IN ('expense', 'income')) > 0 AS has_pl,
-                  COALESCE(SUM(CASE a.type
-                                 WHEN 'income'  THEN -p.amount_base_minor
-                                 WHEN 'expense' THEN  p.amount_base_minor
-                               END), 0) AS total
-             FROM postings p
-             JOIN accounts a ON a.id = p.account_id
-            WHERE p.transaction_id = t.id
+     CROSS JOIN LATERAL (${directionLateral("t")}
            ) s
      WHERE t.id IN (${sql.join(
        ids.map((id) => sql`${id}::uuid`),
        sql`, `,
      )})`);
-  const out = new Map<
-    string,
-    { hasPl: boolean; total: number; flow: string | null; refundOf: string | null }
-  >();
+  const out = new Map<string, TxDirection>();
   for (const r of res.rows as Array<Record<string, unknown>>) {
     out.set(String(r.id), {
-      hasPl: r.has_pl === true,
+      id: String(r.id),
+      plClass: String(r.pl_class),
       total: Number(r.total),
       flow: typeof r.flow === "string" && r.flow !== "" ? r.flow : null,
-      refundOf:
+      refund_of:
         typeof r.refund_of === "string" && r.refund_of !== "" ? r.refund_of : null,
     });
   }
   return out;
+}
+
+/** SQLSTATE of a failed statement, if the error (or the driver error it
+ *  wraps) carries one. */
+function sqlState(err: unknown): string | null {
+  for (let e: unknown = err, hops = 0; e && hops < 4; hops++) {
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return code;
+    e = (e as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+/**
+ * What an API caller is told when an apply or undo threw. The driver's
+ * message carries the statement text and its bound parameters; that
+ * belongs in the server log, not in an HTTP response body.
+ */
+function failureReason(kind: "apply_failed" | "undo_failed", proposalId: string, err: unknown): string {
+  // eslint-disable-next-line no-console
+  console.error(`[reconcile] ${kind} for proposal ${proposalId}:`, err);
+  const code = sqlState(err);
+  return code ? `${kind} (sqlstate ${code}); nothing was changed` : `${kind}; nothing was changed`;
 }
 
 /**
@@ -394,11 +422,9 @@ async function applyDedupProposal(params: {
     if (
       !d ||
       !c ||
-      d.hasPl !== c.hasPl ||
+      d.plClass !== c.plClass ||
       Math.sign(d.total) !== Math.sign(c.total) ||
-      (d.flow !== null && c.flow !== null && d.flow !== c.flow) ||
-      d.refundOf === canonicalId ||
-      c.refundOf === duplicateId
+      flowsDisagree(d, c, d)
     ) {
       return { outcome: "refused", reason: "direction_mismatch" };
     }
@@ -406,7 +432,8 @@ async function applyDedupProposal(params: {
     // 1+2. Move the evidence, remembering exactly what moved.
     const linkRes = await tx.execute(sql`
       SELECT dl.document_id,
-             dl.created_at AS linked_at,
+             to_char(dl.created_at AT TIME ZONE 'UTC',
+                     'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS linked_at,
              EXISTS (SELECT 1 FROM document_links k
                       WHERE k.document_id = dl.document_id
                         AND k.transaction_id = ${canonicalId}::uuid) AS canonical_had_link
@@ -417,12 +444,12 @@ async function applyDedupProposal(params: {
     const links: MovedLink[] = (
       linkRes.rows as Array<{
         document_id: string;
-        linked_at: Date | string | null;
+        linked_at: string | null;
         canonical_had_link: boolean;
       }>
     ).map((r) => ({
       document_id: r.document_id,
-      linked_at: toIso(r.linked_at),
+      linked_at: r.linked_at,
       canonical_had_link: r.canonical_had_link === true,
     }));
     await tx.execute(sql`
@@ -580,10 +607,14 @@ async function resolveMovedLinks(
  *
  * Refuses, changing nothing, when the duplicate's current deletion is
  * not this proposal's doing (it was restored and then removed again for
- * another reason), and when a proposal applied before links were
- * recorded leaves no trace of which documents moved — restoring a
- * transaction without its evidence is the failure this function exists
- * to end.
+ * another reason), when a proposal applied before links were recorded
+ * leaves no trace of which documents moved — restoring a transaction
+ * without its evidence is the failure this function exists to end — and
+ * when the surviving row has since been folded into a third row by
+ * another applied proposal. That later apply carried this duplicate's
+ * documents onward, so they are no longer where this proposal put them;
+ * undoing out of order would leave a document linked to two
+ * transactions. The refusal names the proposal to undo first.
  */
 async function undoDedupProposal(params: {
   workspaceId: string;
@@ -613,7 +644,13 @@ async function undoDedupProposal(params: {
     const payload = prop.payload ?? {};
     const duplicateId = String(payload.duplicate ?? "");
     const canonicalId = String(payload.duplicate_of ?? "");
-    if (!UUID_RE.test(duplicateId) || !UUID_RE.test(canonicalId)) {
+    if (
+      !UUID_RE.test(duplicateId) ||
+      !UUID_RE.test(canonicalId) ||
+      // Same guard as apply: "take the documents back off the survivor"
+      // on a self-pair would strip the row's own evidence.
+      duplicateId === canonicalId
+    ) {
       return { outcome: "refused", reason: "malformed_payload" };
     }
 
@@ -633,6 +670,36 @@ async function undoDedupProposal(params: {
     const dup = rows.get(duplicateId);
     if (!dup) return { outcome: "refused", reason: "duplicate_missing" };
     const wasDeleted = dup.deleted_at !== null;
+
+    // Newest first. If the survivor is itself deleted because a LATER
+    // applied proposal folded it into a third row, this duplicate's
+    // documents travelled on with it. (An apply that removed the survivor
+    // BEFORE this one ran moved nothing of ours: the old engine could
+    // fold a row into an already-deleted survivor, and that undo is not
+    // held up by it.)
+    const canon = rows.get(canonicalId);
+    if (canon && canon.deleted_at !== null) {
+      const later = await tx.execute(sql`
+        SELECT rp.id, rp.batch_id
+          FROM reconcile_proposals rp
+          JOIN batches b ON b.id = rp.batch_id
+         WHERE b.workspace_id = ${workspaceId}::uuid
+           AND rp.kind = 'dedup'
+           AND rp.status IN ('auto_applied', 'user_applied')
+           AND rp.id <> ${proposalId}::uuid
+           AND rp.payload->>'duplicate' = ${canonicalId}
+           AND rp.resolved_at >= (SELECT me.resolved_at FROM reconcile_proposals me
+                                   WHERE me.id = ${proposalId}::uuid)
+         ORDER BY rp.resolved_at DESC, rp.id DESC
+         LIMIT 1`);
+      const outer = later.rows[0] as { id: string; batch_id: string } | undefined;
+      if (outer) {
+        return {
+          outcome: "refused",
+          reason: `survivor_folded: undo proposal ${outer.id} (batch ${outer.batch_id}) first`,
+        };
+      }
+    }
 
     if (wasDeleted) {
       // Only undo a deletion this proposal performed. The newest removal
@@ -1147,11 +1214,7 @@ export async function applyProposals(params: {
         skipped.push({ id: pid, reason: r.reason });
       }
     } catch (err) {
-      skipped.push({
-        id: pid,
-        reason:
-          err instanceof Error ? `apply_failed: ${err.message}` : "apply_failed",
-      });
+      skipped.push({ id: pid, reason: failureReason("apply_failed", pid, err) });
     }
   }
 
@@ -1193,11 +1256,7 @@ export async function undoProposals(params: {
         skipped.push({ id: pid, reason: "already_reverted" });
       } else skipped.push({ id: pid, reason: r.reason });
     } catch (err) {
-      skipped.push({
-        id: pid,
-        reason:
-          err instanceof Error ? `undo_failed: ${err.message}` : "undo_failed",
-      });
+      skipped.push({ id: pid, reason: failureReason("undo_failed", pid, err) });
     }
   }
   return { reverted, skipped };

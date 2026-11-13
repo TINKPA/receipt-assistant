@@ -7,15 +7,28 @@
  * Two transactions that describe ONE money event. A transaction written
  * by this batch (`source_ingest_id` in the batch) is compared with:
  *
- *   in-batch pass     another row of the same batch with the same
- *                     `occurred_on`, the same `payee` and the same total
+ *   in-batch pass     another row of the same batch with the same total
+ *                     that either shares the day and the party (payee
+ *                     compared case-insensitively, or the same
+ *                     merchant), or shares a printed identifier within
+ *                     ±3 days
  *   cross-batch pass  any row outside the batch with the same total and
  *                     an `occurred_on` within ±3 days (settlement drift,
  *                     a receipt filed late against a row already there)
  *
+ * The in-batch pass used to demand the exact payee string and the exact
+ * day. Two extractions of one receipt that landed in the same batch as
+ * `Acme` and `Acme.com`, or a day apart, were then invisible to both
+ * passes even with the same order number — while the same two rows in
+ * different batches were found.
+ *
  * The NEWER row of a pair (by `created_at`) is the duplicate and the
  * older one survives. That is usually the batch row, but a batch row
- * ingested before the row it matches is the survivor instead.
+ * ingested before the row it matches is the survivor instead. One
+ * exception: a `reconciled` row has been matched to a bank line and is
+ * never the duplicate, so when only the newer row is reconciled the
+ * older one is proposed for removal instead. Two reconciled rows are two
+ * bank lines, hence two money events, and are not paired at all.
  *
  * What makes a pair safe to act on
  * --------------------------------
@@ -34,10 +47,18 @@
  *     by sign (`GREATEST(amount, 0)`) made a refund total the same as the
  *     purchase it reverses, and a refund normally reprints the purchase's
  *     order number — together an "exact identifier match" that
- *     auto-deleted the refund. `metadata.flow` and `metadata.refund_of`
- *     are checked as well, for rows whose legs were booked the wrong way
- *     round. Rows with no expense or income leg (transfers) are keyed on
- *     their gross amount and only ever paired with each other.
+ *     auto-deleted the refund.
+ *     The sign alone is not the whole direction: money coming back that
+ *     was booked through an INCOME account (credit, so it keys positive)
+ *     has the same signed total as the purchase it reverses. So each row
+ *     also carries the CLASS of its legs — expense, income, both, or
+ *     neither (a transfer, keyed on its gross amount) — and only rows of
+ *     the same class are paired.
+ *     `metadata.flow` and `metadata.refund_of` are checked as well, for
+ *     rows whose legs were booked the wrong way round: two different
+ *     flows never pair, and neither does a row marked `refund` with a
+ *     row that says nothing when the legs on both read as money going
+ *     out (see `flowsDisagree`).
  *
  *   The identifier contract. All five keys of the #204 contract are
  *     read. The same key carrying the same value on both sides is an
@@ -120,6 +141,8 @@ export interface DedupSide {
   occurred_on: string;
   payee: string | null;
   merchant_id: string | null;
+  /** `posted` or `reconciled` (both sides are live). */
+  status: string;
   payment: string | null;
   flow: string | null;
   refund_of: string | null;
@@ -193,6 +216,40 @@ export function verdictAbout(
   return null;
 }
 
+/**
+ * Second line of the direction gate: what the rows SAY about themselves
+ * in `metadata.flow` / `metadata.refund_of`, for when the legs were
+ * booked the wrong way round and the signed total cannot tell. Shared by
+ * detection and by the apply step.
+ *
+ * `legs` is what the postings say: the leg class and signed total the
+ * two rows share (detection), or the duplicate's (apply, after class and
+ * sign were found equal). See `directionLateral`.
+ *
+ *   - two different flows                         → disagree
+ *   - one row is the other's `refund_of`          → disagree
+ *   - one says `refund`, the other says nothing,
+ *     and the legs read as money GOING OUT (an
+ *     expense leg with a positive total)          → disagree: that
+ *     refund is mis-booked, and the silent row is most likely the
+ *     purchase it reverses. When the legs read as money coming back (a
+ *     negative expense, or an income leg) both rows already are money
+ *     back by their own postings, and an older extraction that wrote no
+ *     flow is no evidence against that.
+ */
+export function flowsDisagree(
+  a: { id: string; flow: string | null; refund_of: string | null },
+  b: { id: string; flow: string | null; refund_of: string | null },
+  legs: { plClass: string; total: number },
+): boolean {
+  const aFlow = clean(a.flow);
+  const bFlow = clean(b.flow);
+  if (aFlow && bFlow && aFlow !== bFlow) return true;
+  const legsSayOutflow = legs.plClass !== "income" && legs.total > 0;
+  if (legsSayOutflow && (aFlow === "refund") !== (bFlow === "refund")) return true;
+  return clean(a.refund_of) === b.id || clean(b.refund_of) === a.id;
+}
+
 export interface PairScore {
   score: number;
   strong: boolean;
@@ -203,19 +260,22 @@ export interface PairScore {
  * Score one candidate pair, or return null when it must not be proposed.
  * `a` and `b` are interchangeable. `recurringOthers` is the number of
  * OTHER live rows sharing the batch row's total and merchant inside the
- * window. Both sides are assumed live and equal in signed total — the
- * candidate SQL guarantees that; nothing here re-reads the database.
+ * window; `plClass` and `total` are the leg class and signed total the
+ * two rows share. Both sides are assumed live, of the same leg class and
+ * equal in signed total — the candidate SQL guarantees that; nothing
+ * here re-reads the database.
  */
 export function scorePair(
   a: DedupSide,
   b: DedupSide,
-  opts: { recurringOthers: number },
+  opts: { recurringOthers: number; plClass: string; total: number },
 ): PairScore | null {
-  // Direction gate, second line (the first is the signed total in SQL).
-  const aFlow = clean(a.flow);
-  const bFlow = clean(b.flow);
-  if (aFlow && bFlow && aFlow !== bFlow) return null;
-  if (clean(a.refund_of) === b.id || clean(b.refund_of) === a.id) return null;
+  // Direction gate, second line (the first is the class and the signed
+  // total in SQL).
+  if (flowsDisagree(a, b, opts)) return null;
+
+  // Each matched to its own bank line: two money events.
+  if (a.status === "reconciled" && b.status === "reconciled") return null;
 
   // Already judged with the document in view.
   const va = verdictAbout(a, b.id);
@@ -281,11 +341,47 @@ export function scorePair(
 
 // ── Candidate generation ──────────────────────────────────────────────
 
+/**
+ * Body of a `CROSS JOIN LATERAL (...)` that reads the money direction of
+ * the transaction aliased `txAlias` off its postings. The ONE place the
+ * leg selection is written; detection and the apply step both use it.
+ *
+ *   pl_class  which profit-and-loss legs the row has: `expense`,
+ *             `income`, `mixed` (both) or `none` (a transfer)
+ *   total     the expense/income leg picked by account type and kept
+ *             signed (#221): expense as booked, income negated so that
+ *             earnings key positive. A refund booked as a negative
+ *             expense therefore keys NEGATIVE. A row of class `none`
+ *             falls back to its gross amount.
+ *
+ * `total` alone is not a direction: +X is both "spent X" (expense) and
+ * "earned X" (income). Compare `pl_class` as well.
+ */
+export const directionLateral = (txAlias: string) =>
+  sql.raw(`
+             SELECT CASE
+                      WHEN bool_or(a.type = 'expense') AND bool_or(a.type = 'income') THEN 'mixed'
+                      WHEN bool_or(a.type = 'expense') THEN 'expense'
+                      WHEN bool_or(a.type = 'income')  THEN 'income'
+                      ELSE 'none'
+                    END AS pl_class,
+                    CASE WHEN bool_or(a.type IN ('expense', 'income'))
+                         THEN COALESCE(SUM(CASE a.type
+                                             WHEN 'income'  THEN -p.amount_base_minor
+                                             WHEN 'expense' THEN  p.amount_base_minor
+                                           END), 0)
+                         ELSE COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0)
+                    END AS total
+               FROM postings p
+               JOIN accounts a ON a.id = p.account_id
+              WHERE p.transaction_id = ${txAlias}.id`);
+
 interface CandidateRow {
   pass: DedupPass;
   b: DedupSide;
   o: DedupSide;
   b_newer: boolean;
+  pl_class: string;
   total: string | number;
   recurring_others: string | number;
   rn: string | number;
@@ -305,6 +401,7 @@ const sideJson = (alias: "b" | "o") =>
              'occurred_on', ${alias}.occurred_on,
              'payee', ${alias}.payee,
              'merchant_id', ${alias}.merchant_id,
+             'status', ${alias}.status,
              'payment', ${alias}.payment,
              'flow', ${alias}.flow,
              'refund_of', ${alias}.refund_of,
@@ -329,6 +426,7 @@ export async function detectDedupPairs(params: {
     ),
     keyed AS (
       SELECT t.id, t.occurred_on, t.payee, t.merchant_id, t.created_at,
+             t.status::text AS status,
              lower(btrim(t.payee)) AS payee_norm,
              COALESCE(t.source_ingest_id IN (SELECT id FROM batch_ingests), false) AS in_batch,
              ${identifierColumns},
@@ -336,26 +434,12 @@ export async function detectDedupPairs(params: {
              t.metadata->>'flow'          AS flow,
              t.metadata->>'refund_of'     AS refund_of,
              t.metadata->'near_dup_check' AS near_dup_check,
-             s.has_pl, s.total
+             s.pl_class, s.total
         FROM ${liveTransactions} t
        CROSS JOIN LATERAL (
-             -- The leg that carries the meaning of the transaction,
-             -- picked by account type and kept signed (#221): expense
-             -- for spend, income (negated, so it keys positive) for
-             -- earnings. A refund therefore keys NEGATIVE. Rows with
-             -- neither leg (transfers) fall back to their gross amount
-             -- and, via has_pl, only pair with each other.
-             SELECT COUNT(*) FILTER (WHERE a.type IN ('expense', 'income')) > 0 AS has_pl,
-                    CASE WHEN COUNT(*) FILTER (WHERE a.type IN ('expense', 'income')) > 0
-                         THEN COALESCE(SUM(CASE a.type
-                                             WHEN 'income'  THEN -p.amount_base_minor
-                                             WHEN 'expense' THEN  p.amount_base_minor
-                                           END), 0)
-                         ELSE COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0)
-                    END AS total
-               FROM postings p
-               JOIN accounts a ON a.id = p.account_id
-              WHERE p.transaction_id = t.id
+             -- Money direction: the class of the row's P&L legs and
+             -- their signed total. See directionLateral.
+             ${directionLateral("t")}
              ) s
        WHERE t.workspace_id = ${workspaceId}::uuid
     ),
@@ -368,7 +452,7 @@ export async function detectDedupPairs(params: {
         LEFT JOIN keyed k
           ON k.id <> b.id
          AND k.total = b.total
-         AND k.has_pl = b.has_pl
+         AND k.pl_class = b.pl_class
          AND k.occurred_on BETWEEN b.occurred_on - ${NEAR_WINDOW_DAYS}::int
                                AND b.occurred_on + ${NEAR_WINDOW_DAYS}::int
          AND (k.merchant_id = b.merchant_id OR k.payee_norm = b.payee_norm)
@@ -380,7 +464,7 @@ export async function detectDedupPairs(params: {
              ${sideJson("b")} AS b,
              ${sideJson("o")} AS o,
              (b.created_at, b.id) > (o.created_at, o.id) AS b_newer,
-             b.total,
+             b.pl_class, b.total,
              b.created_at AS b_created, b.id AS b_id,
              s.recurring_others,
              ROW_NUMBER() OVER (
@@ -395,23 +479,27 @@ export async function detectDedupPairs(params: {
         JOIN keyed o
           ON o.id <> b.id
          AND o.total = b.total
-         AND o.has_pl = b.has_pl
+         AND o.pl_class = b.pl_class
          AND o.occurred_on BETWEEN b.occurred_on - ${NEAR_WINDOW_DAYS}::int
                                AND b.occurred_on + ${NEAR_WINDOW_DAYS}::int
          AND (
                -- cross-batch pass: anything outside the batch
                NOT o.in_batch
-               -- in-batch pass: exact date + payee, each pair once with
-               -- the older row on the "o" side
-               OR (o.occurred_on = b.occurred_on
-                   AND o.payee = b.payee
-                   AND (o.created_at, o.id) < (b.created_at, b.id))
+               -- in-batch pass: each pair once, with the older row on
+               -- the "o" side, and only with some evidence beyond the
+               -- amount — the same day and party, or a shared printed
+               -- identifier (which may sit a day or a spelling apart)
+               OR ((o.created_at, o.id) < (b.created_at, b.id)
+                   AND ((o.occurred_on = b.occurred_on
+                         AND ((o.payee_norm = b.payee_norm) IS TRUE
+                              OR (o.merchant_id = b.merchant_id) IS TRUE))
+                        OR (${identifierOverlap}) IS TRUE))
              )
        WHERE b.in_batch
          -- A zero total carries no discriminating power (#205).
          AND b.total <> 0
     )
-    SELECT pass, b, o, b_newer, total, recurring_others, rn
+    SELECT pass, b, o, b_newer, pl_class, total, recurring_others, rn
       FROM ranked
      WHERE rn <= ${CANDIDATES_PER_ROW}::int
      ORDER BY b_created ASC, b_id ASC, rn ASC
@@ -422,12 +510,26 @@ export async function detectDedupPairs(params: {
   // replaces an earlier one when it is strictly better.
   const bestPerRow = new Map<string, DedupPair>();
   for (const r of res.rows as unknown as CandidateRow[]) {
+    const total = Number(r.total);
     const verdict = scorePair(r.b, r.o, {
       recurringOthers: Number(r.recurring_others),
+      plClass: r.pl_class,
+      total,
     });
     if (!verdict) continue;
-    const dup = r.b_newer ? r.b : r.o;
-    const canon = r.b_newer ? r.o : r.b;
+    // The newer row is the duplicate — unless it alone is `reconciled`:
+    // a row matched to a bank line is never the one removed.
+    let bIsDuplicate = r.b_newer;
+    if (r.b.status === "reconciled" && r.o.status !== "reconciled") {
+      bIsDuplicate = false;
+    } else if (r.o.status === "reconciled" && r.b.status !== "reconciled") {
+      bIsDuplicate = true;
+    }
+    if (bIsDuplicate !== r.b_newer) {
+      verdict.reasons.push("the newer row is reconciled, so the older one is the duplicate");
+    }
+    const dup = bIsDuplicate ? r.b : r.o;
+    const canon = bIsDuplicate ? r.o : r.b;
     const pair: DedupPair = {
       pass: r.pass,
       duplicate_id: dup.id,
@@ -439,7 +541,7 @@ export async function detectDedupPairs(params: {
       canonical_occurred_on: canon.occurred_on,
       payee: dup.payee,
       canonical_payee: canon.payee,
-      total_base_minor: Number(r.total),
+      total_base_minor: total,
     };
     const cur = bestPerRow.get(r.b.id);
     if (!cur || isBetter(pair, cur)) bestPerRow.set(r.b.id, pair);

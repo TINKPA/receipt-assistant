@@ -350,6 +350,9 @@ export interface IncomingFile {
   bytes: Buffer;
 }
 
+/** Tail of the per-workspace upload chain (see `createBatchFromFiles`). */
+const seedChains = new Map<string, Promise<unknown>>();
+
 /**
  * Drive the whole upload pipeline for a batch:
  *   1. Persist every file to disk (once per sha, via the existing
@@ -361,8 +364,50 @@ export interface IncomingFile {
  * We want an `ingests` row for every file even if its document was a
  * sha256 dedup hit — the ingest is the audit trail for "I tried to
  * process this file today", independent of document storage.
+ *
+ * One request at a time per workspace. The L1 decision below is
+ * check-then-insert: "is a transaction live for these bytes, or an
+ * ingest in flight?" is answered first, and the `queued` ingest row that
+ * makes the answer "yes" for everyone else is written only after the
+ * whole request has been probed. Two requests carrying the same bytes
+ * within that window both read "no" and both extract. For bytes that
+ * already have a live transaction the first probe answers on its own, so
+ * the window only matters when there is none: a first upload, or a
+ * re-upload after the transaction was deleted — which extracts again
+ * since the probe learned what a soft delete is, and so made the window
+ * reachable for every deleted receipt. Serializing the probe and the
+ * insert closes it. In-process is enough: the queue the ingests go onto
+ * lives in this process too (`worker.ts`).
  */
-export async function createBatchFromFiles(params: {
+export function createBatchFromFiles(params: {
+  workspaceId: string;
+  files: IncomingFile[];
+  autoReconcile: boolean;
+}): Promise<{
+  batch: BatchSummaryRow;
+  items: Array<{ ingestId: string; filename: string; mime_type: string | null }>;
+}> {
+  const prev = seedChains.get(params.workspaceId) ?? Promise.resolve();
+  // `prev` is always a tail (below), and a tail never rejects.
+  const run = prev.then(() => seedBatchFromFiles(params));
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  seedChains.set(params.workspaceId, tail);
+  // Drop the entry once this request is the last one in line, so the
+  // map does not keep one settled promise per workspace forever.
+  void tail.then(() => {
+    if (seedChains.get(params.workspaceId) === tail) {
+      seedChains.delete(params.workspaceId);
+    }
+  });
+  return run;
+}
+
+/** The body of `createBatchFromFiles`; runs inside the per-workspace
+ *  critical section. */
+async function seedBatchFromFiles(params: {
   workspaceId: string;
   files: IncomingFile[];
   autoReconcile: boolean;

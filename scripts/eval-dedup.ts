@@ -41,20 +41,30 @@
  *   r2   cross-batch card-last4 conflict            → no proposal
  *   r3   reconcile flip+re-run                      → no duplicate proposals (idempotency)
  *   rf   refund vs purchase, same order number      → no proposal, nothing removed
- *        (signed-total gate; flow gate for a refund booked the wrong way round; in-batch too)
+ *        (signed-total gate; flow gate for a refund booked the wrong way round, with a flow
+ *        on both sides or on the refund only; leg-class gate for money back booked through
+ *        an income account; in-batch too)
  *   sd   soft-deleted survivor                      → no proposal against the deleted row, the
  *        new row stays live; re-uploading the deleted row's exact bytes extracts AGAIN,
  *        and a third upload dedups against the new live row
+ *   l1   the same bytes in four requests at once    → extracted once, for a first upload and
+ *        for a re-upload after its transaction was deleted
  *   rc   run of equal-price same-merchant charges   → bounded: ≤ 1 proposal across 6 separate
  *        batches, 0 for 5 in one batch, nothing removed
  *   ib   in-batch identifier rules                  → different order numbers: no proposal;
- *        no identifiers: one 0.9 proposal, NOT applied; same order number: 1.0 auto-apply
+ *        no identifiers: one 0.9 proposal, NOT applied; same order number: 1.0 auto-apply,
+ *        also a day apart; same order number under two spellings of the payee: found, for review
  *   nd   pair the agent judged `distinct`           → not re-raised
  *   pp   same pair seen from a second batch         → still one proposal; a rejection sticks
  *   cl   survivor deleted before apply              → apply refused, proposal `stale`,
  *        duplicate untouched; the next reconcile closes other stale proposals
  *   un   undo                                       → auto-applied and user-applied proposals
- *        both restore the row WITH its own document; second undo is a no-op
+ *        both restore the row WITH its own document (same link timestamp); second undo is a
+ *        no-op; a self-pair on file is refused
+ *   rd   reconciled rows                            → the reconciled row survives even when it
+ *        is the newer one; two reconciled rows are not paired
+ *   ch   applies built on each other                → undo refuses the inner one until the outer
+ *        is undone; newest-first restores every row with exactly its own document
  *
  * Agent decision tree (--with-claude):
  *   b2   re-encoded copy of extracted receipt       → branch-2 attach (near_dup, no new txn)
@@ -220,6 +230,10 @@ interface SeedTx {
   /** Signed: a NEGATIVE total writes a refund (expense leg negative,
    *  card leg positive), exactly the shape the agent writes. */
   total_minor: number;
+  /** Which kind of account carries the `total_minor` leg (default
+   *  expense). `income` with a negative total is money coming back
+   *  booked as income: income credited, card debited. */
+  pl_account_type?: "expense" | "income";
   metadata?: Record<string, unknown>;
 }
 
@@ -338,6 +352,25 @@ async function linksOf(txId: string): Promise<string[]> {
     [txId],
   );
   return rows.map((r) => r.document_id);
+}
+
+/**
+ * Put a dedup proposal on file by hand, the way one written before the
+ * direction gate existed would sit there, and ask the API to apply it.
+ * Returns the reason it was skipped (or the response, if it was not).
+ */
+async function applyHandMadeProposal(duplicate: Seeded, survivor: Seeded): Promise<string> {
+  const id = randomUUID();
+  await q(
+    `INSERT INTO reconcile_proposals (id, batch_id, kind, payload, score, status)
+     VALUES ($1, $2, 'dedup', $3::jsonb, 0.9, 'proposed')`,
+    [id, duplicate.batchId, JSON.stringify({ duplicate: duplicate.tx.id, duplicate_of: survivor.tx.id })],
+  );
+  const res = await postJson(`/v1/batches/${duplicate.batchId}/reconcile/apply`, {
+    proposal_ids: [id],
+  });
+  await q(`DELETE FROM reconcile_proposals WHERE id = $1`, [id]);
+  return String(res.json?.skipped?.[0]?.reason ?? `NOT skipped: ${res.body}`);
 }
 
 /** Soft-delete through the API, the way a person does it. */
@@ -646,7 +679,12 @@ async function main(): Promise<void> {
     assert(isLive(await txState(refund.tx.id)), "refund was removed");
     assert(isLive(await txState(purchase.tx.id)), "purchase was removed");
     assert((await linksOf(refund.tx.id)).length === 1, "refund lost its document");
-    notes.push("cross-batch refund vs purchase, same order number → no proposal, both live");
+    // Proposals from before the gate are still on file in production:
+    // applying one must be refused at the point of deletion too.
+    const legacy = await applyHandMadeProposal(refund, purchase);
+    assert(legacy === "direction_mismatch", `apply of a refund→purchase proposal: ${legacy}`);
+    assert(isLive(await txState(refund.tx.id)), "apply removed the refund");
+    notes.push("cross-batch refund vs purchase, same order number → no proposal, both live; a hand-made proposal is refused at apply");
 
     // (2) the refund's legs booked the wrong way round (positive expense
     //     leg), so the totals DO match: metadata.flow has to stop it.
@@ -697,6 +735,73 @@ async function main(): Promise<void> {
     assert(isLive(await txState(refund.tx.id)), "first refund copy must survive");
     assert(isLive(await txState(purchase.tx.id)), "purchase must be untouched by the refund pair");
     notes.push("second copy of the same refund folds into the first; the purchase is untouched");
+
+    // (5) the mis-booked refund again, but the PURCHASE carries no flow —
+    //     which is what most rows on file look like. "refund" on one side
+    //     only, with legs that read as money going out, must be enough.
+    const base5 = {
+      payee: `Refund Outfitters D ${NONCE}`,
+      occurred_on: "2026-06-04",
+      total_minor: amt(19),
+    };
+    const p5 = await seedOne({ ...base5, metadata: { order_number: `ORD-RF5-${NONCE}` } });
+    const r5 = await seedOne({
+      ...base5,
+      metadata: { order_number: `ORD-RF5-${NONCE}`, flow: "refund" },
+    });
+    assert(
+      (await proposalsBetween(p5.tx.id, r5.tx.id)).length === 0,
+      "flow=refund vs a purchase with no flow was proposed",
+    );
+    assert(isLive(await txState(r5.tx.id)) && isLive(await txState(p5.tx.id)), "one-sided-flow pair lost a row");
+    const legacy5 = await applyHandMadeProposal(r5, p5);
+    assert(legacy5 === "direction_mismatch", `apply of a one-sided-flow proposal: ${legacy5}`);
+    assert(isLive(await txState(r5.tx.id)), "apply removed the mis-booked refund");
+    // ...while a flow on one side only is no obstacle when the legs on
+    // both sides already read as a refund: a third copy of the refund
+    // from (1), this time carrying flow, still folds into the first.
+    const refundWithFlow = await seedOne({
+      ...base,
+      total_minor: -amt(5),
+      metadata: { ...base.metadata, flow: "refund" },
+    });
+    const third = await proposalsBetween(refund.tx.id, refundWithFlow.tx.id);
+    assert(
+      third.length === 1 && third[0]!.status === "auto_applied",
+      `a refund copy carrying flow should fold into the copy without: ${JSON.stringify(third)}`,
+    );
+    notes.push("flow=refund on one side, positive legs → no proposal; negative legs on both → still folds");
+
+    // (6) money back booked through an INCOME account: income is keyed
+    //     positive, so its signed total equals the purchase's. Only the
+    //     class of the legs tells them apart.
+    const [income] = await q(`SELECT 1 FROM accounts WHERE type = 'income' LIMIT 1`);
+    if (!income) {
+      notes.push("(income-booked refund not exercised: this workspace has no income account)");
+    } else {
+      const base6 = {
+        payee: `Refund Outfitters E ${NONCE}`,
+        occurred_on: "2026-06-04",
+        metadata: { order_number: `ORD-RF6-${NONCE}` },
+      };
+      const p6 = await seedOne({ ...base6, total_minor: amt(20) });
+      const r6 = await seedOne({ ...base6, total_minor: -amt(20), pl_account_type: "income" });
+      const [legs] = await q<{ n: number }>(
+        `SELECT count(*)::int AS n FROM postings p JOIN accounts a ON a.id = p.account_id
+          WHERE p.transaction_id = $1 AND a.type = 'income' AND p.amount_base_minor = $2`,
+        [r6.tx.id, -amt(20)],
+      );
+      assert(legs!.n === 1, "seed did not book the refund through an income account");
+      assert(
+        (await proposalsBetween(p6.tx.id, r6.tx.id)).length === 0,
+        "money back booked as income was proposed as a duplicate of the purchase",
+      );
+      assert(isLive(await txState(r6.tx.id)) && isLive(await txState(p6.tx.id)), "income-booked pair lost a row");
+      const legacy6 = await applyHandMadeProposal(r6, p6);
+      assert(legacy6 === "direction_mismatch", `apply of an income-refund→purchase proposal: ${legacy6}`);
+      assert(isLive(await txState(r6.tx.id)), "apply removed the income-booked refund");
+      notes.push("refund booked through an income account vs purchase, same order number → no proposal, apply refused");
+    }
   });
 
   // sd — a soft-deleted transaction is not live for any dedup layer.
@@ -755,6 +860,48 @@ async function main(): Promise<void> {
       `dedup must point at the LIVE transaction, got ${JSON.stringify(ing3!.produced?.transaction_ids)}`,
     );
     notes.push("third upload → dedup, pointing at the live txn (not the deleted one)");
+  });
+
+  // l1 — the byte-level probe is check-then-insert. Requests carrying the
+  // same bytes at the same instant must not all read "nothing live,
+  // nothing in flight" and all extract.
+  await runCase("l1", false, async (notes) => {
+    const burst = async (file: UploadFile): Promise<{ done: string[]; statuses: string[] }> => {
+      const ups = await Promise.all(Array.from({ length: 4 }, () => postBatch([file])));
+      for (const u of ups) await pollReconciled(u.batchId);
+      const rows = await q<{ id: string; status: string }>(
+        `SELECT id, status FROM ingests WHERE id = ANY($1)`,
+        [ups.map((u) => u.ingestIds[0])],
+      );
+      return {
+        done: rows.filter((r) => r.status === "done").map((r) => r.id),
+        statuses: rows.map((r) => r.status).sort(),
+      };
+    };
+    // (1) a file nobody has seen.
+    const file = stubFile(
+      seedInstruction({ payee: `Burst Upload ${NONCE}`, occurred_on: "2026-06-15", total_minor: amt(24) }),
+    );
+    const first = await burst(file);
+    assert(
+      first.statuses.join() === "dedup,dedup,dedup,done",
+      `4 simultaneous first uploads: expected 1 done + 3 dedup, got [${first.statuses.join(", ")}]`,
+    );
+    const tx = await txBySourceIngest(first.done[0]!);
+    notes.push("4 simultaneous uploads of new bytes → 1 extraction, 3 dedup");
+
+    // (2) the same file after its transaction was deleted: the probe now
+    //     (correctly) finds nothing live, so only the in-flight check
+    //     stands between four requests and four extractions.
+    await softDeleteViaApi(tx.id);
+    const again = await burst(file);
+    assert(
+      again.statuses.join() === "dedup,dedup,dedup,done",
+      `4 simultaneous re-uploads after delete: expected 1 done + 3 dedup, got [${again.statuses.join(", ")}]`,
+    );
+    const fresh = await txBySourceIngest(again.done[0]!);
+    assert(isLive(fresh) && fresh.id !== tx.id, "the re-upload did not produce a new live transaction");
+    notes.push("4 simultaneous re-uploads after the delete → extracted once");
   });
 
   // rc — recurring equal-price charges at one merchant are not duplicates
@@ -845,6 +992,34 @@ async function main(): Promise<void> {
       "the survivor should hold both documents",
     );
     notes.push("(c) same order number → auto-applied @1.0, survivor holds both documents");
+
+    // (d) same order number, the two extractions a DAY apart. The
+    //     in-batch pass used to want the exact day, and the cross-batch
+    //     pass skips same-batch rows, so this pair was seen by neither.
+    const [d1, d2] = await seedBatch([
+      { occurred_on: day, total_minor: amt(25), payee: `Day Drift ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-D` } },
+      { occurred_on: "2026-06-10", total_minor: amt(25), payee: `Day Drift ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-D` } },
+    ]);
+    const dp = await proposalsBetween(d1!.tx.id, d2!.tx.id);
+    assert(
+      dp.length === 1 && dp[0]!.status === "auto_applied" && dp[0]!.score === 1,
+      `expected 1 auto-applied @1.0 for a one-day drift, got ${JSON.stringify(dp.map((p) => [p.status, p.score]))}`,
+    );
+    notes.push("(d) same order number, one day apart, one batch → auto-applied @1.0");
+
+    // (e) same order number under two spellings of the payee. Found, but
+    //     the party is not provably the same, so it waits for a person.
+    const [e1, e2] = await seedBatch([
+      { occurred_on: day, total_minor: amt(26), payee: `Spelling Drift ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-E` } },
+      { occurred_on: day, total_minor: amt(26), payee: `Spelling Drift ${NONCE}.com`, metadata: { order_number: `ORD-IB-${NONCE}-E` } },
+    ]);
+    const ep = await proposalsBetween(e1!.tx.id, e2!.tx.id);
+    assert(
+      ep.length === 1 && ep[0]!.status === "proposed" && ep[0]!.score < 0.95,
+      `expected 1 open proposal below the threshold, got ${JSON.stringify(ep.map((p) => [p.status, p.score]))}`,
+    );
+    assert(isLive(await txState(e1!.tx.id)) && isLive(await txState(e2!.tx.id)), "a row was removed");
+    notes.push(`(e) same order number, payee spelled two ways, one batch → 1 proposal @${ep[0]!.score}, NOT applied`);
   });
 
   // nd — a pair the agent already judged distinct is not re-raised.
@@ -955,6 +1130,15 @@ async function main(): Promise<void> {
     assert(isLive(await txState(b.tx.id)), "duplicate was not restored");
     assert((await linksOf(b.tx.id)).join() === b.docId, "restored row did not get its own document back");
     assert((await linksOf(a.tx.id)).join() === a.docId, "survivor kept the other row's document");
+    // The link comes back as the row it was, to the microsecond.
+    const recordedAt = proposal.payload.applied.links[0].linked_at as string;
+    assert(/\.\d{6}Z$/.test(recordedAt), `linked_at was recorded without microseconds: ${recordedAt}`);
+    const [lk] = await q<{ at: string }>(
+      `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS at
+         FROM document_links WHERE transaction_id = $1 AND document_id = $2`,
+      [b.tx.id, b.docId],
+    );
+    assert(lk!.at === recordedAt, `restored link is stamped ${lk!.at}, the original was ${recordedAt}`);
     const [p1] = await proposalsBetween(a.tx.id, b.tx.id);
     assert(p1!.status === "reverted", `proposal should be reverted, got ${p1!.status}`);
     // Second undo: nothing to do, nothing changes.
@@ -995,6 +1179,128 @@ async function main(): Promise<void> {
     });
     assert(never.json.reverted.length === 0 && never.json.skipped.length === 1, `undo of unknown id: ${never.body}`);
     notes.push("user-applied → undo: same round trip; unknown proposal id is skipped");
+
+    // (3) a proposal on file that names one row as both sides. The engine
+    //     cannot write one; undo must still not act on it, because "take
+    //     the documents back off the survivor" would strip the row bare.
+    const selfId = randomUUID();
+    await q(
+      `INSERT INTO reconcile_proposals (id, batch_id, kind, payload, score, status, resolved_at)
+       VALUES ($1, $2, 'dedup', $3::jsonb, 1, 'auto_applied', now())`,
+      [selfId, a.batchId, JSON.stringify({ duplicate: a.tx.id, duplicate_of: a.tx.id })],
+    );
+    const selfUndo = await postJson(`/v1/batches/${a.batchId}/reconcile/undo`, { proposal_ids: [selfId] });
+    assert(
+      selfUndo.json.reverted.length === 0 && selfUndo.json.skipped[0]?.reason === "malformed_payload",
+      `undo of a self-pair: ${selfUndo.body}`,
+    );
+    assert((await linksOf(a.tx.id)).join() === a.docId, "undo of a self-pair took the row's own document");
+    await q(`DELETE FROM reconcile_proposals WHERE id = $1`, [selfId]);
+    notes.push("self-pair on file → undo refused, the row keeps its document");
+  });
+
+  // rd — a reconciled row is matched to a bank line and is never the one
+  // removed, whichever of the two is older.
+  await runCase("rd", false, async (notes) => {
+    // (1) older posted, newer reconciled. The verdict keeps the pair
+    //     apart while it is seeded; it is lifted together with the status
+    //     change, and the batch reconciled again.
+    const base = {
+      payee: `Bank Matched ${NONCE}`,
+      occurred_on: "2026-06-13",
+      total_minor: amt(21),
+    };
+    const older = await seedOne({ ...base, metadata: { order_number: `ORD-RD-${NONCE}` } });
+    const newer = await seedOne({
+      ...base,
+      metadata: {
+        order_number: `ORD-RD-${NONCE}`,
+        near_dup_check: { candidate_transaction_id: older.tx.id, verdict: "distinct" },
+      },
+    });
+    assert((await proposalsBetween(older.tx.id, newer.tx.id)).length === 0, "seed pair was proposed early");
+    await q(
+      `UPDATE transactions SET status = 'reconciled', metadata = metadata - 'near_dup_check' WHERE id = $1`,
+      [newer.tx.id],
+    );
+    await rerunReconcile(newer.batchId);
+    const props = await proposalsBetween(older.tx.id, newer.tx.id);
+    assert(props.length === 1, `expected 1 proposal, got ${props.length}`);
+    assert(
+      props[0]!.payload.duplicate === older.tx.id && props[0]!.payload.duplicate_of === newer.tx.id,
+      "the reconciled row was named as the duplicate",
+    );
+    assert(props[0]!.status === "auto_applied", `expected auto_applied, got ${props[0]!.status}`);
+    const survivor = await txState(newer.tx.id);
+    assert(survivor.status === "reconciled" && survivor.deleted_at === null, "the reconciled row did not survive");
+    assert((await txState(older.tx.id)).deleted_at !== null, "the posted copy was not removed");
+    assert((await linksOf(newer.tx.id)).length === 2, "the reconciled row should hold both documents");
+    notes.push("older posted + newer reconciled → the posted copy is the duplicate; reconciled row keeps both documents");
+
+    // (2) both reconciled: two bank lines, two events.
+    const base2 = {
+      payee: `Bank Matched Twice ${NONCE}`,
+      occurred_on: "2026-06-13",
+      total_minor: amt(22),
+    };
+    const x = await seedOne({ ...base2, metadata: { order_number: `ORD-RD2-${NONCE}` } });
+    const y = await seedOne({
+      ...base2,
+      metadata: {
+        order_number: `ORD-RD2-${NONCE}`,
+        near_dup_check: { candidate_transaction_id: x.tx.id, verdict: "distinct" },
+      },
+    });
+    await q(
+      `UPDATE transactions SET status = 'reconciled', metadata = metadata - 'near_dup_check' WHERE id = ANY($1)`,
+      [[x.tx.id, y.tx.id]],
+    );
+    await rerunReconcile(y.batchId);
+    assert((await proposalsBetween(x.tx.id, y.tx.id)).length === 0, "two reconciled rows were proposed as duplicates");
+    notes.push("both reconciled → no proposal");
+  });
+
+  // ch — applies that build on each other are undone newest first.
+  await runCase("ch", false, async (notes) => {
+    const base = { payee: `Chain Mart ${NONCE}`, occurred_on: "2026-06-14", total_minor: amt(23) };
+    const a = await seedOne(base);
+    // B carries an order number A lacks: no identifier agrees, so B→A is
+    // a 0.9 proposal that waits.
+    const b = await seedOne({ ...base, metadata: { order_number: `ORD-CH-${NONCE}` } });
+    const [pBA] = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(pBA && pBA.status === "proposed", `expected an open B→A proposal: ${JSON.stringify(pBA)}`);
+    // C shares B's order number: auto-applied onto B.
+    const c = await seedOne({ ...base, metadata: { order_number: `ORD-CH-${NONCE}` } });
+    const [pCB] = await proposalsBetween(b.tx.id, c.tx.id);
+    assert(pCB && pCB.status === "auto_applied" && pCB.payload.duplicate === c.tx.id, `expected C→B auto-applied: ${JSON.stringify(pCB)}`);
+    // Now a person applies B→A. C's document travels on to A with B's.
+    const ap = await postJson(`/v1/batches/${pBA.batch_id}/reconcile/apply`, { proposal_ids: [pBA.id] });
+    assert(ap.json.applied?.length === 1, `apply B→A: ${ap.body}`);
+    assert((await linksOf(a.tx.id)).length === 3, "A should hold all three documents");
+
+    // Inner first: refused, and the refusal names the outer proposal.
+    const inner = await postJson(`/v1/batches/${pCB.batch_id}/reconcile/undo`, { proposal_ids: [pCB.id] });
+    const why = String(inner.json.skipped?.[0]?.reason ?? "");
+    assert(
+      inner.json.reverted.length === 0 && why.startsWith("survivor_folded") && why.includes(pBA.id),
+      `undo of the inner apply was not refused with a pointer: ${inner.body}`,
+    );
+    assert((await txState(c.tx.id)).deleted_at !== null, "refused undo still restored C");
+    assert((await linksOf(a.tx.id)).length === 3, "refused undo still moved a document");
+
+    // Newest first: exact.
+    const outer = await postJson(`/v1/batches/${pBA.batch_id}/reconcile/undo`, { proposal_ids: [pBA.id] });
+    assert(outer.json.reverted?.length === 1, `undo B→A: ${outer.body}`);
+    const inner2 = await postJson(`/v1/batches/${pCB.batch_id}/reconcile/undo`, { proposal_ids: [pCB.id] });
+    assert(inner2.json.reverted?.length === 1, `undo C→B after B→A: ${inner2.body}`);
+    for (const [name, row] of [["A", a], ["B", b], ["C", c]] as const) {
+      assert(isLive(await txState(row.tx.id)), `${name} is not live after both undos`);
+      assert(
+        (await linksOf(row.tx.id)).join() === row.docId,
+        `${name} should hold exactly its own document, has [${(await linksOf(row.tx.id)).join(", ")}]`,
+      );
+    }
+    notes.push("C→B then B→A: undo of C→B refused until B→A is undone; newest-first leaves A, B, C each with its own document");
   });
 
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach

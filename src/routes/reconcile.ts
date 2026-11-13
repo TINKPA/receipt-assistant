@@ -271,7 +271,7 @@ export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/batches/{id}/reconcile/undo",
     summary:
-      "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, or when an old proposal left no trace of which documents moved.",
+      "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
     tags: ["reconcile"],
     request: {
       params: z.object({ id: Uuid }),

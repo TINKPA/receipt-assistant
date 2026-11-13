@@ -2,11 +2,16 @@
  * check-ledger.ts — read-only invariant sweep over a ledger database.
  *
  * Usage:
- *   npx tsx scripts/check-ledger.ts postgresql://user:pass@host:port/receipts [--verbose]
+ *   npx tsx scripts/check-ledger.ts postgresql://user:pass@host:port/receipts [--verbose] [--allow=<check>,<check>]
  *   npx tsx scripts/check-ledger.ts --pg=postgresql://... [--verbose]
  *
  * Exit code: 0 when every invariant holds, 1 when any is violated, 2 when
  * the sweep itself could not run.
+ *
+ * `--allow=<check>[,<check>]` still runs and prints the named checks but
+ * leaves them out of the exit code. It is for a backlog that has been
+ * looked at and accepted, so that the checks that should be clean can
+ * gate a deploy; it is never applied by default.
  *
  * SELECT only, and enforced rather than promised: the session is opened
  * with `default_transaction_read_only = on`, so a write would be refused
@@ -21,30 +26,64 @@
  * Invariants:
  *   ingest-target-live      a `dedup` / `near_dup` ingest says "this file is
  *                           already in the ledger as transaction X". X must
- *                           be live, or the file's purchase is nowhere.
+ *                           have been live when the ingest closed, or the
+ *                           file's purchase was nowhere.
  *   proposal-open-live      an open dedup proposal names two live rows.
- *   proposal-survivor-live  an applied dedup proposal's surviving row is
- *                           live: the duplicate's evidence was moved there.
+ *   proposal-survivor-live  an applied dedup proposal's surviving row was
+ *                           live when the duplicate's evidence was moved
+ *                           onto it.
+ *   applied-duplicate-gone  an applied dedup proposal's duplicate is still
+ *                           deleted. A live one was brought back with a
+ *                           plain restore: its documents are still on the
+ *                           surviving row, and `/reconcile/undo` for that
+ *                           proposal moves them back.
  *   document-has-live-txn   a live document that is linked at all is linked
  *                           to at least one live transaction.
- *   refund-not-deduped      no refund sits deleted as the "duplicate" of a
- *                           purchase (opposite money direction, by the
- *                           expense/income leg picked by account type).
+ *   refund-not-deduped      no row sits deleted as the "duplicate" of a row
+ *                           whose money moved the other way: a refund
+ *                           folded into the purchase it reverses. Direction
+ *                           is the detector's: the class of the P&L legs
+ *                           (expense / income / both / neither) and the
+ *                           sign of their total.
  *   items-under-live-txn    no un-retired line item hangs under a deleted
  *                           transaction (it would still count in product
  *                           statistics).
+ *
+ * What is NOT a violation: a transaction soft-deleted AFTER an ingest or
+ * an applied proposal pointed at it. That is somebody's later decision
+ * (or a later fold into another row), the ledger was consistent when the
+ * pointer was written, and `deleted_at` proves the order. A target that
+ * is missing altogether (hard-deleted) cannot be dated and is reported.
+ *
+ * Two checks describe states that ordinary use still produces, so they
+ * stay red until the code path behind them changes or the rows are
+ * dealt with; `--allow` exists for them:
+ *   - document-has-live-txn fires for a receipt whose transaction was
+ *     soft-deleted while the document was kept. Either the purchase is
+ *     missing from the ledger (re-upload the file: it extracts again) or
+ *     the document is not wanted (delete it).
+ *   - items-under-live-txn fires for every soft-deleted transaction that
+ *     has line items: neither a person's delete nor a dedup apply
+ *     retires them, and the item and product reads do not look at the
+ *     parent's `deleted_at`.
  */
 import pg from "pg";
 
 const args = process.argv.slice(2);
 const VERBOSE = args.includes("--verbose");
+const ALLOW = new Set(
+  (args.find((a) => a.startsWith("--allow="))?.slice("--allow=".length) ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x) => x !== ""),
+);
 const url =
   args.find((a) => a.startsWith("--pg="))?.slice("--pg=".length) ??
   args.find((a) => /^postgres(ql)?:\/\//.test(a));
 
 if (!url) {
   console.error(
-    "usage: npx tsx scripts/check-ledger.ts <postgres-url> [--verbose]",
+    "usage: npx tsx scripts/check-ledger.ts <postgres-url> [--verbose] [--allow=<check>,<check>]",
   );
   process.exit(2);
 }
@@ -52,10 +91,30 @@ if (!url) {
 const LIVE = (alias: string): string =>
   `(${alias}.status IN ('posted', 'reconciled') AND ${alias}.deleted_at IS NULL)`;
 
-/** Expense/income leg by ACCOUNT TYPE, signed: a refund is negative. */
-const SIGNED_TOTAL = (alias: string): string => `(
-  SELECT COALESCE(SUM(CASE a.type WHEN 'income' THEN -p.amount_base_minor
-                                  WHEN 'expense' THEN p.amount_base_minor END), 0)
+/** Soft-deleted, and provably AFTER the moment `at`: a later decision,
+ *  not a pointer written at a row that was already gone. */
+const DELETED_AFTER = (alias: string, at: string): string =>
+  `(${alias}.status IN ('posted', 'reconciled') AND ${alias}.deleted_at IS NOT NULL AND ${alias}.deleted_at > ${at})`;
+
+/**
+ * Money direction, the way the dedup detector reads it
+ * (`directionLateral` in src/reconcile/dedup.ts, re-typed here because
+ * this script checks the ledger from the outside): the class of the
+ * row's P&L legs and the sign of their total. Expense as booked, income
+ * negated, so a refund booked as a negative expense reads `expense:-1`
+ * and money back booked through an income account reads `income:1` —
+ * neither equals a purchase's `expense:1`.
+ */
+const DIRECTION = (alias: string): string => `(
+  SELECT CASE WHEN bool_or(a.type = 'expense') AND bool_or(a.type = 'income') THEN 'mixed'
+              WHEN bool_or(a.type = 'expense') THEN 'expense'
+              WHEN bool_or(a.type = 'income')  THEN 'income'
+              ELSE 'none' END
+         || ':' ||
+         sign(CASE WHEN bool_or(a.type IN ('expense', 'income'))
+                   THEN COALESCE(SUM(CASE a.type WHEN 'income'  THEN -p.amount_base_minor
+                                                 WHEN 'expense' THEN  p.amount_base_minor END), 0)
+                   ELSE COALESCE(SUM(GREATEST(p.amount_base_minor, 0)), 0) END)::int
     FROM postings p JOIN accounts a ON a.id = p.account_id
    WHERE p.transaction_id = ${alias}.id)`;
 
@@ -69,12 +128,12 @@ interface Check {
 const CHECKS: Check[] = [
   {
     name: "ingest-target-live",
-    what: "dedup / near_dup ingests pointing at a transaction that is not live",
+    what: "dedup / near_dup ingests pointing at a transaction that was not live",
     sql: `
       SELECT i.id::text AS id,
              i.status || ' → ' || x.tid || ' (' ||
                CASE WHEN t.id IS NULL THEN 'missing'
-                    WHEN t.deleted_at IS NOT NULL THEN 'soft-deleted'
+                    WHEN t.deleted_at IS NOT NULL THEN 'soft-deleted before the ingest closed'
                     ELSE 'status ' || t.status END || ')' AS detail
         FROM ingests i
        CROSS JOIN LATERAL jsonb_array_elements_text(
@@ -82,6 +141,7 @@ const CHECKS: Check[] = [
         LEFT JOIN transactions t ON t.id::text = x.tid
        WHERE i.status IN ('dedup', 'near_dup')
          AND (t.id IS NULL OR NOT ${LIVE("t")})
+         AND NOT COALESCE(${DELETED_AFTER("t", "COALESCE(i.completed_at, i.created_at)")}, false)
        ORDER BY i.created_at`,
   },
   {
@@ -104,17 +164,36 @@ const CHECKS: Check[] = [
   },
   {
     name: "proposal-survivor-live",
-    what: "applied dedup proposals whose surviving transaction is not live",
+    what: "applied dedup proposals whose surviving transaction was not live",
     sql: `
       SELECT rp.id::text AS id,
              'batch ' || rp.batch_id || ': survivor ' ||
                COALESCE(rp.payload->>'duplicate_of', '?') ||
-               CASE WHEN c.id IS NULL THEN ' missing' ELSE ' not live' END AS detail
+               CASE WHEN c.id IS NULL THEN ' missing'
+                    WHEN c.deleted_at IS NOT NULL THEN ' already deleted when the proposal was applied'
+                    ELSE ' not live' END AS detail
         FROM reconcile_proposals rp
         LEFT JOIN transactions c ON c.id::text = rp.payload->>'duplicate_of'
        WHERE rp.kind = 'dedup'
          AND rp.status IN ('auto_applied', 'user_applied')
          AND (c.id IS NULL OR NOT ${LIVE("c")})
+         AND NOT COALESCE(${DELETED_AFTER("c", "COALESCE(rp.resolved_at, rp.created_at)")}, false)
+       ORDER BY rp.created_at`,
+  },
+  {
+    name: "applied-duplicate-gone",
+    what: "applied dedup proposals whose duplicate is live again (restored without undo)",
+    sql: `
+      SELECT rp.id::text AS id,
+             'batch ' || rp.batch_id || ': duplicate ' || d.id ||
+               ' is not deleted; its documents are still on ' ||
+               COALESCE(rp.payload->>'duplicate_of', '?') ||
+               ' — undo this proposal to move them back' AS detail
+        FROM reconcile_proposals rp
+        JOIN transactions d ON d.id::text = rp.payload->>'duplicate'
+       WHERE rp.kind = 'dedup'
+         AND rp.status IN ('auto_applied', 'user_applied')
+         AND d.deleted_at IS NULL
        ORDER BY rp.created_at`,
   },
   {
@@ -135,20 +214,24 @@ const CHECKS: Check[] = [
   },
   {
     name: "refund-not-deduped",
-    what: "refunds deleted as the duplicate of a purchase",
+    what: "rows deleted as the duplicate of a row whose money moved the other way (a refund folded into its purchase)",
     sql: `
-      SELECT d.id::text AS id,
-             'proposal ' || rp.id || ' (batch ' || rp.batch_id || ', ' || rp.status ||
-               '): deleted refund folded into purchase ' || c.id AS detail
-        FROM reconcile_proposals rp
-        JOIN transactions d ON d.id::text = rp.payload->>'duplicate'
-        JOIN transactions c ON c.id::text = rp.payload->>'duplicate_of'
-       WHERE rp.kind = 'dedup'
-         AND rp.status IN ('auto_applied', 'user_applied')
-         AND d.deleted_at IS NOT NULL
-         AND ${SIGNED_TOTAL("d")} < 0
-         AND ${SIGNED_TOTAL("c")} > 0
-       ORDER BY rp.created_at`,
+      SELECT x.id, x.detail
+        FROM (
+          SELECT d.id::text AS id, rp.created_at,
+                 ${DIRECTION("d")} AS d_dir,
+                 ${DIRECTION("c")} AS c_dir,
+                 'proposal ' || rp.id || ' (batch ' || rp.batch_id || ', ' || rp.status ||
+                   '): deleted row folded into ' || c.id AS detail
+            FROM reconcile_proposals rp
+            JOIN transactions d ON d.id::text = rp.payload->>'duplicate'
+            JOIN transactions c ON c.id::text = rp.payload->>'duplicate_of'
+           WHERE rp.kind = 'dedup'
+             AND rp.status IN ('auto_applied', 'user_applied')
+             AND d.deleted_at IS NOT NULL
+        ) x
+       WHERE x.d_dir IS DISTINCT FROM x.c_dir
+       ORDER BY x.created_at`,
   },
   {
     name: "items-under-live-txn",
@@ -166,6 +249,13 @@ const CHECKS: Check[] = [
 ];
 
 async function main(): Promise<void> {
+  const unknown = [...ALLOW].filter((n) => !CHECKS.some((c) => c.name === n));
+  if (unknown.length > 0) {
+    console.error(
+      `--allow names no such check: ${unknown.join(", ")} (checks: ${CHECKS.map((c) => c.name).join(", ")})`,
+    );
+    process.exit(2);
+  }
   const client = new pg.Client({
     connectionString: url,
     // Refuse writes at the server for the whole session.
@@ -178,12 +268,16 @@ async function main(): Promise<void> {
   }
 
   let violated = 0;
+  let allowed = 0;
   console.log("# check-ledger (read-only)\n");
   for (const c of CHECKS) {
     const res = await client.query(c.sql);
     const n = res.rows.length;
-    if (n > 0) violated++;
-    console.log(`${n === 0 ? "ok  " : "FAIL"}  ${c.name.padEnd(24)} ${String(n).padStart(4)}  ${c.what}`);
+    const waived = n > 0 && ALLOW.has(c.name);
+    if (waived) allowed++;
+    else if (n > 0) violated++;
+    const mark = n === 0 ? "ok  " : waived ? "seen" : "FAIL";
+    console.log(`${mark}  ${c.name.padEnd(24)} ${String(n).padStart(4)}  ${c.what}`);
     if (VERBOSE) {
       for (const r of res.rows as Array<{ id: string; detail: string | null }>) {
         console.log(`        ${r.id}  ${r.detail ?? ""}`);
@@ -191,10 +285,12 @@ async function main(): Promise<void> {
     }
   }
   await client.end();
+  const waivedNote =
+    allowed > 0 ? `; ${allowed} more violated but allowed by --allow` : "";
   console.log(
     violated === 0
-      ? "\nall invariants hold"
-      : `\n${violated} of ${CHECKS.length} invariants violated${VERBOSE ? "" : " (re-run with --verbose for ids)"}`,
+      ? `\n${allowed > 0 ? "no unallowed violation" : "all invariants hold"}${waivedNote}`
+      : `\n${violated} of ${CHECKS.length} invariants violated${waivedNote}${VERBOSE ? "" : " (re-run with --verbose for ids)"}`,
   );
   process.exit(violated === 0 ? 0 : 1);
 }
