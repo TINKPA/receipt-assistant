@@ -8,6 +8,7 @@ import {
   IsoDate,
   IsoDateTime,
   Metadata,
+  MetadataPatch,
   Uuid,
 } from "./common.js";
 import { Place } from "./place.js";
@@ -323,7 +324,10 @@ export const UpdateTransactionRequest = z
     payee: z.string().nullable().optional(),
     narration: z.string().nullable().optional(),
     trip_id: Uuid.nullable().optional(),
-    metadata: Metadata.optional(),
+    /** Merge patch, not a replacement — see `MetadataPatch`. Keys the
+     *  server owns (`SERVER_OWNED_TX_METADATA_KEYS` in
+     *  src/projection/metadata-patch.ts) cannot be changed here. */
+    metadata: MetadataPatch.optional(),
   })
   .strict()
   .openapi("UpdateTransactionRequest");

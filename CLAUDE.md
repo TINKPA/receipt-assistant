@@ -43,7 +43,9 @@ Receipts can be wrong (mis-shot, wrong merchant, duplicate). Soft and hard delet
 **`DELETE /v1/documents/:id`**
 - default: soft delete (sets `deleted_at`). `GET` and link-creation hide the row; `?include_deleted=true` surfaces it. Re-uploading the same bytes resurrects it via the sha256 dedup path.
 - `?hard=true`: removes the row and the image file. Refuses with 409 if links exist, unless `?cascade=true`.
-- `?cascade=true`: in one DB transaction, also handles linked transactions: `posted` → soft-deleted, `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge.
+- `?cascade=true`: in one DB transaction, also deletes each linked transaction for which this document is the **last live evidence**. A transaction that another non-deleted document is still linked to is **kept**: an invoice and a payment confirmation both support one purchase, and deleting either file must not delete the purchase. The transactions that are not kept go the usual way: `posted` → soft-deleted, `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **aborts the whole operation with 409, no writes**. A reconciled transaction that is merely kept does not block. The document is soft-deleted and its link rows stay (as on any soft delete), so `restore` brings the association back.
+- `?cascade=true&hard=true`: a full purge of the document. Transactions it was the last live evidence of are hard-deleted; kept transactions only lose the link, and get a `document_unlinked` event.
+- Every `hard_deleted` event, from any path, carries `transaction_id` in its payload: the FK nulls the column when the row goes, so the payload copy is the only pointer back (#202).
 
 **`POST /v1/documents/:id/restore`** clears `deleted_at`.
 
@@ -134,6 +136,32 @@ END
 ```
 
 Once flagged, a field is read-only to re-extract. The flag is a boolean, not a timestamp: when the edit happened is in `transaction_events`.
+
+### Editing a transaction through the API
+
+Three rules keep an ordinary API call from destroying ledger data. All three are checked by `scripts/smoke-ledger-api-safety.ts` (below).
+
+**`PATCH /v1/transactions/:id` merges `metadata`, it never replaces it** (RFC 7396, `src/projection/metadata-patch.ts`). Objects merge recursively, `null` removes a key, and `metadata: {}` changes nothing. One refinement of the RFC: a value sent back exactly as stored is left as stored, nested nulls included, so GET → change a key → PATCH the whole object back is safe (strict RFC 7396 would strip every null inside the echoed values, and most rows carry nulls inside `items` and `ocr_audit`). Only the top-level keys that moved are written, as a jsonb expression, so untouched keys never round-trip through JavaScript. This matters because the deployed web client sends `metadata: {}` on every save: the OpenAPI schema used to give the field `default: {}`, and openapi-typescript renders a defaulted property as required. PATCH request schemas use `MetadataPatch` (no default) for that reason; do not put `Metadata` on a PATCH body. `PATCH /v1/accounts/:id` follows the same rule.
+
+**Some metadata keys belong to the server.** `SERVER_OWNED_TX_METADATA_KEYS` lists the provenance and bookkeeping keys (`extraction`, `extraction_history`, `re_extracted_at`, `source`, `source_ingest_id`, `classification`, `ocr_audit`, `allocation_audit`, `enrichment_skipped`, `photo_ocr`, `receipt_ocr_zh`, `items`, `merge_audit`, `near_dup_check`, `fx`, `points`, `user_edited`), each cited to the code that writes it. A PATCH that would change or remove one is a 422 (`server_owned`); echoing the current value back is a no-op. Receipt facts and projections (`order_number`, `merchant`, `category_hint`, `flow`, …) stay client-writable. **When you add a server-side writer of `transactions.metadata`, add its key to that list in the same PR.** The `updated` event stores old and new values of the head fields and of only the metadata keys that moved.
+
+**Posting mutations** (`POST|PATCH|DELETE …/postings`) are refused with 409 on a `reconciled` (`transaction-reconciled`) or soft-deleted (`transaction-deleted`) transaction, and `resolvePostingMoney` in `src/routes/transactions.service.ts` decides the base-currency side for create, add and update alike:
+
+| Posting currency | `fx_rate` / `amount_base_minor` |
+|---|---|
+| workspace base | server sets `amount_base_minor = amount_minor`, `fx_rate = NULL`; a different client value is a 422 |
+| foreign cash | both required together; a patch that changes `amount_minor` or `currency` must restate them |
+| points (`*_PT`) | both, or neither (the server applies the programme valuation) |
+
+The pair is not checked against `amount_minor × fx_rate`: the FX pass settles rounding residue onto one leg, so the product is only approximate.
+
+Every If-Match-guarded mutation takes the head row's lock (`lockTransactionRow`, `SELECT … FOR UPDATE`) before checking the version, so two requests with the same If-Match cannot both win, and a background pass that writes `metadata.fx` / `metadata.points` cannot be overwritten by a concurrent PATCH.
+
+```bash
+# Sandbox or throwaway DB only: it writes fixtures (and refuses port 3000).
+npx tsx scripts/smoke-ledger-api-safety.ts --base=http://<host>:<port> \
+  --pg=postgresql://postgres:postgres@<host>:<pgport>/receipts
+```
 
 ### Audit queries
 

@@ -310,8 +310,10 @@ documentsRouter.delete(
 //
 // Default: soft delete. Optional flags:
 //   ?hard=true               — actually remove row + image file
-//   ?cascade=true            — also handle linked transactions
-//   ?cascade=true&hard=true  — full purge (txns + links + doc + file)
+//   ?cascade=true            — also delete the linked transactions this
+//                              document is the LAST live evidence of;
+//                              ones another live document supports stay
+//   ?cascade=true&hard=true  — full purge (those txns + links + doc + file)
 
 const DeleteQuery = z.object({
   hard: BoolFlag.optional(),
@@ -563,9 +565,12 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Default: soft delete (sets deleted_at). " +
       "?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. " +
-      "?cascade=true: linked posted transactions are soft-deleted, draft/error transactions are hard-deleted, already-deleted transactions are left intact, reconciled transactions abort the operation with 409. " +
-      "?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). " +
-      "Reconciled transactions always block hard cascades — unreconcile first.",
+      "?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. " +
+      "A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. " +
+      "Of the transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, already-deleted ones are left intact, and a reconciled one aborts the whole operation with 409 (unreconcile first). " +
+      "The document itself is soft-deleted and its link rows stay, so restoring it restores the association. " +
+      "?cascade=true&hard=true: the transactions that are not kept are hard-deleted (postings cascade); kept transactions are only unlinked from this document (a `document_unlinked` event records it). " +
+      "The document row is removed and the image file is moved to .trash/ (never unlinked).",
     tags: ["documents"],
     request: {
       params: z.object({ id: Uuid }),
@@ -577,7 +582,8 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
         }),
         cascade: z.enum(["true", "false", "1", "0"]).optional().openapi({
           description:
-            "Also process transactions linked to this document. Combine with hard=true for full purge.",
+            "Also delete the linked transactions this document is the last live evidence of; " +
+            "transactions another live document supports are kept. Combine with hard=true for full purge.",
         }),
       }),
     },
@@ -586,7 +592,7 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       404: { description: "Not found", content: problemContent },
       409: {
         description:
-          "Hard delete refused because document has links (use cascade), or cascade refused because a linked transaction is reconciled.",
+          "Hard delete refused because document has links (use cascade), or cascade refused because a transaction it would delete is reconciled.",
         content: problemContent,
       },
     },

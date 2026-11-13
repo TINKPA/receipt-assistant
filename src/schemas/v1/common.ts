@@ -60,6 +60,26 @@ export const Metadata = z
   .default({})
   .openapi({ description: "User-defined JSON object; not schema-validated." });
 
+/**
+ * `metadata` on a PATCH body: a JSON Merge Patch (RFC 7396) applied to
+ * the stored object, never a replacement for it.
+ *
+ * Deliberately has NO `.default({})`. `Metadata` above carries one, and
+ * openapi-typescript renders a defaulted property as REQUIRED — which is
+ * how the web client came to send `metadata: {}` on every save. A patch
+ * field that a generated client is forced to send must never mean
+ * "replace".
+ */
+export const MetadataPatch = z.record(z.string(), z.unknown()).openapi({
+  description:
+    "JSON Merge Patch (RFC 7396) applied to the stored metadata object: " +
+    "objects merge recursively, a `null` value removes that key, any other " +
+    "value replaces it, and keys the patch does not name are kept. `{}` " +
+    "changes nothing. A value sent back exactly as stored is left untouched " +
+    "(including nulls nested inside it), so GET → change one key → PATCH the " +
+    "whole object back is safe.",
+});
+
 // ── Path + query primitives ────────────────────────────────────────────
 
 export const IdParam = z.object({ id: Uuid }).openapi({ title: "IdParam" });

@@ -9,7 +9,7 @@ import { mkdir, writeFile, rename, readFile, stat } from "fs/promises";
 import * as path from "path";
 import { simpleParser } from "mailparser";
 import sanitizeHtml from "sanitize-html";
-import { and, eq, sql, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { documents, documentLinks } from "../schema/documents.js";
 import { transactions, transactionEvents } from "../schema/index.js";
@@ -579,25 +579,49 @@ interface CascadeReport {
   txns_soft_deleted: string[];
   txns_hard_deleted: string[];
   txns_skipped: string[];
+  /** Linked transactions left in the ledger because another live
+   *  document still evidences them. */
+  txns_kept: string[];
 }
 
 /**
  * One-call "delete this whole receipt" orchestration.
  *
- * Soft mode (default): linked posted txns → soft-deleted (deleted_at);
- * linked draft/error txns → hard-deleted (no audit value); linked
- * already-deleted txns → left alone, link kept for history; document →
- * soft-deleted.
+ * A linked transaction is only deleted when this document is its LAST
+ * LIVE EVIDENCE — when no other document with `deleted_at IS NULL` is
+ * linked to it. A transaction that an invoice and a payment confirmation
+ * both support is not "owned" by either file: deleting one of them used
+ * to take the transaction (and, with `hard`, its postings and items)
+ * with it, although the other document still stood behind it. Such a
+ * transaction is now KEPT, in both modes.
  *
- * Hard mode (`hard=true`): all linked txns are hard-deleted (postings
- * cascade via FK); document → hard-deleted (row + image file).
+ * Soft mode (default): the document is soft-deleted. Per linked txn:
+ *   - other live evidence → kept, untouched. The link row stays, as it
+ *     does on every soft delete, so restoring the document restores the
+ *     association; a soft-deleted document already reads as a tombstone.
+ *   - already soft-deleted → left alone, link kept for history.
+ *   - draft/error → hard-deleted (no audit value).
+ *   - posted → soft-deleted (deleted_at).
  *
- * Both modes refuse if any linked txn is `reconciled`: 409, no writes.
- * Caller must unreconcile first.
+ * Hard mode (`hard=true`): the document row goes, and its bytes move to
+ * `.trash/`. Per linked txn:
+ *   - other live evidence → kept; the link to this document is removed
+ *     and a `document_unlinked` event records why.
+ *   - otherwise → hard-deleted (postings cascade via FK).
  *
- * Everything happens in a single DB transaction — the file quarantine
- * (hard mode) runs after commit. The bytes are MOVED into `.trash/`,
- * never unlinked; see `quarantineFile` and #72.
+ * Both modes refuse, with 409 and no writes, if a transaction they would
+ * DELETE is `reconciled`. A reconciled transaction that is merely kept
+ * does not block: nothing about the matched amounts changes.
+ *
+ * Every `hard_deleted` event carries `transaction_id` in its payload —
+ * the FK nulls the column when the row goes (see src/schema/audit.ts),
+ * so the payload copy is the only pointer back to the row (#202).
+ *
+ * Everything happens in a single DB transaction, with the document and
+ * the linked transactions row-locked so two concurrent deletes of a
+ * transaction's two documents cannot each see the other as surviving
+ * evidence. The file quarantine (hard mode) runs after commit. The bytes
+ * are MOVED into `.trash/`, never unlinked; see `quarantineFile` and #72.
  */
 export async function cascadeDeleteDocument(params: {
   workspaceId: string;
@@ -617,11 +641,13 @@ export async function cascadeDeleteDocument(params: {
       .from(documents)
       .where(
         and(eq(documents.id, documentId), eq(documents.workspaceId, workspaceId)),
-      );
+      )
+      .for("update");
     if (docRows.length === 0) throw new NotFoundProblem("Document", documentId);
     const doc = docRows[0]!;
 
-    // Find all linked transactions with their current state.
+    // Find all linked transactions with their current state. Locked in
+    // id order so concurrent cascades take the rows in the same sequence.
     const linkedTxns = await tx
       .select({
         id: transactions.id,
@@ -631,16 +657,41 @@ export async function cascadeDeleteDocument(params: {
       })
       .from(documentLinks)
       .innerJoin(transactions, eq(transactions.id, documentLinks.transactionId))
-      .where(eq(documentLinks.documentId, documentId));
+      .where(eq(documentLinks.documentId, documentId))
+      .orderBy(transactions.id)
+      .for("update", { of: transactions });
 
-    // Reconciled guard — refuse the whole batch.
-    const reconciled = linkedTxns.filter((t) => t.status === "reconciled");
+    // Which of them does some OTHER live document still evidence?
+    const supported = new Set<string>();
+    if (linkedTxns.length > 0) {
+      const otherEvidence = await tx
+        .selectDistinct({ transactionId: documentLinks.transactionId })
+        .from(documentLinks)
+        .innerJoin(documents, eq(documents.id, documentLinks.documentId))
+        .where(
+          and(
+            inArray(
+              documentLinks.transactionId,
+              linkedTxns.map((t) => t.id),
+            ),
+            ne(documentLinks.documentId, documentId),
+            isNull(documents.deletedAt),
+          ),
+        );
+      for (const r of otherEvidence) supported.add(r.transactionId);
+    }
+    const kept = linkedTxns.filter((t) => supported.has(t.id));
+    const orphaned = linkedTxns.filter((t) => !supported.has(t.id));
+
+    // Reconciled guard — refuse the whole batch. Only the transactions
+    // this call would otherwise delete count.
+    const reconciled = orphaned.filter((t) => t.status === "reconciled");
     if (reconciled.length > 0) {
       throw new HttpProblem(
         409,
         "cascade-blocked-reconciled",
         "Cannot cascade-delete: linked transaction is reconciled",
-        `Document ${documentId} is linked to ${reconciled.length} reconciled transaction(s). Unreconcile first, then retry.`,
+        `Document ${documentId} is the last live evidence of ${reconciled.length} reconciled transaction(s). Unreconcile first, then retry.`,
         { document_id: documentId, reconciled_transaction_ids: reconciled.map((r) => r.id) },
       );
     }
@@ -648,8 +699,47 @@ export async function cascadeDeleteDocument(params: {
     const txnsSoftDeleted: string[] = [];
     const txnsHardDeleted: string[] = [];
     const txnsSkipped: string[] = [];
+    const txnsKept = kept.map((t) => t.id);
+
+    const hardDeleteTxn = async (
+      t: (typeof linkedTxns)[number],
+      reason: string,
+    ): Promise<void> => {
+      await tx.insert(transactionEvents).values({
+        id: newId(),
+        workspaceId,
+        transactionId: t.id,
+        eventType: "hard_deleted",
+        actorId: userId,
+        payload: {
+          reason,
+          document_id: documentId,
+          prior_status: t.status,
+          // Duplicated on purpose — the DELETE below nulls the
+          // `transaction_events.transaction_id` column.
+          transaction_id: t.id,
+        },
+      });
+      await tx.delete(transactions).where(eq(transactions.id, t.id));
+      txnsHardDeleted.push(t.id);
+    };
 
     if (hard) {
+      // The surviving transactions lose this document as evidence; say
+      // so in their history before the link rows go.
+      for (const t of kept) {
+        await tx.insert(transactionEvents).values({
+          id: newId(),
+          workspaceId,
+          transactionId: t.id,
+          eventType: "document_unlinked",
+          actorId: userId,
+          payload: {
+            reason: "cascade_delete_document",
+            document_id: documentId,
+          },
+        });
+      }
       // Unlink first (FK cascade would also do it, but being explicit
       // makes the audit trail readable: the unlinks happen, then the
       // txns vanish).
@@ -659,22 +749,10 @@ export async function cascadeDeleteDocument(params: {
           .delete(documentLinks)
           .where(eq(documentLinks.documentId, documentId));
       }
-      // Hard delete all linked txns. Postings + remaining links cascade.
-      for (const t of linkedTxns) {
-        await tx.insert(transactionEvents).values({
-          id: newId(),
-          workspaceId,
-          transactionId: t.id,
-          eventType: "hard_deleted",
-          actorId: userId,
-          payload: {
-            reason: "cascade_delete_document",
-            document_id: documentId,
-            prior_status: t.status,
-          },
-        });
-        await tx.delete(transactions).where(eq(transactions.id, t.id));
-        txnsHardDeleted.push(t.id);
+      // Hard delete the transactions this document was the last live
+      // evidence of. Postings + remaining links cascade.
+      for (const t of orphaned) {
+        await hardDeleteTxn(t, "cascade_delete_document");
       }
       // Hard delete the doc.
       await tx.delete(documents).where(eq(documents.id, documentId));
@@ -685,29 +763,17 @@ export async function cascadeDeleteDocument(params: {
         txns_soft_deleted: txnsSoftDeleted,
         txns_hard_deleted: txnsHardDeleted,
         txns_skipped: txnsSkipped,
+        txns_kept: txnsKept,
       };
     }
 
-    // Soft mode.
-    for (const t of linkedTxns) {
+    // Soft mode. `kept` transactions are not touched at all.
+    for (const t of orphaned) {
       if (t.deletedAt) {
         // Already removed. Leave alone; link survives as historical record.
         txnsSkipped.push(t.id);
       } else if (t.status === "draft" || t.status === "error") {
-        await tx.insert(transactionEvents).values({
-          id: newId(),
-          workspaceId,
-          transactionId: t.id,
-          eventType: "hard_deleted",
-          actorId: userId,
-          payload: {
-            reason: "cascade_soft_delete_document",
-            document_id: documentId,
-            prior_status: t.status,
-          },
-        });
-        await tx.delete(transactions).where(eq(transactions.id, t.id));
-        txnsHardDeleted.push(t.id);
+        await hardDeleteTxn(t, "cascade_soft_delete_document");
       } else {
         // posted (reconciled short-circuited above) → soft-delete the
         // transaction: it stays restorable but drops out of money queries.
@@ -723,6 +789,7 @@ export async function cascadeDeleteDocument(params: {
           actorId: userId,
           payload: {
             reason: `cascade_soft_delete_document:${documentId}`,
+            document_id: documentId,
             prior_status: t.status,
           },
         });
@@ -743,6 +810,7 @@ export async function cascadeDeleteDocument(params: {
       txns_soft_deleted: txnsSoftDeleted,
       txns_hard_deleted: txnsHardDeleted,
       txns_skipped: txnsSkipped,
+      txns_kept: txnsKept,
     };
   });
 
