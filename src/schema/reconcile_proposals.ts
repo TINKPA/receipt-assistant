@@ -16,7 +16,12 @@ import { batches } from "./batches.js";
  * /v1/batches/:id/reconcile` lands. Phase 1 does not write any rows.
  *
  * `kind` values (agreed in issue): dedup | payment_link | trip_group | inventory
- * `status`: proposed | auto_applied | user_applied | rejected
+ * `status`: proposed | auto_applied | user_applied | rejected | reverted | stale
+ *   (lifecycle and meaning: `src/reconcile/engine.ts` header). Free text
+ *   in the database; the API enum is `ReconcileProposalStatus`.
+ *
+ * For an applied dedup proposal, `payload.applied.links` records which
+ * document links the apply moved off the duplicate. Undo reads it.
  */
 export const reconcileProposals = pgTable(
   "reconcile_proposals",

@@ -18,6 +18,7 @@ import { and, eq, sql } from "drizzle-orm";
 import * as path from "path";
 import { readFile } from "fs/promises";
 import { db } from "../db/client.js";
+import { liveTransactions } from "../db/live.js";
 import { batches, ingests } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import {
@@ -443,8 +444,8 @@ export async function createBatchFromFiles(params: {
     // when it matches a live transaction, OR a sibling ingest still in
     // flight (another request, or an earlier file in THIS request). The
     // only `!created` case we still extract is a genuine restore: prior
-    // transaction voided/errored, nothing live and nothing in flight
-    // (findLiveTransactionForDocument deliberately ignores voided links).
+    // transaction deleted/errored, nothing live and nothing in flight
+    // (findLiveTransactionForDocument ignores links to deleted rows).
     let bornDedup = false;
     let dedupOf: string | null = null;
     if (!created) {
@@ -558,12 +559,15 @@ export async function createBatchFromFiles(params: {
 }
 
 /**
- * L1 dedup probe (#124). Returns the id of a LIVE transaction (posted or
- * reconciled) already linked to `documentId`, or null if none. A `voided`
- * or `draft` link must NOT suppress a re-ingest — the user may be
- * re-uploading precisely because the prior transaction was voided. One
- * O(ms) indexed lookup per dedup-hit file; `document_links_txn_idx` +
- * the documents PK keep it cheap.
+ * L1 dedup probe (#124). Returns the id of a LIVE transaction already
+ * linked to `documentId`, or null if none. A link to a soft-deleted or
+ * `draft` transaction must NOT suppress a re-ingest — the user may be
+ * re-uploading precisely because the prior transaction was wrong and
+ * they deleted it. Reads through `ledger_live_transactions`: a
+ * soft-deleted row keeps status `posted`, so the status filter this used
+ * to carry closed such a re-upload as "identical file already linked to
+ * a transaction" and the receipt never extracted again. One O(ms)
+ * lookup per dedup-hit file.
  */
 async function findLiveTransactionForDocument(
   workspaceId: string,
@@ -572,11 +576,10 @@ async function findLiveTransactionForDocument(
   const res = await db.execute(sql`
     SELECT t.id
       FROM document_links dl
-      JOIN transactions t ON t.id = dl.transaction_id
+      JOIN ${liveTransactions} t ON t.id = dl.transaction_id
      WHERE dl.document_id = ${documentId}::uuid
        AND t.workspace_id = ${workspaceId}::uuid
-       AND t.status IN ('posted', 'reconciled')
-     ORDER BY t.created_at ASC
+     ORDER BY t.created_at ASC, t.id ASC
      LIMIT 1
   `);
   const row = res.rows[0] as { id: string } | undefined;

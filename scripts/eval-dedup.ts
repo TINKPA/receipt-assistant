@@ -1,42 +1,73 @@
 /**
  * eval-dedup.ts — dedup-system regression matrix (#134/#135 hardening).
  *
- * Runs the full L1/L2/L3 dedup behavior matrix against the SANDBOX
+ * Runs the full L1/L2/L3 dedup behavior matrix against a THROWAWAY
  * stack (never production): decision-tree branches, worker guard
- * negative paths (via the stub extractor), the L3b reconcile edges,
- * the same-batch concurrency race, and the flagged-review API.
+ * negative paths (via the stub extractor), the reconcile engine's safety
+ * rules, the same-batch concurrency race, and the flagged-review API.
  *
  * Prereqs:
- *   - sandbox up: docker compose -p receipts-test -f docker-compose.test.yml up -d --build
- *   - sandbox RESET first (scripts/sandbox-reset.sh) for a clean matrix
- *   - EXTRACTOR_STUB_ALLOWED=1 in the sandbox env (compose.test sets it)
+ *   - a server started with EXTRACTOR_STUB_ALLOWED=1 against a database
+ *     you can throw away: the sandbox (docker-compose.test.yml sets the
+ *     env), or `npx tsx src/server.ts` pointed at a scratch Postgres
+ *   - for the Claude cases only: a RESET sandbox (scripts/sandbox-reset.sh)
+ *     and the corpus images under --uploads-dir
  *
- * Usage (from the repo root; macOS host — `sips` is used to re-encode):
- *   npx tsx scripts/eval-dedup.ts --base=http://100.84.82.96:3001 \
- *       --pg=postgresql://postgres:postgres@100.84.82.96:5433/receipts \
- *       [--only=g1,g2] [--with-claude]
+ * Usage (from the repo root):
+ *   npx tsx scripts/eval-dedup.ts --base=http://<host>:<port> \
+ *       --pg=postgresql://postgres:postgres@<host>:<port>/receipts \
+ *       [--only=g1,rf] [--with-claude]
  *
- * Stub cases (g*, r*) are deterministic and fast (seconds). Claude
- * cases (b*, race) each pay a real extraction (~2-4 min) and are
- * gated behind --with-claude. Run them after any eval-dates batch
- * finishes to avoid auth-pool contention.
+ * Stub cases are deterministic and fast (about a minute in total): every
+ * seed carries a per-run nonce, so they can run against a dirty database
+ * and repeat without interfering. Claude cases (b*, race) each pay a real
+ * extraction (~2-4 min), need macOS `sips`, and are gated behind
+ * --with-claude. Run them after any eval-dates batch finishes to avoid
+ * auth-pool contention.
  *
- * Case matrix:
+ * "Removed" below always means SOFT-DELETED: `deleted_at` set, status
+ * still `posted` (#171). Nothing writes `voided` any more, and a count of
+ * live rows must filter `deleted_at IS NULL`.
+ *
+ * Case matrix — worker guards (stub):
  *   g1   near_dup claimed without a committed link  → worker forces error (#134 guard)
  *   g2   done with produced=[] but txn written      → #133 self-heal repairs produced
  *   g3   done with produced=[] and no txn           → worker forces error (#125 guard)
- *   r1   cross-batch order-number exact match       → 1.0 auto-void + evidence re-link (#135)
- *   r2   cross-batch card-last4 conflict            → no proposal (score < 0.5)
+ *   g4   near_dup attach to a SOFT-DELETED txn      → worker forces error (deleted is not live)
+ *
+ * Reconcile engine (stub):
+ *   r1   cross-batch order-number exact match       → 1.0 auto-apply: later row soft-deleted,
+ *        evidence re-linked, and the moved links RECORDED on the proposal (#135)
+ *   r2   cross-batch card-last4 conflict            → no proposal
  *   r3   reconcile flip+re-run                      → no duplicate proposals (idempotency)
+ *   rf   refund vs purchase, same order number      → no proposal, nothing removed
+ *        (signed-total gate; flow gate for a refund booked the wrong way round; in-batch too)
+ *   sd   soft-deleted survivor                      → no proposal against the deleted row, the
+ *        new row stays live; re-uploading the deleted row's exact bytes extracts AGAIN,
+ *        and a third upload dedups against the new live row
+ *   rc   run of equal-price same-merchant charges   → bounded: ≤ 1 proposal across 6 separate
+ *        batches, 0 for 5 in one batch, nothing removed
+ *   ib   in-batch identifier rules                  → different order numbers: no proposal;
+ *        no identifiers: one 0.9 proposal, NOT applied; same order number: 1.0 auto-apply
+ *   nd   pair the agent judged `distinct`           → not re-raised
+ *   pp   same pair seen from a second batch         → still one proposal; a rejection sticks
+ *   cl   survivor deleted before apply              → apply refused, proposal `stale`,
+ *        duplicate untouched; the next reconcile closes other stale proposals
+ *   un   undo                                       → auto-applied and user-applied proposals
+ *        both restore the row WITH its own document; second undo is a no-op
+ *
+ * Agent decision tree (--with-claude):
  *   b2   re-encoded copy of extracted receipt       → branch-2 attach (near_dup, no new txn)
  *   b3   same-app-template different purchase (d≈2) → branch-3 INSERT distinct (pHash never decides)
  *   b4   candidates but no strong tiebreaker        → branch-4 INSERT + flagged_for_review,
  *        then GET ?flagged=near_dup + dismiss endpoint round-trip
  *   race two byte-different copies in ONE batch     → ledger converges to 1 live txn
- *        (either L3a attach in-flight, or L3b in-batch auto-void repairs after)
+ *        (L3a attach in-flight, or the in-batch pass repairs after — which needs the two
+ *        extractions to agree on an identifier; without one it is a 0.9 proposal for a
+ *        person, and this case then fails by design)
  */
 import "dotenv/config";
-import { readFile, writeFile, mkdtemp } from "node:fs/promises";
+import { readFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -72,11 +103,20 @@ const RACE_IMAGE =
 const db = new pg.Client({ connectionString: PG_URL });
 
 // Per-run nonce: stub seeds carry it in payees/order-numbers so reruns
-// against a dirty sandbox never cross-match a previous run's rows
-// (fixed values would near-dup-match across runs and auto-void each
+// against a dirty database never cross-match a previous run's rows
+// (fixed values would near-dup-match across runs and remove each
 // other — observed before this existed). Claude cases (b2/b3/race) use
 // real corpus images and DO require a reset sandbox.
 const NONCE = randomUUID().slice(0, 6);
+
+// Per-run AMOUNTS too. Reconcile pairs rows on an equal total inside a
+// ±3-day window whatever their payee, so a fixed amount would pair this
+// run's seeds with a previous run's (or with a real row, on a
+// production-shaped copy) and the "no proposal" assertions below would
+// be measuring that noise. `amt(k)` is unique per (run, k): give every
+// sub-case its own k unless it WANTS two rows to share a total.
+const NONCE_NUM = parseInt(NONCE, 16);
+const amt = (k: number): number => 100_000 + (NONCE_NUM % 1_000_000) * 100 + k;
 
 // ── helpers ────────────────────────────────────────────────────────────
 async function q<T = Record<string, unknown>>(
@@ -96,7 +136,15 @@ async function api(pathname: string, init?: RequestInit): Promise<any> {
   } catch {
     /* non-JSON */
   }
-  return { status: res.status, json, body };
+  return { status: res.status, json, body, headers: res.headers };
+}
+
+async function postJson(pathname: string, payload: unknown): Promise<any> {
+  return api(pathname, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 interface UploadFile {
@@ -126,17 +174,29 @@ async function postBatch(files: UploadFile[]): Promise<{
 }
 
 const TERMINAL_BATCH = new Set(["extracted", "reconciled", "failed", "error"]);
+// Reconcile is fire-and-forget after `extracted`, so a case that asserts
+// on proposals must wait for the batch to leave the reconcile pipeline,
+// not merely for extraction to finish.
+const RECONCILE_DONE = new Set(["reconciled", "reconcile_error", "failed", "error"]);
 
-async function pollBatch(batchId: string, timeoutMs = 420_000): Promise<any> {
+async function pollBatch(
+  batchId: string,
+  timeoutMs = 420_000,
+  until: Set<string> = TERMINAL_BATCH,
+): Promise<any> {
   const start = Date.now();
-  for (;;) {
+  for (let n = 0; ; n++) {
     const { json } = await api(`/v1/batches/${batchId}`);
-    if (json && TERMINAL_BATCH.has(json.status)) return json;
+    if (json && until.has(json.status)) return json;
     if (Date.now() - start > timeoutMs)
       throw new Error(`batch ${batchId} not terminal after ${timeoutMs}ms (status=${json?.status})`);
-    await new Promise((r) => setTimeout(r, 4000));
+    // Stub extractions finish in milliseconds; real ones take minutes.
+    await new Promise((r) => setTimeout(r, n < 20 ? 250 : 4000));
   }
 }
+
+const pollReconciled = (batchId: string, timeoutMs = 60_000): Promise<any> =>
+  pollBatch(batchId, timeoutMs, RECONCILE_DONE);
 
 function stubFile(ins: Record<string, unknown>): UploadFile {
   return {
@@ -150,6 +210,155 @@ function stubFile(ins: Record<string, unknown>): UploadFile {
     ),
     mime: "application/json",
   };
+}
+
+// ── stub-seed helpers (reconcile matrix) ───────────────────────────────
+
+interface SeedTx {
+  payee: string;
+  occurred_on: string;
+  /** Signed: a NEGATIVE total writes a refund (expense leg negative,
+   *  card leg positive), exactly the shape the agent writes. */
+  total_minor: number;
+  metadata?: Record<string, unknown>;
+}
+
+interface TxState {
+  id: string;
+  status: string;
+  deleted_at: Date | null;
+}
+
+interface Seeded {
+  batchId: string;
+  ingestId: string;
+  file: UploadFile;
+  tx: TxState;
+  docId: string;
+}
+
+const seedInstruction = (w: SeedTx): Record<string, unknown> => ({
+  write_transaction: { ...w, link_document: true },
+  terminal: { status: "done", transaction_ids: ["$TX"] },
+});
+
+async function txBySourceIngest(ingestId: string): Promise<TxState> {
+  const rows = await q<TxState>(
+    `SELECT id, status, deleted_at FROM transactions WHERE source_ingest_id = $1`,
+    [ingestId],
+  );
+  assert(rows.length === 1, `expected 1 txn for ingest ${ingestId}, got ${rows.length}`);
+  return rows[0]!;
+}
+
+async function txState(id: string): Promise<TxState> {
+  const [row] = await q<TxState>(
+    `SELECT id, status, deleted_at FROM transactions WHERE id = $1`,
+    [id],
+  );
+  assert(row, `transaction ${id} missing`);
+  return row;
+}
+
+/** The ledger's one definition of live, spelled out so this harness
+ *  checks the view from the outside instead of trusting it. */
+const isLive = (t: TxState): boolean =>
+  t.deleted_at === null && (t.status === "posted" || t.status === "reconciled");
+
+async function docOfIngest(ingestId: string): Promise<string> {
+  const [row] = await q<{ id: string }>(
+    `SELECT d.id FROM ingests i
+       JOIN documents d ON d.workspace_id = i.workspace_id AND d.file_path = i.file_path
+      WHERE i.id = $1`,
+    [ingestId],
+  );
+  assert(row, `document for ingest ${ingestId} missing`);
+  return row.id;
+}
+
+/** Seed several transactions in ONE batch and wait for its reconcile. */
+async function seedBatch(ws: SeedTx[]): Promise<Seeded[]> {
+  const files = ws.map((w) => stubFile(seedInstruction(w)));
+  const { batchId, ingestIds } = await postBatch(files);
+  await pollReconciled(batchId);
+  const out: Seeded[] = [];
+  for (let i = 0; i < ingestIds.length; i++) {
+    out.push({
+      batchId,
+      ingestId: ingestIds[i]!,
+      file: files[i]!,
+      tx: await txBySourceIngest(ingestIds[i]!),
+      docId: await docOfIngest(ingestIds[i]!),
+    });
+  }
+  return out;
+}
+
+/** Seed one transaction in its own batch and wait for its reconcile. */
+async function seedOne(w: SeedTx): Promise<Seeded> {
+  return (await seedBatch([w]))[0]!;
+}
+
+interface ProposalState {
+  id: string;
+  batch_id: string;
+  status: string;
+  score: number;
+  payload: any;
+}
+
+/** Every dedup proposal naming BOTH ids, in either orientation. */
+async function proposalsBetween(a: string, b: string): Promise<ProposalState[]> {
+  return q<ProposalState>(
+    `SELECT id, batch_id, status, score::float8 AS score, payload
+       FROM reconcile_proposals
+      WHERE kind = 'dedup'
+        AND ((payload->>'duplicate' = $1 AND payload->>'duplicate_of' = $2)
+          OR (payload->>'duplicate' = $2 AND payload->>'duplicate_of' = $1))
+      ORDER BY created_at`,
+    [a, b],
+  );
+}
+
+/** Every dedup proposal naming ANY of the ids on either side. */
+async function proposalsTouching(ids: string[]): Promise<ProposalState[]> {
+  return q<ProposalState>(
+    `SELECT id, batch_id, status, score::float8 AS score, payload
+       FROM reconcile_proposals
+      WHERE kind = 'dedup'
+        AND (payload->>'duplicate' = ANY($1) OR payload->>'duplicate_of' = ANY($1))
+      ORDER BY created_at`,
+    [ids],
+  );
+}
+
+async function linksOf(txId: string): Promise<string[]> {
+  const rows = await q<{ document_id: string }>(
+    `SELECT document_id FROM document_links WHERE transaction_id = $1 ORDER BY document_id`,
+    [txId],
+  );
+  return rows.map((r) => r.document_id);
+}
+
+/** Soft-delete through the API, the way a person does it. */
+async function softDeleteViaApi(txId: string): Promise<void> {
+  const got = await api(`/v1/transactions/${txId}`);
+  assert(got.status === 200, `GET txn → ${got.status}`);
+  const etag = got.headers.get("etag");
+  assert(etag, "GET txn returned no ETag");
+  const del = await api(`/v1/transactions/${txId}`, {
+    method: "DELETE",
+    headers: { "If-Match": etag },
+  });
+  assert(del.status === 204, `DELETE txn → ${del.status}: ${del.body}`);
+}
+
+/** Flip a reconciled batch back and run its reconcile again. */
+async function rerunReconcile(batchId: string): Promise<void> {
+  await q(`UPDATE batches SET status = 'extracted' WHERE id = $1`, [batchId]);
+  const res = await postJson(`/v1/batches/${batchId}/reconcile`, {});
+  assert(res.status === 200, `reconcile → ${res.status}: ${res.body}`);
+  assert(res.json.status === "reconciled", `reconcile left batch ${res.json.status}`);
 }
 
 let tmp = "";
@@ -258,7 +467,7 @@ async function main(): Promise<void> {
         write_transaction: {
           payee: `SelfHeal Mart ${NONCE}`,
           occurred_on: "2026-06-01",
-          total_minor: 1234,
+          total_minor: amt(1),
           link_document: true,
         },
         terminal: { status: "done", transaction_ids: [] },
@@ -292,111 +501,500 @@ async function main(): Promise<void> {
     notes.push(`forced error: "${String(ing!.error).slice(0, 80)}…"`);
   });
 
-  // r1 — cross-batch order-number exact → 1.0 auto-void + re-link (#135)
-  let r1BatchB: string | null = null;
+  // g4 — near_dup claimed against a SOFT-DELETED transaction, with a
+  // committed link → forced error. A deleted row keeps status `posted`,
+  // so a guard that only reads status accepts the attach and the
+  // document's purchase then exists nowhere in the ledger.
+  await runCase("g4", false, async (notes) => {
+    const target = await seedOne({
+      payee: `Tombstone Deli ${NONCE}`,
+      occurred_on: "2026-06-01",
+      total_minor: amt(2),
+    });
+    await softDeleteViaApi(target.tx.id);
+    // The stub links its own document to the transaction it writes, not
+    // to an arbitrary one, so pre-commit the link the "agent" claims:
+    // upload the attach file once with a guard-tripping phantom target to
+    // learn its document id, then link that document and re-drive the
+    // same bytes after the first ingest has errored (no live transaction,
+    // nothing in flight → extracted again).
+    const attach = stubFile({
+      terminal: { status: "near_dup", transaction_ids: [target.tx.id] },
+    });
+    const first = await postBatch([attach]);
+    await pollBatch(first.batchId);
+    const docId = await docOfIngest(first.ingestIds[0]!);
+    await q(
+      `INSERT INTO document_links (document_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [docId, target.tx.id],
+    );
+    const second = await postBatch([attach]);
+    await pollBatch(second.batchId);
+    const [ing] = await q<{ status: string; error: string | null }>(
+      `SELECT status, error FROM ingests WHERE id = $1`,
+      [second.ingestIds[0]],
+    );
+    assert(
+      ing!.status === "error",
+      `expected error for an attach to a deleted txn, got ${ing!.status} (${ing!.error})`,
+    );
+    assert(String(ing!.error).includes("#134"), `error msg: ${ing!.error}`);
+    notes.push("committed link to a soft-deleted txn is not a live attach → forced error");
+  });
+
+  // r1 — cross-batch order-number exact → 1.0 auto-apply + re-link (#135)
+  let r1: { a: Seeded; b: Seeded; proposal: ProposalState } | null = null;
   await runCase("r1", false, async (notes) => {
-    const seed = {
+    const seed: SeedTx = {
       payee: `EdgeMart ${NONCE}`,
       occurred_on: "2026-06-02",
-      total_minor: 5555,
+      total_minor: amt(3),
       metadata: { order_number: `ORD-EDGE-${NONCE}`, payment: "Visa ****1111" },
-      link_document: true,
     };
-    const a = await postBatch([
-      stubFile({ write_transaction: seed, terminal: { status: "done", transaction_ids: ["$TX"] } }),
-    ]);
-    await pollBatch(a.batchId);
-    const b = await postBatch([
-      stubFile({ write_transaction: seed, terminal: { status: "done", transaction_ids: ["$TX"] } }),
-    ]);
-    await pollBatch(b.batchId);
-    r1BatchB = b.batchId;
-    const [txA] = await q<{ id: string; status: string }>(
-      `SELECT id, status FROM transactions WHERE source_ingest_id = $1`,
-      [a.ingestIds[0]],
+    const a = await seedOne(seed);
+    const b = await seedOne(seed);
+    const txA = await txState(a.tx.id);
+    const txB = await txState(b.tx.id);
+    // Removal is a soft delete: deleted_at set, status untouched.
+    assert(txB.deleted_at !== null, "expected B soft-deleted (deleted_at set)");
+    assert(txB.status === "posted", `soft delete must keep status, got ${txB.status}`);
+    assert(isLive(txA), "expected A (the earlier row) to stay live");
+    const linksA = await linksOf(a.tx.id);
+    assert(linksA.length === 2, `expected 2 links on canonical, got ${linksA.length}`);
+    assert((await linksOf(b.tx.id)).length === 0, "removed duplicate still owns links");
+    // Reconcile is serialized per workspace and a pair is proposed once,
+    // so there is exactly one proposal, whichever batch saw it first.
+    const props = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(props.length === 1, `expected exactly 1 proposal for the pair, got ${props.length}`);
+    const prop = props[0]!;
+    assert(prop.score === 1 && prop.status === "auto_applied", `proposal: ${JSON.stringify(prop)}`);
+    assert(prop.payload.duplicate === b.tx.id, "the LATER row must be the duplicate");
+    // The apply must record exactly what it moved.
+    const rec = prop.payload.applied;
+    assert(rec && Array.isArray(rec.links), "proposal carries no applied.links record");
+    assert(
+      rec.links.length === 1 &&
+        rec.links[0].document_id === b.docId &&
+        rec.links[0].canonical_had_link === false,
+      `applied.links wrong: ${JSON.stringify(rec.links)}`,
     );
-    const [txB] = await q<{ id: string; status: string }>(
-      `SELECT id, status FROM transactions WHERE source_ingest_id = $1`,
-      [b.ingestIds[0]],
+    const evB = await q(
+      `SELECT 1 FROM transaction_events
+        WHERE transaction_id = $1 AND event_type = 'deleted' AND payload->>'proposal_id' = $2`,
+      [b.tx.id, prop.id],
     );
-    assert(txA && txB, "seed txns missing");
-    assert(txB!.status === "voided", `expected B voided, got ${txB!.status}`);
-    assert(txA!.status === "posted", `expected A posted, got ${txA!.status}`);
-    const links = await q(`SELECT document_id FROM document_links WHERE transaction_id = $1`, [txA!.id]);
-    assert(links.length === 2, `expected 2 links on canonical, got ${links.length}`);
-    const orphan = await q(`SELECT 1 FROM document_links WHERE transaction_id = $1`, [txB!.id]);
-    assert(orphan.length === 0, "voided duplicate still owns links");
-    // The 1.0 proposal may land in EITHER batch depending on which
-    // side's fire-and-forget reconcile saw the pair first (A's can run
-    // after B's txn commits). Either way the earlier txn must survive.
-    const [prop] = await q<{ score: string; status: string }>(
-      `SELECT score, status FROM reconcile_proposals
-        WHERE batch_id IN ($1, $2) AND kind='dedup'
-        ORDER BY score DESC LIMIT 1`,
-      [a.batchId, b.batchId],
+    const evA = await q(
+      `SELECT 1 FROM transaction_events
+        WHERE transaction_id = $1 AND event_type = 'dedup_absorbed' AND payload->>'proposal_id' = $2`,
+      [a.tx.id, prop.id],
     );
-    assert(prop && Number(prop.score) === 1 && prop.status === "auto_applied",
-      `proposal: ${JSON.stringify(prop)}`);
-    notes.push(`later txn auto-voided @1.0; earliest survives with both documents`);
+    assert(evB.length === 1 && evA.length === 1, "expected one event on each row of the pair");
+    r1 = { a, b, proposal: prop };
+    notes.push("later txn soft-deleted @1.0; earliest survives with both documents; moved link recorded");
   });
 
   // r2 — card-last4 conflict kills the pair → no proposal
   await runCase("r2", false, async (notes) => {
-    const mk = (last4: string) => ({
+    const mk = (last4: string): SeedTx => ({
       payee: `CardConflict Deli ${NONCE}`,
       occurred_on: "2026-06-03",
-      total_minor: 2750,
+      total_minor: amt(4),
       metadata: { payment: `Visa ****${last4}` },
-      link_document: true,
     });
-    const a = await postBatch([
-      stubFile({ write_transaction: mk("1111"), terminal: { status: "done", transaction_ids: ["$TX"] } }),
-    ]);
-    await pollBatch(a.batchId);
-    const b = await postBatch([
-      stubFile({ write_transaction: mk("2222"), terminal: { status: "done", transaction_ids: ["$TX"] } }),
-    ]);
-    await pollBatch(b.batchId);
+    const a = await seedOne(mk("1111"));
+    const b = await seedOne(mk("2222"));
     // Assert specifically that the CONFLICT PAIR produced no proposal —
-    // a dirty sandbox can legitimately propose B against unrelated
+    // a dirty database can legitimately propose B against unrelated
     // same-amount rows from earlier runs, which is correct behavior.
-    const [txAr] = await q<{ id: string }>(
-      `SELECT id FROM transactions WHERE source_ingest_id = $1`, [a.ingestIds[0]]);
-    const [txBr] = await q<{ id: string }>(
-      `SELECT id FROM transactions WHERE source_ingest_id = $1`, [b.ingestIds[0]]);
-    const props = await q(
-      `SELECT 1 FROM reconcile_proposals
-        WHERE kind='dedup'
-          AND ((payload->>'duplicate' = $1 AND payload->>'duplicate_of' = $2)
-            OR (payload->>'duplicate' = $2 AND payload->>'duplicate_of' = $1))`,
-      [txAr!.id, txBr!.id],
-    );
+    const props = await proposalsBetween(a.tx.id, b.tx.id);
     assert(props.length === 0, `conflict pair got ${props.length} proposal(s)`);
-    const [txB] = await q<{ status: string }>(
-      `SELECT status FROM transactions WHERE source_ingest_id = $1`,
-      [b.ingestIds[0]],
-    );
-    assert(txB!.status === "posted", `B should stay posted, got ${txB!.status}`);
+    assert(isLive(await txState(b.tx.id)), "B should stay live");
+    assert(isLive(await txState(a.tx.id)), "A should stay live");
     notes.push("conflicting card last-4 → pair killed, both txns live");
   });
 
   // r3 — flip + re-run reconcile → no duplicate proposals
   await runCase("r3", false, async (notes) => {
-    assert(r1BatchB, "r1 must run before r3");
-    const before = await q<{ n: number }>(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
-    await q(`UPDATE batches SET status = 'extracted' WHERE id = $1`, [r1BatchB]);
-    const res = await api(`/v1/batches/${r1BatchB}/reconcile`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    assert(res.status === 200 || res.status === 201, `reconcile → ${res.status}`);
-    const after = await q<{ n: number }>(`SELECT count(*)::int AS n FROM reconcile_proposals WHERE batch_id = $1`, [r1BatchB]);
+    assert(r1, "r1 must run before r3");
+    const ids = [r1.a.tx.id, r1.b.tx.id];
+    const before = (await proposalsTouching(ids)).length;
+    await rerunReconcile(r1.b.batchId);
+    await rerunReconcile(r1.a.batchId);
+    const after = (await proposalsTouching(ids)).length;
+    assert(after === before, `proposals duplicated: ${before} → ${after}`);
+    notes.push(`re-running both batches minted 0 new proposals (${after} stable)`);
+  });
+
+  // rf — a refund is never a duplicate of the purchase it reverses.
+  // Production lost two refunds this way: the old cross-batch pass picked
+  // the amount by sign, so the refund's positive card leg equalled the
+  // purchase total, and the shared order number scored the pair 1.0.
+  await runCase("rf", false, async (notes) => {
+    // (1) cross-batch, legs booked correctly, NO flow metadata — the gate
+    //     must hold on the signed total alone (old rows carry no flow).
+    const base = {
+      payee: `Refund Outfitters ${NONCE}`,
+      occurred_on: "2026-06-04",
+      metadata: { order_number: `ORD-RF-${NONCE}`, payment: "Visa ****1111" },
+    };
+    const purchase = await seedOne({ ...base, total_minor: amt(5) });
+    const refund = await seedOne({ ...base, total_minor: -amt(5) });
     assert(
-      after[0]!.n === before[0]!.n,
-      `proposals duplicated: ${before[0]!.n} → ${after[0]!.n}`,
+      (await proposalsBetween(purchase.tx.id, refund.tx.id)).length === 0,
+      "refund was proposed as a duplicate of its purchase",
     );
-    notes.push(`re-run minted 0 new proposals (${after[0]!.n} stable)`);
+    assert(isLive(await txState(refund.tx.id)), "refund was removed");
+    assert(isLive(await txState(purchase.tx.id)), "purchase was removed");
+    assert((await linksOf(refund.tx.id)).length === 1, "refund lost its document");
+    notes.push("cross-batch refund vs purchase, same order number → no proposal, both live");
+
+    // (2) the refund's legs booked the wrong way round (positive expense
+    //     leg), so the totals DO match: metadata.flow has to stop it.
+    const base2 = {
+      payee: `Refund Outfitters B ${NONCE}`,
+      occurred_on: "2026-06-04",
+      total_minor: amt(6),
+    };
+    const p2 = await seedOne({
+      ...base2,
+      metadata: { order_number: `ORD-RF2-${NONCE}`, flow: "purchase" },
+    });
+    const r2 = await seedOne({
+      ...base2,
+      metadata: { order_number: `ORD-RF2-${NONCE}`, flow: "refund", refund_of: p2.tx.id },
+    });
+    assert(
+      (await proposalsBetween(p2.tx.id, r2.tx.id)).length === 0,
+      "flow=refund vs flow=purchase was proposed",
+    );
+    assert(isLive(await txState(r2.tx.id)), "mis-signed refund was removed");
+    notes.push("equal totals but flow refund/purchase → no proposal (metadata gate)");
+
+    // (3) both in ONE batch — the in-batch pass applies the same gate.
+    const base3 = {
+      payee: `Refund Outfitters C ${NONCE}`,
+      occurred_on: "2026-06-04",
+      metadata: { order_number: `ORD-RF3-${NONCE}` },
+    };
+    const [p3, r3] = await seedBatch([
+      { ...base3, total_minor: amt(7) },
+      { ...base3, total_minor: -amt(7) },
+    ]);
+    assert(
+      (await proposalsBetween(p3!.tx.id, r3!.tx.id)).length === 0,
+      "in-batch refund vs purchase was proposed",
+    );
+    assert(isLive(await txState(p3!.tx.id)) && isLive(await txState(r3!.tx.id)), "in-batch pair lost a row");
+    notes.push("same batch → no proposal either");
+
+    // (4) and a refund uploaded twice still dedups against ITSELF.
+    const refundAgain = await seedOne({ ...base, total_minor: -amt(5) });
+    const again = await proposalsBetween(refund.tx.id, refundAgain.tx.id);
+    assert(
+      again.length === 1 && again[0]!.status === "auto_applied",
+      `second copy of the refund should fold into the first: ${JSON.stringify(again)}`,
+    );
+    assert(isLive(await txState(refund.tx.id)), "first refund copy must survive");
+    assert(isLive(await txState(purchase.tx.id)), "purchase must be untouched by the refund pair");
+    notes.push("second copy of the same refund folds into the first; the purchase is untouched");
+  });
+
+  // sd — a soft-deleted transaction is not live for any dedup layer.
+  await runCase("sd", false, async (notes) => {
+    // (1) reconcile: the deleted row is not a survivor.
+    const seed: SeedTx = {
+      payee: `Reshoot Bakery ${NONCE}`,
+      occurred_on: "2026-06-05",
+      total_minor: amt(8),
+      metadata: { order_number: `ORD-SD-${NONCE}` },
+    };
+    const wrong = await seedOne(seed);
+    await softDeleteViaApi(wrong.tx.id);
+    const reshot = await seedOne(seed);
+    const props = await proposalsTouching([wrong.tx.id, reshot.tx.id]);
+    assert(props.length === 0, `proposal against a deleted row: ${JSON.stringify(props)}`);
+    assert(isLive(await txState(reshot.tx.id)), "the re-shot receipt's transaction was removed");
+    assert(
+      (await linksOf(reshot.tx.id)).join() === reshot.docId,
+      "the re-shot receipt's document was moved off its transaction",
+    );
+    notes.push("same order number as a soft-deleted row → no proposal, new row live with its document");
+
+    // (2) L1: the same BYTES re-uploaded after the delete extract again.
+    const first = await seedOne({
+      payee: `Reupload Cafe ${NONCE}`,
+      occurred_on: "2026-06-05",
+      total_minor: amt(9),
+    });
+    await softDeleteViaApi(first.tx.id);
+    const again = await postBatch([first.file]);
+    await pollReconciled(again.batchId);
+    const [ing] = await q<{ status: string; error: string | null }>(
+      `SELECT status, error FROM ingests WHERE id = $1`,
+      [again.ingestIds[0]],
+    );
+    assert(
+      ing!.status === "done",
+      `re-upload after delete should extract again, got ${ing!.status} (${ing!.error})`,
+    );
+    const second = await txBySourceIngest(again.ingestIds[0]!);
+    assert(isLive(second) && second.id !== first.tx.id, "no new live transaction from the re-upload");
+    assert((await txState(first.tx.id)).deleted_at !== null, "the deleted row must stay deleted");
+    notes.push("identical bytes after soft delete → extracted again (new live txn)");
+
+    // (3) positive control: with a live transaction, L1 still dedups.
+    const third = await postBatch([first.file]);
+    await pollBatch(third.batchId);
+    const [ing3] = await q<{ status: string; produced: any }>(
+      `SELECT status, produced FROM ingests WHERE id = $1`,
+      [third.ingestIds[0]],
+    );
+    assert(ing3!.status === "dedup", `third upload should be born dedup, got ${ing3!.status}`);
+    assert(
+      ing3!.produced?.transaction_ids?.[0] === second.id,
+      `dedup must point at the LIVE transaction, got ${JSON.stringify(ing3!.produced?.transaction_ids)}`,
+    );
+    notes.push("third upload → dedup, pointing at the live txn (not the deleted one)");
+  });
+
+  // rc — recurring equal-price charges at one merchant are not duplicates
+  // of each other, and must not produce a proposal per pair. Production:
+  // 12 scooter rides produced 51 proposals, up to 9 for one ride.
+  await runCase("rc", false, async (notes) => {
+    const ride = (payee: string, day: string, total: number): SeedTx => ({
+      payee,
+      occurred_on: day,
+      total_minor: total,
+      metadata: { payment: "Visa ****1111" },
+    });
+    // (1) six rides, each uploaded on its own.
+    const payee = `Scoot Share ${NONCE}`;
+    const days = ["2026-06-06", "2026-06-06", "2026-06-06", "2026-06-07", "2026-06-07", "2026-06-08"];
+    const rides: Seeded[] = [];
+    for (const d of days) rides.push(await seedOne(ride(payee, d, amt(10))));
+    const ids = rides.map((r) => r.tx.id);
+    const props = await proposalsTouching(ids);
+    for (const id of ids) assert(isLive(await txState(id)), `ride ${id.slice(0, 8)} was removed`);
+    assert(
+      props.every((p) => p.status === "proposed" && p.score < 0.95),
+      `a recurring charge was auto-applied: ${JSON.stringify(props.map((p) => [p.status, p.score]))}`,
+    );
+    assert(props.length <= 1, `expected ≤ 1 proposal for 6 rides, got ${props.length}`);
+    notes.push(`6 equal-price rides in 6 batches → ${props.length} proposal(s), 0 removed (15 pairs possible)`);
+
+    // (2) five rides in ONE batch (same day): the old in-batch pass
+    //     auto-removed four of them at 1.0.
+    const batch = await seedBatch(
+      Array.from({ length: 5 }, () => ride(`Scoot Share Batch ${NONCE}`, "2026-06-06", amt(11))),
+    );
+    const bids = batch.map((r) => r.tx.id);
+    const bprops = await proposalsTouching(bids);
+    for (const id of bids) assert(isLive(await txState(id)), `batched ride ${id.slice(0, 8)} was removed`);
+    assert(bprops.length === 0, `expected 0 proposals for 5 rides in one batch, got ${bprops.length}`);
+    notes.push("5 equal-price rides in one batch → 0 proposals, 0 removed");
+  });
+
+  // ib — the in-batch pass no longer auto-applies on date+payee+amount
+  // alone, and never when identifiers disagree.
+  let ibOpen: { older: Seeded; newer: Seeded; proposal: ProposalState } | null = null;
+  await runCase("ib", false, async (notes) => {
+    const day = "2026-06-09";
+    // (a) different order numbers → two purchases.
+    const [a1, a2] = await seedBatch([
+      { occurred_on: day, total_minor: amt(12), payee: `Twin Orders ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-1` } },
+      { occurred_on: day, total_minor: amt(12), payee: `Twin Orders ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-2` } },
+    ]);
+    assert(
+      (await proposalsBetween(a1!.tx.id, a2!.tx.id)).length === 0,
+      "different order numbers were proposed as duplicates",
+    );
+    assert(isLive(await txState(a1!.tx.id)) && isLive(await txState(a2!.tx.id)), "a row was removed");
+    notes.push("(a) same day/payee/amount, different order numbers → no proposal");
+
+    // (b) no identifiers at all → "two coffees": a proposal for a person.
+    const [b1, b2] = await seedBatch([
+      { occurred_on: day, total_minor: amt(13), payee: `Two Coffees ${NONCE}` },
+      { occurred_on: day, total_minor: amt(13), payee: `Two Coffees ${NONCE}` },
+    ]);
+    const bp = await proposalsBetween(b1!.tx.id, b2!.tx.id);
+    assert(bp.length === 1, `expected 1 proposal, got ${bp.length}`);
+    assert(
+      bp[0]!.status === "proposed" && Math.abs(bp[0]!.score - 0.9) < 1e-6,
+      `expected proposed @0.9, got ${bp[0]!.status} @${bp[0]!.score}`,
+    );
+    assert(isLive(await txState(b1!.tx.id)) && isLive(await txState(b2!.tx.id)), "a row was removed");
+    const [older, newer] =
+      bp[0]!.payload.duplicate === b2!.tx.id ? [b1!, b2!] : [b2!, b1!];
+    ibOpen = { older, newer, proposal: bp[0]! };
+    notes.push("(b) no identifiers → 1 proposal @0.9, NOT applied, both live");
+
+    // (c) same order number → identity; the race repair still works.
+    const [c1, c2] = await seedBatch([
+      { occurred_on: day, total_minor: amt(14), payee: `Same Order ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-C` } },
+      { occurred_on: day, total_minor: amt(14), payee: `Same Order ${NONCE}`, metadata: { order_number: `ORD-IB-${NONCE}-C` } },
+    ]);
+    const cp = await proposalsBetween(c1!.tx.id, c2!.tx.id);
+    assert(
+      cp.length === 1 && cp[0]!.status === "auto_applied" && cp[0]!.score === 1,
+      `expected 1 auto-applied @1.0, got ${JSON.stringify(cp.map((p) => [p.status, p.score]))}`,
+    );
+    const live = [await txState(c1!.tx.id), await txState(c2!.tx.id)].filter(isLive);
+    assert(live.length === 1, `expected exactly 1 live row, got ${live.length}`);
+    assert(
+      (await linksOf(live[0]!.id)).length === 2,
+      "the survivor should hold both documents",
+    );
+    notes.push("(c) same order number → auto-applied @1.0, survivor holds both documents");
+  });
+
+  // nd — a pair the agent already judged distinct is not re-raised.
+  await runCase("nd", false, async (notes) => {
+    const base = { payee: `Judged Diner ${NONCE}`, occurred_on: "2026-06-10", total_minor: amt(15) };
+    const a = await seedOne(base);
+    const b = await seedOne({
+      ...base,
+      metadata: {
+        near_dup_check: {
+          candidate_transaction_id: a.tx.id,
+          verdict: "distinct",
+          reason: "eval-dedup: different items",
+        },
+      },
+    });
+    assert(
+      (await proposalsBetween(a.tx.id, b.tx.id)).length === 0,
+      "reconcile re-raised a pair the agent judged distinct",
+    );
+    // Control: the same shape WITHOUT a verdict is proposed (case ib-b),
+    // so the absence above is the verdict's doing, not a dead detector.
+    notes.push("near_dup_check verdict=distinct naming the candidate → no proposal");
+  });
+
+  // pp — one proposal per pair, whichever batches see it, and a person's
+  // rejection is not undone by the next reconcile.
+  await runCase("pp", false, async (notes) => {
+    const base = { payee: `Pair Once Grill ${NONCE}`, occurred_on: "2026-06-11", total_minor: amt(16) };
+    const a = await seedOne(base);
+    const b = await seedOne(base);
+    const first = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(first.length === 1 && first[0]!.status === "proposed", `seed proposal: ${JSON.stringify(first)}`);
+    // A's batch now sees B as an outside row: the same pair, from the
+    // other side. The old key was per batch and minted a second row.
+    await rerunReconcile(a.batchId);
+    assert((await proposalsBetween(a.tx.id, b.tx.id)).length === 1, "pair proposed again from the other batch");
+    const rej = await postJson(`/v1/batches/${first[0]!.batch_id}/reconcile/reject`, {
+      proposal_ids: [first[0]!.id],
+    });
+    assert(rej.status === 200 && rej.json.rejected.length === 1, `reject → ${rej.status} ${rej.body}`);
+    await rerunReconcile(a.batchId);
+    await rerunReconcile(b.batchId);
+    const after = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(
+      after.length === 1 && after[0]!.status === "rejected",
+      `a rejected pair came back: ${JSON.stringify(after.map((p) => p.status))}`,
+    );
+    notes.push("pair proposed once across both batches; stays rejected after two more reconciles");
+  });
+
+  // cl — the survivor must be live when a proposal is applied.
+  await runCase("cl", false, async (notes) => {
+    const base = { payee: `Survivor Check ${NONCE}`, occurred_on: "2026-06-12", total_minor: amt(17) };
+    const a = await seedOne(base);
+    const b = await seedOne(base);
+    const [prop] = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(prop && prop.status === "proposed", "expected an open proposal to work with");
+    const canonical = prop.payload.duplicate_of as string;
+    const duplicate = prop.payload.duplicate as string;
+    await softDeleteViaApi(canonical);
+    const res = await postJson(`/v1/batches/${prop.batch_id}/reconcile/apply`, {
+      proposal_ids: [prop.id],
+    });
+    assert(res.status === 200, `apply → ${res.status}`);
+    assert(
+      res.json.applied.length === 0 && String(res.json.skipped[0]?.reason).includes("canonical_not_live"),
+      `apply onto a deleted survivor was not refused: ${res.body}`,
+    );
+    assert(isLive(await txState(duplicate)), "the only live copy was removed");
+    assert((await linksOf(duplicate)).length === 1, "the live copy lost its document");
+    const [after] = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(after!.status === "stale", `proposal should be stale, got ${after!.status}`);
+    notes.push("apply with a deleted survivor → refused, proposal stale, duplicate keeps its document");
+
+    // A second open proposal goes stale without anyone trying to apply
+    // it: the next reconcile in the workspace closes it.
+    const base2 = { payee: `Survivor Sweep ${NONCE}`, occurred_on: "2026-06-12", total_minor: amt(18) };
+    const c = await seedOne(base2);
+    const d = await seedOne(base2);
+    const [open] = await proposalsBetween(c.tx.id, d.tx.id);
+    assert(open && open.status === "proposed", "expected a second open proposal");
+    await softDeleteViaApi(open.payload.duplicate_of as string);
+    await rerunReconcile(a.batchId); // any batch of the workspace
+    const [swept] = await proposalsBetween(c.tx.id, d.tx.id);
+    assert(swept!.status === "stale", `sweep left the proposal ${swept!.status}`);
+    notes.push("open proposal naming a deleted row → closed as stale by the next reconcile");
+  });
+
+  // un — undo restores the transaction AND gives it its documents back.
+  await runCase("un", false, async (notes) => {
+    // (1) the auto-applied proposal from r1.
+    assert(r1, "r1 must run before un");
+    const { a, b, proposal } = r1;
+    const undo = await postJson(`/v1/batches/${proposal.batch_id}/reconcile/undo`, {
+      proposal_ids: [proposal.id],
+    });
+    assert(undo.status === 200, `undo → ${undo.status}: ${undo.body}`);
+    const done = undo.json.reverted?.[0];
+    assert(done, `nothing reverted: ${undo.body}`);
+    assert(
+      done.restored === true &&
+        done.links_source === "recorded" &&
+        done.documents_relinked.join() === b.docId &&
+        done.documents_removed_from_canonical.join() === b.docId,
+      `undo detail wrong: ${JSON.stringify(done)}`,
+    );
+    assert(isLive(await txState(b.tx.id)), "duplicate was not restored");
+    assert((await linksOf(b.tx.id)).join() === b.docId, "restored row did not get its own document back");
+    assert((await linksOf(a.tx.id)).join() === a.docId, "survivor kept the other row's document");
+    const [p1] = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(p1!.status === "reverted", `proposal should be reverted, got ${p1!.status}`);
+    // Second undo: nothing to do, nothing changes.
+    const twice = await postJson(`/v1/batches/${proposal.batch_id}/reconcile/undo`, {
+      proposal_ids: [proposal.id],
+    });
+    assert(
+      twice.json.reverted.length === 0 && twice.json.skipped[0]?.reason === "already_reverted",
+      `second undo: ${twice.body}`,
+    );
+    // And the engine does not immediately propose the pair again.
+    await rerunReconcile(b.batchId);
+    const afterRerun = await proposalsBetween(a.tx.id, b.tx.id);
+    assert(afterRerun.length === 1, "a reverted pair was proposed again");
+    assert(isLive(await txState(b.tx.id)), "a reverted pair was removed again");
+    notes.push("auto-applied → undo: row live again with its own document; second undo no-op; not re-proposed");
+
+    // (2) a proposal a person applied (the open 0.9 one from ib-b).
+    assert(ibOpen, "ib must run before un");
+    const { older, newer } = ibOpen;
+    const prop = ibOpen.proposal;
+    const applied = await postJson(`/v1/batches/${prop.batch_id}/reconcile/apply`, {
+      proposal_ids: [prop.id],
+    });
+    assert(applied.json.applied?.length === 1, `apply → ${applied.body}`);
+    assert((await txState(newer.tx.id)).deleted_at !== null, "user apply did not remove the duplicate");
+    assert((await linksOf(older.tx.id)).length === 2, "user apply did not move the document");
+    const undo2 = await postJson(`/v1/batches/${prop.batch_id}/reconcile/undo`, {
+      proposal_ids: [prop.id],
+    });
+    assert(undo2.json.reverted?.length === 1, `undo of a user apply: ${undo2.body}`);
+    assert(isLive(await txState(newer.tx.id)), "user-applied duplicate was not restored");
+    assert((await linksOf(newer.tx.id)).join() === newer.docId, "restored row is missing its document");
+    assert((await linksOf(older.tx.id)).join() === older.docId, "survivor kept the moved document");
+    // A proposal that was never applied cannot be undone.
+    const never = await postJson(`/v1/batches/${prop.batch_id}/reconcile/undo`, {
+      proposal_ids: [randomUUID()],
+    });
+    assert(never.json.reverted.length === 0 && never.json.skipped.length === 1, `undo of unknown id: ${never.body}`);
+    notes.push("user-applied → undo: same round trip; unknown proposal id is skipped");
   });
 
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach
@@ -427,7 +1025,7 @@ async function main(): Promise<void> {
 
   // b3 — branch 3: same app template, different purchase → INSERT distinct
   await runCase("b3", true, async (notes) => {
-    const before = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted'`);
+    const before = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted' AND deleted_at IS NULL`);
     const up = await postBatch([
       { name: "starbucks-2.jpg", bytes: await readFile(path.join(UPLOADS_DIR, STARBUCKS_2)), mime: "image/jpeg" },
     ]);
@@ -435,7 +1033,7 @@ async function main(): Promise<void> {
     const [ing] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [up.ingestIds[0]]);
     assert(ing!.status === "done", `expected done (distinct INSERT), got ${ing!.status} — a near_dup here means pHash overrode the differing receipt numbers (calibration regression!)`);
-    const after = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted'`);
+    const after = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted' AND deleted_at IS NULL`);
     assert((after[0] as any).n === (before[0] as any).n + 1, "no new txn inserted");
     const [meta] = await q<{ check: any }>(
       `SELECT metadata->'near_dup_check' AS check FROM transactions WHERE id = $1`,
@@ -503,17 +1101,20 @@ async function main(): Promise<void> {
       { name: "race-a.jpg", bytes: await reencode(RACE_IMAGE, 70), mime: "image/jpeg" },
       { name: "race-b.jpg", bytes: await reencode(RACE_IMAGE, 64), mime: "image/jpeg" },
     ]);
-    await pollBatch(up.batchId, 1_200_000); // two concurrent heavy extractions + icon pipeline legitimately exceed 10 min
+    // two concurrent heavy extractions + icon pipeline legitimately exceed
+    // 10 min; wait for reconcile too, since path B is repaired by it.
+    await pollBatch(up.batchId, 1_200_000, RECONCILE_DONE);
     const ings = await q<{ status: string }>(
       `SELECT status FROM ingests WHERE batch_id = $1`, [up.batchId]);
     const statuses = ings.map((i) => i.status).sort();
+    // Soft delete keeps status `posted`: a live count must filter deleted_at.
     const live = await q(
-      `SELECT id FROM transactions WHERE payee ILIKE '%mitsuwa%' AND status = 'posted'`);
+      `SELECT id FROM transactions WHERE payee ILIKE '%mitsuwa%' AND status = 'posted' AND deleted_at IS NULL`);
     notes.push(`ingest outcomes: [${statuses.join(", ")}]`);
     if (statuses.join(",") === "done,near_dup") {
       notes.push("path A: second extraction saw the first's txn → L3a attach");
     } else if (statuses.join(",") === "done,done") {
-      notes.push("path B: both raced past L3a → in-batch L3b exact pass must repair");
+      notes.push("path B: both raced past L3a → the in-batch pass must repair (needs a shared identifier)");
     }
     assert(live.length === 1, `expected exactly 1 live Mitsuwa txn, got ${live.length} — the race left a duplicate the system did not repair`);
     notes.push("ledger converged to 1 live transaction ✓");
@@ -526,6 +1127,7 @@ async function main(): Promise<void> {
     console.log(`  ${r.pass ? "PASS" : "FAIL"}  ${r.name}`);
     if (!r.pass) failed++;
   }
+  console.log(`\n${results.length - failed}/${results.length} passed`);
   await db.end();
   process.exit(failed > 0 ? 1 : 0);
 }

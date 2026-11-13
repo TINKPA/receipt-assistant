@@ -127,7 +127,7 @@ The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1)
 | Ingest | `POST /v1/ingest/batch` | Upload receipt files (images, PDFs, `.eml`); returns a `batchId` for async extraction |
 | | `GET /v1/batches`, `GET /v1/batches/:id`, `GET /v1/batches/:id/stream` | Batch status, per-file results, SSE progress |
 | | `GET /v1/ingests`, `GET /v1/ingests/problems`, `POST /v1/ingests/:id/retry` | Per-file ingest rows; list and retry failures |
-| Reconcile | `/v1/batches/:id/reconcile` (+ `/apply`, `/reject`) | Review and apply a batch's reconcile proposals |
+| Reconcile | `/v1/batches/:id/reconcile` (+ `/apply`, `/reject`, `/undo`) | Review, apply and take back a batch's reconcile proposals |
 | Ledger | `/v1/transactions` (+ `/bulk`, `/:id/restore`, `/:id/reconcile`, `/:id/unreconcile`, `/:id/items`, `/:id/postings`) | Double-entry transactions with their postings and line items |
 | | `/v1/accounts` (+ `/:id/balance`, `/:id/register`), `GET /v1/postings`, `GET /v1/items` | Chart of accounts; posting and line-item search |
 | Documents | `/v1/documents` (+ `/:id/content`, `/:id/rendered`, `/:id/links`, `/:id/restore`, `/:id/re-extract`) | Stored receipt files and their links to transactions |

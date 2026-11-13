@@ -54,6 +54,30 @@ Receipts can be wrong (mis-shot, wrong merchant, duplicate). Soft and hard delet
 
 The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging.
 
+### What counts as a live transaction
+
+A transaction is **live** when `status IN ('posted','reconciled') AND deleted_at IS NULL`. A soft delete leaves `status = 'posted'`, so a status filter alone treats a deleted row as live; that is how a receipt re-uploaded after its transaction was deleted came to be closed as a duplicate of the deleted row.
+
+The definition lives in the database as the view `ledger_live_transactions` (migration 0040), exposed to code as `liveTransactions` in `src/db/live.ts`. It has the columns of `transactions`.
+
+- Read it wherever the question is "is this in the ledger": every dedup probe does (the byte-level probe in `src/routes/ingest.service.ts`, the pHash neighbour query and the `near_dup` guard in `src/ingest/worker.ts`, both passes in `src/reconcile/dedup.ts`, and the apply step in `src/reconcile/engine.ts`).
+- Keep reading `transactions` where deleted rows are wanted on purpose: restore, `include_deleted`, hard delete, audit, and anything that must tell "missing" from "deleted".
+- Not yet moved: the hand-written predicate is still in `src/routes/reports.ts`, `accounts.ts`, `merchants.ts`, `brands.ts`, `src/insights/discover.ts`, `src/insights/ask.ts`, and in the extraction prompt's own candidate query.
+- The view is `SELECT t.*`, expanded at creation. A migration that **drops or retypes** a `transactions` column must `DROP VIEW` first and recreate it after; a migration that **adds** one must re-run the `CREATE OR REPLACE VIEW` for the column to show through. Postings and line items have no view: join them to this one.
+
+### Reconcile proposals: apply, undo, stale
+
+A dedup proposal names a `duplicate` (the newer row) and a `duplicate_of` (the survivor). Status moves `proposed` → `auto_applied` | `user_applied` → `reverted`, or `proposed` → `rejected` | `stale`.
+
+- **Apply** (`src/reconcile/engine.ts::applyDedupProposal`, used by auto-apply and by `POST /v1/batches/:id/reconcile/apply`) is one DB transaction: move the duplicate's document links to the survivor, soft-delete the duplicate, write an event on both rows, and store which links moved in `payload.applied.links`. It refuses when either row is not live, when the duplicate is `reconciled`, or when the two rows moved money in opposite directions.
+- **Undo** (`POST /v1/batches/:id/reconcile/undo`) restores the duplicate and moves those links back. For proposals applied before links were recorded it rebuilds the list from ingest history and link timestamps and reports `links_source: "inferred"`; it refuses rather than restore a row with no documents.
+- **Stale**: an open proposal naming a row that is no longer live is closed as `stale` by the next reconcile in the workspace. No ledger row changes.
+- A pair is proposed once per workspace, whatever batch sees it; `stale` is the only status that lets it be proposed again.
+
+What the detector will and will not propose is documented at the top of `src/reconcile/dedup.ts`. Two of its rules are heuristics, not proofs: the ±3-day window, and "two or more other same-total rows at the same merchant in that window means a recurring charge". The second threshold was chosen from the proposals on file in November 2026.
+
+`scripts/check-ledger.ts <postgres-url> [--verbose]` is a SELECT-only sweep (the session is opened read-only) that exits non-zero when a dedup or `near_dup` ingest points at a non-live transaction, a proposal names one, a live document is linked only to non-live transactions, a refund sits deleted as the duplicate of a purchase, or un-retired items hang under a deleted transaction. It does not use the view, so it also runs against a database migration 0040 has not reached.
+
 ## The three-layer data model (#80)
 
 Every derived value belongs to one of three layers, and the rule is that a lower layer can always be re-run without destroying a higher one.
@@ -343,9 +367,10 @@ for line in sys.stdin:
 
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
-The dedup system (#134/#135) has a dedicated sandbox-only regression
-harness. Run it after ANY change to `src/ingest/prompt.ts` Phase 4a.0,
-the worker guards, `src/reconcile/dedup.ts`, or the pHash code:
+The dedup system (#134/#135) has a dedicated regression harness that
+must never be pointed at production. Run it after ANY change to
+`src/ingest/prompt.ts` Phase 4a.0, the worker guards, `src/reconcile/*`,
+the dedup probes, or the pHash code:
 
 ```bash
 # sandbox up + reset first:
@@ -355,11 +380,27 @@ npx tsx scripts/eval-dedup.ts --base=http://<mini>:3001 \
   --pg=postgresql://postgres:postgres@<mini>:5433/receipts --with-claude
 ```
 
-Stub cases (`g1-g3` worker guards, `r1-r3` reconcile edges) are
-deterministic seconds; `--with-claude` adds the agent decision-tree
-branches (`b2` attach, `b3` distinct-despite-pHash, `b4` flag+review
-round-trip) and the same-batch `race` case (~15 min total). The stub
-extractor it relies on is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
+Stub cases are deterministic and take about a minute: `g1-g4` worker
+guards, and the reconcile engine's rules — `r1-r3` (identifier match,
+card conflict, idempotent re-run), `rf` (refund vs purchase), `sd`
+(soft-deleted survivor, re-upload after delete), `rc` (recurring
+equal-price charges), `ib` (in-batch identifier rules), `nd` (agent
+verdict respected), `pp` (one proposal per pair), `cl` (survivor must
+be live at apply), `un` (undo). Every seed carries a per-run nonce in
+its payee and its amount, so they need no reset and can be pointed at
+any throwaway server started with `EXTRACTOR_STUB_ALLOWED=1`, not only
+the sandbox. "Removed" in this harness means soft-deleted: `deleted_at`
+set, status still `posted`.
+
+`--with-claude` adds the agent decision-tree branches (`b2` attach,
+`b3` distinct-despite-pHash, `b4` flag+review round-trip) and the
+same-batch `race` case (~15 min total); those do need a reset sandbox.
+The in-batch pass no longer removes a row on date + payee + amount
+alone, so `race` only converges on its second path when both
+extractions wrote the same identifier. That path has not been re-run
+since the change.
+
+The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable
 that env on the production compose. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and
