@@ -356,11 +356,14 @@ receipt-text block too if you gave one. It never tells you a value;
 never change a field it did not name to make the list go away.
 
 A date after the upload comes back as \`future_date\`. It is the one
-problem you may answer by keeping your value: if the document shows no
-earlier charge or transaction date, send the date unchanged with
-\`date_unresolved\` in audit.review_flags, and the server books it as
-printed and has a person check it. Never answer it with a date the
-document does not show (another year included) just to pass the check.
+problem you may answer by keeping your value. Look for an earlier charge
+or transaction date on the document, or, where it prints only service
+dates (a stay, a pickup, travel), the email's Date header or the PDF's
+creation date that Check A step 5 allows. If there is none, send the
+date unchanged with \`date_unresolved\` in audit.review_flags, and the
+server books it as printed and has a person check it. Never answer it
+with a date the document does not show (another year included) just to
+pass the check.
 
 ${renderContractForPrompt()}
 
@@ -1016,9 +1019,12 @@ ${w(
   `Only if you geocoded successfully in Phase 3. Call Places Details to
 get the business's canonical name:`,
   `Only if Phase 3a found a place. When the Find-Place answer you used
-carries the business's \`name\`, that is Google's name: compare with it
-and make no further call. Only for a place found by geocoding alone,
-call Places Details for the name:`,
+carries the business's \`name\` in the same script as the printed payee
+(both Latin, or both Chinese or Japanese characters), that is Google's
+name: compare with it and make no further call. That request asks for
+zh-CN names, so a shop printed in English may come back in Chinese;
+then, and for a place found by geocoding alone, call Places Details for
+the name (it asks for no language):`,
 )}
 
   curl -sS "https://maps.googleapis.com/maps/api/place/details/json?place_id=<PLACE_ID>&fields=name&key=$GOOGLE_MAPS_API_KEY"

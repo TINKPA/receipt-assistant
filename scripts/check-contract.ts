@@ -27,8 +27,10 @@
  *     `date_unresolved`, when it validates with `future_date_unresolved`
  *     and is kept as printed;
  *   - the repair request names paths and rules and never a value (the
- *     future_date line asks for an earlier printed date or the same date
- *     flagged, never another), and the repair diff finds the fields a
+ *     future_date line asks for an earlier printed charge date, the
+ *     derived charge date the prompt allows where only service dates are
+ *     printed, or the same date flagged, never another), and the repair
+ *     diff finds the fields a
  *     repair changed without being asked, and what each round changed;
  *   - the artefact parser on prose before the fence, two fences, a fence
  *     inside the receipt text, chatter after the fence, CRLF, the
@@ -447,6 +449,8 @@ expectErrors("three days after upload", variant((r) => {
   const text = renderRepairRequest(bad.report.errors);
   check("future_date repair: names the path and rule", text.includes("- facts.occurred_on — future_date:"), text);
   check("future_date repair: an earlier printed charge date wins", text.includes("earlier charge or transaction date"), text);
+  check("future_date repair: a derived charge date only where only service dates are printed, as Check A says",
+    text.includes("only service dates") && text.includes("Check A, step 5"), text);
   check("future_date repair: else resend unchanged with date_unresolved", text.includes("send it again unchanged") && text.includes("date_unresolved"), text);
   check("future_date repair: never a date the document does not show", text.includes("Never change a printed date to one the document does not show"), text);
   check("future_date repair: names no value", !/2026|10-01|\d{4}-\d{2}-\d{2}/.test(text), text);

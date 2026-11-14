@@ -1027,10 +1027,11 @@ export function noteRepairRound(
 const REREAD: Partial<Record<ErrorRule, string>> = {
   calendar_date: "Re-read the date on the document.",
   future_date:
-    "Re-read the dates on the document. If it shows an earlier charge or transaction date (or, where it prints none, " +
-    "the email's Date header or the PDF's creation date, as the prompt allows), use that one and its time. If the date " +
-    "you gave is the one the document prints, send it again unchanged and add date_unresolved to audit.review_flags. " +
-    "Never change a printed date to one the document does not show.",
+    "Re-read the dates on the document. If it shows an earlier charge or transaction date, use that one and its time; " +
+    "where it prints no charge date at all, only service dates, the email's Date header or the PDF's creation date is " +
+    "the charge date, as the prompt's date check (Check A, step 5) says. If the date you gave is the one the document " +
+    "prints, send it again unchanged and add date_unresolved to audit.review_flags. Never change a printed date to one " +
+    "the document does not show.",
   ancient_date: "Re-read the date on the document, the year especially.",
   currency_unknown: "Re-read the currency on the document.",
   sign_flow_mismatch: "Re-read the total, and whether money left the user or came back.",

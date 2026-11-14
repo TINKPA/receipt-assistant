@@ -364,14 +364,14 @@ Before committing your YYYY-MM-DD:
        "",
        `
   5. Is your date AFTER today? Look for an earlier charge or transaction
-     date on the document first (Check B). If the document prints none,
-     keep the date exactly as printed and add \`date_unresolved\` to
-     audit.review_flags: the server books it as printed and sends the
-     transaction to a person. Never move a printed date, its year
-     included, to one the document does not show. (Where a lesson says
-     the document prints no charge date and names another source, such as
-     an email's Date header or a PDF's creation date, that source is not
-     an invention.)`,
+     date on the document first (Check B). Where the document prints no
+     charge date at all, only service dates (a stay, a pickup, travel),
+     an email's Date header or a PDF's creation date is the charge date,
+     as the lessons say; those are readings of the document, not
+     inventions. Otherwise keep the date exactly as printed and add
+     \`date_unresolved\` to audit.review_flags: the server books it as
+     printed and sends the transaction to a person. Never move a printed
+     date, its year included, to one the document does not show.`,
      )}
 
 ### Check B — Multi-candidate date enumeration (catches day-digit swaps)
