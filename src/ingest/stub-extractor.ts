@@ -31,8 +31,16 @@
  *     "grandchild_s": 60,             // also start a background `sleep` of
  *                                     // this many seconds (0..3600), which
  *                                     // may outlive the child itself
- *     "ignore_term": true,            // child and grandchild ignore SIGTERM,
- *                                     // so only the SIGKILL step ends them
+ *     "escaped_s": 60,                // also start a process in a session
+ *                                     // of its own, as CLI 2.1.251's Bash
+ *                                     // tool runs every command, that lives
+ *                                     // this many seconds (0..3600) with its
+ *                                     // own stdio; the group kill does not
+ *                                     // reach it, the timeout's descendant
+ *                                     // sweep does
+ *     "ignore_term": true,            // child and (escaped) grandchildren
+ *                                     // ignore SIGTERM, so only the SIGKILL
+ *                                     // step ends them
  *     "timeout_ms": 5000              // this run's timeout; default and
  *                                     // ceiling CLAUDE_TIMEOUT_MS
  *   },
@@ -68,9 +76,26 @@ interface StubChild {
   sleep_s?: number;
   exit_code?: number;
   grandchild_s?: number;
+  escaped_s?: number;
   ignore_term?: boolean;
   timeout_ms?: number;
 }
+
+/**
+ * The `escaped_s` helper, run by `node -e` in the child's group: it starts
+ * `/bin/sh` in a new session (`detached`, which is setsid) with stdio of
+ * its own, and stays its parent until it ends, the way the CLI stays the
+ * parent of a running Bash tool command. Fixed text: the file supplies
+ * only the integers, as environment variables.
+ */
+const ESCAPED_HELPER_JS = [
+  'const { spawn } = require("node:child_process");',
+  'if (process.env.STUB_IGNORE_TERM === "1") process.on("SIGTERM", () => {});',
+  'const c = spawn("/bin/sh", ["-c", "if [ \\"$STUB_IGNORE_TERM\\" = 1 ]; then trap \\"\\" TERM; fi; sleep \\"$STUB_ESCAPED_S\\""],',
+  '  { detached: true, stdio: "ignore" });',
+  'console.log("STUB ESCAPED pid=" + c.pid);',
+  'c.on("exit", () => process.exit(0));',
+].join("\n");
 
 interface StubInstructions {
   __stub__: true;
@@ -118,18 +143,21 @@ function boundedInt(v: unknown, lo: number, hi: number, fallback: number, name: 
 
 /**
  * Run the fake agent: `/bin/sh` that optionally ignores SIGTERM, optionally
- * starts a background `sleep` (the grandchild), sleeps, and exits with a
- * chosen status. Only integers from the file reach the script, and they travel
- * as environment variables, never spliced into it.
+ * starts a background `sleep` (the grandchild) and a process in a session
+ * of its own (the escaped one), sleeps, and exits with a chosen status.
+ * Only integers from the file reach the script, and they travel as
+ * environment variables, never spliced into it.
  */
 async function runStubChild(c: StubChild, sessionId: string): Promise<void> {
   const sleepS = boundedInt(c.sleep_s, 0, 3600, 1, "sleep_s");
   const exitCode = boundedInt(c.exit_code, 0, 255, 0, "exit_code");
   const grandchildS = boundedInt(c.grandchild_s, 0, 3600, 0, "grandchild_s");
+  const escapedS = boundedInt(c.escaped_s, 0, 3600, 0, "escaped_s");
   const timeoutMs = boundedInt(c.timeout_ms, 1, CLAUDE_TIMEOUT_MS, CLAUDE_TIMEOUT_MS, "timeout_ms");
   const script = [
     'if [ "$STUB_IGNORE_TERM" = 1 ]; then trap "" TERM; fi',
     'if [ "$STUB_GRANDCHILD_S" -gt 0 ]; then sleep "$STUB_GRANDCHILD_S" & fi',
+    'if [ "$STUB_ESCAPED_S" -gt 0 ]; then "$STUB_NODE" -e "$STUB_ESCAPED_JS" & fi',
     'echo "STUB CHILD pid=$$ sleeping $STUB_SLEEP_S s"',
     'sleep "$STUB_SLEEP_S"',
     'exit "$STUB_EXIT_CODE"',
@@ -140,6 +168,9 @@ async function runStubChild(c: StubChild, sessionId: string): Promise<void> {
       STUB_SLEEP_S: String(sleepS),
       STUB_EXIT_CODE: String(exitCode),
       STUB_GRANDCHILD_S: String(grandchildS),
+      STUB_ESCAPED_S: String(escapedS),
+      STUB_NODE: process.execPath,
+      STUB_ESCAPED_JS: ESCAPED_HELPER_JS,
       STUB_IGNORE_TERM: c.ignore_term ? "1" : "0",
     },
     input: "",

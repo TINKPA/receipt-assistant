@@ -553,7 +553,7 @@ Every ingest and re-extract run has a row in `agent_runs` (migration 0042, `src/
 - **Before the spawn** the worker inserts it `running`, in the same transaction that moves the ingest to `processing` and sets `ingests.current_run_id`, with a session id it minted. A run that dies at once (auth, spawn) still has its row and its transcript name.
 - **After the exit** it becomes `finished` with `outcome` (`written`, `attached`, `unsupported`, `duplicate_skip`, `no_change`, `agent_error`, `failed`), `error_class` (`auth`, `quota`, `overloaded`, `timeout`, `spawn`, `crash`, `agent_reported`, `guard`, `no_closeout`, `apply`), the exit code or signal, and what `src/session-transcript.ts::summarizeSession` reads from the transcript: turns, tool calls, the three input buckets, output, and `model_observed`. The run is finished before the ingest's SSE event goes out.
 - **At boot** every run still `running` becomes `abandoned` / `interrupted`, in the same transaction that errors the ingests of abandoned batches, and the boot log line `[ingest worker] boot recovery: …` gives the counts.
-- **Timeouts** kill the agent's whole process group (`src/claude.ts::runSupervised`: SIGTERM, then SIGKILL after 15 s), and the worker's slot is released only after the child has closed, so the next extraction never overlaps a dying one. A process the agent leaves running after a normal exit is killed with its group too. In the container node is PID 1, so stopping it ends every group; a server killed outside a container leaves its current agent group running.
+- **Timeouts** kill the agent's whole process group (`src/claude.ts::runSupervised`: SIGTERM, then SIGKILL after 15 s), and the worker's slot is released only after the child has closed, so the next extraction never overlaps a dying one. The CLI (2.1.251) runs every Bash tool command in a session of its own, outside that group, so on a timeout the server first reads which groups the CLI's descendants are in and signals those too, and SIGKILLs any of them still alive when the pipes close. After a **normal** exit only the CLI's own group is killed: a tool command the agent left running in the background is no longer the CLI's child by then and is not reached. If something outside the group holds the CLI's pipes after it exits, they are abandoned 15 s later and the exit code stands (it is not turned into a timeout). In the container node is PID 1, so stopping it ends every group; a server killed outside a container leaves its current agent group running.
 
 `writer` is `agent_sql` (the agent writes the ledger, today's only path) or `stub` (the sandbox stub extractor); `EXTRACTION_WRITER` is read per run, and any value other than `agent_sql` is logged and ignored until the server writer exists. `scripts/check-ledger.ts` checks that no ended run leaves its ingest open (`run-without-terminal-ingest`).
 
@@ -670,7 +670,8 @@ The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable
 that env on the production compose. Its `child` mode runs a fake agent
 process through the same supervisor as `claude -p` (own process group,
-group kill on timeout, a grandchild that outlives it), for testing the
+group kill on timeout, a grandchild that outlives it, and one in a
+session of its own as the CLI's Bash tool runs commands), for testing the
 timeout and slot-release path without a real run; see the header of
 `src/ingest/stub-extractor.ts`. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and

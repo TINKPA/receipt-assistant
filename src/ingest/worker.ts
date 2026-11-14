@@ -19,7 +19,8 @@
  *     var does not quietly turn the window back on.
  *   - A slot is released only when the agent's process group is gone:
  *     `runClaude` settles on the child's `close`, after a timeout has
- *     killed the whole group, so the next job never overlaps the last.
+ *     killed the whole group and the groups its tool commands run in, so
+ *     the next job never overlaps a timed-out one.
  *   - Every run is recorded in `agent_runs` (`./runs.ts`): inserted before
  *     the spawn, in the transaction that moves the ingest to `processing`,
  *     and finished before the SSE event for the ingest goes out.

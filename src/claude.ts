@@ -1,5 +1,6 @@
-import { spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { readdirSync, readFileSync } from "fs";
 import { AGENT_ROLE, roleDatabaseUrl } from "./db/agent-roles.js";
 
 /**
@@ -262,8 +263,80 @@ export function assertCallerArgs(args: readonly string[], profile: string): void
 }
 
 /** How long a child gets after SIGTERM before its process group is
- *  SIGKILLed, and again after SIGKILL before its pipes are abandoned. */
+ *  SIGKILLed, and again after SIGKILL (or after it exited on its own)
+ *  before its pipes are abandoned. */
 export const KILL_GRACE_MS = 15_000;
+
+/**
+ * Every process on the machine as `[pid, ppid, pgid]`, from `/proc` on
+ * Linux (the container) and `ps` elsewhere. Empty when neither can be
+ * read: the caller then signals only the child's own group, as it would
+ * have anyway.
+ */
+function processTable(): Array<[number, number, number]> {
+  try {
+    if (process.platform === "linux") {
+      const rows: Array<[number, number, number]> = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        let stat: string;
+        try {
+          stat = readFileSync(`/proc/${name}/stat`, "utf8");
+        } catch {
+          continue; // exited while we looked
+        }
+        // "pid (comm) state ppid pgrp …"; comm may hold spaces and ")".
+        const f = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        rows.push([Number(name), Number(f[1]), Number(f[2])]);
+      }
+      return rows;
+    }
+    const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,pgid="], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    return out
+      .split("\n")
+      .map((l) => l.trim().split(/\s+/).map(Number))
+      .filter((r): r is [number, number, number] => r.length === 3 && r.every(Number.isInteger));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The process groups of `rootPid`'s live descendants, other than its own
+ * group. The CLI (2.1.251) starts every Bash tool command `detached`, in
+ * a session of its own, so a `psql` waiting on a lock or a command left
+ * running with `&` is not in the group `kill(-pid)` reaches. They are the
+ * CLI's descendants only while it lives (an orphan is re-parented), so
+ * this is read before the first signal. Never returns this server's own
+ * group, or group 0 or 1.
+ */
+function descendantGroups(rootPid: number): number[] {
+  const table = processTable();
+  const children = new Map<number, number[]>();
+  const groupOf = new Map<number, number>();
+  for (const [pid, ppid, pgid] of table) {
+    groupOf.set(pid, pgid);
+    const list = children.get(ppid);
+    if (list) list.push(pid);
+    else children.set(ppid, [pid]);
+  }
+  const own = groupOf.get(process.pid);
+  const groups = new Set<number>();
+  const seen = new Set<number>();
+  const stack = [...(children.get(rootPid) ?? [])];
+  while (stack.length > 0) {
+    const p = stack.pop()!;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    const g = groupOf.get(p);
+    if (g !== undefined && g > 1 && g !== rootPid && g !== own) groups.add(g);
+    stack.push(...(children.get(p) ?? []));
+  }
+  return [...groups];
+}
 
 /** Why a supervised child did not succeed. */
 export type ChildFailureKind = "spawn" | "timeout" | "exit";
@@ -311,22 +384,34 @@ export interface SuperviseOptions {
  * gone.
  *
  * The child is the leader of a new process group (`detached: true`, which
- * is `setsid` on Linux and macOS), so every process it starts — the
- * agent's Bash tool, a `curl`, a `python3`, a `sleep` left in the
- * background — can be signalled at once with `kill(-pgid)`.
+ * is `setsid` on Linux and macOS), so every process it starts in that
+ * group — a `curl`, a `python3`, a `sleep` left in the background — can
+ * be signalled at once with `kill(-pgid)`. The CLI's Bash tool is the
+ * exception: CLI 2.1.251 runs each tool command in a session of its own,
+ * outside that group (see `descendantGroups`).
  *
- *   - Timeout: SIGTERM to the group, then SIGKILL to the group after
- *     `killGraceMs`. A child that has not closed its pipes another
- *     `killGraceMs` later (only possible if something escaped into a
- *     session of its own) has its pipes destroyed so the caller is not
- *     held forever; the log says so.
- *   - Normal exit: the group is SIGKILLed as soon as the leader exits, so
- *     nothing the agent left running outlives its run.
+ *   - Timeout: the groups of the child's descendants that left its group
+ *     are read first, while they are still its descendants. Then SIGTERM
+ *     to the child's group and to those, and SIGKILL to all of them after
+ *     `killGraceMs`. When the pipes close, any of those groups still alive
+ *     is SIGKILLed before the promise settles. A child that has not closed
+ *     its pipes another `killGraceMs` after the SIGKILL (something held
+ *     them from outside every group we know) has its pipes destroyed so
+ *     the caller is not held forever; the log says so.
+ *   - Exit before the timeout: whatever is left in the child's group is
+ *     SIGKILLed as soon as the leader exits, and the timeout is cancelled,
+ *     so a late close is never reported as a timeout. If the pipes are
+ *     still open `killGraceMs` after the exit (held by a process in a
+ *     session of its own), they are destroyed and the exit stands. Such a
+ *     process, and a tool command left running in its own session, is
+ *     not reached after a normal exit: by then it is no longer the
+ *     child's descendant and cannot be told from anyone else's process.
  *   - The promise settles on 'close' — after the child has exited AND its
- *     stdout/stderr have closed — never on the timer. The worker releases
- *     its slot when this settles, so the next job cannot start while the
- *     previous child's processes are still alive (before wave 1 the
- *     timeout rejected at once and only SIGTERMed the leader).
+ *     stdout/stderr have closed (or been destroyed as above) — never on
+ *     the timer. The worker releases its slot when this settles, so the
+ *     next job cannot start while a timed-out child's processes are still
+ *     alive (before wave 1 the timeout rejected at once and only
+ *     SIGTERMed the leader).
  *
  * Resolves with how the child ended, timeouts included. Rejects only when
  * the child could not be spawned at all.
@@ -346,10 +431,18 @@ export function runSupervised(
 
     let settled = false;
     let timedOut = false;
+    let exited = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
     const timers: NodeJS.Timeout[] = [];
-    const clearTimers = () => timers.splice(0).forEach(clearTimeout);
+    const clearTimers = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      timeoutTimer = null;
+      timers.splice(0).forEach(clearTimeout);
+    };
+    /** Groups the child's descendants moved to, collected on timeout. */
+    const strayGroups = new Set<number>();
 
     const killGroup = (signal: NodeJS.Signals): void => {
       if (pid === undefined) return;
@@ -367,6 +460,26 @@ export function runSupervised(
         }
       }
     };
+    const killStrays = (signal: NodeJS.Signals): void => {
+      for (const g of strayGroups) {
+        try {
+          process.kill(-g, signal);
+        } catch {
+          /* ESRCH: that group is gone */
+        }
+      }
+    };
+    const collectStrays = (): void => {
+      if (pid === undefined || exited) return;
+      for (const g of descendantGroups(pid)) strayGroups.add(g);
+    };
+    const abandonPipes = (why: string): void => {
+      console.error(
+        `[${label}] pipes of process ${pid} still open ${why} (held by a process outside its group); abandoning them`,
+      );
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
 
     // The child may exit before draining stdin (bad flag, auth failure).
     // Without this the EPIPE surfaces as an unhandled 'error' on the
@@ -381,43 +494,54 @@ export function runSupervised(
     child.stdout.on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.on("data", (chunk: string) => { stderr += chunk; });
 
-    timers.push(
-      setTimeout(() => {
-        timedOut = true;
-        console.warn(
-          `[${label}] timed out after ${timeoutMs}ms; SIGTERM to process group ${pid}`,
-        );
-        killGroup("SIGTERM");
-        timers.push(
-          setTimeout(() => {
-            console.warn(`[${label}] process group ${pid} still open after ${killGraceMs}ms; SIGKILL`);
-            killGroup("SIGKILL");
-            timers.push(
-              setTimeout(() => {
-                console.error(
-                  `[${label}] process group ${pid} still holds its pipes ${killGraceMs}ms after SIGKILL; ` +
-                    `abandoning them (a process escaped the group)`,
-                );
-                child.stdout.destroy();
-                child.stderr.destroy();
-              }, killGraceMs),
-            );
-          }, killGraceMs),
-        );
-      }, timeoutMs),
-    );
+    timeoutTimer = setTimeout(() => {
+      timeoutTimer = null;
+      timedOut = true;
+      // Before any signal: once the leader dies its tool shells are
+      // re-parented and can no longer be found.
+      collectStrays();
+      console.warn(
+        `[${label}] timed out after ${timeoutMs}ms; SIGTERM to process group ${pid}` +
+          (strayGroups.size > 0
+            ? ` and to ${strayGroups.size} group(s) its descendants started (${[...strayGroups].join(", ")})`
+            : ""),
+      );
+      killGroup("SIGTERM");
+      killStrays("SIGTERM");
+      timers.push(
+        setTimeout(() => {
+          collectStrays(); // anything started since, if the leader still lives
+          console.warn(`[${label}] process group ${pid} still open after ${killGraceMs}ms; SIGKILL`);
+          killGroup("SIGKILL");
+          killStrays("SIGKILL");
+          timers.push(setTimeout(() => abandonPipes(`${killGraceMs}ms after SIGKILL`), killGraceMs));
+        }, killGraceMs),
+      );
+    }, timeoutMs);
 
     child.on("exit", (code, signal) => {
+      exited = true;
       exitCode = code;
       exitSignal = signal;
-      // The leader is gone; nothing it started may outlive it.
+      // The leader is gone; nothing it started in its group may outlive it.
       killGroup("SIGKILL");
+      if (timeoutTimer) {
+        // It ended before the timeout: waiting for its pipes is not a
+        // timeout, but it is bounded.
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+        timers.push(setTimeout(() => abandonPipes(`${killGraceMs}ms after it exited`), killGraceMs));
+      }
     });
 
     child.on("close", (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimers();
+      // A timed-out run's stragglers die before the caller (and the next
+      // job) goes on. SIGTERM went out at the timeout; whatever ignored it
+      // or has not finished yet gets no more time.
+      if (timedOut) killStrays("SIGKILL");
       resolve({
         stdout,
         stderr,
