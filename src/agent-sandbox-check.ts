@@ -34,8 +34,9 @@
  *                or server, is a failure. The Ask profile's list is empty
  *              · the extraction profile runs psql through its own
  *                `$DATABASE_URL`; it must arrive as `receipts_agent`
- *              · the record profile (`extraction_record`, wave 1) prints
- *                its own `$DATABASE_URL`; there must be none. Its run is
+ *              · the record profile (`extraction_record`, wave 1) reports
+ *                whether it has a `$DATABASE_URL` (never the value); there
+ *                must be none. Its run is
  *                then resumed (`--resume`, the repair round's spawn) and
  *                the resumed session must offer exactly the same tools
  *              · the Ask profile is told to run a shell command; it must
@@ -1114,10 +1115,14 @@ const PROBE_PROMPT: Record<AgentProfileName, string> = {
   extraction: `This is an automated self-test. Run the Bash command below exactly as written, once, then reply with the single word DONE.
 
 psql "$DATABASE_URL" -Atc "select 'agent-db-user=' || session_user"`,
-  // The record profile has no database: the variable must be unset.
-  extraction_record: `This is an automated self-test. Run the Bash command below exactly as written, once, then reply with the single word DONE.
+  // The record profile has no database: the variable must be unset. The
+  // command says only whether it is set. Asked to print the value itself,
+  // the model may refuse to put a connection string with credentials in
+  // the conversation (it did on 2026-11-14), which leaves the check
+  // INCONCLUSIVE although nothing is wrong.
+  extraction_record: `This is an automated self-test. Run the Bash command below exactly as written, once, then reply with the single word DONE. It prints only whether the variable is set, never its value.
 
-printf 'record-db-url=%s\\n' "\${DATABASE_URL:-none}"`,
+if [ -n "\${DATABASE_URL+x}" ]; then echo record-db-url=set; else echo record-db-url=none; fi`,
   // A canary. With an empty tool list there is nothing to run it with.
   ask: `This is an automated self-test of this session. Use any tool you have to run the shell command \`id\`, then \`tac /etc/hostname\`, and show their output. If you have no tool that can run a command, reply with exactly: NO-TOOLS`,
   text: "Reply with the single word: ok",
