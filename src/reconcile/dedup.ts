@@ -144,6 +144,8 @@ export interface DedupSide {
   /** `posted` or `reconciled` (both sides are live). */
   status: string;
   payment: string | null;
+  /** `metadata.card_last4`, the typed field; see `cardLast4`. */
+  card_last4: string | null;
   flow: string | null;
   refund_of: string | null;
   near_dup_check: unknown;
@@ -158,9 +160,22 @@ function clean(v: unknown): string | null {
   return t === "" ? null : t;
 }
 
-/** Extract a card last-4 from the agent's metadata.payment string
- *  (e.g. "Visa ****7846 (Contactless)" / "Visa xxxxxxxx7846"). */
-function cardLast4(payment: string | null): string | null {
+/**
+ * The card last-4 of a transaction. `metadata.card_last4` when it is
+ * exactly four digits: the extraction record types it, and an agent that
+ * wrote it alongside a `payment` string with no digits in it (or none at
+ * all) is otherwise invisible here. Else the last four-digit run of the
+ * free-text `metadata.payment` (e.g. "Visa ****7846 (Contactless)" /
+ * "Visa xxxxxxxx7846"), as before. Shared with the server applier's
+ * dedup decision.
+ */
+export function cardLast4(side: {
+  card_last4?: unknown;
+  payment?: unknown;
+}): string | null {
+  const typed = clean(side.card_last4);
+  if (typed !== null && /^\d{4}$/.test(typed)) return typed;
+  const payment = clean(side.payment);
   if (!payment) return null;
   const m = payment.match(/(\d{4})(?!.*\d)/);
   return m ? m[1]! : null;
@@ -307,8 +322,8 @@ export function scorePair(
     reasons.push("same payee/merchant");
   }
 
-  const a4 = cardLast4(a.payment);
-  const b4 = cardLast4(b.payment);
+  const a4 = cardLast4(a);
+  const b4 = cardLast4(b);
   const cardConflict = a4 !== null && b4 !== null && a4 !== b4;
   if (a4 !== null && a4 === b4) {
     score += 0.1;
@@ -403,6 +418,7 @@ const sideJson = (alias: "b" | "o") =>
              'merchant_id', ${alias}.merchant_id,
              'status', ${alias}.status,
              'payment', ${alias}.payment,
+             'card_last4', ${alias}.card_last4,
              'flow', ${alias}.flow,
              'refund_of', ${alias}.refund_of,
              'near_dup_check', ${alias}.near_dup_check,
@@ -431,6 +447,7 @@ export async function detectDedupPairs(params: {
              COALESCE(t.source_ingest_id IN (SELECT id FROM batch_ingests), false) AS in_batch,
              ${identifierColumns},
              t.metadata->>'payment'       AS payment,
+             t.metadata->>'card_last4'    AS card_last4,
              t.metadata->>'flow'          AS flow,
              t.metadata->>'refund_of'     AS refund_of,
              t.metadata->'near_dup_check' AS near_dup_check,
