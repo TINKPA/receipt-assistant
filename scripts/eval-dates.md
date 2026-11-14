@@ -17,9 +17,11 @@ was stamped with, the model its transcript shows, turns and billed tokens.
 
 ```bash
 # The sandbox, never production (a fixture is a real transaction in the
-# ledger it is sent to). From a worktree add
-# --env-file ~/Developer/receipt-assistant/.env so the agent can log in.
-docker compose -f docker-compose.test.yml up -d --build
+# ledger it is sent to), one extraction at a time: the harness refuses a
+# stack with MAX_CLAUDE_CONCURRENCY other than 1 (the sandbox's default is
+# 6). From a worktree add --env-file ~/Developer/receipt-assistant/.env so
+# the agent can log in.
+MAX_CLAUDE_CONCURRENCY=1 docker compose -f docker-compose.test.yml up -d --build
 
 npm run eval:dates -- --dry-run          # check the manifest; no upload, no quota
 npm run eval:dates -- --reset            # one trial of corpus C1, about 1 hour
@@ -28,7 +30,8 @@ npm run eval:dates -- --reset --limit=6  # the six-fixture sanity set
 
 Reports land next to the manifest as
 `eval-dates.<run id>.report.{json,md}` (gitignored in `scripts/`), or in
-`--out=<dir>`.
+`--out=<dir>`. They are rewritten after every trial and when the run ends
+for any reason, Ctrl-C included.
 
 Each real extraction costs about a million tokens of the owner's Claude
 subscription. A full C1 trial is 24 of them.
@@ -41,8 +44,37 @@ subscription. A full C1 trial is 24 of them.
    or `$UPLOADS_DIR`). An entry whose file is missing, or that does not
    validate, is **reported and skipped**; the run goes on. (One deleted
    photo used to abort the whole corpus at fixture 5.)
-2. **Resets the sandbox** with `--reset` (`scripts/sandbox-reset.sh`),
-   before every trial.
+2. **Checks the stack under test.** It reads the environment of the
+   container serving `--base` (`--container`, default
+   `receipt-assistant-test`) with `docker inspect`, through a template that
+   returns only `EXTRACTOR_STUB_ALLOWED`, `CLAUDE_MODEL`,
+   `EXTRACTION_WRITER`, `EXTRACTION_REPAIR_ROUNDS`,
+   `MAX_CLAUDE_CONCURRENCY`, `CLAUDE_TIMEOUT_MS` and whether
+   `GOOGLE_MAPS_API_KEY` is set (never a secret's value). It refuses:
+   - a container that does not publish `--base`'s port (the URL is served
+     by something else);
+   - one without `EXTRACTOR_STUB_ALLOWED=1`, i.e. not a sandbox, unless
+     `--allow-production`. This is what stops a run through the
+     frontend's `/api/` proxy, which reaches production on another port;
+   - `MAX_CLAUDE_CONCURRENCY` other than 1, unless `--allow-concurrency`:
+     neighbours in one batch extracted in parallel race on dedup, so
+     attach and duplicate outcomes would depend on timing, not on the arm;
+   - `--reset` when `scripts/sandbox-reset.sh` would empty a database of
+     another compose project than the container's.
+
+   The values go on the report (`conditions`, and per trial), with the
+   image id, which names the build even when `/version` says
+   `gitSha: unknown` (a worktree build). If the image or any of those
+   values changes between trials, the run stops. `--container=none` skips
+   all of it, for a server you run yourself outside docker; the report
+   then says the conditions are unknown, and `--reset` is refused.
+3. **Waits until the stack is idle** (no ingest queued or processing, no
+   batch reconciling) and then, with `--reset`, **resets the sandbox**
+   (`scripts/sandbox-reset.sh`), before every trial. A reset under a
+   running extraction lets that agent write its brand, merchant and place
+   rows into the fresh ledger, warming the next trial's lookups. The wait
+   lasts as long as that work keeps moving, and gives up after
+   `--stall-min` without movement.
 
    > **Run against a reset sandbox, never a populated ledger.** A copy of
    > a document the ledger already holds is found as a near-duplicate
@@ -51,7 +83,7 @@ subscription. A full C1 trial is 24 of them.
    > 1 requires `--reset`, and why the default `--base` is the sandbox
    > (`http://127.0.0.1:3001`). A base on port 3000 is refused unless you
    > pass `--allow-production`.
-3. **Copies each fixture under a new sha256** so the upload is never a
+4. **Copies each fixture under a new sha256** so the upload is never a
    byte duplicate, without changing what the agent reads:
 
    | Source | Copy | Uploaded as |
@@ -65,32 +97,56 @@ subscription. A full C1 trial is 24 of them.
    `image/jpeg`, which turned the two text-layer PDF fixtures into photos
    of a page: they could never exercise the agent's `pdftotext` path. The
    harness now checks that `pdftotext` reads the same text from a PDF copy
-   as from the original, and after upload that the stored file
-   (`GET /v1/documents/:id/content`) is the copy and still has text
-   (`pdf_text_layer` in the report). Appending to an email body instead
-   of adding a header would corrupt a single-part base64 body.
-4. **Uploads one batch per trial** (`POST /v1/ingest/batch`, at most 50
+   as from the original, and after upload finds the upload's own document
+   (by sha256, or with `--pg` by file path, since an errored or attached
+   upload is not in `produced`) and compares the stored file
+   (`GET /v1/documents/:id/content`) with the original: `pdf_check` is
+   `text_kept` (same bytes as uploaded, same `pdftotext` output),
+   `scan_kept` (the original has no text layer either), `changed`,
+   `bytes_differ`, `not_found` (no document of its own, e.g. attached to
+   its twin) or `unchecked` (no `pdftotext`). Appending to an email body
+   instead of adding a header would corrupt a single-part base64 body.
+5. **Uploads one batch per trial** (`POST /v1/ingest/batch`, at most 50
    files per batch) and polls until every ingest is terminal (`done`,
    `unsupported`, `error`, `dedup`, `near_dup`) **and** the batch has
    finished reconciling, since reconcile can still rewrite transactions.
-5. **Reads each transaction** over the API (`GET /v1/transactions/:id`)
+   A failed poll (no answer, a dropped connection, 5xx, 429) is retried
+   and never ends the run. The trial is **given up** only when no ingest
+   or batch has changed state for `--stall-min` (default the stack's
+   per-run timeout, `CLAUDE_TIMEOUT_MS` or 15 min, plus 5: the worker
+   errors a run that takes longer, so a longer silence means the stack is
+   stuck), after `--timeout-min` in all (default enough for every fixture
+   to use the full per-run timeout at the stack's concurrency, plus 15),
+   or when a batch is gone (404).
+6. **Reads each transaction** over the API (`GET /v1/transactions/:id`)
    and scores it (below).
-6. **Finds each run's transcript** in `--transcripts` (default the
-   sandbox's `~/Developer/receipt-assistant-data/test-claude/projects/-app/`)
-   by the ingest id in the prompt, and counts turns and tokens the way
-   `measure-ingest-turns.ts` does (grouped by `message.id`; billed input is
-   fresh + cache read + cache write).
-7. **Dumps the rows** with `--dump=<dir> --pg=<url>`: for every fixture the
+7. **Finds each run's transcript** in `--transcripts` (default the
+   sandbox's `~/Developer/receipt-assistant-data/test-claude/projects/-app/`):
+   by `agent_runs.session_id` when run records exist (needs `--pg`),
+   otherwise by the ingest id in the prompt. It counts turns and tokens
+   the way `measure-ingest-turns.ts` does (grouped by `message.id`; billed
+   input is fresh + cache read + cache write).
+8. **Dumps the rows** with `--dump=<dir> --pg=<url>`: for every fixture the
    ingest, documents, links, transactions, postings (with account name and
    type), items, parties, events, place, merchant, owned items and, once
    they exist, `agent_runs`, as whole rows, one JSON file per fixture under
    `<dir>/<run id>/t<trial>/`. The connection is opened with
    `default_transaction_read_only=on` and refused otherwise, and a dump
-   directory inside this repository is refused: the rows are real
-   receipts. The wave-1 arm diff reads these.
-8. **Writes the report**: fields and buckets over all trials, cost
-   medians, a per-fixture majority over trials, every run, errors, and the
-   skipped fixtures.
+   directory inside this repository is refused (letter case and symlinks
+   do not get past it): the rows are real receipts. The wave-1 arm diff
+   reads these.
+9. **Writes the report** after every trial, and again when the run ends,
+   stops or is interrupted: fields and buckets, cost medians, a
+   per-fixture majority over trials, every run, errors, and the skipped
+   fixtures. A trial that is given up ends the run (the stack still has
+   its work in flight, so the next reset would land under it): its runs
+   stay in the report marked `unfinished`, the trial is `complete: false`,
+   and the aggregates and majority cover finished trials only. The trial
+   in progress at Ctrl-C is not in the report.
+
+Exit status: 0 every trial finished (and `--gate` passed); 1 refused, a
+fatal error (the report says which), or `--gate` failed; 3 stopped before
+every trial finished; 130 interrupted.
 
 No auth headers (the seed-workspace middleware), no `--json-schema`.
 
@@ -102,27 +158,44 @@ No auth headers (the seed-workspace middleware), no `--json-schema`.
 | Flag | Default | What it does |
 |---|---|---|
 | `--base=<url>` | `http://127.0.0.1:3001` | API of the stack under test |
-| `--allow-production` | off | Allow a base on port 3000 |
+| `--container=<name>` | `receipt-assistant-test` | Container serving `--base`, checked and recorded (step 2); `none` to skip |
+| `--allow-production` | off | Allow a stack without `EXTRACTOR_STUB_ALLOWED=1`, or a base on port 3000 |
+| `--allow-concurrency` | off | Allow `MAX_CLAUDE_CONCURRENCY` other than 1 (never for an arm of the A/B) |
 | `--manifest=<path>` | `scripts/eval-dates.fixtures.json` | Corpus to run |
 | `--uploads-dir=<path>` | iCloud `data/uploads/uploads` | Where sources live (`$UPLOADS_DIR` also works) |
 | `--limit=<n>` | all | First n manifest entries |
 | `--trials=<n>` | 1 | Run the set n times, one batch each; needs `--reset` above 1 |
-| `--reset` | off | `scripts/sandbox-reset.sh` before every trial |
+| `--reset` | off | `scripts/sandbox-reset.sh` before every trial, once the stack is idle |
 | `--run-id=<id>` | `ed-<UTC time>-<hex>` | Names the report files and the dump directory |
 | `--label=<text>` | none | Free text on the report, e.g. `arm A` |
 | `--out=<dir>` | the manifest's directory | Where the report goes |
 | `--dump=<dir>` | off | Write each fixture's rows (needs `--pg`; refused inside the repo) |
-| `--pg=<url>` | none | Postgres of the stack under test, opened read-only. Sandbox: `postgresql://postgres:postgres@127.0.0.1:5433/receipts` |
+| `--pg=<url>` | none | Postgres of the stack under test, opened read-only. Sandbox: `postgresql://postgres:postgres@127.0.0.1:5433/receipts`. Also finds each upload's own document and, once run records exist, its transcript |
 | `--transcripts=<dir>` | sandbox `test-claude/projects/-app` | Session JSONL directory; `none` to skip |
-| `--timeout-min=<n>` | 60 | Per-trial polling timeout |
+| `--stall-min=<n>` | per-run timeout + 5 | Give a trial up when nothing has moved this long |
+| `--timeout-min=<n>` | from fixtures, timeout, concurrency | Hard cap per trial |
 | `--gate` | off | Exit 1 if date accuracy < 90% (#27 AC#1) |
 | `--dry-run` | off | Resolve and copy every fixture, check the copies, upload nothing |
 | `--rescore=<batch id>[,<id>]` | off | Score batches that already ran, with the current manifest and code: no reset, upload or model calls. Items are matched to fixtures by upload filename. Use it after correcting ground truth, or to dump a run after the fact (before the next reset) |
 
-Two arms are two runs: flip the sandbox between them
-(`EXTRACTION_WRITER=server_apply docker compose -f docker-compose.test.yml up -d`)
-and give each its own `--run-id` and `--label`. `--trials=n` repeats one
-arm.
+Two arms are two runs. Recreate the sandbox for each with the conditions
+that differ from the compose defaults named on the command line (the
+sandbox's concurrency default is 6, and a value in `.env` would move
+production too):
+
+```bash
+# arm A
+MAX_CLAUDE_CONCURRENCY=1 EXTRACTION_WRITER=agent_sql \
+  docker compose -f docker-compose.test.yml up -d
+# arm B
+MAX_CLAUDE_CONCURRENCY=1 EXTRACTION_WRITER=server_apply \
+  docker compose -f docker-compose.test.yml up -d
+```
+
+Give each its own `--run-id` and `--label`; `--trials=n` repeats one arm.
+The report records what the container actually ran with (`conditions`),
+so a run with the wrong setting shows on its face, and the harness
+refuses a concurrency other than 1.
 
 ## Corpora
 
@@ -210,12 +283,26 @@ in a private manifest outside the repo, like C2.
 own (none, or its twin's). Classification, flow and currency are reported
 on their own and not folded into the pass.
 
-With several trials the report adds, per fixture and field, the majority
-verdict (`pass`, `fail`, `split` on a tie, `n/a`), which is how the wave-1
-gate G1 compares arms.
+Every field is scored twice:
 
-The aggregate date accuracy is `correct / scored`, so documents that were
-never extracted do not dilute it; `--gate` checks it against 90%.
+- **Lenient** (`scoring.<field>_match`, `aggregate.fields`): a run that
+  produced no value is not scored (null), as in #27.
+- **Strict** (`scoring.strict`, `aggregate.fields_strict`): on a fixture
+  that expects a transaction of its own (`expected_status` exactly
+  `done`, bucket not `duplicate` or `good_rejects`), a field the ground
+  truth names but the run left empty (an error, no transaction, no payee)
+  is **wrong**. Otherwise as lenient. Compare arms on this view: under the
+  lenient one an arm that errors more drops those documents from the
+  denominator and looks more accurate.
+
+With several trials the report adds, per fixture, the majority verdict
+(`pass`, `fail`, `split` on a tie, `n/a`) for the bucket and for each
+field, lenient at the top level and strict under `strict`. The Markdown
+table shows the strict verdicts, which is how the wave-1 gate G1 compares
+arms: an arm that books nothing on a fixture fails it.
+
+The aggregate date accuracy for `--gate` is the lenient `correct /
+scored` (#27 AC#1), checked against 90%.
 
 ## Known stragglers (do not panic)
 

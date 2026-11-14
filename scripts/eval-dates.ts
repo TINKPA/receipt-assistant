@@ -9,9 +9,17 @@
  * the transcript shows, turns and billed tokens. Full contract, manifest
  * format and pass rules: scripts/eval-dates.md.
  *
+ * Before anything is uploaded it reads the environment of the container
+ * that serves --base (docker inspect, a fixed list of keys, never a
+ * secret's value): it refuses a stack that is not a sandbox
+ * (EXTRACTOR_STUB_ALLOWED=1) or runs more than one extraction at a time,
+ * and records the model, writer and concurrency on the report, since
+ * those are what the two arms of the A/B must hold equal.
+ *
  * Per trial, the harness:
- *   1. (--reset) runs scripts/sandbox-reset.sh, so every document is new
- *      to the ledger. Without it a copy from an earlier trial is found as
+ *   1. Waits until the stack has no extraction in flight, then (--reset)
+ *      runs scripts/sandbox-reset.sh, so every document is new to the
+ *      ledger. Without the reset a copy from an earlier trial is found as
  *      a near-duplicate and nothing is extracted.
  *   2. Copies each fixture under a new sha256 without changing what the
  *      agent reads: images through `sips` (as since #27), PDFs with bytes
@@ -21,29 +29,50 @@
  *      reported and skipped, never fatal.
  *   3. Uploads the copies with their real content type and polls until
  *      every ingest is terminal (done / unsupported / error / dedup /
- *      near_dup) and the batch has finished reconciling.
+ *      near_dup) and the batch has finished reconciling. A poll that fails
+ *      is retried; the trial is given up only when nothing has moved for
+ *      --stall-min, or after --timeout-min.
  *   4. Reads each transaction over the API, scores it, finds the agent's
- *      transcript by ingest id, and (--dump) writes the rows the run left
- *      in the database to a directory outside the repo.
- *   5. Writes `eval-dates.<run id>.report.{json,md}`.
+ *      transcript, and (--dump) writes the rows the run left in the
+ *      database to a directory outside the repo.
+ *   5. Writes `eval-dates.<run id>.report.{json,md}`, after every trial and
+ *      again when the run ends or stops, so a trial that fails (or Ctrl-C)
+ *      never loses the trials before it. A trial that did not finish is
+ *      kept in the report, left out of the aggregates, and ends the run:
+ *      the stack still has its work in flight.
  *
- * It talks to the HTTP API and, only with --dump, to Postgres with
- * read-only transactions. No auth headers (seed-workspace middleware), no
- * `--json-schema`. Deps: tsx, Node built-ins, `pg`.
+ * It talks to the HTTP API, to `docker inspect`, and, only with --pg, to
+ * Postgres with read-only transactions. No auth headers (seed-workspace
+ * middleware), no `--json-schema`. Deps: tsx, Node built-ins, `pg`.
+ *
+ * Exit: 0 every trial finished (and --gate passed); 1 refused, a fatal
+ * error, or --gate failed; 3 stopped before every trial finished; 130
+ * interrupted. A report is written in every case but a refusal.
  *
  * CLI — `--key=value`, or a bare `--flag` for the switches. The space form
  * (`--limit 5`) and unknown flags are refused; until wave 1 they were bound
  * to `true` silently, and `--limit 5` ran ONE fixture.
  *   --base=<url>          API base. Default http://127.0.0.1:3001 (the sandbox).
- *   --allow-production    Allow a base on port 3000, production's port. Every
- *                         fixture becomes a transaction in that ledger.
+ *   --container=<name>    The container serving --base. Default
+ *                         receipt-assistant-test (the sandbox app). It must
+ *                         publish --base's port and have
+ *                         EXTRACTOR_STUB_ALLOWED=1. `none` skips the check
+ *                         (a server you run yourself, outside docker); the
+ *                         report then says the conditions are unknown.
+ *   --allow-production    Allow a stack that is not a sandbox, or a base on
+ *                         port 3000. Every fixture becomes a transaction in
+ *                         that ledger.
+ *   --allow-concurrency   Run although the container's MAX_CLAUDE_CONCURRENCY
+ *                         is not 1. Never for an arm of the A/B: neighbours
+ *                         in one batch extracted in parallel race on dedup.
  *   --manifest=<path>     Default scripts/eval-dates.fixtures.json (corpus C1).
  *   --uploads-dir=<path>  Where fixture sources live. Default the iCloud
  *                         project's data/uploads/uploads (or $UPLOADS_DIR).
  *   --limit=<n>           Take the first n manifest entries.
  *   --trials=<n>          Run the set n times, one batch per trial. Default 1.
  *   --reset               Run scripts/sandbox-reset.sh before every trial.
- *                         Required when --trials > 1.
+ *                         Required when --trials > 1. Only for a --container
+ *                         in the compose project that script resets.
  *   --run-id=<id>         Default ed-<UTC timestamp>-<4 hex>.
  *   --label=<text>        Free text on the report, e.g. "arm A".
  *   --out=<dir>           Report directory. Default the manifest's directory.
@@ -52,9 +81,16 @@
  *                         inside this repository: the rows are real receipts.
  *   --pg=<url>            Postgres of the stack under test (sandbox:
  *                         postgresql://postgres:postgres@127.0.0.1:5433/receipts).
+ *                         Also used to find each upload's own document and,
+ *                         once run records exist, its transcript.
  *   --transcripts=<dir>   Session JSONL directory of the stack under test.
  *                         Default the sandbox's; `none` to skip.
- *   --timeout-min=<n>     Per-trial polling timeout. Default 60.
+ *   --stall-min=<n>       Give a trial up when no ingest or batch has changed
+ *                         state for n minutes. Default the stack's per-run
+ *                         timeout (CLAUDE_TIMEOUT_MS, else 15 min) + 5.
+ *   --timeout-min=<n>     Hard cap per trial. Default enough for every
+ *                         fixture to use the full per-run timeout at the
+ *                         stack's concurrency, + 15.
  *   --gate                Exit 1 if aggregate date accuracy < 0.9 (#27 AC#1).
  *   --dry-run             Resolve and copy every fixture, check the copies, and
  *                         stop: no upload, no server, no model calls.
@@ -69,10 +105,11 @@
  */
 import { spawn, spawnSync } from "child_process";
 import { createHash, randomBytes } from "crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "fs/promises";
 import { realpathSync } from "fs";
 import { homedir, tmpdir } from "os";
 import * as path from "path";
+import { fileURLToPath } from "url";
 import pg from "pg";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -94,6 +131,8 @@ const BUCKETS: readonly Bucket[] = [
 ];
 
 type Flow = "purchase" | "refund" | "income";
+const FIELDS = ["date", "total", "payee", "classification", "flow", "currency"] as const;
+type Field = (typeof FIELDS)[number];
 type SourceKind = "image" | "pdf" | "eml" | "html";
 type IngestStatus = "queued" | "processing" | "done" | "error" | "unsupported" | "dedup" | "near_dup";
 
@@ -181,7 +220,25 @@ interface Scoring {
   currency_match: boolean | null;
   status_match: boolean;
   bucket_pass: boolean;
+  /**
+   * The same six fields with "nothing extracted" counted as wrong: on a
+   * fixture that expects its own transaction, a field the ground truth
+   * names but the run left empty (no transaction, an error, no payee) is
+   * `false` here, where the fields above say null (not scored). This is
+   * the view the arms are compared on: an arm that errors must not look
+   * more accurate for it.
+   */
+  strict: Record<Field, boolean | null>;
 }
+
+/** What the post-upload PDF check found on the stored file. */
+type PdfCheck =
+  | "text_kept" // same bytes as uploaded, pdftotext reads what it read from the original
+  | "scan_kept" // same, and the original has no text layer either (a scan)
+  | "changed" // pdftotext reads something else from the stored file
+  | "bytes_differ" // the stored file is not the copy that was uploaded
+  | "not_found" // no document of this upload's own (attached to a twin, or errored before)
+  | "unchecked"; // pdftotext not available
 
 interface SessionSummary {
   session_id: string;
@@ -206,15 +263,26 @@ interface FixtureResult {
   upload_sha256: string | null;
   batch_id: string;
   ingest_id: string;
+  /** As last seen; not terminal when `unfinished`. */
   ingest_status: string;
   ingest_error: string | null;
+  /** The trial was given up before this ingest reached a terminal status. */
+  unfinished: boolean;
   transaction_id: string | null;
+  /** The upload's own document when it could be told apart (by sha256, or
+   *  by file path with --pg), else the first one the ingest produced. */
   document_id: string | null;
-  /** PDFs only: the stored bytes equal the upload and still carry text. */
+  /** PDFs only: true when the stored file is the uploaded copy and reads
+   *  the same as the original (`pdf_check` text_kept); false when it was
+   *  changed; null when there was nothing to check or no text to keep. */
   pdf_text_layer: boolean | null;
+  pdf_check: PdfCheck | null;
   extracted: Extracted;
   scoring: Scoring;
   session: SessionSummary | null;
+  /** How the transcript was found: by `agent_runs.session_id`, or by the
+   *  ingest id in the prompt. */
+  session_source: "agent_runs" | "prompt" | null;
   /** `agent_runs.id`, once run records exist (--pg). */
   agent_run_id: string | null;
 }
@@ -226,10 +294,13 @@ const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 const HOME = homedir();
 
 const VALUE_FLAGS = [
-  "base", "manifest", "uploads-dir", "limit", "trials", "run-id", "label",
-  "out", "dump", "pg", "transcripts", "timeout-min", "rescore",
+  "base", "container", "manifest", "uploads-dir", "limit", "trials", "run-id", "label",
+  "out", "dump", "pg", "transcripts", "stall-min", "timeout-min", "rescore",
 ] as const;
-const BARE_FLAGS = ["allow-production", "reset", "gate", "dry-run"] as const;
+const BARE_FLAGS = ["allow-production", "allow-concurrency", "reset", "gate", "dry-run"] as const;
+
+/** The sandbox app container (docker-compose.test.yml). */
+const SANDBOX_CONTAINER = "receipt-assistant-test";
 
 function parseArgs(argv: string[]) {
   const args: Record<string, string | boolean> = {};
@@ -259,9 +330,12 @@ function parseArgs(argv: string[]) {
   };
   const manifest = path.resolve(str("manifest") ?? path.join(SCRIPT_DIR, "eval-dates.fixtures.json"));
   const transcripts = str("transcripts");
+  const container = str("container") ?? SANDBOX_CONTAINER;
   return {
     base: (str("base") ?? "http://127.0.0.1:3001").replace(/\/+$/, ""),
+    container: container === "none" ? null : container,
     allowProduction: flag("allow-production"),
+    allowConcurrency: flag("allow-concurrency"),
     manifest,
     uploadsDir:
       str("uploads-dir") ??
@@ -281,7 +355,9 @@ function parseArgs(argv: string[]) {
         : path.resolve(
             transcripts ?? path.join(HOME, "Developer/receipt-assistant-data/test-claude/projects/-app"),
           ),
-    timeoutMs: num("timeout-min", 60) * 60_000,
+    /** Null: derived from the stack (see trialTimeouts). */
+    stallMs: str("stall-min") !== undefined ? num("stall-min", 0) * 60_000 : null,
+    timeoutMs: str("timeout-min") !== undefined ? num("timeout-min", 0) * 60_000 : null,
     rescore: str("rescore") ? str("rescore")!.split(",").map((x) => x.trim()).filter(Boolean) : null,
     gate: flag("gate"),
     dryRun: flag("dry-run"),
@@ -294,9 +370,13 @@ function defaultRunId(): string {
   return `ed-${ts}-${randomBytes(2).toString("hex")}`;
 }
 
+function basePort(base: string): string {
+  const url = new URL(base);
+  return url.port || (url.protocol === "https:" ? "443" : "80");
+}
+
 function checkArgs(args: Args): void {
-  const url = new URL(args.base);
-  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const port = basePort(args.base);
   if (port === "3000" && !args.allowProduction) {
     throw new Error(
       `--base=${args.base} is on port 3000, production's port. Every fixture would be booked in ` +
@@ -308,6 +388,12 @@ function checkArgs(args: Args): void {
     throw new Error(
       `--trials=${args.trials} needs --reset: the second trial's copies would be found as ` +
         `near-duplicates of the first trial's (same pHash, same identifiers) and nothing would be extracted.`,
+    );
+  }
+  if (args.reset && !args.container) {
+    throw new Error(
+      "--reset needs --container: scripts/sandbox-reset.sh empties the sandbox, and the harness checks " +
+        "first that the sandbox is the stack under test. With --container=none it cannot.",
     );
   }
   if (args.dump && !args.pg) throw new Error("--dump needs --pg=<postgres url of the stack under test>");
@@ -341,22 +427,28 @@ function repositoryRoots(): string[] {
   return [...roots];
 }
 
+/**
+ * The canonical path. `realpathSync.native` (realpath(3)) also restores
+ * the on-disk letter case, which the JS implementation keeps as typed: on
+ * a case-insensitive volume `/users/x/REPO` is the repository too.
+ */
 function realpathOr(p: string): string {
   try {
-    return realpathSync(p);
+    return realpathSync.native(p);
   } catch {
     return path.resolve(p);
   }
 }
 
 /** True when `p` is `root` or below it. `p` may not exist yet. */
-function isInside(p: string, root: string): boolean {
+export function isInside(p: string, root: string): boolean {
   let probe = path.resolve(p);
   const tail: string[] = [];
-  // Resolve the deepest existing ancestor so a symlinked parent counts.
+  // Resolve the deepest existing ancestor so a symlinked or differently
+  // cased parent counts.
   for (;;) {
     try {
-      probe = path.join(realpathSync(probe), ...tail.reverse());
+      probe = path.join(realpathSync.native(probe), ...tail.reverse());
       break;
     } catch {
       const parent = path.dirname(probe);
@@ -365,9 +457,193 @@ function isInside(p: string, root: string): boolean {
       probe = parent;
     }
   }
-  const rel = path.relative(root, probe);
+  // macOS and Windows volumes are case-insensitive by default; the part of
+  // the path that does not exist yet was not canonicalised above.
+  const fold = (s: string) => (process.platform === "darwin" || process.platform === "win32" ? s.toLowerCase() : s);
+  const rel = path.relative(fold(realpathOr(root)), fold(probe));
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
+
+// ── The stack under test ───────────────────────────────────────────────
+
+/** Environment keys read off the container. Nothing else is read: the
+ *  container's environment also holds the OAuth token and API keys. */
+const CONDITION_KEYS = [
+  "EXTRACTOR_STUB_ALLOWED",
+  "CLAUDE_MODEL",
+  "EXTRACTION_WRITER",
+  "EXTRACTION_REPAIR_ROUNDS",
+  "MAX_CLAUDE_CONCURRENCY",
+  "CLAUDE_TIMEOUT_MS",
+] as const;
+type ConditionKey = (typeof CONDITION_KEYS)[number];
+
+/** What the A/B holds equal across arms, as configured on the container. */
+export interface StackConditions {
+  container: string;
+  read_at: string;
+  running: boolean;
+  /** `Config.Image`, the tag it was started from. */
+  image: string | null;
+  /** The image id: names the build even when /version says gitSha unknown
+   *  (a worktree build). */
+  image_id: string | null;
+  compose_project: string | null;
+  /** Host ports the container publishes. */
+  host_ports: string[];
+  /** Unset keys are null. Under compose an unset variable is the compose
+   *  file's default, which `docker inspect` shows as set. */
+  env: Record<ConditionKey, string | null>;
+  /** Place lookups (Phase 3a, Check C) change payee and place; only whether
+   *  a key is there is read, never its value. */
+  google_maps_key_set: boolean;
+}
+
+/**
+ * `docker inspect` through a template that emits only CONDITION_KEYS and
+ * whether GOOGLE_MAPS_API_KEY is non-empty, so no secret ever reaches this
+ * process. Null when there is no such container.
+ */
+export function readContainer(name: string): StackConditions | null {
+  const keys = CONDITION_KEYS.map((k) => JSON.stringify(k)).join(" ");
+  const fmt = [
+    "{{json .State.Running}}",
+    "{{json .Config.Image}}",
+    "{{json .Image}}",
+    '{{json (index .Config.Labels "com.docker.compose.project")}}',
+    "{{json .NetworkSettings.Ports}}",
+    "{{range .Config.Env}}{{$k := index (split . \"=\") 0}}" +
+      `{{if eq $k ${keys}}}{{json .}}{{println}}{{end}}` +
+      '{{if eq $k "GOOGLE_MAPS_API_KEY"}}{{if gt (len .) 20}}"GOOGLE_MAPS_API_KEY=<set>"{{println}}{{end}}{{end}}' +
+      "{{end}}",
+  ].join("\n");
+  const r = spawnSync("docker", ["inspect", "--type", "container", "--format", fmt, name], { encoding: "utf8" });
+  if (r.status !== 0) return null;
+  const lines = r.stdout.split("\n");
+  const json = (i: number): unknown => {
+    try {
+      return JSON.parse(lines[i] ?? "null");
+    } catch {
+      return null;
+    }
+  };
+  const ports = (json(4) ?? {}) as Record<string, { HostIp?: string; HostPort?: string }[] | null>;
+  const env = Object.fromEntries(CONDITION_KEYS.map((k) => [k, null])) as Record<ConditionKey, string | null>;
+  let mapsKey = false;
+  for (const line of lines.slice(5)) {
+    if (!line.trim()) continue;
+    const kv = JSON.parse(line) as string;
+    const eq = kv.indexOf("=");
+    const k = kv.slice(0, eq);
+    if (k === "GOOGLE_MAPS_API_KEY") mapsKey = true;
+    else if ((CONDITION_KEYS as readonly string[]).includes(k)) env[k as ConditionKey] = kv.slice(eq + 1);
+  }
+  const project = json(3);
+  return {
+    container: name,
+    read_at: new Date().toISOString(),
+    running: json(0) === true,
+    image: (json(1) as string | null) ?? null,
+    image_id: (json(2) as string | null) ?? null,
+    compose_project: typeof project === "string" && project ? project : null,
+    host_ports: [
+      ...new Set(
+        Object.values(ports)
+          .flatMap((b) => b ?? [])
+          .map((b) => b.HostPort)
+          .filter((p): p is string => !!p),
+      ),
+    ].sort(),
+    env,
+    google_maps_key_set: mapsKey,
+  };
+}
+
+/** The part of the conditions that must not move between trials. */
+function conditionsKey(c: StackConditions | null): string {
+  return c ? JSON.stringify({ image_id: c.image_id, env: c.env, maps: c.google_maps_key_set }) : "none";
+}
+
+/**
+ * Refuse a stack the run must not touch or cannot compare. Throws with the
+ * reason; returns the conditions to record (null with --container=none).
+ */
+export function checkStack(
+  args: Pick<Args, "base" | "container" | "allowProduction" | "allowConcurrency" | "reset" | "rescore">,
+  read: (name: string) => StackConditions | null = readContainer,
+): StackConditions | null {
+  if (!args.container) {
+    console.error(
+      "  warn: --container=none: the stack's model, writer and concurrency are not checked or recorded, " +
+        "and nothing confirms --base is a sandbox.",
+    );
+    return null;
+  }
+  if (args.container === "receipt-assistant" && !args.allowProduction) {
+    throw new Error("REFUSING: 'receipt-assistant' is the production container.");
+  }
+  const c = read(args.container);
+  if (!c) throw new Error(`no container named '${args.container}'. Bring the stack up, or name the one serving --base.`);
+  if (!c.running) throw new Error(`container '${args.container}' is not running.`);
+  const port = basePort(args.base);
+  if (!c.host_ports.includes(port)) {
+    throw new Error(
+      `container '${args.container}' publishes port(s) ${c.host_ports.join(", ") || "none"}, not ${port}: ` +
+        `--base=${args.base} is served by something else. Pass --container=<the one serving it>, ` +
+        `or --container=none for a server outside docker.`,
+    );
+  }
+  if (c.env.EXTRACTOR_STUB_ALLOWED !== "1" && !args.allowProduction) {
+    throw new Error(
+      `REFUSING: '${args.container}' does not have EXTRACTOR_STUB_ALLOWED=1, so it is not a sandbox. ` +
+        `Every fixture would be booked in its ledger. Pass --allow-production if that really is what you want.`,
+    );
+  }
+  if (!args.rescore && c.env.MAX_CLAUDE_CONCURRENCY !== "1" && !args.allowConcurrency) {
+    throw new Error(
+      `'${args.container}' runs MAX_CLAUDE_CONCURRENCY=${c.env.MAX_CLAUDE_CONCURRENCY ?? "(unset: the code default)"}. ` +
+        `Accuracy runs hold it at 1: neighbours in one batch extracted in parallel race on dedup, so ` +
+        `attach and duplicate outcomes would depend on timing. Recreate the stack with ` +
+        `MAX_CLAUDE_CONCURRENCY=1 (scripts/eval-dates.md), or pass --allow-concurrency for a run that is ` +
+        `not an arm of the A/B.`,
+    );
+  }
+  if (args.reset) {
+    const pgName = process.env.SANDBOX_PG_CONTAINER ?? "receipts-test-postgres";
+    const pgc = read(pgName);
+    if (!pgc || !pgc.compose_project || pgc.compose_project !== c.compose_project) {
+      throw new Error(
+        `--reset empties '${pgName}' (compose project ${pgc?.compose_project ?? "none"}), which is not the ` +
+          `database of '${args.container}' (project ${c.compose_project ?? "none"}). Refusing to reset one ` +
+          `stack and test another.`,
+      );
+    }
+  }
+  return c;
+}
+
+/**
+ * How long a trial may sit still, and how long it may take at most. A run
+ * is bounded by the worker's own per-run timeout, after which it errors,
+ * so "nothing moved for longer than that" means the stack is stuck; the
+ * hard cap only backs that up.
+ */
+function trialTimeouts(
+  args: Pick<Args, "stallMs" | "timeoutMs">,
+  c: StackConditions | null,
+  fixtures: number,
+): { stallMs: number; totalMs: number } {
+  const perRun = Number(c?.env.CLAUDE_TIMEOUT_MS) > 0 ? Number(c!.env.CLAUDE_TIMEOUT_MS) : 900_000;
+  const conc = Number(c?.env.MAX_CLAUDE_CONCURRENCY) > 0 ? Number(c!.env.MAX_CLAUDE_CONCURRENCY) : 1;
+  return {
+    stallMs: args.stallMs ?? perRun + 5 * 60_000,
+    totalMs: args.timeoutMs ?? Math.ceil(fixtures / conc) * perRun + 15 * 60_000,
+  };
+}
+
+/** Ends the run early without losing what it has: the report is written
+ *  and the exit status is 3. */
+class StopRun extends Error {}
 
 // ── Manifest ───────────────────────────────────────────────────────────
 
@@ -521,13 +797,100 @@ function sha256Hex(b: Uint8Array): string {
 
 // ── HTTP ───────────────────────────────────────────────────────────────
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init);
+class HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** One request. Never retried: a POST that is sent twice uploads twice. */
+async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 120_000): Promise<T> {
+  const r = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   if (!r.ok) {
     const body = await r.text().catch(() => "");
-    throw new Error(`${init?.method ?? "GET"} ${url} → ${r.status}: ${body.slice(0, 500)}`);
+    throw new HttpError(`${init?.method ?? "GET"} ${url} → ${r.status}: ${body.slice(0, 500)}`, r.status);
   }
   return r.json() as Promise<T>;
+}
+
+/** A failure worth asking again: no answer, a dropped connection, 5xx, 429. */
+function transient(e: unknown): boolean {
+  return !(e instanceof HttpError) || e.status >= 500 || e.status === 429;
+}
+
+/** GET with retries over about 30 s for transient failures. A run that
+ *  has spent an hour of quota must not die on one 502. */
+async function getJson<T>(url: string): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fetchJson<T>(url);
+    } catch (e) {
+      if (!transient(e) || attempt >= 5) throw e;
+      await sleep(2000 * attempt);
+    }
+  }
+}
+
+/** GET of a binary body, with the same retries. Null on a 404. */
+async function getBytes(url: string): Promise<Uint8Array | null> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+      if (r.status === 404) return null;
+      if (!r.ok) throw new HttpError(`GET ${url} → ${r.status}`, r.status);
+      return new Uint8Array(await r.arrayBuffer());
+    } catch (e) {
+      if (!transient(e) || attempt >= 5) throw e;
+      await sleep(2000 * attempt);
+    }
+  }
+}
+
+/**
+ * Wait until the stack has nothing in flight: no ingest queued or
+ * processing, no batch reconciling. A reset under a running extraction
+ * lets that agent write its catalog rows (brand, merchant, place) into
+ * the fresh ledger, where the next trial finds them warm; and at
+ * concurrency 1 a leftover queue would also hold this trial's uploads
+ * back. Waits as long as that work keeps moving; gives up (StopRun) when
+ * nothing has changed for `stallMs`.
+ */
+async function waitForIdle(base: string, stallMs: number, before: string): Promise<void> {
+  const start = Date.now();
+  let said = false;
+  let lastSignature = "";
+  let lastMove = Date.now();
+  for (;;) {
+    type Row = { id: string; status: string };
+    const ingests = await getJson<{ items: Row[] }>(`${base}/v1/ingests?status=queued,processing&limit=100`);
+    const batches = await getJson<{ items: Row[] }>(`${base}/v1/batches?status=reconciling&limit=100`);
+    if (ingests.items.length === 0 && batches.items.length === 0) {
+      if (said) console.error(`  idle after ${Math.round((Date.now() - start) / 1000)}s`);
+      return;
+    }
+    const counts = `${ingests.items.length} ingest(s) queued or processing, ${batches.items.length} batch(es) reconciling`;
+    if (!said) {
+      console.error(`  waiting for the stack to go idle before ${before}: ${counts}`);
+      said = true;
+    }
+    const signature = JSON.stringify([ingests.items.map((i) => [i.id, i.status]), batches.items.map((b) => b.id)]);
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      lastMove = Date.now();
+    }
+    if (Date.now() - lastMove > stallMs) {
+      throw new StopRun(
+        `the stack's work in flight had not moved for ${Math.round(stallMs / 60_000)} min, so ${before} was not ` +
+          `started (${counts})`,
+      );
+    }
+    await sleep(5000);
+  }
 }
 
 interface CreateBatchResponse {
@@ -538,7 +901,7 @@ interface CreateBatchResponse {
 async function postBatch(base: string, files: Prepared[]): Promise<CreateBatchResponse> {
   const form = new FormData();
   for (const f of files) form.append("files", new Blob([f.bytes as BlobPart], { type: f.mime }), f.filename);
-  return fetchJson<CreateBatchResponse>(`${base}/v1/ingest/batch`, { method: "POST", body: form });
+  return fetchJson<CreateBatchResponse>(`${base}/v1/ingest/batch`, { method: "POST", body: form }, 600_000);
 }
 
 interface ApiIngest {
@@ -566,27 +929,74 @@ interface ApiTransaction {
 /** Batch states that mean reconcile may still rewrite transactions. */
 const BATCH_BUSY = new Set(["pending", "processing", "reconciling"]);
 
-async function pollBatches(base: string, ids: string[], timeoutMs: number): Promise<Map<string, ApiBatch>> {
+/**
+ * Poll until every item is terminal and no batch is busy. Never throws:
+ * a failed poll is logged and tried again, and when the trial has to be
+ * given up (nothing moved for `stallMs`, `totalMs` passed, or a batch is
+ * gone) it returns the last state it saw with the reason, so the items
+ * that did finish are still scored.
+ */
+async function pollBatches(
+  base: string,
+  ids: string[],
+  limits: { stallMs: number; totalMs: number },
+): Promise<{ batches: Map<string, ApiBatch>; gaveUp: string | null }> {
   const start = Date.now();
+  const last = new Map<string, ApiBatch>();
   let lastLine = "";
+  let lastSignature = "";
+  let lastMove = Date.now();
+  let lastError = "";
+  const since = () => `${Math.floor((Date.now() - start) / 1000)}s`;
   for (;;) {
-    const rows = await Promise.all(ids.map((id) => fetchJson<ApiBatch>(`${base}/v1/batches/${id}`)));
+    let gone: string | null = null;
+    for (const id of ids) {
+      try {
+        last.set(id, await getJson<ApiBatch>(`${base}/v1/batches/${id}`));
+      } catch (e) {
+        if (e instanceof HttpError && e.status === 404) gone = id;
+        const msg = (e as Error).message;
+        if (msg !== lastError) console.error(`  [${since()}] poll failed, will retry: ${msg}`);
+        lastError = msg;
+      }
+    }
+    if (gone) {
+      return { batches: last, gaveUp: `batch ${gone} is gone (404): was the stack reset during the trial?` };
+    }
+    const rows = [...last.values()];
     const items = rows.flatMap((r) => r.items);
     const terminal = items.filter((i) => TERMINAL.has(i.status)).length;
     const busy = rows.filter((r) => BATCH_BUSY.has(r.status)).map((r) => r.status);
-    const line = `${terminal}/${items.length} terminal` + (terminal === items.length && busy.length ? `, batch ${busy.join(",")}` : "");
-    if (line !== lastLine) {
-      console.error(`  [${Math.floor((Date.now() - start) / 1000)}s] ${line}`);
-      lastLine = line;
+    if (rows.length === ids.length) {
+      const line =
+        `${terminal}/${items.length} terminal` + (terminal === items.length && busy.length ? `, batch ${busy.join(",")}` : "");
+      if (line !== lastLine) {
+        console.error(`  [${since()}] ${line}`);
+        lastLine = line;
+      }
+      if (terminal === items.length && busy.length === 0) return { batches: last, gaveUp: null };
+      const signature = JSON.stringify([rows.map((r) => r.status), items.map((i) => i.status)]);
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        lastMove = Date.now();
+      }
     }
-    if (terminal === items.length && busy.length === 0) return new Map(rows.map((r) => [r.id, r]));
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(
-        `batches ${ids.join(", ")} not finished after ${Math.round(timeoutMs / 60000)} min: ` +
-          JSON.stringify(items.map((i) => ({ filename: i.filename, status: i.status }))),
-      );
+    const open = items.filter((i) => !TERMINAL.has(i.status)).map((i) => `${i.filename}: ${i.status}`);
+    if (Date.now() - lastMove > limits.stallMs) {
+      return {
+        batches: last,
+        gaveUp:
+          `nothing moved for ${Math.round(limits.stallMs / 60_000)} min (--stall-min)` +
+          (open.length ? `; still open: ${open.join(", ")}` : lastError ? `; last poll error: ${lastError}` : ""),
+      };
     }
-    await new Promise((r) => setTimeout(r, 3000));
+    if (Date.now() - start > limits.totalMs) {
+      return {
+        batches: last,
+        gaveUp: `not finished after ${Math.round(limits.totalMs / 60_000)} min (--timeout-min); still open: ${open.join(", ") || "-"}`,
+      };
+    }
+    await sleep(3000);
   }
 }
 
@@ -616,7 +1026,7 @@ function emptyExtracted(classification: string | null): Extracted {
  * that currency, which is the mirror leg, so a split across several
  * expense accounts still scores as one total.
  */
-function readMoney(tx: ApiTransaction): Pick<Extracted, "total_minor" | "currency" | "currencies" | "flow"> {
+export function readMoney(tx: ApiTransaction): Pick<Extracted, "total_minor" | "currency" | "currencies" | "flow"> {
   const income = tx.postings.filter((p) => p.account_type === "income");
   const expense = tx.postings.filter((p) => p.account_type === "expense");
   const spend = income.length > 0 ? income : expense;
@@ -749,7 +1159,26 @@ function expectedClassifications(fx: Fixture, kind: SourceKind): string[] {
   return DEFAULT_CLASSIFICATION[kind];
 }
 
-function score(
+/** The fixture should end `done` with a transaction of its own. */
+function expectsOwnTransaction(fx: Fixture): boolean {
+  return (
+    fx.bucket !== "good_rejects" &&
+    fx.bucket !== "duplicate" &&
+    [fx.expected_status].flat().every((s) => s === "done")
+  );
+}
+
+/** Whether the ground truth names a value for the field. Classification,
+ *  flow and currency always have one (their defaults). */
+function truthHas(fx: Fixture, f: Field): boolean {
+  const gt = fx.ground_truth;
+  if (f === "date") return gt.date != null;
+  if (f === "total") return gt.total_minor != null;
+  if (f === "payee") return gt.merchant_tokens.length > 0;
+  return true;
+}
+
+export function score(
   fx: Fixture,
   kind: SourceKind,
   status: string,
@@ -792,7 +1221,30 @@ function score(
   else if (fx.bucket === "hard_date") bucket_pass = !!date_match;
   else if (fx.bucket === "hard_total") bucket_pass = !!total_match;
   else if (fx.bucket === "hard_all") bucket_pass = !!(date_match && total_match && payee_match);
-  return { date_match, total_match, payee_match, classification_match, flow_match, currency_match, status_match, bucket_pass };
+
+  const lenient: Record<Field, boolean | null> = {
+    date: date_match,
+    total: total_match,
+    payee: payee_match,
+    classification: classification_match,
+    flow: flow_match,
+    currency: currency_match,
+  };
+  const own = expectsOwnTransaction(fx);
+  const strict = Object.fromEntries(
+    FIELDS.map((f) => [f, lenient[f] ?? (own && truthHas(fx, f) ? false : null)]),
+  ) as Record<Field, boolean | null>;
+  return {
+    date_match,
+    total_match,
+    payee_match,
+    classification_match,
+    flow_match,
+    currency_match,
+    status_match,
+    bucket_pass,
+    strict,
+  };
 }
 
 // ── Dump (SELECT only) ─────────────────────────────────────────────────
@@ -806,6 +1258,15 @@ async function openReadOnly(url: string): Promise<pg.Client> {
     throw new Error("--pg connection is not read-only; refusing to dump");
   }
   return client;
+}
+
+/** Documents of one ingest ($1): those stored at its file path, or that
+ *  name it as their source. */
+function ownDocumentSql(select: string): string {
+  return `SELECT ${select} AS j FROM documents d
+           WHERE d.source_ingest_id = $1
+              OR EXISTS (SELECT 1 FROM ingests i
+                          WHERE i.id = $1 AND i.workspace_id = d.workspace_id AND i.file_path = d.file_path)`;
 }
 
 async function tableExists(client: pg.Client, name: string): Promise<boolean> {
@@ -823,9 +1284,9 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
   const ingest = (await one("SELECT to_jsonb(i) AS j FROM ingests i WHERE i.id = $1", [ingestId]))[0] ?? null;
   const produced = (ingest as { produced?: { transaction_ids?: string[]; document_ids?: string[] } } | null)?.produced;
   const docIds = new Set<string>(produced?.document_ids ?? []);
-  for (const r of await one("SELECT to_jsonb(d.id) AS j FROM documents d WHERE d.source_ingest_id = $1", [ingestId])) {
-    docIds.add(r as string);
-  }
+  // The upload's own document: `source_ingest_id` is not set at upload, so
+  // an ingest that errored or was attached to a twin is found by its file.
+  for (const r of await one(ownDocumentSql("to_jsonb(d.id)"), [ingestId])) docIds.add(r as string);
   const links = await one("SELECT to_jsonb(l) AS j FROM document_links l WHERE l.document_id = ANY($1::uuid[])", [[...docIds]]);
   const txIds = new Set<string>(produced?.transaction_ids ?? []);
   for (const l of links as { transaction_id: string }[]) txIds.add(l.transaction_id);
@@ -879,9 +1340,8 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
 
 // ── Aggregates ─────────────────────────────────────────────────────────
 
-const FIELDS = ["date", "total", "payee", "classification", "flow", "currency"] as const;
-type Field = (typeof FIELDS)[number];
 const fieldOf = (s: Scoring, f: Field): boolean | null => s[`${f}_match` as keyof Scoring] as boolean | null;
+const strictOf = (s: Scoring, f: Field): boolean | null => s.strict[f];
 
 interface FieldAgg {
   correct: number;
@@ -890,13 +1350,16 @@ interface FieldAgg {
 }
 
 function aggregate(results: FixtureResult[]) {
-  const fields = Object.fromEntries(
-    FIELDS.map((f) => {
-      const scored = results.filter((r) => fieldOf(r.scoring, f) !== null);
-      const correct = scored.filter((r) => fieldOf(r.scoring, f) === true).length;
-      return [f, { correct, scored: scored.length, accuracy: scored.length ? correct / scored.length : 0 }];
-    }),
-  ) as Record<Field, FieldAgg>;
+  const fieldAgg = (pick: (s: Scoring, f: Field) => boolean | null) =>
+    Object.fromEntries(
+      FIELDS.map((f) => {
+        const scored = results.filter((r) => pick(r.scoring, f) !== null);
+        const correct = scored.filter((r) => pick(r.scoring, f) === true).length;
+        return [f, { correct, scored: scored.length, accuracy: scored.length ? correct / scored.length : 0 }];
+      }),
+    ) as Record<Field, FieldAgg>;
+  const fields = fieldAgg(fieldOf);
+  const fieldsStrict = fieldAgg(strictOf);
   const buckets: Record<string, { pass: number; total: number }> = {};
   for (const r of results) {
     buckets[r.bucket] ??= { pass: 0, total: 0 };
@@ -915,7 +1378,11 @@ function aggregate(results: FixtureResult[]) {
   return {
     fixtures: results.length,
     statuses,
+    /** Over the runs that produced a value (#27's convention). */
     fields,
+    /** Over every run whose fixture expects the field: nothing extracted
+     *  counts as wrong. Compare arms on this one. */
+    fields_strict: fieldsStrict,
     buckets,
     cost: {
       sessions_found: sessions.length,
@@ -956,11 +1423,28 @@ function majority(results: FixtureResult[]) {
       trials: rs.length,
       bucket_pass: verdict(rs.map((r) => r.scoring.bucket_pass)),
       ...Object.fromEntries(FIELDS.map((f) => [f, verdict(rs.map((r) => fieldOf(r.scoring, f)))])),
-    } as { key: string; bucket: Bucket; trials: number; bucket_pass: Verdict } & Record<Field, Verdict>;
+      /** Nothing extracted counts as a fail: an arm that books nothing on a
+       *  fixture fails it, it does not drop out (gate G1). */
+      strict: Object.fromEntries(FIELDS.map((f) => [f, verdict(rs.map((r) => strictOf(r.scoring, f)))])),
+    } as { key: string; bucket: Bucket; trials: number; bucket_pass: Verdict; strict: Record<Field, Verdict> } & Record<
+      Field,
+      Verdict
+    >;
   });
 }
 
 // ── Report ─────────────────────────────────────────────────────────────
+
+interface TrialRecord {
+  trial: number;
+  batch_ids: string[];
+  /** Every ingest reached a terminal status and the batch settled. */
+  complete: boolean;
+  incomplete_reason: string | null;
+  /** The stack's conditions read just before this trial. */
+  conditions: StackConditions | null;
+  aggregate: ReturnType<typeof aggregate>;
+}
 
 interface Report {
   run_id: string;
@@ -968,13 +1452,30 @@ interface Report {
   generated_at: string;
   base: string;
   server: unknown;
+  /** As read before the first trial; null with --container=none. Under
+   *  --rescore, read at rescore time, not when the batches ran. */
+  conditions: StackConditions | null;
   manifest: string;
+  /** --rescore: the batches scored; the run itself happened earlier. */
+  rescore: string[] | null;
+  /** Trials asked for. */
   trials: number;
+  trials_complete: number;
+  /** Every trial asked for finished. */
+  complete: boolean;
+  /** Why the run ended early, when it did. */
+  stopped: string | null;
+  /** A fatal error, when there was one. */
+  error: string | null;
+  timeouts: { stall_ms: number; total_ms: number } | null;
   duration_ms: number;
   skipped: Skipped[];
+  /** Over complete trials only. */
   aggregate: ReturnType<typeof aggregate>;
-  per_trial: { trial: number; batch_ids: string[]; aggregate: ReturnType<typeof aggregate> }[];
+  per_trial: TrialRecord[];
+  /** Over complete trials only. */
   majority: ReturnType<typeof majority>;
+  /** Every run, complete trials or not (`trial` joins it to per_trial). */
   fixtures: FixtureResult[];
 }
 
@@ -986,23 +1487,56 @@ function renderMarkdown(rep: Report): string {
   const agg = rep.aggregate;
   L.push(`# Extraction eval ${rep.run_id}${rep.label ? ` (${rep.label})` : ""}`);
   L.push("");
+  if (!rep.complete) {
+    L.push(
+      `> **Incomplete: ${rep.trials_complete} of ${rep.trials} trial(s) finished.** ` +
+        `${rep.error ? `Fatal error: ${rep.error}` : rep.stopped ?? ""} ` +
+        `The aggregates below cover finished trials only; runs of an unfinished trial are listed with their trial number.`,
+    );
+    L.push("");
+  }
   L.push(
-    `${rep.generated_at.slice(0, 19)}Z · ${rep.base} · ${rep.trials} trial(s) · ${(rep.duration_ms / 60000).toFixed(1)} min · ` +
-      `manifest \`${path.basename(rep.manifest)}\``,
+    `${rep.generated_at.slice(0, 19)}Z · ${rep.base} · ${rep.trials_complete}/${rep.trials} trial(s) · ` +
+      `${(rep.duration_ms / 60000).toFixed(1)} min · manifest \`${path.basename(rep.manifest)}\``,
   );
+  if (rep.rescore) {
+    L.push(`Rescored from batch(es) ${rep.rescore.map((b) => `\`${b}\``).join(", ")}; server and stack below were read at rescore time.`);
+  }
   const srv = rep.server as { gitSha?: string; promptVersion?: string } | null;
   if (srv) L.push(`Server: \`${JSON.stringify(srv)}\``);
+  const c = rep.conditions;
+  if (c) {
+    L.push(
+      `Stack: \`${c.container}\` (project ${c.compose_project ?? "—"}, image ${c.image ?? "—"} ` +
+        `${(c.image_id ?? "").replace(/^sha256:/, "").slice(0, 12)}) · ` +
+        CONDITION_KEYS.filter((k) => k !== "EXTRACTOR_STUB_ALLOWED")
+          .map((k) => `${k}=${c.env[k] ?? "unset"}`)
+          .join(" · ") +
+        ` · GOOGLE_MAPS_API_KEY ${c.google_maps_key_set ? "set" : "unset"}`,
+    );
+  } else {
+    L.push("Stack: not checked (--container=none); model, writer and concurrency unknown.");
+  }
   L.push(`Models stamped: ${agg.models_stamped.join(", ") || "—"} · observed: ${agg.models_observed.join(", ") || "—"}`);
   L.push("");
-  L.push("## Fields (all trials)");
+  L.push("## Fields (finished trials)");
   L.push("");
-  L.push("| Field | Accuracy | Correct / scored |");
-  L.push("|---|---|---|");
-  for (const f of FIELDS) L.push(`| ${f} | ${pct(agg.fields[f])} | ${agg.fields[f].correct} / ${agg.fields[f].scored} |`);
+  L.push(
+    "Lenient: over the runs that produced the field (#27's convention). " +
+      "Strict: over every run whose fixture expects it; nothing extracted counts as wrong.",
+  );
+  L.push("");
+  L.push("| Field | Lenient | Correct / scored | Strict | Correct / expected |");
+  L.push("|---|---|---|---|---|");
+  for (const f of FIELDS) {
+    const a = agg.fields[f];
+    const s = agg.fields_strict[f];
+    L.push(`| ${f} | ${pct(a)} | ${a.correct} / ${a.scored} | ${pct(s)} | ${s.correct} / ${s.scored} |`);
+  }
   L.push("");
   L.push(`Statuses: ${Object.entries(agg.statuses).map(([s, c]) => `${s} ${c}`).join(", ")}`);
   L.push("");
-  L.push("## Buckets (all trials)");
+  L.push("## Buckets (finished trials)");
   L.push("");
   L.push("| Bucket | Pass | Total |");
   L.push("|---|---|---|");
@@ -1016,13 +1550,29 @@ function renderMarkdown(rep: Report): string {
       `median wall ${n(agg.cost.median_wall_s)} s · total billed input ${n(agg.cost.total_billed_input)}`,
   );
   L.push("");
-  if (rep.trials > 1) {
-    L.push("## Per fixture, majority over trials");
+  if (rep.trials_complete > 1) {
+    L.push("## Per fixture, majority over finished trials (strict)");
+    L.push("");
+    L.push("A run that booked nothing counts as a fail here. The lenient verdicts are in the JSON.");
     L.push("");
     L.push(`| Fixture | Bucket | Pass | ${FIELDS.join(" | ")} |`);
     L.push(`|---|---|---|${FIELDS.map(() => "---").join("|")}|`);
     for (const m of rep.majority) {
-      L.push(`| \`${m.key}\` | \`${m.bucket}\` | ${m.bucket_pass} | ${FIELDS.map((f) => m[f]).join(" | ")} |`);
+      L.push(`| \`${m.key}\` | \`${m.bucket}\` | ${m.bucket_pass} | ${FIELDS.map((f) => m.strict[f]).join(" | ")} |`);
+    }
+    L.push("");
+  }
+  if (rep.per_trial.length > 1 || !rep.complete) {
+    L.push("## Trials");
+    L.push("");
+    L.push("| Trial | Batches | Finished | Date (strict) | Statuses |");
+    L.push("|---|---|---|---|---|");
+    for (const t of rep.per_trial) {
+      const d = t.aggregate.fields_strict.date;
+      L.push(
+        `| ${t.trial} | ${t.batch_ids.map((b) => `\`${b}\``).join(", ")} | ${t.complete ? "yes" : `no: ${t.incomplete_reason}`} | ` +
+          `${d.correct} / ${d.scored} | ${Object.entries(t.aggregate.statuses).map(([s, c]) => `${s} ${c}`).join(", ")} |`,
+      );
     }
     L.push("");
   }
@@ -1034,7 +1584,8 @@ function renderMarkdown(rep: Report): string {
     const e = r.extracted;
     const s = r.scoring;
     L.push(
-      `| ${r.trial} | \`${r.key}\` | \`${r.bucket}\` | ${r.ingest_status} | ${mark(s.classification_match)} ${e.classification ?? ""} | ` +
+      `| ${r.trial} | \`${r.key}\` | \`${r.bucket}\` | ${r.ingest_status}${r.unfinished ? " (unfinished)" : ""} | ` +
+        `${mark(s.classification_match)} ${e.classification ?? ""} | ` +
         `${mark(s.flow_match)} ${e.flow ?? ""} | ${mark(s.currency_match)} ${e.currency ?? ""} | ` +
         `${mark(s.date_match)} ${e.occurred_on ?? ""} | ${mark(s.total_match)} ${e.total_minor ?? ""} | ` +
         `${mark(s.payee_match)} ${e.payee ?? ""} | ${s.bucket_pass ? "✅" : "❌"} | ${n(r.session?.turns ?? null)} | ` +
@@ -1049,9 +1600,15 @@ function renderMarkdown(rep: Report): string {
     for (const r of errors) L.push(`- t${r.trial} \`${r.key}\`: ${r.ingest_error!.replace(/\s+/g, " ").slice(0, 300)}`);
     L.push("");
   }
-  const pdfs = rep.fixtures.filter((r) => r.pdf_text_layer !== null);
+  const pdfs = rep.fixtures.filter((r) => r.pdf_check !== null);
   if (pdfs.length) {
-    L.push(`PDF text layer kept on the stored file: ${pdfs.filter((r) => r.pdf_text_layer).length} of ${pdfs.length}.`);
+    const count: Record<string, number> = {};
+    for (const r of pdfs) count[r.pdf_check!] = (count[r.pdf_check!] ?? 0) + 1;
+    L.push(
+      `PDF uploads, stored file against the original: ${Object.entries(count).map(([k, v]) => `${k} ${v}`).join(", ")} ` +
+        `(text_kept: same bytes as uploaded, same pdftotext output; scan_kept: the original has no text layer either; ` +
+        `not_found: no document of the upload's own, e.g. attached to its twin).`,
+    );
     L.push("");
   }
   if (rep.skipped.length) {
@@ -1065,6 +1622,8 @@ function renderMarkdown(rep: Report): string {
 
 // ── Main ───────────────────────────────────────────────────────────────
 
+/** Run only after checkStack has tied the sandbox to the stack under test
+ *  and waitForIdle has seen it quiet. */
 async function resetSandbox(): Promise<void> {
   console.error("  sandbox-reset.sh");
   const r = spawnSync(path.join(SCRIPT_DIR, "sandbox-reset.sh"), [], { stdio: ["ignore", "inherit", "inherit"] });
@@ -1078,13 +1637,15 @@ interface Uploaded {
   ingestId: string;
 }
 
-/** Reset (if asked), copy, upload. One batch per 50 files. */
+/** Wait for quiet, reset (if asked), copy, upload. One batch per 50 files. */
 async function uploadTrial(
   args: Args,
   trial: number,
   prepared: Ready[],
   tmp: string,
+  idleStallMs: number,
 ): Promise<{ uploaded: Uploaded[]; batchIds: string[]; startedAt: number }> {
+  await waitForIdle(args.base, idleStallMs, args.reset ? `the reset for trial ${trial}` : `trial ${trial}`);
   if (args.reset) await resetSandbox();
   const startedAt = Date.now();
   const files: Prepared[] = [];
@@ -1121,7 +1682,7 @@ async function adoptBatches(
   const uploaded: Uploaded[] = [];
   let startedAt = Infinity;
   for (const id of batchIds) {
-    const b = await fetchJson<ApiBatch & { created_at: string }>(`${args.base}/v1/batches/${id}`);
+    const b = await getJson<ApiBatch & { created_at: string }>(`${args.base}/v1/batches/${id}`);
     startedAt = Math.min(startedAt, Date.parse(b.created_at));
     for (const it of b.items) {
       const file = byName.get(it.filename);
@@ -1137,15 +1698,60 @@ async function adoptBatches(
   return { uploaded, batchIds, startedAt: Number.isFinite(startedAt) ? startedAt : Date.now() };
 }
 
+type Db = { client: pg.Client; hasRuns: boolean };
+
+/**
+ * Find the upload's own document among those the ingest produced (and,
+ * with --pg, the one stored at its file path), and check the stored PDF:
+ * the same bytes as uploaded, and pdftotext reads from it what it read
+ * from the original.
+ */
+async function checkStoredPdf(
+  base: string,
+  key: string,
+  ingestId: string,
+  uploadSha: string | null,
+  producedDocs: string[],
+  db: Db | null,
+  tmp: string,
+): Promise<{ docId: string | null; check: PdfCheck }> {
+  const byPath = new Set<string>();
+  if (db) {
+    const r = await db.client.query(ownDocumentSql("d.id"), [ingestId]).catch(() => null);
+    for (const row of r?.rows ?? []) byPath.add(row.j as string);
+  }
+  let own: string | null = null;
+  for (const id of new Set([...byPath, ...producedDocs])) {
+    const d = await getJson<{ sha256: string; source_ingest_id: string | null }>(`${base}/v1/documents/${id}`).catch(
+      () => null,
+    );
+    if (d && (byPath.has(id) || d.source_ingest_id === ingestId || (uploadSha !== null && d.sha256 === uploadSha))) {
+      own = id;
+      break;
+    }
+  }
+  if (!own) return { docId: null, check: "not_found" };
+  const stored = await getBytes(`${base}/v1/documents/${own}/content`).catch(() => null);
+  if (!stored) return { docId: own, check: "not_found" };
+  if (uploadSha !== null && sha256Hex(stored) !== uploadSha) return { docId: own, check: "bytes_differ" };
+  const text = await pdfText(stored, tmp);
+  const original = pdfOriginalText.get(key);
+  if (text === null || original === undefined) return { docId: own, check: "unchecked" };
+  if (text.trim() !== original.trim()) return { docId: own, check: "changed" };
+  return { docId: own, check: original.trim() ? "text_kept" : "scan_kept" };
+}
+
 /** Wait for the batches, then read, score and (--dump) dump every fixture. */
 async function collectTrial(
   args: Args,
   trial: number,
   run: { uploaded: Uploaded[]; batchIds: string[]; startedAt: number },
   tmp: string,
-  db: { client: pg.Client; hasRuns: boolean } | null,
-): Promise<FixtureResult[]> {
-  const batches = await pollBatches(args.base, run.batchIds, args.timeoutMs);
+  db: Db | null,
+  limits: { stallMs: number; totalMs: number },
+): Promise<{ results: FixtureResult[]; gaveUp: string | null }> {
+  const { batches, gaveUp } = await pollBatches(args.base, run.batchIds, limits);
+  if (gaveUp) console.error(`  trial ${trial} given up: ${gaveUp}`);
   const items = new Map<string, ApiIngest & { batch_id: string }>();
   for (const [id, b] of batches) for (const it of b.items) items.set(it.id, { ...it, batch_id: id });
 
@@ -1157,14 +1763,24 @@ async function collectTrial(
   const txOfKey = new Map<string, string | null>();
   const results: FixtureResult[] = [];
   for (const { file: f, sha256, ingestId } of run.uploaded) {
-    const item = items.get(ingestId)!;
+    // Never seen (every poll of its batch failed): scored as nothing.
+    const item = items.get(ingestId) ?? {
+      id: ingestId,
+      filename: f.filename,
+      status: "unknown" as IngestStatus,
+      classification: null,
+      produced: null,
+      error: null,
+      batch_id: run.batchIds[0] ?? "",
+    };
+    const unfinished = !TERMINAL.has(item.status);
     const produced = item.produced ?? { transaction_ids: [], document_ids: [] };
     const txId = produced.transaction_ids[0] ?? null;
     txOfKey.set(f.key, txId);
     let extracted = emptyExtracted(item.classification);
     if (txId && item.status === "done") {
       try {
-        const tx = await fetchJson<ApiTransaction>(`${args.base}/v1/transactions/${txId}`);
+        const tx = await getJson<ApiTransaction>(`${args.base}/v1/transactions/${txId}`);
         const ex = (tx.metadata?.extraction ?? {}) as Record<string, unknown>;
         extracted = {
           ...extracted,
@@ -1180,34 +1796,46 @@ async function collectTrial(
       }
     }
 
-    // A PDF must arrive as uploaded and still carry its text layer.
-    let pdfTextLayer: boolean | null = null;
-    const docId = produced.document_ids[0] ?? null;
-    if (f.kind === "pdf" && docId) {
-      const r = await fetch(`${args.base}/v1/documents/${docId}/content`);
-      if (r.ok) {
-        const stored = new Uint8Array(await r.arrayBuffer());
-        const text = await pdfText(stored, tmp);
-        pdfTextLayer = (sha256 === null || sha256Hex(stored) === sha256) && (text === null || text.trim().length > 0);
-      }
+    // A PDF must arrive as uploaded and read as the original did.
+    let docId = produced.document_ids[0] ?? null;
+    let pdfCheck: PdfCheck | null = null;
+    if (f.kind === "pdf" && !unfinished) {
+      const c = await checkStoredPdf(args.base, f.key, ingestId, sha256, produced.document_ids, db, tmp);
+      pdfCheck = c.check;
+      docId = c.docId ?? docId;
     }
 
-    const sessionPath = sessions.get(ingestId);
-    const session = sessionPath
-      ? summarizeJsonl(await readFile(sessionPath, "utf8"), path.basename(sessionPath, ".jsonl"))
-      : null;
-
+    // The run record, once there is one (wave 1): its session id names the
+    // transcript even when the prompt no longer carries the ingest id.
     let agentRunId: string | null = null;
+    let runSession: string | null = null;
     if (db?.hasRuns) {
       const r = await db.client
         .query(
-          "SELECT (to_jsonb(r)->>'id') AS id FROM agent_runs r WHERE (to_jsonb(r)->>'ingest_id') = $1 " +
-            "ORDER BY (to_jsonb(r)->>'started_at') DESC NULLS LAST LIMIT 1",
+          "SELECT (to_jsonb(r)->>'id') AS id, (to_jsonb(r)->>'session_id') AS session_id FROM agent_runs r " +
+            "WHERE (to_jsonb(r)->>'ingest_id') = $1 ORDER BY (to_jsonb(r)->>'started_at') DESC NULLS LAST LIMIT 1",
           [ingestId],
         )
         .catch(() => null);
       agentRunId = r?.rows[0]?.id ?? null;
+      runSession = r?.rows[0]?.session_id ?? null;
     }
+    let sessionPath: string | null = null;
+    let sessionSource: FixtureResult["session_source"] = null;
+    if (args.transcripts && runSession && /^[0-9a-f-]{36}$/i.test(runSession)) {
+      const p = path.join(args.transcripts, `${runSession}.jsonl`);
+      if (await stat(p).then(() => true, () => false)) {
+        sessionPath = p;
+        sessionSource = "agent_runs";
+      }
+    }
+    if (!sessionPath && sessions.has(ingestId)) {
+      sessionPath = sessions.get(ingestId)!;
+      sessionSource = "prompt";
+    }
+    const session = sessionPath
+      ? summarizeJsonl(await readFile(sessionPath, "utf8"), path.basename(sessionPath, ".jsonl"))
+      : null;
 
     results.push({
       key: f.key,
@@ -1220,12 +1848,15 @@ async function collectTrial(
       ingest_id: ingestId,
       ingest_status: item.status,
       ingest_error: item.error,
+      unfinished,
       transaction_id: txId,
       document_id: docId,
-      pdf_text_layer: pdfTextLayer,
+      pdf_text_layer: pdfCheck === "text_kept" ? true : pdfCheck === "changed" || pdfCheck === "bytes_differ" ? false : null,
+      pdf_check: pdfCheck,
       extracted,
       scoring: score(f.fixture, f.kind, item.status, extracted, null, null, false), // replaced below
       session,
+      session_source: sessionSource,
       agent_run_id: agentRunId,
     });
   }
@@ -1254,11 +1885,13 @@ async function collectTrial(
     }
     console.error(`  dump: ${dir}${failed ? ` (${failed} fixture(s) failed to dump; see dump_error)` : ""}`);
   }
-  return results;
+  return { results, gaveUp };
 }
 
 /** What the up-front PDF check found, per fixture key, for --dry-run. */
 const pdfChecks = new Map<string, string>();
+/** pdftotext of each PDF fixture's original, to compare the stored copy with. */
+const pdfOriginalText = new Map<string, string>();
 
 /**
  * A text-layer PDF must read the same after the copy as before (the reason
@@ -1273,6 +1906,7 @@ async function checkPdfCopy(p: Ready, tmp: string): Promise<string | null> {
   }
   if (before.trim() !== after.trim()) return "copying it changed what pdftotext reads from it";
   pdfChecks.set(p.key, before.trim() ? `text layer kept, ${after.trim().length} chars` : "no text layer (a scan)");
+  pdfOriginalText.set(p.key, before);
   return null;
 }
 
@@ -1365,8 +1999,23 @@ async function main() {
     return;
   }
 
-  const server = await fetchJson<unknown>(`${args.base}/version`).catch(() => null);
-  const db = args.pg
+  // The stack under test: refuse one that must not be touched, and record
+  // what the arms of the A/B hold equal.
+  const conditions = checkStack(args);
+  const limits = trialTimeouts(args, conditions, prepared.length);
+  if (conditions) {
+    console.error(
+      `  stack:       ${conditions.container} (${conditions.compose_project ?? "no compose project"}) ` +
+        CONDITION_KEYS.map((k) => `${k}=${conditions.env[k] ?? "unset"}`).join(" "),
+    );
+  }
+  console.error(
+    `  limits:      give a trial up after ${Math.round(limits.stallMs / 60_000)} min without movement, ` +
+      `or ${Math.round(limits.totalMs / 60_000)} min in all`,
+  );
+
+  const server = await getJson<unknown>(`${args.base}/version`).catch(() => null);
+  const db: Db | null = args.pg
     ? await openReadOnly(args.pg).then(async (client) => ({ client, hasRuns: await tableExists(client, "agent_runs") }))
     : null;
   const tmp = await mkdtemp(path.join(tmpdir(), "eval-dates-"));
@@ -1374,61 +2023,151 @@ async function main() {
     await rm(tmp, { recursive: true, force: true }).catch(() => {});
     await db?.client.end().catch(() => {});
   };
-  process.on("SIGINT", () => { cleanup().finally(() => process.exit(130)); });
 
   const start = Date.now();
   const all: FixtureResult[] = [];
-  const perTrial: Report["per_trial"] = [];
+  const perTrial: TrialRecord[] = [];
+  let stopped: string | null = null;
+  let fatal: string | null = null;
+  await mkdir(args.out, { recursive: true });
+  const stem = path.join(args.out, `eval-dates.${args.runId}.report`);
+
+  const buildReport = (): Report => {
+    const finished = new Set(perTrial.filter((t) => t.complete).map((t) => t.trial));
+    const counted = all.filter((r) => finished.has(r.trial));
+    return {
+      run_id: args.runId,
+      label: args.label,
+      generated_at: new Date().toISOString(),
+      base: args.base,
+      server,
+      conditions,
+      manifest: args.manifest,
+      rescore: args.rescore,
+      trials: args.trials,
+      trials_complete: finished.size,
+      complete: finished.size === args.trials && !stopped && !fatal,
+      stopped,
+      error: fatal,
+      timeouts: { stall_ms: limits.stallMs, total_ms: limits.totalMs },
+      duration_ms: Date.now() - start,
+      skipped,
+      aggregate: aggregate(counted),
+      per_trial: perTrial,
+      majority: majority(counted),
+      fixtures: all,
+    };
+  };
+  // Written after every trial and on every way out, so a failure in trial
+  // k (or Ctrl-C) keeps trials 1..k-1, whose rows the next reset erased.
+  const writeReport = async (): Promise<Report> => {
+    const rep = buildReport();
+    await writeAtomic(`${stem}.json`, JSON.stringify(rep, null, 2));
+    await writeAtomic(`${stem}.md`, renderMarkdown(rep));
+    return rep;
+  };
+  let interrupted = false;
+  process.on("SIGINT", () => {
+    if (interrupted) process.exit(130);
+    interrupted = true;
+    stopped =
+      "interrupted (Ctrl-C). Batches already uploaded keep running on the stack; the next run waits for them " +
+      "before it resets.";
+    writeReport()
+      .then(() => console.error(`\n${stopped}\nReports: ${stem}.{json,md}`))
+      .catch((e) => console.error(`could not write the report: ${(e as Error).message}`))
+      .finally(() => cleanup().finally(() => process.exit(130)));
+  });
+
   try {
     for (let t = 1; t <= args.trials; t++) {
       console.error(`\n── trial ${t}/${args.trials}${args.rescore ? ` (rescoring ${args.rescore.join(", ")})` : ""} ──`);
+      if (t > 1 && args.container && conditionsKey(readContainer(args.container)) !== conditionsKey(conditions)) {
+        throw new StopRun(
+          `the stack's image or environment changed after the run started, so trial ${t} would not be ` +
+            `comparable with the ones before it`,
+        );
+      }
       const run = args.rescore
         ? await adoptBatches(args, prepared, args.rescore)
-        : await uploadTrial(args, t, prepared, tmp);
-      const results = await collectTrial(args, t, run, tmp, db);
-      all.push(...results);
-      perTrial.push({ trial: t, batch_ids: run.batchIds, aggregate: aggregate(results) });
+        : await uploadTrial(args, t, prepared, tmp, limits.stallMs);
+      const collected = await collectTrial(args, t, run, tmp, db, limits);
+      let gaveUp = collected.gaveUp;
+      if (!gaveUp && !args.rescore && args.container) {
+        if (conditionsKey(readContainer(args.container)) !== conditionsKey(conditions)) {
+          gaveUp = "the stack's image or environment changed during the trial";
+        }
+      }
+      all.push(...collected.results);
+      perTrial.push({
+        trial: t,
+        batch_ids: run.batchIds,
+        complete: gaveUp === null,
+        incomplete_reason: gaveUp,
+        conditions: t === 1 ? conditions : args.container ? readContainer(args.container) : null,
+        aggregate: aggregate(collected.results),
+      });
       const a = perTrial.at(-1)!.aggregate;
       console.error(
         `  trial ${t}: date ${a.fields.date.correct}/${a.fields.date.scored}, total ${a.fields.total.correct}/${a.fields.total.scored}, ` +
           `payee ${a.fields.payee.correct}/${a.fields.payee.scored}, statuses ${JSON.stringify(a.statuses)}`,
       );
+      await writeReport();
+      if (gaveUp) {
+        throw new StopRun(
+          `trial ${t} did not finish: ${gaveUp}.` +
+            (t + 1 === args.trials
+              ? ` Trial ${args.trials} was not run.`
+              : t < args.trials
+                ? ` Trials ${t + 1}-${args.trials} were not run.`
+                : ""),
+        );
+      }
     }
+  } catch (e) {
+    if (e instanceof StopRun) stopped = e.message;
+    else fatal = e instanceof Error ? e.message : String(e);
   } finally {
     await cleanup();
   }
+  if (interrupted) return; // the SIGINT handler writes and exits
 
-  const report: Report = {
-    run_id: args.runId,
-    label: args.label,
-    generated_at: new Date().toISOString(),
-    base: args.base,
-    server,
-    manifest: args.manifest,
-    trials: args.trials,
-    duration_ms: Date.now() - start,
-    skipped,
-    aggregate: aggregate(all),
-    per_trial: perTrial,
-    majority: majority(all),
-    fixtures: all,
-  };
-  await mkdir(args.out, { recursive: true });
-  const stem = path.join(args.out, `eval-dates.${args.runId}.report`);
-  await writeFile(`${stem}.json`, JSON.stringify(report, null, 2));
-  await writeFile(`${stem}.md`, renderMarkdown(report));
-
+  const report = await writeReport();
   const d = report.aggregate.fields.date;
-  console.error(`\nDone in ${(report.duration_ms / 60000).toFixed(1)} min.`);
-  console.error(`Date accuracy: ${(d.accuracy * 100).toFixed(1)}% (${d.correct}/${d.scored})`);
+  const ds = report.aggregate.fields_strict.date;
+  console.error(`\n${report.complete ? "Done" : "Ended early"} in ${(report.duration_ms / 60000).toFixed(1)} min.`);
+  console.error(
+    `Date accuracy (finished trials): ${(d.accuracy * 100).toFixed(1)}% (${d.correct}/${d.scored}); ` +
+      `strict ${(ds.accuracy * 100).toFixed(1)}% (${ds.correct}/${ds.scored})`,
+  );
   console.error(`Reports: ${stem}.{json,md}`);
+  if (fatal) {
+    console.error(`\nFAILED: ${fatal}`);
+    process.exit(1);
+  }
+  if (stopped) {
+    console.error(`\nSTOPPED: ${stopped}`);
+    process.exit(3);
+  }
   if (args.gate && d.accuracy < 0.9) {
     console.error(`\nGATE FAILED: date accuracy ${(d.accuracy * 100).toFixed(1)}% < 90%`);
     process.exit(1);
   }
 }
 
-main().catch((e) => {
-  console.error(e instanceof Error ? e.message : e);
-  process.exit(1);
-});
+/** Write via a temporary file, so a reader never sees half a report. */
+async function writeAtomic(file: string, text: string): Promise<void> {
+  const tmpFile = `${file}.${process.pid}.tmp`;
+  await writeFile(tmpFile, text);
+  await rename(tmpFile, file);
+}
+
+// Run when executed, not when imported (a later arm-diff script may reuse
+// score / readMoney / checkStack).
+const invokedAs = process.argv[1] ? realpathOr(process.argv[1]) : "";
+if (invokedAs === realpathOr(fileURLToPath(import.meta.url))) {
+  main().catch((e) => {
+    console.error(e instanceof Error ? e.message : e);
+    process.exit(1);
+  });
+}
