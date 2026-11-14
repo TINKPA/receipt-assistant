@@ -96,6 +96,13 @@ subscription. A full C1 trial is 24 of them.
    | PDF | a comment line appended after the final `%%EOF`; pages and text layer untouched | `application/pdf` |
    | `.eml` | one `X-Eval-Nonce:` header put before the first line | `message/rfc822` |
    | HTML | a comment appended at the end | `text/html` |
+   | `.json` stub (sandbox only) | one `_eval_nonce` key added | `application/json` |
+
+   A `.json` fixture must be a stub instruction file (`"__stub__": true`,
+   `src/ingest/stub-extractor.ts`) of at most 16 KB after the copy, or it
+   is skipped: any other JSON would reach the real agent. Stubs are for
+   rehearsing the A/B campaign without a model (`scripts/ab-campaign.md`);
+   give their classification in the truth.
 
    Until wave 1 every file went through `sips` and was sent as
    `image/jpeg`, which turned the two text-layer PDF fixtures into photos
@@ -135,13 +142,17 @@ subscription. A full C1 trial is 24 of them.
    turns.
 8. **Dumps the rows** with `--dump=<dir> --pg=<url>`: for every fixture the
    ingest, documents, links, transactions, postings (with account name and
-   type), items, parties, events, place, merchant, owned items and, once
-   they exist, `agent_runs`, as whole rows, one JSON file per fixture under
-   `<dir>/<run id>/t<trial>/`. The connection is opened with
+   type), items, parties, events, place (without the fetched body; with
+   `has_v1_en`, whether the projection can read it), merchant, brands,
+   products, owned items, `agent_runs` and `document_extractions`, as
+   whole rows, plus each transaction's fingerprint
+   (`src/ingest/apply/fingerprint.ts`, `readLedgerFingerprint`, read
+   before the next reset erases the rows), one JSON file per fixture
+   under `<dir>/<run id>/t<trial>/`. The connection is opened with
    `default_transaction_read_only=on` and refused otherwise, and a dump
    directory inside this repository is refused (letter case and symlinks
    do not get past it): the rows are real receipts. The wave-1 arm diff
-   reads these.
+   (`scripts/diff-arms.ts`) reads these.
 9. **Writes the report** after every trial, and again when the run ends,
    stops or is interrupted: fields and buckets, cost medians, a
    per-fixture majority over trials, every run, errors, and the skipped

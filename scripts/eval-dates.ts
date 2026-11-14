@@ -134,7 +134,7 @@ const BUCKETS: readonly Bucket[] = [
 type Flow = "purchase" | "refund" | "income";
 const FIELDS = ["date", "total", "payee", "classification", "flow", "currency"] as const;
 type Field = (typeof FIELDS)[number];
-type SourceKind = "image" | "pdf" | "eml" | "html";
+type SourceKind = "image" | "pdf" | "eml" | "html" | "stub";
 type IngestStatus = "queued" | "processing" | "done" | "error" | "unsupported" | "dedup" | "near_dup";
 
 interface GroundTruth {
@@ -682,6 +682,7 @@ function validateFixture(fx: Fixture): string[] {
 // ── Sources and copies ─────────────────────────────────────────────────
 
 const KIND_BY_EXT: Record<string, SourceKind> = {
+  ".json": "stub",
   ".jpg": "image",
   ".jpeg": "image",
   ".png": "image",
@@ -698,15 +699,21 @@ const MIME_BY_KIND: Record<SourceKind, string> = {
   pdf: "application/pdf",
   eml: "message/rfc822",
   html: "text/html",
+  stub: "application/json",
 };
 
-const UPLOAD_EXT: Record<SourceKind, string> = { image: ".jpg", pdf: ".pdf", eml: ".eml", html: ".html" };
+/** src/ingest/stub-extractor.ts reads a stub file only up to this size. */
+const STUB_MAX_BYTES = 16_384;
+
+const UPLOAD_EXT: Record<SourceKind, string> = { image: ".jpg", pdf: ".pdf", eml: ".eml", html: ".html", stub: ".json" };
 
 const DEFAULT_CLASSIFICATION: Record<SourceKind, string[]> = {
   image: ["receipt_image"],
   pdf: ["receipt_pdf"],
   eml: ["receipt_email"],
   html: ["receipt_email", "receipt_pdf"],
+  // A stub names its own; give it in the truth. This is the stubs' default.
+  stub: ["receipt_image"],
 };
 
 async function locateSource(
@@ -757,6 +764,10 @@ async function sipsReencode(srcPath: string, outPath: string): Promise<void> {
  * Email: one `X-Eval-Nonce` header before the first line. Appending to the
  * body instead would corrupt a single-part base64 body.
  * HTML: a trailing comment, which the decoded text never shows.
+ * Stub (a sandbox stub instruction file, for rehearsing a campaign without
+ * a model): one `_eval_nonce` key added; the stub ignores unknown keys.
+ * Only a file with `"__stub__": true` is taken: any other JSON would go to
+ * the real agent.
  */
 async function makeCopy(kind: SourceKind, src: string, tmp: string, nonce: string): Promise<Uint8Array> {
   if (kind === "image") {
@@ -765,6 +776,11 @@ async function makeCopy(kind: SourceKind, src: string, tmp: string, nonce: strin
     return new Uint8Array(await readFile(out));
   }
   const bytes = await readFile(src);
+  if (kind === "stub") {
+    const parsed = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+    if (parsed?.__stub__ !== true) throw new Error('a .json fixture must be a stub file ("__stub__": true)');
+    return new Uint8Array(Buffer.from(JSON.stringify({ ...parsed, _eval_nonce: nonce }, null, 1), "utf8"));
+  }
   if (kind === "pdf") {
     if (bytes.lastIndexOf("%%EOF") === -1) throw new Error("not a PDF: no %%EOF marker");
     const sep = bytes[bytes.length - 1] === 0x0a ? "" : "\n";
@@ -1260,7 +1276,12 @@ async function tableExists(client: pg.Client, name: string): Promise<boolean> {
 /**
  * Everything one ingest left behind, as rows. Whole rows (`to_jsonb`), so
  * the dump keeps up with migrations without edits here; the arm diff
- * (wave-1 P4) picks its fields from them.
+ * (`scripts/diff-arms.ts`, wave-1 P4) picks its fields from them. Each
+ * transaction also gets its fingerprint (`readLedgerFingerprint`, the
+ * one `check-projection-replay` uses), read while the rows still exist:
+ * the next reset erases them, and the two arms are compared on it.
+ * `places` leaves the fetched body out and says only whether it carries
+ * the v1 English place (gate G6: a place the projection can read).
  */
 async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean): Promise<Record<string, unknown>> {
   const one = async (sql: string, params: unknown[]) => (await client.query(sql, params)).rows.map((r) => r.j);
@@ -1280,6 +1301,34 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
   const transactions = await one("SELECT to_jsonb(t) AS j FROM transactions t WHERE t.id = ANY($1::uuid[])", [tx]);
   const placeIds = (transactions as { place_id?: string }[]).map((t) => t.place_id).filter(Boolean);
   const merchantIds = (transactions as { merchant_id?: string }[]).map((t) => t.merchant_id).filter(Boolean);
+  const merchants = await one("SELECT to_jsonb(m) AS j FROM merchants m WHERE m.id = ANY($1::uuid[])", [merchantIds]);
+  const items = await one(
+    "SELECT to_jsonb(i) AS j FROM transaction_items i WHERE i.transaction_id = ANY($1::uuid[]) ORDER BY i.transaction_id, i.line_no",
+    [tx],
+  );
+  const productIds = [...new Set((items as { product_id?: string }[]).map((i) => i.product_id).filter(Boolean))];
+  const products = await one("SELECT to_jsonb(p) AS j FROM products p WHERE p.id = ANY($1::uuid[])", [productIds]).catch(
+    () => [],
+  );
+  const brandIds = [
+    ...new Set(
+      [
+        ...(merchants as { brand_id?: string }[]).map((m) => m.brand_id),
+        ...(products as { brand_id?: string }[]).map((p) => p.brand_id),
+      ].filter(Boolean),
+    ),
+  ];
+  const fingerprints: Record<string, unknown> = {};
+  if (tx.length) {
+    // Imported here, not at the top: it brings the server's modules with
+    // it, which a run without --dump has no use for.
+    const { readLedgerFingerprint } = await import("../src/ingest/apply/fingerprint.js");
+    const { drizzle } = await import("drizzle-orm/node-postgres");
+    const executor = drizzle(client);
+    for (const id of tx) {
+      fingerprints[id] = await readLedgerFingerprint(executor, id).catch((e: Error) => ({ fingerprint_error: e.message }));
+    }
+  }
   return {
     ingest,
     documents: await one("SELECT to_jsonb(d) AS j FROM documents d WHERE d.id = ANY($1::uuid[])", [[...docIds]]),
@@ -1291,10 +1340,7 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
         WHERE p.transaction_id = ANY($1::uuid[]) ORDER BY p.transaction_id, p.created_at, p.id`,
       [tx],
     ),
-    transaction_items: await one(
-      "SELECT to_jsonb(i) AS j FROM transaction_items i WHERE i.transaction_id = ANY($1::uuid[]) ORDER BY i.transaction_id, i.line_no",
-      [tx],
-    ),
+    transaction_items: items,
     transaction_parties: await one(
       "SELECT to_jsonb(p) AS j FROM transaction_parties p WHERE p.transaction_id = ANY($1::uuid[])",
       [tx],
@@ -1303,8 +1349,17 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
       "SELECT to_jsonb(e) AS j FROM transaction_events e WHERE e.transaction_id = ANY($1::uuid[]) ORDER BY e.created_at",
       [tx],
     ),
-    places: await one("SELECT to_jsonb(p) - 'raw_response' AS j FROM places p WHERE p.id = ANY($1::uuid[])", [placeIds]),
-    merchants: await one("SELECT to_jsonb(m) AS j FROM merchants m WHERE m.id = ANY($1::uuid[])", [merchantIds]),
+    places: await one(
+      `SELECT (to_jsonb(p) - 'raw_response')
+              || jsonb_build_object('has_v1_en', jsonb_typeof(p.raw_response->'v1'->'en') = 'object') AS j
+         FROM places p WHERE p.id = ANY($1::uuid[])`,
+      [placeIds],
+    ),
+    merchants,
+    brands: await one("SELECT to_jsonb(b) AS j FROM brands b WHERE b.brand_id = ANY($1::text[])", [brandIds]).catch(
+      () => [],
+    ),
+    products,
     owned_items: await one(
       `SELECT to_jsonb(o) AS j FROM owned_items o
          JOIN transaction_items i ON i.id = o.transaction_item_id
@@ -1318,6 +1373,11 @@ async function dumpIngest(client: pg.Client, ingestId: string, hasRuns: boolean)
     agent_runs: hasRuns
       ? await one("SELECT to_jsonb(r) AS j FROM agent_runs r WHERE r.ingest_id = $1", [ingestId]).catch(() => [])
       : [],
+    document_extractions: await one(
+      "SELECT to_jsonb(e) AS j FROM document_extractions e WHERE e.document_id = ANY($1::uuid[]) ORDER BY e.created_at",
+      [[...docIds]],
+    ).catch(() => []),
+    fingerprints,
   };
 }
 
@@ -1959,6 +2019,18 @@ async function main() {
     const entry = { fixture: fx, key, kind, source: src.path, filename, mime: MIME_BY_KIND[kind] };
     if (kind === "pdf") {
       const why = await checkPdfCopy(entry, checkTmp).catch((e: Error) => e.message);
+      if (why) {
+        skipped.push({ key, reason: why });
+        continue;
+      }
+    }
+    if (kind === "stub") {
+      // The server reads a stub only up to 16 KB; a larger copy would be
+      // an ordinary upload, which the real agent reads.
+      const why = await makeCopy("stub", entry.source, checkTmp, "check-nonce-of-a-typical-length").then(
+        (b) => (b.length > STUB_MAX_BYTES ? `the stub copy is ${b.length} B, over the server's ${STUB_MAX_BYTES} B stub limit` : null),
+        (e: Error) => e.message,
+      );
       if (why) {
         skipped.push({ key, reason: why });
         continue;
