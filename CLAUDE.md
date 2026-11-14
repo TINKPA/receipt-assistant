@@ -900,7 +900,15 @@ Three rules keep it that way; the compose file's header explains each.
 
 What the two stacks do share is the account behind the keys: `.env` gives both the same `CLAUDE_CODE_OAUTH_TOKEN`, Google Maps key and logo.dev keys, so sandbox agent runs spend the same subscription quota. Compose reads `.env` from the directory the compose file is in. A git worktree has none, so there the token renders empty and every real extraction fails on auth (stub uploads still work); pass `--env-file ~/Developer/receipt-assistant/.env`. After rotating the token, run `docker compose -f docker-compose.test.yml up -d` so the sandbox picks up the new value.
 
-A build from a git worktree is stamped `unknown`: the `Dockerfile` copies `.git` to read the commit, and in a worktree `.git` is a one-line pointer to a host path the builder cannot follow. `/version` and every `metadata.extraction.prompt_git_sha` that image writes then say `unknown`, so an eval run cannot be tied to its commit. When that matters, check the branch out in the main checkout and build there.
+An image is stamped with the commit it was built from: `/version`, and `metadata.extraction.prompt_git_sha` on everything it writes. `scripts/generate-build-info.mjs` takes `GIT_SHA`, `GIT_SHORT_SHA` and `GIT_BRANCH` from its environment and otherwise asks the `.git` the `Dockerfile` copies. From the main checkout `.git` answers. In a git worktree it is a one-line pointer to a host path the builder cannot follow, so without the three the stamp says `unknown` and an eval run cannot be tied to its commit. Both compose files forward the three as build args (empty by default, which keeps the `.git` path), so build a worktree as:
+
+```bash
+GIT_SHA=$(git rev-parse HEAD) GIT_SHORT_SHA=$(git rev-parse --short HEAD) GIT_BRANCH=$(git branch --show-current) \
+  docker compose -f docker-compose.test.yml --env-file ~/Developer/receipt-assistant/.env up -d --build
+curl -s 127.0.0.1:3001/version   # gitSha is HEAD's
+```
+
+The stamp names a commit, not a working tree: uncommitted changes are built but not named, so commit before an eval build.
 
 ### What `scripts/sandbox-reset.sh` does
 

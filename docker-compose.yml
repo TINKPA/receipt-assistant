@@ -50,6 +50,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # The build stamp. Empty (the usual case: production builds from the
+      # main checkout) means the Dockerfile reads the copied .git.
+      args:
+        GIT_SHA: ${GIT_SHA:-}
+        GIT_SHORT_SHA: ${GIT_SHORT_SHA:-}
+        GIT_BRANCH: ${GIT_BRANCH:-}
     image: receipt-assistant:local
     container_name: receipt-assistant
     depends_on:

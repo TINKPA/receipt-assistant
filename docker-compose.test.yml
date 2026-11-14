@@ -102,6 +102,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # The build stamp. Empty means the Dockerfile reads the copied .git,
+      # which works from the main checkout only. From a git worktree:
+      #   GIT_SHA=$(git rev-parse HEAD) GIT_SHORT_SHA=$(git rev-parse --short HEAD) \
+      #   GIT_BRANCH=$(git branch --show-current) docker compose -f docker-compose.test.yml \
+      #   --env-file ~/Developer/receipt-assistant/.env up -d --build
+      args:
+        GIT_SHA: ${GIT_SHA:-}
+        GIT_SHORT_SHA: ${GIT_SHORT_SHA:-}
+        GIT_BRANCH: ${GIT_BRANCH:-}
     # NOT `receipt-assistant:local`. That tag is production's. See rule 2.
     image: receipt-assistant:sandbox
     container_name: receipt-assistant-test

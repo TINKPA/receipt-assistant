@@ -20,7 +20,10 @@ was stamped with, the model its transcript shows, turns and billed tokens.
 # ledger it is sent to), one extraction at a time: the harness refuses a
 # stack with MAX_CLAUDE_CONCURRENCY other than 1 (the sandbox's default is
 # 6). From a worktree add --env-file ~/Developer/receipt-assistant/.env so
-# the agent can log in.
+# the agent can log in, and GIT_SHA=$(git rev-parse HEAD)
+# GIT_SHORT_SHA=$(git rev-parse --short HEAD) GIT_BRANCH=$(git branch
+# --show-current) in front so the image names its commit (CLAUDE.md,
+# "Sandbox stack").
 MAX_CLAUDE_CONCURRENCY=1 docker compose -f docker-compose.test.yml up -d --build
 
 npm run eval:dates -- --dry-run          # check the manifest; no upload, no quota
@@ -64,7 +67,8 @@ subscription. A full C1 trial is 24 of them.
 
    The values go on the report (`conditions`, and per trial), with the
    image id, which names the build even when `/version` says
-   `gitSha: unknown` (a worktree build). If the image or any of those
+   `gitSha: unknown` (a worktree build without the `GIT_*` build args).
+   If the image or any of those
    values changes between trials, the run stops. `--container=none` skips
    all of it, for a server you run yourself outside docker; the report
    then says the conditions are unknown, and `--reset` is refused.

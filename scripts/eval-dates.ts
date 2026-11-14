@@ -487,7 +487,7 @@ export interface StackConditions {
   /** `Config.Image`, the tag it was started from. */
   image: string | null;
   /** The image id: names the build even when /version says gitSha unknown
-   *  (a worktree build). */
+   *  (a worktree build without the GIT_* build args). */
   image_id: string | null;
   compose_project: string | null;
   /** Host ports the container publishes. */
