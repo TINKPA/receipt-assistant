@@ -90,10 +90,15 @@ CREATE INDEX "agent_runs_running_idx" ON "agent_runs" USING btree ("started_at")
 ALTER TABLE "ingests" ADD CONSTRAINT "ingests_document_id_documents_id_fk" FOREIGN KEY ("document_id") REFERENCES "public"."documents"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "ingests" ADD CONSTRAINT "ingests_current_run_id_agent_runs_id_fk" FOREIGN KEY ("current_run_id") REFERENCES "public"."agent_runs"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "ingests_document_idx" ON "ingests" USING btree ("document_id");--> statement-breakpoint
--- Backfill: an ingest's document is the one stored under the same
--- sha256-named path in the same workspace. (workspace_id, file_path) is
--- unique among documents, so each ingest matches at most one. Ingests
--- whose document was hard-deleted keep NULL; nothing else points at one.
+-- Backfill: an ingest's document is the one stored under the same path
+-- in the same workspace. Upload paths are named by the file's sha256 and
+-- documents are unique per (workspace_id, sha256)
+-- (documents_workspace_sha_uniq), so each ingest matches at most one
+-- document. No constraint covers (workspace_id, file_path) itself.
+-- The match is by bytes, not by history: an ingest whose own document
+-- was hard-deleted, and whose bytes were uploaded again later, gets the
+-- later document (its produced.document_ids still names the old one).
+-- An ingest whose bytes are no longer stored at all keeps NULL.
 UPDATE "ingests" i
    SET "document_id" = d."id"
   FROM "documents" d

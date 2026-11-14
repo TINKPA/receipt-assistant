@@ -30,7 +30,11 @@ import { agentRuns } from "./agent_runs.js";
  *
  * `document_id` is the document the file was stored as. It used to be
  * re-derived by matching `file_path` on every read; it is now written at
- * upload (migration 0042 backfilled older rows the same way).
+ * upload (migration 0042 backfilled older rows the same way). On a
+ * backfilled row it is the document holding the same bytes, which is not
+ * always the one the ingest created: if that one was hard-deleted and the
+ * file uploaded again, it is the later upload, and `produced.document_ids`
+ * still names the deleted one.
  *
  * `current_run_id` points at the `agent_runs` row that owns the ingest
  * while it is `processing`, written in the same transaction that moves
