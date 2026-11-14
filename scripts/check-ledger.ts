@@ -80,8 +80,11 @@
  *     and for one restored after a cascade took it and its document
  *     together. Both are a person's choice. What it is for is the same
  *     state reached with nobody choosing it; `/reconcile/undo` refuses
- *     to create it (`no_live_document`) and the cascade delete removes
- *     the transaction with its last live document.
+ *     to create it from either side (`no_live_document` for the row it
+ *     would restore, `survivor_no_live_document` for the survivor it
+ *     would take documents off; the survivor test reads "had a document"
+ *     the way this check does) and the cascade delete removes the
+ *     transaction with its last live document.
  *   - items-under-live-txn fires for every soft-deleted transaction that
  *     has line items: neither a person's delete nor a dedup apply
  *     retires them, and the item and product reads do not look at the

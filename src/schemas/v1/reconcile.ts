@@ -208,6 +208,9 @@ export const UndoResult = z
             "`duplicate_missing`, `not_deleted_by_this_proposal`, `no_link_record`, " +
             "`no_live_document` (every document the apply moved has since been deleted, " +
             "so restoring the transaction would leave it without evidence), " +
+            "`survivor_no_live_document` (the surviving transaction's own documents have all been " +
+            "deleted since, so taking the moved ones back would leave it in the ledger with no live " +
+            "document; restore one of its own, or delete it, then undo again), " +
             "`survivor_folded`, or `undo_failed`.",
         }),
       }),
