@@ -110,6 +110,17 @@ export function currencyExponent(code: string): number {
   return ISO_4217_EXPONENTS[code] ?? DEFAULT_CURRENCY_EXPONENT;
 }
 
+/**
+ * The ISO codes listed above with `exponent`, for text that has to name
+ * them (the Ask prompt tells the model which amounts not to divide by
+ * 100). Empty for the default, which covers every unlisted code.
+ */
+export function currenciesWithExponent(exponent: number): string[] {
+  return Object.keys(ISO_4217_EXPONENTS).filter(
+    (code) => ISO_4217_EXPONENTS[code] === exponent,
+  );
+}
+
 // ── Decimal helpers (integers only, no floats past the parse) ──────────
 
 function pow10(n: number): bigint {

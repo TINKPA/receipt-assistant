@@ -42,6 +42,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { runClaude } from "../claude.js";
+import { currenciesWithExponent } from "../ledger/money.js";
 import { runLedgerQuery, MAX_ROWS, type LedgerQueryResult } from "./ledger-query.js";
 
 /** A column, or a column with the annotation the digest prints after it. */
@@ -299,14 +300,22 @@ function renderDigest(): string {
   }).join("\n");
 }
 
+/**
+ * Which currencies are not in hundredths, read from the table the
+ * ledger converts with (`src/ledger/money.ts`), so the prompt names every
+ * one of them and cannot drift from it.
+ */
+const codes = (exponent: number) => currenciesWithExponent(exponent).join(", ");
+
 const SCHEMA_DIGEST = `
 LEDGER SCHEMA (PostgreSQL):
 ${renderDigest()}
-MONEY: a *_minor column is an integer in the minor unit of ITS OWN currency: hundredths for USD, CNY, EUR and most others (divide by 100), whole units for JPY, KRW, VND (do not divide), thousandths for KWD, BHD, whole points for a points code (it ends in _PT).
+MONEY: a *_minor column is an integer in the minor unit of ITS OWN currency: whole units, do not divide, for ${codes(0)}; thousandths for ${codes(3)}; ten-thousandths for ${codes(4)}; whole points for a points code (it ends in _PT); hundredths (divide by 100) for every other currency, USD, CNY and EUR included.
 - postings.amount_base_minor is the leg in the workspace base currency: US dollar cents, unless workspaces.base_currency says otherwise. Every total is a SUM of it, labelled with the base currency, NEVER with postings.currency.
 - postings.amount_minor with postings.currency is the same leg as the receipt stated it (yuan, yen, points). Add it up only within one currency. To show a foreign or points amount, give amount_minor under its own currency and amount_base_minor as its value, each under its own label.
 - postings.fx_rate multiplies amount_minor into amount_base_minor, minor unit to minor unit (NULL on a base-currency leg). It is not the published rate when the decimals differ (a yen leg carries 0.65 where fx_rates.rate is 0.0065); on a points leg it is points_valuations.minor_per_point.
-- A foreign cash leg with fx_rate IS NULL was never converted, and its amount_base_minor still holds the native number: say so if a total contains one.
+- A points leg with fx_rate 0 has no valuation: its amount_base_minor is 0, so a total leaves those points out. Say so, with the point count.
+- A foreign leg, cash or points, with fx_rate IS NULL was never converted, and its amount_base_minor still holds the native number: say so if a total contains one.
 - transaction_items and wish_items amounts are in the row's own currency, never converted.
 CONVENTIONS: spending for a period = SUM(p.amount_base_minor) FROM ledger_live_transactions t JOIN postings p ON p.transaction_id = t.id JOIN accounts a ON a.id = p.account_id WHERE a.type = 'expense'. One transaction's total is that sum over its own expense legs, and its category is the name of that expense account. Do NOT add an amount_base_minor > 0 filter: a refund is booked as a negative expense leg against the category it reverses, and excluding it overstates spend. Income sits on a.type = 'income' with a NEGATIVE amount, so report income as -SUM(p.amount_base_minor). Dates are local; occurred_on is the receipt date.`;
 
