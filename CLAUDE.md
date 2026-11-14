@@ -826,6 +826,15 @@ what keeps it at one transaction; without the lock it fails 0/3.
 `--with-claude` adds the agent decision-tree branches (`b2` attach,
 `b3` distinct-despite-pHash, `b4` flag+review round-trip) and the
 same-batch `race` case (~15 min total); those do need a reset sandbox.
+Their receipts are real documents, so they are named in a private
+manifest outside the repository (`--claude-manifest`, default
+`~/Developer/receipt-assistant-data/eval/dedup-claude.manifest.json`;
+the script's header says what each file must be), and the cases find
+their rows by ingest and document, never by a merchant name.
+`--only=<cases>` selects cases (a name that matches none is an error),
+`--repeat=<n> --reset-between` runs them n times on a reset sandbox
+each round (the A/B's `race` ×3), and `--json=<file>` writes the
+results for `scripts/ab-campaign.ts`.
 The in-batch pass no longer removes a row on date + payee + amount
 alone, so `race` only converges on its second path when both
 extractions wrote the same identifier. That path has not been re-run
