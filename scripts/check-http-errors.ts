@@ -567,6 +567,28 @@ if (wants("bool")) {
     status: 422,
     type: "validation",
   });
+  // The upload's flag is a multipart field, and an unreadable one used to
+  // mean "on". Only refusals are exercised: an accepted upload is enqueued,
+  // and enqueueing spawns the extractor.
+  const batches = async (): Promise<number> => Number((await q(`SELECT count(*) AS n FROM batches`))[0]!.n);
+  for (const v of ["no", "off", "yes"]) {
+    const before = await batches();
+    const form = new FormData();
+    form.append("file", new Blob([`check-http-errors ${NONCE} auto_reconcile ${v}\n`], { type: "text/plain" }), "r.txt");
+    form.append("auto_reconcile", v);
+    record(G, `POST /v1/ingest/batch  auto_reconcile=${v}`, await call("POST", "/v1/ingest/batch", { body: form }), {
+      status: 422,
+      type: "validation",
+      also: (o) =>
+        !JSON.stringify(o.json?.violations ?? []).includes("auto_reconcile")
+          ? "violation does not name auto_reconcile"
+          : null,
+    });
+    const after = await batches();
+    if (after !== before) {
+      rows.push({ group: G, request: `POST /v1/ingest/batch  auto_reconcile=${v}`, status: 0, shape: "", expect: "no batch written", ok: false, why: `${after - before} batch row(s) written` });
+    }
+  }
 }
 
 // ── cur: pagination cursors ────────────────────────────────────────────
