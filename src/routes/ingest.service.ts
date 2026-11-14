@@ -71,6 +71,8 @@ export interface IngestRow {
     receipt_ids: string[];
     transaction_ids: string[];
     document_ids: string[];
+    /** Only on an ingest the server writer closed (`src/ingest/apply/`). */
+    extraction_ids?: string[];
   } | null;
   error: string | null;
   // #158 derived fields.

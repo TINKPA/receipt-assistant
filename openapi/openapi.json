@@ -3625,6 +3625,15 @@
               "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
             },
             "default": []
+          },
+          "extraction_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "The extraction records (`document_extractions`) the server writer stored for this ingest. Absent on an ingest the extraction agent closed itself."
           }
         }
       },
