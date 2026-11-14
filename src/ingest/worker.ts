@@ -427,8 +427,12 @@ async function runOne(item: QueueItem): Promise<void> {
     await finish({ outcome: "failed", errorClass: "apply", error: err });
     if (await markErrorIfOpen(ingestId, workspaceId, err)) {
       busEmit("job.error", { batchId, ingestId, error: ingestErrorText(err) });
-      await onBatchChildTerminated(batchId, workspaceId);
     }
+    // Also when the agent had already closed the ingest and a query of
+    // ours failed after that: the ingest is terminal either way, and if it
+    // was the batch's last one the batch must not wait for a restart. The
+    // call is guarded (no open child, batch still pending/processing).
+    await onBatchChildTerminated(batchId, workspaceId);
     throw err;
   }
 }
