@@ -122,9 +122,10 @@ services:
       CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
       # Who writes an extraction into the ledger (wave 1). `agent_sql`: the
       # agent does, through psql, as it always has. `server_apply`: the
-      # agent hands back a record and the server writes it. Nothing reads
-      # it before the run records land; the default stays `agent_sql`
-      # until the A/B passes.
+      # agent hands back a record and the server writes it. Read per run
+      # and recorded on `agent_runs.writer`; until the server writer ships,
+      # any other value is logged once and `agent_sql` runs. The default
+      # stays `agent_sql` until the A/B passes.
       EXTRACTION_WRITER: ${EXTRACTION_WRITER:-agent_sql}
       # How many times a `server_apply` run may send an invalid record
       # back to the same session (`claude -p --resume`) before the ingest

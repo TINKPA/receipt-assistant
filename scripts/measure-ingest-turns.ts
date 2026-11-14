@@ -40,8 +40,10 @@
  * represents (turns × prompt, because the prompt is re-read from cache on
  * every single turn).
  *
- * CLI — `--key=value` only, same convention as eval-dates.ts. A bare
- * `--key` binds to `true`, so the space form fails silently.
+ * CLI — `--key=value` only. A bare `--key` binds to `true`, so the space
+ * form (`--last 6`) fails silently: `--last` becomes `true` and is refused,
+ * `--session` becomes the literal `true`. (eval-dates.ts refuses a bare
+ * value flag outright; this script does not.)
  *   --session=<id|path>   Session id or JSONL path. Repeatable, or comma-separated.
  *   --dir=<path>          Where to look for `<id>.jsonl`. Default: the
  *                         Claude Code projects dir for this cwd.

@@ -111,6 +111,7 @@ import { homedir, tmpdir } from "os";
 import * as path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
+import { summarizeSession } from "../src/session-transcript.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -1052,22 +1053,18 @@ export function readMoney(tx: ApiTransaction): Pick<Extracted, "total_minor" | "
 // ── Transcripts ────────────────────────────────────────────────────────
 
 /**
- * Turns and tokens of one session JSONL, grouped by `message.id`: the CLI
- * writes one record per content block and repeats the turn's `usage` on
- * each, so counting records double counts (see the header of
- * scripts/measure-ingest-turns.ts). Billed input is fresh + cache read +
- * cache write.
- *
- * Wave 1 moves the server's copy of this parser into
- * src/session-transcript.ts (`summarizeSession`) and stores the result on
- * `agent_runs`; switch to that once it exists.
+ * Turns, tokens and model of one session JSONL, from `summarizeSession`
+ * (src/session-transcript.ts): the parser the server uses to fill
+ * `agent_runs` and `measure:turns` uses to report, so the three cannot
+ * disagree. Turns are grouped by `message.id` and billed input is fresh +
+ * cache read + cache write (see that file). Only the wall time, first to
+ * last record timestamp, is read here.
  */
-function summarizeJsonl(text: string, sessionId: string): SessionSummary {
-  const turns = new Map<string, { usage: Record<string, number>; tools: number }>();
-  let model: string | null = null;
+async function summarizeTranscript(jsonlPath: string): Promise<SessionSummary> {
+  const s = summarizeSession(jsonlPath);
   let first: number | null = null;
   let last: number | null = null;
-  for (const line of text.split("\n")) {
+  for (const line of (await readFile(jsonlPath, "utf8")).split("\n")) {
     if (!line.trim()) continue;
     let rec: any;
     try {
@@ -1080,31 +1077,17 @@ function summarizeJsonl(text: string, sessionId: string): SessionSummary {
       first ??= t;
       last = t;
     }
-    if (rec.type !== "assistant") continue;
-    const msg = rec.message ?? {};
-    if (msg.model && msg.model !== "<synthetic>") model ??= msg.model;
-    const id: string = msg.id ?? `_noid_${turns.size}`;
-    let turn = turns.get(id);
-    if (!turn) {
-      turn = { usage: msg.usage ?? {}, tools: 0 };
-      turns.set(id, turn);
-    }
-    for (const b of Array.isArray(msg.content) ? msg.content : []) if (b?.type === "tool_use") turn.tools++;
   }
-  const sum = (k: string) => [...turns.values()].reduce((s, t) => s + (Number(t.usage[k]) || 0), 0);
-  const fresh = sum("input_tokens");
-  const read = sum("cache_read_input_tokens");
-  const write = sum("cache_creation_input_tokens");
   return {
-    session_id: sessionId,
-    model_observed: model,
-    turns: turns.size,
-    tool_calls: [...turns.values()].reduce((s, t) => s + t.tools, 0),
-    billed_input: fresh + read + write,
-    cache_read: read,
-    cache_creation: write,
-    fresh_input: fresh,
-    output: sum("output_tokens"),
+    session_id: s.session,
+    model_observed: s.model,
+    turns: s.turns,
+    tool_calls: s.toolCalls,
+    billed_input: s.billedInput,
+    cache_read: s.cacheRead,
+    cache_creation: s.cacheCreation,
+    fresh_input: s.freshInput,
+    output: s.output,
     wall_s: first !== null && last !== null ? Math.round((last - first) / 1000) : null,
   };
 }
@@ -1834,7 +1817,7 @@ async function collectTrial(
       sessionSource = "prompt";
     }
     const session = sessionPath
-      ? summarizeJsonl(await readFile(sessionPath, "utf8"), path.basename(sessionPath, ".jsonl"))
+      ? await summarizeTranscript(sessionPath)
       : null;
 
     results.push({
