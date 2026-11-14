@@ -187,7 +187,8 @@ export const SERVER_OWNED_TX_METADATA_KEYS = [
   "points",
 
   // Server-writer bookkeeping (wave 1). Writer: the server applier's
-  // metadata builder (src/ingest/apply/metadata.ts, plan §6.4), the only
+  // metadata builder (src/ingest/apply/metadata.ts; docs/server-writer.md,
+  // "Transaction metadata"), the only
   // writer of either key. `mirror_account` names the account the applier
   // derived from `payment.method` for the counter-posting: it records a
   // decision, and the posting is the fact, so editing the key would only

@@ -28,6 +28,17 @@ COPY tsconfig.json ./
 COPY scripts/ ./scripts/
 COPY src/ ./src/
 COPY drizzle/ ./drizzle/
+# The build stamp (`/version`, `metadata.extraction.prompt_git_sha`).
+# scripts/generate-build-info.mjs, which the build's prebuild runs, takes
+# these when they are set and asks the copied .git otherwise. From the main
+# checkout .git answers; from a git worktree it is a one-line pointer to a
+# host path the builder cannot follow, so the stamp would say `unknown`
+# unless the caller passes them (both compose files forward them; see the
+# CLAUDE.md "Sandbox stack" section). Declared here, after every COPY, so
+# a new value re-runs only this build step and what follows it.
+ARG GIT_SHA=""
+ARG GIT_SHORT_SHA=""
+ARG GIT_BRANCH=""
 RUN npm run build
 
 # Drop devDependencies so the runtime stage can copy a lean node_modules

@@ -15,10 +15,11 @@
  *
  * WHAT IT CHECKS
  *
- *   - every §4.2 error rule bounces the record, with the right rule id
+ *   - every error rule (docs/server-writer.md, "Validation") bounces the
+ *     record, with the right rule id
  *     and path, and nothing else fires alongside it;
- *   - every §4.3 warning that can be decided from the record alone, and
- *     every §4.1 normalisation, is recorded;
+ *   - every warning that can be decided from the record alone, and every
+ *     normalisation, is recorded;
  *   - unknown keys are refused anywhere, and each key the record must
  *     never carry (`FORBIDDEN_PAYLOAD_KEYS`) is refused at the top level
  *     and inside the nested objects;
@@ -277,7 +278,7 @@ expectValid("given channel is kept", variant((r) => {
   ];
 }));
 
-// ── §4.1 normalisations ────────────────────────────────────────────────
+// ── Normalisations ─────────────────────────────────────────────────────
 
 {
   const o = expectValid("trim and empty to null", variant((r) => {
@@ -364,7 +365,7 @@ expectValid("given channel is kept", variant((r) => {
   }
 }
 
-// ── §4.2 errors ────────────────────────────────────────────────────────
+// ── Errors ─────────────────────────────────────────────────────────────
 
 expectErrors("not an object", [1, 2], [["schema", ""]]);
 expectErrors("wrong contract version", variant((r) => (r.contract_version = 2)), [["schema", "contract_version"]]);
@@ -373,6 +374,8 @@ expectErrors("fractional total", variant((r) => (r.facts.total_minor = 10.8)), [
 expectErrors("bad enum", variant((r) => (r.merchant.category = "Coffee")), [["schema", "merchant.category"]]);
 expectErrors("bad slug", variant((r) => (r.merchant.brand_id = "Example Cafe")), [["schema", "merchant.brand_id"]]);
 expectErrors("bad card last4", variant((r) => (r.payment.card_last4 = "12345")), [["schema", "payment.card_last4"]]);
+// The method is the enum, never the tender word: `debit` is `debit_card`.
+expectErrors("debit is not a method", variant((r) => (r.payment.method = "debit")), [["schema", "payment.method"]]);
 expectErrors("date in the wrong format", variant((r) => (r.facts.occurred_on = "06/10/2026")), [["schema", "facts.occurred_on"]]);
 expectErrors("required item field missing", variant((r) => delete r.items[1].confidence), [["schema", "items[1].confidence"]]);
 
@@ -494,7 +497,7 @@ expectErrors("receipt facts too large", variant((r) => {
     ["schema", "items[0].confidence"],
     ["schema", "merchant.place_id"],
   ]);
-  // §4.4: the repair request.
+  // The repair request.
   const text = renderRepairRequest(o.report.errors);
   check("repair: header", text.startsWith("Your extraction record was not accepted. Fix only the fields listed"));
   check("repair: asks for the full record in one json block", text.includes("full corrected record in one ```json block"));
@@ -551,7 +554,7 @@ expectErrors("forbidden refund_of inside a party", variant((r) => (r.parties = [
   ["schema", "parties[0].refund_of"],
 ]);
 
-// ── §4.3 warnings decidable from the record ────────────────────────────
+// ── Warnings decidable from the record ─────────────────────────────────
 
 expectValid("lines do not add up", variant((r) => {
   r.facts.total_minor = 2000;
@@ -608,6 +611,54 @@ expectValid("review flags", variant((r) => (r.audit.review_flags = ["needs_revie
 expectValid("the other review flags", variant((r) => (r.audit.review_flags = ["date_unresolved", "total_unresolved", "partial_document"])), {
   warnings: ["review_flag_date_unresolved", "review_flag_total_unresolved", "review_flag_partial_document"],
 });
+// Tenders (the owner's decisions of November 2026): a debit card and a
+// gift card or balance are their own methods; a mixed tender warns, as
+// money, because one method cannot book the split.
+{
+  const debit = expectValid("debit card", variant((r) => (r.payment = { method: "debit_card", card_last4: "0000", as_printed: "US DEBIT ****0000" })), {
+    noWarnings: ["mixed_tender"],
+  });
+  if (debit.status === "valid") check("debit card: kept as debit_card", debit.record.payment.method === "debit_card");
+  expectValid("gift card", variant((r) => (r.payment = { method: "gift_card", as_printed: "GIFT CARD" })), { noWarnings: ["mixed_tender"] });
+  const mixed = expectValid("mixed tender", variant((r) => (r.payment = { method: "mixed", as_printed: "CASH 5.00 / VISA 5.80" })), {
+    warnings: ["mixed_tender"],
+  });
+  const w = mixed.report.warnings.find((x) => x.rule === "mixed_tender");
+  check("mixed tender: a money warning at payment.method", w?.path === "payment.method" && w?.money === true, JSON.stringify(w));
+  expectValid("mixed tender on a refund", variant((r) => {
+    r.facts.flow = "refund";
+    r.facts.total_minor = -1080;
+    r.facts.total_printed = "-$10.80";
+    for (const it of r.items) {
+      it.line_total_minor = -it.line_total_minor;
+      if (it.tax_minor) it.tax_minor = -it.tax_minor;
+    }
+    r.payment = { method: "mixed" };
+  }), { warnings: ["mixed_tender"] });
+  // Income lands where `income` says; its method books nothing.
+  expectValid("mixed tender on income is quiet", variant((r) => {
+    r.facts.flow = "income";
+    r.income = { deposit_account: "Checking", income_account: "Other" };
+    r.payment = { method: "mixed" };
+  }), { noWarnings: ["mixed_tender"] });
+  // On a points record the method is what paid the cash part: with one,
+  // a mixed tender warns; with none, the points account pays whatever
+  // the method says, and nothing is left unbooked.
+  const pointsStay = (r: any, cash: boolean) => {
+    r.facts.currency = "EXAMPLE_PT";
+    r.facts.total_minor = 20000;
+    r.facts.total_printed = "20,000 points";
+    r.points = { programme_name: "Example Rewards" };
+    r.payment = { method: "mixed" };
+    r.items = [{ line_no: 1, raw_name: "ROOM", line_total_minor: 20000, item_class: "service", confidence: "high" }];
+    if (cash) {
+      r.cash_component = { amount_minor: 5000, currency: "USD" };
+      r.items.push({ line_no: 2, raw_name: "RESORT FEE", line_total_minor: 5000, currency: "USD", item_class: "service", confidence: "high", line_type: "service_fee" });
+    }
+  };
+  expectValid("mixed tender on the cash part of points plus cash", variant((r) => pointsStay(r, true)), { warnings: ["mixed_tender"] });
+  expectValid("mixed tender on points with no cash part is quiet", variant((r) => pointsStay(r, false)), { noWarnings: ["mixed_tender"] });
+}
 
 // Printed amounts, directly.
 for (const [text, exp, want] of [

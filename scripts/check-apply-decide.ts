@@ -2,7 +2,9 @@
  * check-apply-decide.ts — the server applier's pure half: the duplicate
  * decision (`src/ingest/apply/decide.ts`), the projection to postings and
  * line items (`project.ts`), the metadata key set (`metadata.ts`) and the
- * fingerprint (`fingerprint.ts`) (wave 1, plan §6–§7, §12.3).
+ * fingerprint (`fingerprint.ts`) (wave 1; docs/server-writer.md,
+ * "Attach or insert", "Accounts and postings" and
+ * "Transaction metadata").
  *
  * WHY THIS EXISTS
  *
@@ -10,8 +12,8 @@
  * for a receipt: which account each amount goes to, with which sign, and
  * whether a document becomes a new purchase or evidence for one already
  * booked. A rule that quietly changes there books money wrong or merges
- * two purchases into one. Every rule of plan §7 and every posting shape
- * of §6.3 g is a row of the tables below, run on every build.
+ * two purchases into one. Every rule of the duplicate decision and every
+ * posting shape is a row of the tables below, run on every build.
  *
  * WHAT IT CHECKS
  *
@@ -25,14 +27,17 @@
  *              the uncertain residue; a zero total; the pHash-only note.
  *   project()  purchase, refund, income (defaults and named accounts),
  *              points with an existing and a new account, points plus
- *              cash, every payment method's mirror account, JPY and KWD
+ *              cash (by card, cash and debit card), every payment
+ *              method's mirror account for a purchase and the tenders'
+ *              for a refund, a mixed tender's review flag, JPY and KWD
  *              amounts left as they are, a zero total, the missing-account
  *              and not-a-receipt errors, owned items, parties, place,
  *              the sold item, and per-currency balance of every draft.
  *   metadata   the fixed key set, the extraction stamp, identifiers at
  *              top level, the payment strings, printed totals,
- *              allocation audit, the dedup keys, and that the keys it
- *              introduces are server-owned.
+ *              allocation audit, the dedup keys, a mixed tender's flag in
+ *              near_dup_check, and that the keys it introduces are
+ *              server-owned.
  *   fingerprint  order and offset independence, and that an amount
  *              change shows.
  *
@@ -47,6 +52,7 @@ import type { AccountCatalog, CatalogAccount } from "../src/ingest/apply/account
 import { decide, type ApplyCandidate, type ApplyDecision } from "../src/ingest/apply/decide.js";
 import {
   MIRROR_BY_METHOD,
+  MIXED_TENDER_REVIEW,
   ProjectionError,
   project,
   unbalancedCurrencies,
@@ -214,7 +220,7 @@ function expectDecision(
   check(`decide: ${name}`, ok, `got ${json(got)} (${d.reason})`);
 }
 
-// ── decide(): §7 ───────────────────────────────────────────────────────
+// ── decide() ───────────────────────────────────────────────────────────
 
 {
   const r = rec();
@@ -494,7 +500,7 @@ function expectDecision(
   );
 }
 
-// ── project(): §6.3 ────────────────────────────────────────────────────
+// ── project() ──────────────────────────────────────────────────────────
 
 function expectShape(name: string, d: ApplyDraft, want: string[]): void {
   check(`project: ${name}`, shape(d) === [...want].sort().join(" | "), shape(d));
@@ -513,12 +519,16 @@ function expectShape(name: string, d: ApplyDraft, want: string[]): void {
   check("project: applier version", d.applierVersion === APPLIER_VERSION);
 }
 
+// The owner's tender decisions (November 2026): a debit card draws on
+// Checking, a gift card or balance on Cash, a mixed tender is Credit Card
+// and flagged for review.
 for (const [method, account] of [
   ["cash", "asset:Cash"],
+  ["gift_card", "asset:Cash"],
+  ["debit_card", "asset:Checking"],
   ["check", "asset:Checking"],
   ["bank_transfer", "asset:Checking"],
   ["card", "liability:Credit Card"],
-  ["gift_card", "liability:Credit Card"],
   ["mixed", "liability:Credit Card"],
   ["other", "liability:Credit Card"],
   ["unknown", "liability:Credit Card"],
@@ -526,6 +536,30 @@ for (const [method, account] of [
   const d = project(rec((x) => (x.payment = { method })), FULL);
   expectShape(`mirror for ${method}`, d, ["expense:Shopping 1234 USD", `${account} -1234 USD`]);
   check(`project: mirror table says the same for ${method}`, account.endsWith(MIRROR_BY_METHOD[method]));
+  check(`project: ${method} ${method === "mixed" ? "is" : "is not"} flagged for review`, (d.reviewFlag === MIXED_TENDER_REVIEW) === (method === "mixed"), String(d.reviewFlag));
+}
+
+{
+  const refund = (method: string) =>
+    project(
+      rec((x) => {
+        x.facts.flow = "refund";
+        x.facts.total_minor = -1234;
+        x.items = x.items.map((i: Rec) => ({ ...i, line_total_minor: -i.line_total_minor }));
+        x.payment = { method };
+      }),
+      FULL,
+    );
+  expectShape("a debit card refund returns to Checking", refund("debit_card"), ["expense:Shopping -1234 USD", "asset:Checking 1234 USD"]);
+  expectShape("a gift card refund returns to Cash", refund("gift_card"), ["expense:Shopping -1234 USD", "asset:Cash 1234 USD"]);
+  const mixedRefund = refund("mixed");
+  expectShape("a mixed refund returns to Credit Card", mixedRefund, ["expense:Shopping -1234 USD", "liability:Credit Card 1234 USD"]);
+  check("project: a mixed refund is flagged too", mixedRefund.reviewFlag === MIXED_TENDER_REVIEW);
+  const income = project(rec((x) => {
+    x.facts.flow = "income";
+    x.payment = { method: "mixed" };
+  }), FULL);
+  check("project: income's method books nothing, so a mixed one is not flagged", income.reviewFlag === null);
 }
 
 {
@@ -630,6 +664,32 @@ const pointsRecord = (mut: (x: Rec) => void = () => {}) =>
     "expense:Travel 3000 USD",
     "asset:Cash -3000 USD",
   ]);
+
+  const pcDebit = project(
+    pointsRecord((x) => {
+      x.payment = { method: "debit_card", card_last4: "0000" };
+      x.cash_component = { amount_minor: 3000, currency: "USD" };
+    }),
+    FULL,
+  );
+  expectShape("points plus cash on a debit card: the cash pair on Checking", pcDebit, [
+    "expense:Travel 40500 STAYCO_PT",
+    "asset:Stayco Rewards points -40500 STAYCO_PT",
+    "expense:Travel 3000 USD",
+    "asset:Checking -3000 USD",
+  ]);
+  check("project: …and the points still on the points account, not overridden", !pcDebit.warnings.some((w) => w.rule === "account_overridden"));
+
+  const pcMixed = project(
+    pointsRecord((x) => {
+      x.payment = { method: "mixed" };
+      x.cash_component = { amount_minor: 3000, currency: "USD" };
+    }),
+    FULL,
+  );
+  check("project: a mixed tender's cash part goes to Credit Card, flagged", pcMixed.reviewFlag === MIXED_TENDER_REVIEW &&
+    pcMixed.postings.some((p) => p.role === "cash_mirror" && p.account.name === "Credit Card"));
+  check("project: points with a mixed tender but no cash part book nothing to a card, no flag", project(pointsRecord((x) => (x.payment = { method: "mixed" })), FULL).reviewFlag === null);
 
   const pcRefund = project(
     pointsRecord((x) => {
@@ -836,7 +896,7 @@ check(
   json(unbalancedCurrencies([{ amountMinor: 5, currency: "USD" }, { amountMinor: -5, currency: "USD" }, { amountMinor: 1, currency: "EUR" }])) === json(["EUR"]),
 );
 
-// ── metadata: §6.4 ─────────────────────────────────────────────────────
+// ── metadata ───────────────────────────────────────────────────────────
 
 const RUN: MetadataRunContext = {
   ingestId: "i-1",
@@ -932,7 +992,44 @@ const RUN: MetadataRunContext = {
   check("metadata: near_dup_check and refund_of from the decision", json(m.near_dup_check) === json(nd) && m.refund_of === "p-1");
 }
 
-// ── fingerprint: §12.3 ─────────────────────────────────────────────────
+// The tenders' cells, and a mixed tender's review flag in near_dup_check:
+// the review queue lists `flagged_for_review`, reconcile reads only the
+// verdict about the candidates the check names.
+{
+  const debit = rec((x) => (x.payment = { method: "debit_card" }));
+  const md = buildTransactionMetadata(debit, project(debit, FULL), RUN);
+  check("metadata: a debit card's cell and mirror", md.payment_method === "Debit card" && md.mirror_account === "Checking", json([md.payment_method, md.mirror_account]));
+  const gift = rec((x) => (x.payment = { method: "gift_card", as_printed: "GIFT CARD" }));
+  const mg = buildTransactionMetadata(gift, project(gift, FULL), RUN);
+  check("metadata: a gift card's printed tender and mirror", mg.payment_method === "GIFT CARD" && mg.mirror_account === "Cash", json([mg.payment_method, mg.mirror_account]));
+
+  const mixed = rec((x) => (x.payment = { method: "mixed" }));
+  const alone = buildTransactionMetadata(mixed, project(mixed, FULL), RUN).near_dup_check as Record<string, unknown>;
+  check(
+    "metadata: a mixed tender with no candidate is flagged, naming nobody",
+    alone?.flagged_for_review === true && alone.verdict === "uncertain" && json(alone.candidate_transaction_ids) === "[]" &&
+      !("candidate_transaction_id" in alone) && alone.reason === MIXED_TENDER_REVIEW && alone.decided_by === "applier",
+    json(alone),
+  );
+  const distinct = decide(mixed, [sameBrand({ identifiers: { order_number: "A-000200" } }), sameBrand({ id: "c-2", identifiers: { order_number: "A-000300" } })]);
+  const nd = distinct.action === "insert" ? distinct.nearDupCheck : null;
+  const both = buildTransactionMetadata(mixed, project(mixed, FULL), RUN, { refundOf: null, nearDupCheck: nd }).near_dup_check as Record<string, unknown>;
+  check(
+    "metadata: a mixed tender flags a distinct check and keeps its verdict and candidates",
+    nd?.verdict === "distinct" && nd.flagged_for_review === false && both.verdict === "distinct" && both.flagged_for_review === true &&
+      json(both.candidate_transaction_ids) === json(nd.candidate_transaction_ids) && both.reason === `${MIXED_TENDER_REVIEW}; ${nd.reason}`,
+    json(both),
+  );
+  const card = rec();
+  const cardDecision = decide(card, [sameBrand({ identifiers: { order_number: "A-000200" } })]);
+  const cardNd = cardDecision.action === "insert" ? cardDecision.nearDupCheck : null;
+  check(
+    "metadata: a single tender leaves the decision's check as it is",
+    json(buildTransactionMetadata(card, project(card, FULL), RUN, { refundOf: null, nearDupCheck: cardNd }).near_dup_check) === json(cardNd),
+  );
+}
+
+// ── fingerprint ────────────────────────────────────────────────────────
 
 {
   const r = rec();

@@ -1,24 +1,24 @@
 /**
- * Validating an extraction record (wave 1, plan §4).
+ * Validating an extraction record (wave 1; docs/server-writer.md,
+ * "Validation").
  *
  * Three kinds of finding, each with a stable `rule` id:
  *
- *   NORMALISATIONS (§4.1) are applied deterministically and listed on the
+ *   NORMALISATIONS are applied deterministically and listed on the
  *     record (`validation.normalizations`), never bounced: trimmed
  *     strings, "" to null on nullable fields, empty identifiers dropped,
- *     defaults filled in from other fields. Two are added here beyond the
- *     plan's list, both only case: currency codes are upper-cased and
- *     `domain_hint` lower-cased. An empty `other_references` value is
- *     dropped like an empty identifier.
+ *     defaults filled in from other fields. Two only change case:
+ *     currency codes are upper-cased and `domain_hint` lower-cased. An
+ *     empty `other_references` value is dropped like an empty identifier.
  *
- *   ERRORS (§4.2) cover structure, the contract and impossible values
+ *   ERRORS cover structure, the contract and impossible values
  *     only. They bounce the record to the repair round
  *     (`renderRepairRequest`), and a record still in error after it is
  *     stored as evidence with `status = 'invalid'`. Every error is found
  *     in one pass, including the cross-field rules on a record whose
  *     shape is partly wrong, so the one repair round sees all of them.
  *
- *   WARNINGS (§4.3) are stored and never bounced. The ones decidable from
+ *   WARNINGS are stored and never bounced. The ones decidable from
  *     the record alone are computed here. The others are found while the
  *     record is applied (`APPLY_WARNING_RULES`); by then the record row is
  *     written and immutable, so those go on the run's `apply_report` via
@@ -77,6 +77,7 @@ export const RECORD_WARNING_RULES = [
   "no_items",
   "income_defaults_applied",
   "party_line_dropped",
+  "mixed_tender",
   ...REVIEW_FLAGS.map((f) => `review_flag_${f}` as const),
   "repair_changed_unnamed",
 ] as const;
@@ -484,7 +485,7 @@ function normaliseFields(rec: Record<string, unknown>, log: NormalizationLog | n
   }
 }
 
-/** The pre-parse half of §4.1: what zod sees. */
+/** The pre-parse half of the normalisations: what zod sees. */
 function preNormalise(input: unknown, log: NormalizationLog | null): unknown {
   const out = normaliseAgainst(ExtractionV1Schema, input, [], log);
   if (isPlainObject(out)) normaliseFields(out, log);
@@ -575,10 +576,10 @@ function issueToErrors(issue: z.ZodIssue): ValidationError[] {
   return [{ rule: "schema", path, message: issueMessage(issue) }];
 }
 
-// ── Cross-field rules (§4.2), on the normalised input ──────────────────
+// ── Cross-field error rules, on the normalised input ───────────────────
 
 /**
- * Every §4.2 rule that spans fields. Runs on the pre-parse normalised
+ * Every error rule that spans fields. Runs on the pre-parse normalised
  * input even when zod refused part of it, reading each field defensively,
  * so a record with one malformed field still has its other problems
  * reported in the same round.
@@ -592,7 +593,8 @@ function crossFieldErrors(rec: Record<string, unknown>, ctx: ValidationContext):
   const facts = asObj(rec.facts);
   const present = (k: string) => rec[k] !== undefined && rec[k] !== null;
 
-  // required_for_classification: both directions of the plan's "iff".
+  // required_for_classification: both directions, required for the
+  // classification and refused on any other.
   if (classification !== null && (receipt || classification === "statement_pdf" || classification === "unsupported")) {
     for (const k of ["facts", "merchant", "audit"]) {
       if (receipt && !present(k)) {
@@ -851,6 +853,15 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
     if (rec.classification === "receipt_email" && facts.occurred_at == null) {
       warn("email_without_time", "facts.occurred_at", "an email with no transaction time");
     }
+    // A record names one tender, so the applier books a mixed one whole to
+    // Credit Card and flags the transaction for review (`project.ts`).
+    // Only a cash pair is paid by the method: income is deposited where
+    // `income` says, and points with no cash part pay from the points
+    // account whatever the method.
+    const cashPair = !isPointsCurrency(facts.currency) || rec.cash_component != null;
+    if (facts.flow !== "income" && cashPair && rec.payment.method === "mixed") {
+      warn("mixed_tender", "payment.method", "paid with two or more tenders; the split between them is not booked", true);
+    }
   }
 
   // The server decodes email and HTML itself; a photo or a PDF, text
@@ -969,7 +980,7 @@ export function noteRepairRound(report: ValidationReport, round: number, errors:
   return report;
 }
 
-// ── §4.4 the text sent back ────────────────────────────────────────────
+// ── The text sent back: the repair request ─────────────────────────────
 
 /** What to look at again, per rule. Never a value. */
 const REREAD: Partial<Record<ErrorRule, string>> = {
@@ -990,9 +1001,10 @@ const REREAD: Partial<Record<ErrorRule, string>> = {
 const REPAIR_LINES_MAX = 40;
 
 /**
- * The repair request (§4.4): one line per error naming its path and rule,
- * never proposing a value, asking for a re-read of the region where the
- * rule is about the reading. Sent on stdin of the `--resume` spawn.
+ * The repair request (docs/server-writer.md, "The repair round"): one line
+ * per error naming its path and rule, never proposing a value, asking for
+ * a re-read of the region where the rule is about the reading. Sent on
+ * stdin of the `--resume` spawn.
  */
 export function renderRepairRequest(errors: readonly ValidationError[]): string {
   const seen = new Set<string>();

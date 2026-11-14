@@ -1,8 +1,9 @@
 /**
- * The ingest extractor prompt: one template, two renderings (wave 1, plan
- * §9). `ctx.writer` picks one, and every write-specific block is wrapped
- * in `forWriter(writer, legacyText, recordText)` so the reading text the
- * two share has one source and the arms cannot drift.
+ * The ingest extractor prompt: one template, two renderings (wave 1;
+ * docs/server-writer.md, "Two renderings of one prompt"). `ctx.writer`
+ * picks one, and every write-specific block is wrapped in
+ * `forWriter(writer, legacyText, recordText)` so the reading text the two
+ * share has one source and the arms cannot drift.
  *
  *   agent_sql     (legacy, `PROMPT_VERSION`) — the agent writes the v1
  *                 double-entry ledger directly via the `psql` Bash tool;
@@ -190,7 +191,8 @@ you converted yourself, would be booked as if the receipt had printed it.
 `;
 
 /** Record rendering: Phase 4a.0's place. The decision tree, the pHash list
- *  and the candidate query are the server's now (plan §7). */
+ *  and the candidate query are the server's now (docs/server-writer.md,
+ *  "Attach or insert"). */
 const RECORD_DUPLICATES = `**Duplicates are the server's call (#134).** The same purchase may
 already be in the ledger through another copy (a re-shot photo, a
 re-scanned PDF) or another evidence channel (the email for a PDF, the
@@ -204,15 +206,33 @@ duplicate the server cannot see.
 `;
 
 /** Record rendering: how the total was paid, which decides the paying
- *  account (plan §3.3), and the printed totals. Legacy has no counterpart:
- *  its template always credited Credit Card. */
-const RECORD_PAYMENT = `**payment** — how the total was paid, read off the tender line. The
-server picks the paying account from \`payment.method\`: \`cash\` → Cash;
-\`check\` and \`bank_transfer\` → Checking; \`points\` → the programme's
-points account; anything else (\`card\`, \`gift_card\`, \`mixed\`,
-\`other\`, \`unknown\`) → Credit Card. \`unknown\` when the document does
-not say. Copy card_last4 (exactly four digits), card_network and the
-tender line itself (as_printed) when they are printed.
+ *  account (docs/server-writer.md, "Tenders"; `project.ts`), and
+ *  the printed totals. Legacy has no counterpart: its template always
+ *  credited Credit Card. */
+const RECORD_PAYMENT = `**payment** — how total_minor was paid, read off the tender line. The
+server picks the paying account from \`payment.method\` (the contract
+below says which method books where), so the method is a reading of the
+document, never a guess:
+  - A card is \`card\` unless the document itself says debit: the tender
+    line reads DEBIT on its own or names a debit-only network (Interac,
+    Maestro, a "US DEBIT" chip label). Then it is \`debit_card\`. A label
+    that names both kinds (CREDIT/DEBIT, "Credit/Debit Card") or neither
+    ("bank card", "card") is \`card\`. A phone wallet (Apple Pay, Google
+    Pay) pays with a card and follows the same rule.
+  - \`gift_card\` is a gift card, store credit, or a balance held in an
+    app or account (a store app's balance, a PayPal or Venmo balance). A
+    card linked through PayPal or an app is that card, not a balance.
+  - A gift card or balance is never counted as a second tender:
+    total_minor is the residual (Phase 2), and the method is what paid
+    the residual.
+    When a gift card or balance paid the whole order, total_minor is 0
+    (Phase 2) and the method is \`gift_card\`. \`mixed\` is two or more
+    tenders that together paid total_minor (cash and a card, two cards);
+    the server books it whole to Credit Card and flags the transaction
+    for a person.
+\`unknown\` when the document does not say. Copy card_last4 (exactly four
+digits), card_network and the tender line itself (as_printed) when they
+are printed.
 
 **printed_totals** — the document's printed subtotal, tax, tip, discount
 and fees (service, delivery and surcharges added together), in minor
@@ -224,17 +244,20 @@ items[] as well.`;
 const RECORD_POINTS = `
 
 **points** — an award redemption (Phase 2): facts.currency is the
-programme code, facts.total_minor the points redeemed (never 0),
-\`points.programme_name\` the programme as printed, and payment.method
-\`points\`. When the folio ALSO charges cash (a resort fee, parking), add
-\`cash_component\` {amount_minor, currency} for the cash part; a line
-priced in that cash currency says so in its own \`currency\`.`;
+programme code, facts.total_minor the points redeemed (never 0), and
+\`points.programme_name\` the programme as printed. When the folio ALSO
+charges cash (a resort fee, parking), add \`cash_component\`
+{amount_minor, currency} for the cash part; a line priced in that cash
+currency says so in its own \`currency\`. payment.method is what paid
+the cash part, read as above (a card, a debit card, cash, …), or
+\`points\` when there is no cash part.`;
 
 /**
- * Record rendering: the hand-back (plan §5). It replaces the legacy Phase
- * 5 close-out, Output and Rules: the ending rule, "omit rather than
- * invent", the one repair round, and the contract itself, rendered from
- * the zod schema the validator enforces so the two cannot drift.
+ * Record rendering: the hand-back (docs/server-writer.md, "The hand-back").
+ * It replaces the legacy Phase 5 close-out, Output and Rules: the ending
+ * rule, "omit rather than invent", the one repair round, and the contract
+ * itself, rendered from the zod schema the validator enforces so the two
+ * cannot drift.
  */
 function recordHandBack(): string {
   return `── Rules ──────────────────────────────────────────────────────────────

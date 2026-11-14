@@ -89,7 +89,8 @@ ${forWriter(writer, "metadata.raw_text", "the record's source_used (email_attach
 
 /**
  * A fence name for the decoded-source block that nothing in `text` can
- * contain. The record rendering uses a fresh one per run (plan §9.2): the
+ * contain. The record rendering uses a fresh one per run
+ * (docs/server-writer.md, "Two renderings of one prompt"): the
  * decoded text is written by whoever sent the email, and with a fixed
  * `DECODED_SOURCE` line a sender could close the block early and have the
  * rest of the message read as prompt. A random name cannot be guessed in

@@ -419,10 +419,22 @@ export const ListTransactionsQuery = z.object({
   include_deleted: QueryBoolean.optional(),
   source_ingest_id: Uuid.optional(),
   /** flagged=near_dup → only transactions whose extraction recorded
-   *  metadata.near_dup_check.flagged_for_review=true (#134 branch 4:
-   *  a same-amount/date candidate existed but neither side had a
-   *  strong tiebreaker, so the agent inserted AND flagged). */
-  flagged: z.enum(["near_dup"]).optional(),
+   *  metadata.near_dup_check.flagged_for_review=true: the review queue.
+   *  Usually #134 branch 4 (a same-amount/date candidate existed but
+   *  neither side had a strong tiebreaker, so the writer inserted AND
+   *  flagged); the server writer also flags a mixed tender, which names
+   *  no candidate (src/ingest/apply/decide.ts::flagForReview). */
+  flagged: z
+    .enum(["near_dup"])
+    .optional()
+    .openapi({
+      description:
+        "near_dup: only transactions with metadata.near_dup_check.flagged_for_review = true, the rows a person " +
+        "must look at. Usually the duplicate check found a candidate it could neither rule in nor out " +
+        "(near_dup_check names it). A row paid with a mixed tender is flagged too, with no " +
+        "candidate: it was booked whole to Credit Card and the split between its tenders was not booked. " +
+        "metadata.near_dup_check.reason says which, the tender first when both apply.",
+    }),
   sort: z.enum(["occurred_on", "amount", "created_at"]).optional(),
   order: z.enum(["asc", "desc"]).optional(),
   cursor: z.string().optional(),
@@ -461,10 +473,13 @@ export const BulkResponse = z
   .openapi("BulkResponse");
 
 
-/** POST /v1/transactions/:id/near-dup-review — resolve a #134 branch-4
- *  flag. v1 supports only dismiss ("I checked; they are distinct
- *  purchases"): clears flagged_for_review and stamps reviewed_at. A
- *  future "merge" action would attach this txn's documents to the
+/** POST /v1/transactions/:id/near-dup-review — resolve a review flag
+ *  (#134 branch 4, or a mixed tender). v1 supports only dismiss ("I
+ *  checked"): clears flagged_for_review and stamps reviewed_at, and
+ *  changes no posting. For a duplicate flag that means "they are
+ *  distinct purchases"; for a mixed tender, that the split is settled,
+ *  so a split the reviewer wants booked is a postings edit made first.
+ *  A future "merge" action would attach this txn's documents to the
  *  candidate and void — that's the reconcile apply path's job today. */
 export const NearDupReviewRequest = z
   .object({ action: z.literal("dismiss") })

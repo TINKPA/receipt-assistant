@@ -1,7 +1,8 @@
 /**
  * Attach or insert: the duplicate decision for one receipt record, made in
- * code (wave 1, plan §7). Pure: it reads only the record and the
- * candidates `candidates.ts` found under the workspace apply lock.
+ * code (wave 1; docs/server-writer.md, "Attach or insert"). Pure: it reads
+ * only the record and the candidates `candidates.ts` found under the
+ * workspace apply lock.
  *
  * The legacy agent made this call itself (prompt Phase 4a.0) from a Turn
  * A read that gave it payee, date and the five identifiers. Code sees
@@ -39,8 +40,8 @@
  *      Exactly one strong candidate: attach to it. More than one: insert,
  *      `uncertain`, flagged ("several candidates match").
  *
- *      An identifier alone never attaches. The plan let a match outweigh a
- *      conflict and took any total; both lose money. An order number is
+ *      An identifier alone never attaches. Letting a match outweigh a
+ *      conflict, at any total, loses money both ways. An order number is
  *      shared by every partial refund and split shipment of the order, and
  *      a subscription's id by every month of it, so the second refund, the
  *      second charge or next month's invoice would be filed as evidence for
@@ -73,7 +74,7 @@ import {
 } from "../../reconcile/dedup.js";
 import { APPLIER_VERSION } from "./version.js";
 
-/** How a candidate was found (§7 a–c). */
+/** How a candidate was found (docs/server-writer.md, "Candidates"). */
 export type CandidateSource = "amount" | "identifier" | "phash";
 
 /** One live transaction near the record, as `candidates.ts` reads it. */
@@ -117,9 +118,12 @@ export interface CandidateVerdict {
   strong: boolean;
 }
 
-/** `metadata.near_dup_check` as the applier writes it (§6.4). */
+/** `metadata.near_dup_check` as the applier writes it (docs/server-writer.md,
+ *  "What reconcile and the review queue read"). Without a candidate
+ *  (`flagForReview` on a row nothing resembles) the list is empty and
+ *  `candidate_transaction_id` absent. */
 export interface NearDupCheck {
-  candidate_transaction_id: string;
+  candidate_transaction_id?: string;
   candidate_transaction_ids: string[];
   verdict: "distinct" | "uncertain";
   flagged_for_review: boolean;
@@ -152,6 +156,31 @@ export type ApplyDecision =
       /** What goes in `metadata.near_dup_check`, or null. */
       nearDupCheck: NearDupCheck | null;
     });
+
+/**
+ * The duplicate check with a review flag added for a reason that is not
+ * about duplicates (a mixed tender, `project.ts`). `flagged_for_review` is
+ * what the review queue lists (`GET /v1/transactions?flagged=near_dup`)
+ * and what its dismiss clears, so a row a person must look at for any
+ * reason carries it there. A check that already exists keeps its verdict
+ * and candidates (reconcile reads those, and a flag says nothing about
+ * them) and gains the reason in front of its own: a reader that shows
+ * only the start of the reason (the review queue's card cuts it short,
+ * after a sentence of its own about duplicates) still shows this one.
+ * With no check, the flag names no candidate, so reconcile finds no
+ * verdict about any pair in it.
+ */
+export function flagForReview(check: NearDupCheck | null, reason: string): NearDupCheck {
+  if (check) return { ...check, flagged_for_review: true, reason: `${reason}; ${check.reason}` };
+  return {
+    candidate_transaction_ids: [],
+    verdict: "uncertain",
+    flagged_for_review: true,
+    reason,
+    decided_by: "applier",
+    applier_version: APPLIER_VERSION,
+  };
+}
 
 /** Identifier values shorter than this match only under the same key. */
 export const CROSS_KEY_MIN_LENGTH = 6;
@@ -267,10 +296,10 @@ function judge(record: ExtractionV1, rec: DedupSide, c: ApplyCandidate): Candida
 const hasConflict = (v: CandidateVerdict) => v.identifierConflicts.length > 0 && v.identifierMatches.length === 0;
 
 /**
- * §7 for one valid receipt record. Candidates are expected nearest first
- * (`candidates.ts` orders them); the decision does not depend on their
- * order except for which id `near_dup_check.candidate_transaction_id`
- * names first.
+ * The decision for one valid receipt record. Candidates are expected
+ * nearest first (`candidates.ts` orders them); the decision does not
+ * depend on their order except for which id
+ * `near_dup_check.candidate_transaction_id` names first.
  */
 export function decide(record: ExtractionV1, candidates: readonly ApplyCandidate[]): ApplyDecision {
   if (!record.facts || !record.merchant) {

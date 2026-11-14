@@ -1,10 +1,11 @@
 /**
- * The apply transaction's body (wave 1, plan §6.2–§6.3): the prologue, the
- * five branches, the document stamp, the ingest close and the run finish.
+ * The apply transaction's body (wave 1; docs/server-writer.md,
+ * "applyExtraction"): the prologue, the five branches, the document stamp,
+ * the ingest close and the run finish.
  * Everything here runs on ONE caller-owned DB transaction (`index.ts`
  * opens it, retries it and closes a failed one); nothing here commits.
  *
- * PROLOGUE (§6.2), in this order:
+ * PROLOGUE ("Prologue and run fence"), in this order:
  *   lock_timeout 10 s, statement_timeout 60 s;
  *   the workspace apply lock (`takeWorkspaceApplyLock`), so candidates and
  *     the insert see no other apply in between;
@@ -15,11 +16,12 @@
  *   no transaction may already carry `source_ingest_id = <ingest>`;
  *   the document exists in the workspace and is not deleted.
  *
- * The document is read WITHOUT a lock there. The plan's prologue took it
- * `FOR KEY SHARE` before the attach target's `FOR UPDATE`: document before
- * head row, against CLAUDE.md's lock order (postings, transaction rows,
- * then the document), and a cascade delete (which locks head rows and then
- * the document `FOR UPDATE`) could deadlock with it. The lock is taken
+ * The document is read WITHOUT a lock there. Taking it `FOR KEY SHARE`
+ * there, before the attach target's `FOR UPDATE`, would put the document
+ * before the head row, against CLAUDE.md's lock order (postings,
+ * transaction rows, then the document), and a cascade delete (which locks
+ * head rows and then the document `FOR UPDATE`) could deadlock with it
+ * ("Lock order"). The lock is taken
  * where the order puts it instead: by `linkDocumentIn` after the new or
  * target transaction row (it re-checks `deleted_at` under the lock), and
  * by the stamp's UPDATE (`... AND deleted_at IS NULL`, zero rows is
@@ -152,7 +154,7 @@ export interface Prologue {
 
 const one = <T>(rows: unknown[]): T | undefined => rows[0] as T | undefined;
 
-/** §6.2. Throws `ApplyError` for every refusal; see the header. */
+/** The prologue. Throws `ApplyError` for every refusal; see the header. */
 export async function prologue(tx: DbTx, ids: ApplyIds): Promise<Prologue> {
   await tx.execute(sql`SET LOCAL lock_timeout = '10s'`);
   await tx.execute(sql`SET LOCAL statement_timeout = '60s'`);
@@ -211,8 +213,9 @@ export interface StampText {
 }
 
 /**
- * The text `documents.ocr_text` gets (§6.3): the record's receipt-text
- * block, stamped with the model that read it; else the server's decode of
+ * The text `documents.ocr_text` gets (docs/server-writer.md,
+ * "The document stamp"): the record's receipt-text block, stamped with the
+ * model that read it; else the server's decode of
  * an email or HTML source, stamped `server-decode/1`; else nothing (the
  * column keeps what it has).
  */
@@ -413,8 +416,9 @@ async function event(
 }
 
 /**
- * §6.3 j: fire the deferred balance trigger now, then check what it does
- * not: every currency of the transaction sums to zero in `amount_minor`.
+ * Insert step j: fire the deferred balance trigger now, then check what
+ * it does not: every currency of the transaction sums to zero in
+ * `amount_minor`.
  */
 export async function assertNativeBalance(tx: DbTx, transactionId: string): Promise<void> {
   await tx.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
@@ -530,7 +534,7 @@ const candidateReport = (cs: readonly ApplyCandidate[]) =>
   cs.map((c) => ({ id: c.id, matched_on: c.matched_on, date_distance: c.date_distance }));
 
 /**
- * A receipt record (§6.3 receipt_*): project, find candidates, decide,
+ * A receipt record (`receipt_*`): project, find candidates, decide,
  * then attach or insert. The attach target is locked `FOR UPDATE` and the
  * decision re-taken under that lock; a different answer (the target was
  * deleted or changed meanwhile) is a retryable `attach_target_changed`, so
@@ -760,6 +764,7 @@ async function insert(
         mirror_account_id: mirrorPosting ? accountId(mirrorPosting.account) : null,
         expense_or_income: draft.flow === "income" ? "income" : draft.merchant.category,
         ...(points ? { points_account_id: points.id, points_account_created: points.created } : {}),
+        ...(draft.reviewFlag ? { flagged_for_review: draft.reviewFlag } : {}),
       },
       brand: { brand_id: draft.merchantBrand.brandId, created: brand.created, name_kept: brand.nameKept },
       merchant: { id: merchant.id, created: merchant.created },

@@ -17,7 +17,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /**
- * Which rendering of the ingest prompt (wave 1, plan §9.1). One template,
+ * Which rendering of the ingest prompt (wave 1; docs/server-writer.md,
+ * "Two renderings of one prompt"). One template,
  * two renderings, so the reading text both arms share has one source:
  *
  *   agent_sql     the legacy rendering (`PROMPT_VERSION`): the agent writes
@@ -76,7 +77,9 @@ export const PROMPT_VERSION = "3.4";
  * WebSearch. Bump it on any semantic change to the record rendering, and
  * always together with `EXTRACTION_CONTRACT_VERSION` when the record's
  * shape changes. When the legacy writer is retired the two constants
- * collapse into one `PROMPT_VERSION = "4.0"`.
+ * collapse into one `PROMPT_VERSION = "4.0"`. The tender text of November
+ * 2026 (`debit_card`, how to choose a method) went in under "4.0" because
+ * no record had been written outside throwaway and sandbox databases.
  */
 export const RECORD_PROMPT_VERSION = "4.0";
 

@@ -1,10 +1,10 @@
 {
   "_comment": "Rendered size of the extraction prompts with an EMPTY context, in bytes. Regenerate deliberately with `npm run check:prompt-budget -- --update-baseline` in the same commit as the prompt change, so growth arrives as a reviewable diff. ingest_record is the record rendering (wave 1), ratcheted on its own. See scripts/check-prompt-budget.ts and issue #197.",
-  "generatedAt": "2026-11-14T08:09:45.986Z",
+  "generatedAt": "2026-11-14T09:43:25.573Z",
   "totals": {
     "ingest": 168332,
     "reextract": 101028,
-    "ingest_record": 132016
+    "ingest_record": 133853
   },
   "modules": {
     "prompt-contract.ts": 36275,
@@ -16,6 +16,6 @@
     "brand-icon-pipeline.md (on demand)": 10166
   },
   "record_modules": {
-    "contract block (renderContractForPrompt)": 16517
+    "contract block (renderContractForPrompt)": 17242
   }
 }

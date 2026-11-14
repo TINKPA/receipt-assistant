@@ -41,7 +41,11 @@
  *
  * VERSIONING. Any change to this shape bumps
  * `EXTRACTION_CONTRACT_VERSION`, always together with
- * `RECORD_PROMPT_VERSION` (`prompt-contract.ts`).
+ * `RECORD_PROMPT_VERSION` (`prompt-contract.ts`). One exception was
+ * taken: `debit_card` joined `PAYMENT_METHODS` inside version 1 (November
+ * 2026), because no record had been written outside throwaway and sandbox
+ * databases yet, so no stored version-1 record lacks it. Once production
+ * holds records, there are no more exceptions.
  */
 import { z } from "zod";
 import type { IdentifierKey } from "../../reconcile/dedup.js";
@@ -94,6 +98,7 @@ export const PAYEE_SOURCES = ["printed", "google_check_c", "email_sender"] as co
 
 export const PAYMENT_METHODS = [
   "card",
+  "debit_card",
   "cash",
   "check",
   "bank_transfer",
@@ -295,7 +300,7 @@ function bag<V extends z.ZodTypeAny>(value: V, maxKeys: number, maxBytes?: numbe
   });
 }
 
-// ── §3.2 facts ─────────────────────────────────────────────────────────
+// ── facts ──────────────────────────────────────────────────────────────
 
 const Facts = z
   .object({
@@ -362,15 +367,21 @@ const Facts = z
     "The transaction header. Required when classification is receipt_image, receipt_email or receipt_pdf, and only then.",
   );
 
-// ── §3.3 payment, points, income ───────────────────────────────────────
+// ── payment, points, income ────────────────────────────────────────────
 
 const Payment = z
   .object({
     method: z
       .enum(PAYMENT_METHODS)
       .describe(
-        "How the total was paid. cash pays from Cash, check and bank_transfer from Checking, points from the points account, " +
-          "anything else from Credit Card. unknown when the document does not say.",
+        "How total_minor was paid; on a points redemption, how its cash_component was paid (points when there is none). " +
+          "card: a credit card, or a card whose kind the document does not say: a label naming both kinds (CREDIT/DEBIT) or " +
+          "neither (\"bank card\"), and a phone wallet such as Apple Pay. debit_card: only when the document itself says " +
+          "debit: the tender line reads DEBIT on its own or names a debit-only network. gift_card: a gift card, store credit, " +
+          "or a balance held in an app or account, never a card linked through one; total_minor is what it left to pay, 0 " +
+          "when it paid everything. mixed: two or more tenders that together paid total_minor. other: any other tender. " +
+          "unknown when the document does not say. Books to: cash and gift_card → Cash; debit_card, check and bank_transfer " +
+          "→ Checking; points → the points account; anything else → Credit Card, and a mixed tender is flagged for review.",
       ),
     card_last4: z
       .string()
@@ -425,7 +436,7 @@ const Income = z
     "Only when facts.flow is income. When left out, Checking and Other are used and the record carries a warning.",
   );
 
-// ── §3.4 merchant and place ────────────────────────────────────────────
+// ── merchant and place ─────────────────────────────────────────────────
 
 const Merchant = z
   .object({
@@ -495,7 +506,7 @@ const Place = z
   .strict()
   .describe("The merchant's location as you resolved it. The server fetches and stores the place record itself.");
 
-// ── §3.5 items ─────────────────────────────────────────────────────────
+// ── items ──────────────────────────────────────────────────────────────
 
 const optText = (max: number, d: string) => z.string().max(max).nullish().describe(d);
 const optMinor = (d: string) => minor().nullish().describe(d);
@@ -599,7 +610,7 @@ const Item = z
   })
   .strict();
 
-// ── §3.1 the rest of the top level ─────────────────────────────────────
+// ── the rest of the top level ──────────────────────────────────────────
 
 const Identifiers = z
   .object(

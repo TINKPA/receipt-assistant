@@ -1,6 +1,6 @@
 /**
  * check-projection-replay.ts — does the server applier's projection
- * reproduce the ledger? (wave 1, plan §12.3, §12.4.)
+ * reproduce the ledger? (wave 1; docs/server-writer.md, "Checks" and "Gates".)
  *
  * Usage:
  *   npx tsx scripts/check-projection-replay.ts --pg=<url> --from-ledger [--verbose] [--workspace=<uuid>]
@@ -14,7 +14,7 @@
  * the server does not confirm it. It is meant to run against production
  * as `receipts_ro`; until the owner asks for that, run it against a copy.
  *
- * --from-ledger (the pre-A/B gate, §12.4)
+ * --from-ledger (the pre-A/B gate)
  *
  *   For every live transaction an ingest wrote, it synthesises in memory
  *   the extraction record the legacy agent's reading amounts to, from the
@@ -37,12 +37,16 @@
  *     payment.method the payment text in metadata (`payment_method`,
  *                    `tender`, `payment`, …) read by keyword, else a typed
  *                    `card_last4` (card), else the booked mirror account
- *                    (circular, counted). The plan says so: the mirror
- *                    rule is partly circular here.
+ *                    (circular, counted): the paying-account rule is
+ *                    partly circular here, and the report says how often.
  *     income         the booked deposit and income accounts (circular).
  *     points         the programme from the points account's name.
  *
- *   Every row lands in one class. A mismatch class is EXPLAINED only by a
+ *   Every row lands in one class. Before any comparison with the ledger,
+ *   the projection's paying account is checked against the tender table
+ *   as this script writes it out (`INTENDED_MIRROR`, not the applier's
+ *   own `MIRROR_BY_METHOD`); a disagreement is a projector fault and is
+ *   never explained. A mismatch class is EXPLAINED only by a
  *   rule written in `explain()` below, with its reason; the exit code
  *   counts unexplained money mismatches on rows whose
  *   `metadata.extraction.prompt_version` is 3.0 or later (the gate).
@@ -51,12 +55,19 @@
  *       record books nothing (X10);
  *     - several legs in one currency (a split tender): the contract has
  *       one pair per currency;
- *     - the payment text names cash, a check or a bank transfer and the
- *       row was booked to Credit Card: the legacy prompt's default mirror
- *       (hole 9), which §3.3 replaces with the stated method;
- *     - the other way round, a tender §3.3 sends to Credit Card (a debit
- *       card, a gift-card or wallet balance, a mixed tender) that the
- *       legacy agent booked to Cash or Checking: the table is the plan's;
+ *     - the payment text names a tender the tender table
+ *       (docs/server-writer.md, "Tenders") books away from Credit Card
+ *       (cash, a check, a bank transfer, a debit card, a gift card or a
+ *       balance) and the row was booked to Credit Card: the legacy
+ *       prompt's default mirror (hole 9), which the table replaces with
+ *       the stated method;
+ *     - the other way round, a tender the table sends to Credit Card (a
+ *       card of no stated kind, a mixed tender, another tender) that the
+ *       legacy agent booked to Cash or Checking: that is the table's rule.
+ *       A debit card booked to Checking and a gift card or balance booked
+ *       to Cash match since the owner's tender decisions, and a debit card
+ *       or gift card booked anywhere but its own account or Credit Card
+ *       is not explained;
  *     - the expense account differs from the `metadata.merchant.category`
  *       the same agent wrote: the record carries one category, and it
  *       picks the account.
@@ -77,6 +88,13 @@
  *   are counted, not compared. A record whose apply failed (its run
  *   finished `failed` / `apply`, the ingest `error`) is explained: the
  *   failure is the run's to report, and the record waits for a re-apply.
+ *   So is one whose ingest the Message-ID re-check under the apply lock
+ *   closed `dedup` (X9: the run finished `duplicate_skip`, and the
+ *   record's document is linked to a transaction
+ *   `ingests.produced.transaction_ids` names, the one the same email was
+ *   applied to while this run read). That transaction may have been
+ *   soft-deleted since, as the original's record still matches its own;
+ *   a hard delete takes the link, and leaves both records unexplained.
  *   A record whose transaction was re-extracted since (a legacy re-extract
  *   moves the stamp into `metadata.extraction_history`) is explained and
  *   not compared: a later reading wrote the values. Any other receipt
@@ -96,10 +114,11 @@ import {
   SLUG_RE,
   isReceiptClassification,
   type ExtractionV1,
+  type PaymentMethod,
 } from "../src/ingest/contract/v1.js";
 import { isPointsCurrency } from "../src/points/codes.js";
 import { readAccountCatalog, type AccountCatalog } from "../src/ingest/apply/accounts.js";
-import { MIRROR_BY_METHOD, ProjectionError, project, type ApplyDraft } from "../src/ingest/apply/project.js";
+import { ProjectionError, project, type ApplyDraft } from "../src/ingest/apply/project.js";
 import {
   diffFingerprints,
   fingerprintFromDraft,
@@ -173,23 +192,34 @@ function texts(v: unknown, out: string[] = []): string[] {
 
 const PAYMENT_TEXT_KEYS = ["payment_method", "tender", "payment", "tender_type", "payment_type", "card_type", "refund_method", "payout_method"];
 
+/** Gift cards, store credit and balances held in an app or account: the
+ *  contract's `gift_card`. A store-branded CARD ("… store card ending
+ *  1234") is a credit card, so "store card" is not here. */
+const GIFT_TEXT = /gift[ _-]?card|shop[ _-]?card|stored[ _-]?value|store[ _-]?credit|购物卡|储值|\b(?:account|app|wallet|venmo|paypal|cash app) balance\b/;
+/** A bank card's own words: debit, or a debit-only network. */
+const DEBIT_TEXT = /debit|interac|maestro|interlink|eftpos|girocard|\bcheck ?card\b/;
+const BANK_CARD_TEXT = /visa|master ?card|amex|american express|discover|credit|apple (pay|card)|google pay|contactless|\bchip\b|\bcard\b/;
+
 /** The payment method a row's own payment text names, by keyword: one
  *  tender kind gives that method, two or more give `mixed`, none gives
- *  null. */
+ *  null. A bank card is `debit_card` when the text says debit or names a
+ *  debit-only network, else `card`, as the contract defines them;
+ *  "credit/debit" says neither, so it is `card`. */
 export function methodFromText(md: Record<string, any>): ExtractionV1["payment"]["method"] | null {
-  const t = PAYMENT_TEXT_KEYS.flatMap((k) => texts(md[k])).join(" ").toLowerCase();
-  if (t.trim() === "") return null;
+  const raw = PAYMENT_TEXT_KEYS.flatMap((k) => texts(md[k])).join(" ").toLowerCase();
+  if (raw.trim() === "") return null;
+  // "credit/debit", "credit_debit", "debit or credit": either one, so a card of no stated kind.
+  const t = raw.replace(/credit\s*(?:\/|_|-|or)\s*debit|debit\s*(?:\/|_|-|or)\s*credit/g, "card");
   const kinds = new Set<ExtractionV1["payment"]["method"]>();
   if (/\bpoints?\b|\bmiles\b|award/.test(t)) kinds.add("points");
   if (/\bcash\b(?!\s*(back|app))|现金|現金/.test(t)) kinds.add("cash");
-  if (/\bcheck\b|\bcheque\b/.test(t)) kinds.add("check");
+  if (/\bcheck\b(?!\s*card)|\bcheque\b/.test(t)) kinds.add("check");
   if (/\bach\b|bank transfer|direct deposit|\bwire\b|\beft\b|zelle/.test(t)) kinds.add("bank_transfer");
-  if (/gift[ _-]?card|store[ _-]?card|shop[ _-]?card|stored[ _-]?value|购物卡/.test(t)) kinds.add("gift_card");
-  if (/visa|master ?card|amex|american express|discover|credit|debit|apple (pay|card)|google pay|contactless|\bchip\b|\bcard\b/.test(t)) {
-    // "gift card" and "store card" alone are not a bank card.
-    if (/visa|master ?card|amex|american express|discover|credit|debit|apple (pay|card)|google pay|contactless|\bchip\b/.test(t) ||
-        t.replace(/(gift|store|shop)[ _-]?card/g, "").match(/\bcard\b/)) kinds.add("card");
-  }
+  if (GIFT_TEXT.test(t)) kinds.add("gift_card");
+  // A bank card, once the gift-card and store-credit wording is taken out.
+  const rest = t.replace(/(gift|shop)[ _-]?card|store[ _-]?credit/g, "");
+  if (DEBIT_TEXT.test(rest)) kinds.add("debit_card");
+  else if (BANK_CARD_TEXT.test(rest)) kinds.add("card");
   if (kinds.size === 0 && /paypal|alipay|wechat|支付宝|微信|venmo|cash app|klarna|affirm/.test(t)) kinds.add("other");
   if (kinds.size === 0) return null;
   return kinds.size > 1 ? "mixed" : [...kinds][0]!;
@@ -358,6 +388,9 @@ function sameMultiset(a: string[], b: string[]): boolean {
 
 export interface MoneyDiff {
   kinds: string[];
+  /** Per currency whose paying (or receiving) account differs: the
+   *  projected and the booked account's names. */
+  mirrors: { currency: string; projected: string; booked: string }[];
 }
 
 /** What differs between the projected and the booked postings, as kinds:
@@ -365,6 +398,7 @@ export interface MoneyDiff {
  *  `currency`. */
 export function moneyDiff(draft: ApplyDraft, row: LedgerRow): MoneyDiff {
   const kinds = new Set<string>();
+  const mirrors: MoneyDiff["mirrors"] = [];
   const projected = draft.postings;
   const booked = row.postings;
   if (projected.length !== booked.length) kinds.add("leg_count");
@@ -377,12 +411,15 @@ export function moneyDiff(draft: ApplyDraft, row: LedgerRow): MoneyDiff {
     if (pe && be && pe.account.name !== be.account_name) kinds.add("expense_account");
     const pm = projected.find((p) => p.currency === cur && !(p.role === "expense" || p.role === "cash_expense" || p.role === "income"));
     const bm = booked.find((p) => p.currency === cur && !PL.has(p.account_type));
-    if (pm && bm && `${pm.account.type}:${pm.account.name}` !== `${bm.account_type}:${bm.account_name}`) kinds.add("mirror_account");
+    if (pm && bm && `${pm.account.type}:${pm.account.name}` !== `${bm.account_type}:${bm.account_name}`) {
+      kinds.add("mirror_account");
+      mirrors.push({ currency: cur, projected: pm.account.name, booked: bm.account_name });
+    }
     const pa = projected.filter((p) => p.currency === cur).map((p) => p.amountMinor).sort((x, y) => x - y);
     const ba = booked.filter((p) => p.currency === cur).map((p) => p.amount_minor).sort((x, y) => x - y);
     if (pa.join(",") !== ba.join(",")) kinds.add("amount_or_sign");
   }
-  return { kinds: [...kinds].sort() };
+  return { kinds: [...kinds].sort(), mirrors };
 }
 
 export function promptAtLeast3(md: Record<string, any>): boolean {
@@ -393,6 +430,52 @@ export function promptAtLeast3(md: Record<string, any>): boolean {
 }
 
 /**
+ * The tender table (docs/server-writer.md, "Tenders"), written out here
+ * instead of read from `MIRROR_BY_METHOD`: the rules below compare the
+ * projector with the accounts the table intends, so a wrong entry in
+ * `project.ts` is a fault this check reports, not an explanation it reads
+ * back from itself. `scripts/check-apply-decide.ts` pins the same table
+ * for every build.
+ */
+export const INTENDED_MIRROR: Readonly<Record<PaymentMethod, "Cash" | "Checking" | "Credit Card" | "points">> = {
+  cash: "Cash",
+  gift_card: "Cash",
+  debit_card: "Checking",
+  check: "Checking",
+  bank_transfer: "Checking",
+  points: "points",
+  card: "Credit Card",
+  mixed: "Credit Card",
+  other: "Credit Card",
+  unknown: "Credit Card",
+};
+
+/** The account a method pays a cash-currency pair from: `points` names
+ *  no programme there, so it is Credit Card (`account_overridden`, or the
+ *  cash part of points plus cash). */
+export function intendedCashMirror(method: PaymentMethod): "Cash" | "Checking" | "Credit Card" {
+  const a = INTENDED_MIRROR[method];
+  return a === "points" ? "Credit Card" : a;
+}
+
+/**
+ * Where the projection pays a cash-currency pair from an account the
+ * tender table does not intend for the record's method: a projector
+ * fault, whatever the ledger row says, so it is never explained. Income
+ * is deposited where its `income` block says, and a points-currency pair
+ * always pays from the points account; neither reads the method.
+ */
+export function projectorFault(draft: ApplyDraft, method: PaymentMethod): string | null {
+  if (draft.flow === "income") return null;
+  for (const p of draft.postings) {
+    if ((p.role !== "mirror" && p.role !== "cash_mirror") || isPointsCurrency(p.currency)) continue;
+    const want = intendedCashMirror(method);
+    if (p.account.name !== want) return `${method} paid from ${p.account.name}; the tender table says ${want}`;
+  }
+  return null;
+}
+
+/**
  * The explanation rules. Each returns a reason, or null. A class with no
  * rule is unexplained, which is what the gate counts.
  */
@@ -400,30 +483,41 @@ export function explain(row: LedgerRow, syn: Synthesis, diff: MoneyDiff): string
   const kinds = new Set(diff.kinds);
   if (kinds.size === 0) return null;
   const booked = row.postings;
-  const mainMirror = booked.find((p) => !PL.has(p.account_type));
   // The contract has one pair per currency; a split tender cannot be expressed.
   if (kinds.has("leg_count") && booked.length > 2 && new Set(booked.map((p) => p.currency)).size === 1) {
     return "legacy shape: several legs in one currency (a split tender), which the contract does not express";
   }
-  // §3.3 derives the mirror from the method the record states. The legacy
-  // prompt said "Mirror side is Credit Card (default)", so an agent that read
-  // a cash, check or bank tender and still booked the card is the rule
-  // change of hole 9, not a projector fault.
-  const projectedMirror = MIRROR_BY_METHOD[syn.raw.payment?.method as keyof typeof MIRROR_BY_METHOD];
-  if (kinds.size === 1 && kinds.has("mirror_account") && syn.sources.method === "text") {
-    if (mainMirror?.account_name === "Credit Card") {
-      return "hole 9: the payment text names a cash, check or bank tender; the legacy prompt's default mirror was Credit Card";
+  // The tender table derives the mirror from the method the record
+  // states. The legacy prompt said "Mirror side is Credit Card (default)",
+  // so an agent that read a tender the table books elsewhere (cash, a
+  // check or bank transfer, and since the owner's tender decisions a debit
+  // card, a gift card or a balance) and still booked the card is the rule
+  // change of hole 9, not a projector fault. Each method is its own
+  // class, so the printout shows which. Only cash-currency pairs, and
+  // only where the projection paid from the account the table intends.
+  const method = syn.raw.payment?.method as PaymentMethod;
+  const intended = intendedCashMirror(method);
+  const tenderOnly =
+    kinds.size === 1 &&
+    kinds.has("mirror_account") &&
+    syn.sources.method === "text" &&
+    syn.raw.facts?.flow !== "income" &&
+    diff.mirrors.length > 0 &&
+    diff.mirrors.every((m) => !isPointsCurrency(m.currency) && m.projected === intended);
+  if (tenderOnly) {
+    if (intended !== "Credit Card" && diff.mirrors.every((m) => m.booked === "Credit Card")) {
+      return `hole 9: the payment text names a ${method} tender, which the applier books to ${intended}; the legacy prompt's default mirror was Credit Card`;
     }
-    // The other way round: the legacy agent left its default for a tender
-    // §3.3 sends to Credit Card (a debit card, a gift-card or wallet
-    // balance). The table is the plan's; these rows are where it and the
-    // legacy agent's own choice part.
-    if (projectedMirror === "Credit Card") {
-      return `§3.3 sends this tender (${syn.raw.payment.method}) to Credit Card; the legacy agent chose ${mainMirror?.account_name}`;
+    // The other way round: the legacy agent booked a tender the table
+    // sends to Credit Card (a card of no stated kind, a mixed tender,
+    // another tender) to Cash or Checking. A debit card booked to Checking and a
+    // gift card or balance booked to Cash are no longer here: they match.
+    if (intended === "Credit Card") {
+      return `the applier sends this tender (${method}) to Credit Card; the legacy agent chose ${[...new Set(diff.mirrors.map((m) => m.booked))].join(", ")}`;
     }
   }
   if (kinds.size === 1 && kinds.has("expense_account") && syn.sources.category === "metadata") {
-    return "the legacy agent booked an expense account other than the merchant.category it wrote; the record carries one category and it picks the account (§6.3 d)";
+    return "the legacy agent booked an expense account other than the merchant.category it wrote; the record carries one category and it picks the account";
   }
   return null;
 }
@@ -594,7 +688,8 @@ async function fromLedger(pool: pg.Pool, db: Db, opts: { workspace?: string; ver
     if (!catalogs.has(row.workspace_id)) catalogs.set(row.workspace_id, await readAccountCatalog(db, row.workspace_id));
     if (row.metadata?.classification === "statement_pdf") {
       // X10: the legacy agent booked one transaction per statement row; a
-      // statement record books nothing (plan §6.3, owner question 2).
+      // statement record books nothing (docs/server-writer.md,
+      // "Records that book nothing").
       tally.add("statement row", row.id, gated, "X10: statements are recorded, not booked");
       continue;
     }
@@ -610,9 +705,10 @@ async function fromLedger(pool: pg.Pool, db: Db, opts: { workspace?: string; ver
     let refusedFor = "";
     if (!v.record && v.rules.every((r) => r.startsWith("future_date@"))) {
       // The contract refuses a date more than 2 days after the upload
-      // (§4.2), so arm B would ask for a re-read instead of booking it. The
-      // money is still checked, judged as of the transaction's own date.
-      refusedFor = "dated after its upload (future_date, §4.2); ";
+      // (`future_date`), so arm B would ask for a re-read instead of
+      // booking it. The money is still checked, judged as of the
+      // transaction's own date.
+      refusedFor = "dated after its upload (future_date); ";
       v = validateSynthesis(syn.raw, new Date(`${row.occurred_on}T00:00:00Z`));
     }
     if (!v.record) {
@@ -625,6 +721,14 @@ async function fromLedger(pool: pg.Pool, db: Db, opts: { workspace?: string; ver
       draft = project(v.record, catalogs.get(row.workspace_id)!);
     } catch (e) {
       tally.add(`projection error: ${e instanceof ProjectionError ? e.code : String(e)}`, row.id, gated, null);
+      continue;
+    }
+    // Before any comparison with the ledger: a projection that pays from
+    // an account the tender table does not intend is the applier's fault,
+    // even on a row the legacy agent happened to book the same way.
+    const fault = projectorFault(draft, v.record.payment.method);
+    if (fault) {
+      tally.add(`projector disagrees with the tender table: ${fault}`, row.id, gated, null);
       continue;
     }
     const projected = draft.postings.map((p) => postingKey(`${p.account.type}:${p.account.name}`, p.amountMinor, p.currency));
@@ -735,7 +839,15 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
               ORDER BY t.created_at LIMIT 1) AS re_extracted_transaction_id,
             (SELECT r.outcome::text || '/' || COALESCE(r.error_class, '') FROM agent_runs r
               WHERE r.extraction_id = e.id
-              ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run
+              ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run,
+            -- How many of the transactions the ingest says it produced this
+            -- record's document is linked to. Live or not: a person may
+            -- delete the purchase later, and its link stays.
+            (SELECT count(*)::int FROM document_links dl
+              WHERE dl.document_id = e.document_id
+                AND dl.transaction_id::text IN (SELECT jsonb_array_elements_text(
+                      CASE WHEN jsonb_typeof(i.produced->'transaction_ids') = 'array'
+                           THEN i.produced->'transaction_ids' ELSE '[]'::jsonb END))) AS produced_linked
        FROM document_extractions e
        JOIN documents d ON d.id = e.document_id
        LEFT JOIN ingests i ON i.id = e.ingest_id
@@ -764,12 +876,20 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
     }
     if (!r.transaction_id) {
       const applyFailed = r.ingest_status === "error" && r.last_run === "failed/apply";
+      // X9 under the apply lock: a copy of the same email was applied while
+      // this run read, so the document was linked to that transaction and
+      // the ingest closed dedup. The record is valid and booked nothing.
+      const messageIdCopy = r.ingest_status === "dedup" && r.last_run === "duplicate_skip/";
       const why =
         r.ingest_status === "near_dup"
           ? "attached to an existing transaction"
           : applyFailed
             ? "the apply failed"
-            : `not applied (ingest ${r.ingest_status ?? "gone"})`;
+            : messageIdCopy
+              ? r.produced_linked > 0
+                ? "a Message-ID copy, linked (ingest dedup)"
+                : "a Message-ID copy not linked to a transaction its ingest names (ingest dedup)"
+              : `not applied (ingest ${r.ingest_status ?? "gone"})`;
       tally.add(
         `no transaction names the record: ${why}`,
         r.id,
@@ -778,7 +898,9 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
           ? "an attach books nothing"
           : applyFailed
             ? "the run records the failure (agent_runs.error); the record waits, valid, for a re-apply"
-            : null,
+            : messageIdCopy && r.produced_linked > 0
+              ? "X9: the same email was applied while this run read; the document is linked to the transaction its ingest names"
+              : null,
       );
       continue;
     }

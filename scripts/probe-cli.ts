@@ -5,7 +5,8 @@
  *
  * Wave 1 has the extraction agent hand back a record instead of writing
  * SQL. When the record is invalid, the server sends the errors back to the
- * same session once, as `claude -p --resume <session id>` (plan §5). That is
+ * same session once, as `claude -p --resume <session id>` (docs/server-writer.md,
+ * "The repair round"). That is
  * only safe and cheap if the CLI behaves a certain way, so this script asks
  * it, with the extraction profile's own flags from `buildClaudeArgs`:
  *
@@ -21,8 +22,8 @@
  *              with `--fork-session`; and which tool list wins when the
  *              resuming spawn passes a different `--tools`.
  *   2. json    `--output-format json` changes only the envelope: the same
- *              final text, the same prompt size. Information only; the plan
- *              keeps `text`.
+ *              final text, the same prompt size. Information only; the record
+ *              run keeps `text`.
  *   3. stream  `--input-format stream-json` takes a second user message on
  *              the same stdin and process. Information only.
  *
@@ -93,7 +94,8 @@ const model = docker(["exec", container, "printenv", "CLAUDE_MODEL"]).stdout.tri
 if (!model) die(`CLAUDE_MODEL is not set in '${container}'. The compose files pin it; rebuild the sandbox from this tree.`);
 const imageId = docker(["inspect", "--format", "{{.Image}}", container]).stdout.trim();
 const profileTools: string[] = [...AGENT_PROFILES[profile].tools];
-const RECORD_TOOLS = ["Bash", "Read", "Write"]; // the arm-B profile (plan §0)
+// The arm-B profile (docs/server-writer.md, "The two writers").
+const RECORD_TOOLS = ["Bash", "Read", "Write"];
 
 // ── Running claude in the container ────────────────────────────────────
 

@@ -1,6 +1,6 @@
 /**
- * The workspace's chart of accounts as the applier sees it (wave 1,
- * plan §6.3 c–d).
+ * The workspace's chart of accounts as the applier sees it (wave 1;
+ * docs/server-writer.md, "Accounts and postings").
  *
  * `project()` is a pure function, so the accounts it books to are handed
  * to it as data: every account row of the workspace, read once inside the

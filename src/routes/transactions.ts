@@ -731,6 +731,11 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/transactions/{id}/near-dup-review",
     summary: "Resolve a near-duplicate review flag (#134 branch 4); v1 action: dismiss",
+    description:
+      "Clears metadata.near_dup_check.flagged_for_review and stamps reviewed_at: a person has looked. It " +
+      "changes no posting. On a duplicate flag, dismiss means the two are distinct purchases. On a " +
+      "mixed-tender flag (the reason starts with \"mixed tender\"), what the tenders paid stays on Credit Card: " +
+      "book the split with the postings endpoints first if it matters, then dismiss.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),

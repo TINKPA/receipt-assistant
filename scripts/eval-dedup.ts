@@ -98,7 +98,8 @@
  *   g4   a record whose only match is SOFT-DELETED  → inserted as a new live transaction, never
  *                                                     attached to the deleted row
  *
- * Server applier dedup (record stubs, both writers; plan §7, §12.2):
+ * Server applier dedup (record stubs, both writers; docs/server-writer.md,
+ * "Attach or insert" and "Checks"):
  *   a1   identifier attach                          → near_dup onto the first row, document linked,
  *                                                     merge_audit + document_linked event, the second
  *                                                     reading stored too

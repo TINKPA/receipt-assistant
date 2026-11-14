@@ -1,6 +1,6 @@
 /**
- * Finding the extraction record in what the agent handed back (wave 1,
- * plan §5).
+ * Finding the extraction record in what the agent handed back (wave 1;
+ * docs/server-writer.md, "The hand-back").
  *
  * The record prompt (4.0) asks the agent to end its final message with an
  * optional ```receipt-text block and exactly one ```json block whose

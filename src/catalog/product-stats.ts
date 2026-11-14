@@ -21,8 +21,9 @@
  * live (soft-deleted, draft, error) count. The products route and the
  * agent's SQL count them (`liveOnly: false`): nothing retires a deleted
  * transaction's items, and the three writers have to agree while the
- * agent still writes. The server applier passes `true` (wave 1 plan,
- * X12). It is a required argument so every caller says which it means.
+ * agent still writes. The server applier passes `true` (X12 in
+ * docs/server-writer.md, "Expected differences from the legacy writer").
+ * It is a required argument so every caller says which it means.
  *
  * Unlike the agent's SQL, a product with no counted line left is reset to
  * zero and NULL dates instead of keeping its old numbers.
