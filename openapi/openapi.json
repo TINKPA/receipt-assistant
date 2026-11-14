@@ -3625,6 +3625,15 @@
               "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
             },
             "default": []
+          },
+          "extraction_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "The extraction records (`document_extractions`) the server writer stored for this ingest. Absent on an ingest the extraction agent closed itself."
           }
         }
       },
@@ -6373,7 +6382,7 @@
       },
       "patch": {
         "summary": "Patch transaction head fields",
-        "description": "JSON Merge Patch (RFC 7396). A field the body does not name is left alone.\n\n**`metadata` merges, it does not replace.** Objects merge recursively, a `null` value removes that key, any other value replaces it, and `metadata: {}` changes nothing. Send only the keys you mean to change.\n\n**Server-owned metadata keys cannot be changed here.** These are provenance and bookkeeping the server maintains: `user_edited`, `extraction`, `extraction_history`, `re_extracted_at`, `source`, `source_ingest_id`, `classification`, `ocr_audit`, `allocation_audit`, `enrichment_skipped`, `photo_ocr`, `receipt_ocr_zh`, `items`, `merge_audit`, `near_dup_check`, `fx`, `points`. A patch that would change or remove one is refused with 422 (violation code `server_owned`); echoing a key back with its current value is a no-op and is accepted, so a client may GET the object, change its own keys and PATCH the whole object back.\n\nPatching `payee`, `occurred_on` or `occurred_at` sets `metadata.user_edited.<field>`, which keeps re-extract from overwriting the value.\n\nA patch that changes nothing returns 200 without bumping `version`.",
+        "description": "JSON Merge Patch (RFC 7396). A field the body does not name is left alone.\n\n**`metadata` merges, it does not replace.** Objects merge recursively, a `null` value removes that key, any other value replaces it, and `metadata: {}` changes nothing. Send only the keys you mean to change.\n\n**Server-owned metadata keys cannot be changed here.** These are provenance and bookkeeping the server maintains: `user_edited`, `extraction`, `extraction_history`, `re_extracted_at`, `source`, `source_ingest_id`, `classification`, `ocr_audit`, `allocation_audit`, `enrichment_skipped`, `photo_ocr`, `receipt_ocr_zh`, `items`, `merge_audit`, `near_dup_check`, `fx`, `points`, `mirror_account`, `printed_totals`. A patch that would change or remove one is refused with 422 (violation code `server_owned`); echoing a key back with its current value is a no-op and is accepted, so a client may GET the object, change its own keys and PATCH the whole object back.\n\nPatching `payee`, `occurred_on` or `occurred_at` sets `metadata.user_edited.<field>`, which keeps re-extract from overwriting the value.\n\nA patch that changes nothing returns 200 without bumping `version`.",
         "tags": [
           "transactions"
         ],

@@ -95,7 +95,8 @@ export interface SessionSummary {
 
 /**
  * How a transcript's first user message starts, per kind. These are the
- * opening words of `buildExtractorPrompt` (src/ingest/prompt.ts) and
+ * opening words of `buildExtractorPrompt` (src/ingest/prompt.ts; both its
+ * legacy and its record rendering start this way) and
  * `buildReExtractPrompt` (src/ingest/reextract-prompt.ts); a prompt that
  * changes its first sentence must be added here, or its sessions count as
  * `other`. Only the measuring script filters on kind; the server knows

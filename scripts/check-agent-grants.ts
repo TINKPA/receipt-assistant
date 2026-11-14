@@ -28,6 +28,15 @@
  *   4. Every table and column AGENT_GRANTS names exists in `src/schema`.
  *   5. Every table and column in the Ask prompt's schema digest exists in
  *      `src/schema`, and every view it names is created by a migration.
+ *   6. The record rendering of the ingest prompt (wave 1, `writer:
+ *      'server_apply'`), whose agent has no database at all, contains no SQL
+ *      and nothing that reaches for a database or a tool it was not given:
+ *      no statement the reader above can find, no uppercase INSERT, UPDATE,
+ *      DELETE, CREATE, ALTER or DROP, and no `psql`, `DATABASE_URL`,
+ *      `WebSearch`, logo.dev key or Google place-record endpoint. Rendered
+ *      with decoded email text and an attachment so every branch of it is
+ *      read. It is not part of the grant tables: nothing it says may need
+ *      a grant.
  *
  * It is a reader of prose, not a SQL parser. It errs toward seeing a
  * statement where there is only a mention; if it ever trips on a sentence,
@@ -124,6 +133,7 @@ interface Usage {
 }
 const used = new Map<string, Usage>();
 const violations: string[] = [];
+let recordPromptClean = false;
 
 function usage(table: string): Usage {
   let u = used.get(table);
@@ -260,6 +270,7 @@ function scanBothWays(source: string, text: string): void {
 }
 
 const ctx = {
+  writer: "agent_sql" as const,
   filePath: "/data/uploads/x.pdf",
   ingestId: "00000000-0000-7000-8000-0000000000a1",
   workspaceId: "00000000-0000-7000-8000-0000000000a2",
@@ -370,6 +381,55 @@ for (const entry of ASK_SCHEMA_DIGEST) {
   }
 }
 
+// ── 6. the record rendering has no SQL ─────────────────────────────────
+//
+// Its agent runs with no DATABASE_URL (the `extraction_record` profile), so
+// a statement or a psql call in its prompt is not a grant problem but a
+// prompt that contradicts its own profile: an instruction the agent cannot
+// carry out, and the first thing a turned agent would go looking around for.
+
+{
+  const recordPrompt = buildExtractorPrompt({
+    ...ctx,
+    writer: "server_apply",
+    filePath: "/data/uploads/x.eml",
+    phashNeighbors: [],
+    sourceText: "From: Example <orders@example.com>\nSubject: Receipt\n\nWidget 1 $1.00\nTotal $1.00",
+    attachments: [{ path: "/tmp/x/attachment-1.pdf", filename: "invoice.pdf", bytes: 1 }],
+  });
+  const before = violations.length;
+  const saved = new Map(used);
+  used.clear();
+  scanBothWays("record prompt", recordPrompt);
+  for (const [table, u] of used) {
+    if (u.insert || u.update.size > 0) {
+      violations.push(`record prompt: writes ${table} — the record rendering's agent has no database`);
+    }
+  }
+  used.clear();
+  for (const [k, v] of saved) used.set(k, v);
+  // A FROM or JOIN naming a table is a read the agent cannot run either,
+  // but prose ("from the receipt") reads the same; the forbidden words
+  // below catch any real statement first.
+  const forbidden: Array<[RegExp, string]> = [
+    [/\b(?:INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/, "an uppercase SQL write or DDL keyword"],
+    [/\bpsql\b/i, "psql"],
+    [/DATABASE_URL/, "DATABASE_URL"],
+    [/\bWebSearch\b/i, "WebSearch"],
+    [/LOGODEV/i, "the logo.dev key"],
+    [/places\.googleapis\.com/i, "the Google place-record endpoint (the server fetches places)"],
+  ];
+  for (const [re, what] of forbidden) {
+    const m = re.exec(recordPrompt);
+    if (m) {
+      const line = recordPrompt.slice(0, m.index).split("\n").length;
+      const text = recordPrompt.split("\n")[line - 1]!.trim().slice(0, 100);
+      violations.push(`record prompt, line ${line}: ${what} ("${text}")`);
+    }
+  }
+  if (violations.length === before) recordPromptClean = true;
+}
+
 // ── Report ─────────────────────────────────────────────────────────────
 
 if (process.argv.includes("--list")) {
@@ -395,5 +455,6 @@ if (violations.length > 0) {
 }
 console.log(
   `check-agent-grants: OK — ${used.size} tables used by the templates, all covered by AGENT_GRANTS; ` +
-    `the Ask digest's ${ASK_SCHEMA_DIGEST.length} relations and their columns exist.`,
+    `the Ask digest's ${ASK_SCHEMA_DIGEST.length} relations and their columns exist; ` +
+    `the record prompt has no SQL${recordPromptClean ? "" : " (NOT CHECKED)"}.`,
 );

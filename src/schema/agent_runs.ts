@@ -10,6 +10,7 @@ import {
   index,
   uniqueIndex,
   check,
+  foreignKey,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -23,6 +24,7 @@ import { ingests } from "./ingests.js";
 import { documents } from "./documents.js";
 import { transactions } from "./transactions.js";
 import { derivationEvents } from "./derivation_events.js";
+import { documentExtractions } from "./document_extractions.js";
 
 /**
  * One row per `claude -p` run the server starts for a document: every
@@ -54,8 +56,9 @@ import { derivationEvents } from "./derivation_events.js";
  *
  * Several columns are created now so the later phases of wave 1 only
  * add constraints: the lease and heartbeat (durable queue), the
- * `extraction_id` (its foreign key comes with `document_extractions`),
- * `repair_rounds`, `apply_report`. They stay NULL / 0 until then.
+ * `extraction_id` (its foreign key came with `document_extractions` in
+ * 0043), `repair_rounds`, `apply_report`. They stay NULL / 0 until the
+ * phase that writes them.
  *
  * `error_class` vocabulary (text, not an enum, so a class can be added
  * without a migration):
@@ -65,10 +68,14 @@ import { derivationEvents } from "./derivation_events.js";
  *   guard            a worker guard (#125 / #134) refused what the agent
  *                    reported
  *   no_closeout      the agent exited 0 without closing the ingest
- *   apply            the server's own step after the agent failed
+ *   apply            the server's own step after the agent failed, or
+ *                    (server writer) the apply transaction failed
  *   config           the run could not be set up (missing workspace, …)
- *   shutdown | stall | artefact_missing | artefact_invalid | fenced_out
- *                    reserved for the later phases
+ *   artefact_missing the server writer's agent handed back no record
+ *   artefact_invalid its record was still invalid after the repair rounds
+ *   fenced_out       the run no longer owned its ingest when it went to
+ *                    store or apply its record
+ *   shutdown | stall reserved for the durable queue
  *   An abandoned run carries `crash`: nothing marked a clean shutdown.
  */
 export const agentRuns = pgTable(
@@ -94,8 +101,9 @@ export const agentRuns = pgTable(
     attempt: integer("attempt").notNull().default(1),
     /** upload | retry | api | auto_retry | recovery | apply_only */
     trigger: text("trigger").notNull(),
-    /** Which code path wrote the ledger: the agent's own SQL, the server
-     *  applier (wave 1, P2 onward), or the sandbox stub extractor. */
+    /** Which code path wrote the ledger: the agent's own SQL (`agent_sql`),
+     *  the server applier (`server_apply`, wave 1; also a sandbox record
+     *  stub's runs), or a legacy sandbox stub that wrote it itself (`stub`). */
     writer: text("writer").notNull(),
     /** Minted by the server before the spawn; NULL only when nothing was
      *  spawned. Names the transcript (`getSessionJsonlPath`). */
@@ -134,7 +142,8 @@ export const agentRuns = pgTable(
     produced: jsonb("produced"),
     agentReport: jsonb("agent_report"),
     applyReport: jsonb("apply_report"),
-    /** Foreign key added with `document_extractions` (wave 1, P2). */
+    /** The extraction record this run handed back (`document_extractions`,
+     *  wave 1, P2), set in the transaction that stores it. */
     extractionId: uuid("extraction_id"),
     before: jsonb("before"),
     result: jsonb("result"),
@@ -157,5 +166,12 @@ export const agentRuns = pgTable(
       "agent_runs_writer_check",
       sql`${t.writer} IN ('agent_sql','server_apply','stub')`,
     ),
+    // Declared here rather than with `.references()` so the constraint
+    // keeps the name migration 0043 gives it.
+    foreignKey({
+      name: "agent_runs_extraction_fk",
+      columns: [t.extractionId],
+      foreignColumns: [documentExtractions.id],
+    }).onDelete("set null"),
   ],
 );

@@ -76,6 +76,24 @@
  *                           through `POST /v1/transactions` (their postings
  *                           may be in different currencies, balanced in
  *                           base), and postings edited by hand.
+ *   apply-row-has-record    a transaction the server applier wrote
+ *                           (`metadata.extraction.writer = 'server_apply'`)
+ *                           still has the evidence it was derived from:
+ *                           the record its `metadata.extraction.
+ *                           extraction_id` names is valid and current, or
+ *                           a document linked to it has a current valid
+ *                           record (a later reading superseded the first).
+ *                           A soft-deleted row with no linked document is
+ *                           left out (a dedup apply moved its document to
+ *                           the survivor, and a purge of that document took
+ *                           the record). The one way an owner action still
+ *                           reaches it: purging (`?hard=true`) the document
+ *                           a record belongs to while another document,
+ *                           with no record of its own, keeps the
+ *                           transaction live; its events show the purge
+ *                           (`document_unlinked`). Skipped on a database
+ *                           without `document_extractions` (before
+ *                           migration 0043).
  *   run-without-terminal-ingest
  *                           an ingest run that has ended (`finished`, or
  *                           `abandoned` at boot) belongs to an ingest that
@@ -121,12 +139,17 @@
  *     retires them, and the item and product reads do not look at the
  *     parent's `deleted_at`.
  *
- * The two newest checks are expected to be clean and fail by default:
+ * The three newest checks are expected to be clean and fail by default:
  * postings-native-balance held for every transaction in production when
  * it was added (2026-11-13; none was multi-currency, a draft or an
  * `error` row, so its scope only keeps out the states a person can
- * create), and run-without-terminal-ingest describes a state no code
- * path produces.
+ * create), and run-without-terminal-ingest and apply-row-has-record
+ * describe states no code path produces on its own. The applier stores a
+ * record before it writes a row from it, and records are only removed
+ * with their document; the one way to reach the second is a person
+ * purging (`?cascade=true&hard=true`) the document a record belonged to
+ * while another document, one with no record of its own, keeps the
+ * transaction.
  */
 import pg from "pg";
 
@@ -390,6 +413,32 @@ const CHECKS: Check[] = [
                           WHERE e.transaction_id = t.id
                             AND e.event_type IN ('posting_added', 'posting_updated', 'posting_removed'))
        GROUP BY t.id, t.created_at
+       ORDER BY t.created_at`,
+  },
+  {
+    name: "apply-row-has-record",
+    what: "transactions the server applier wrote with no current valid extraction record behind them",
+    requires: ["document_extractions"],
+    sql: `
+      SELECT t.id::text AS id,
+             CASE WHEN e.id IS NULL THEN 'record ' || COALESCE(t.metadata->'extraction'->>'extraction_id', '(none named)') || ' missing'
+                  WHEN e.status <> 'valid' THEN 'record ' || e.id || ' is ' || e.status
+                  ELSE 'record ' || e.id || ' superseded, and no linked document has a current valid record'
+             END AS detail
+        FROM transactions t
+        LEFT JOIN document_extractions e ON e.id::text = t.metadata->'extraction'->>'extraction_id'
+       WHERE t.metadata->'extraction'->>'writer' = 'server_apply'
+         -- A deleted row with no document left (a dedup apply moved its
+         -- links to the survivor, then the document was purged) is out of
+         -- the ledger and holds no evidence to lose.
+         AND NOT (t.deleted_at IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM document_links dl WHERE dl.transaction_id = t.id))
+         AND NOT EXISTS (
+               SELECT 1 FROM document_extractions c
+                WHERE c.status = 'valid' AND c.superseded_at IS NULL
+                  AND (c.id = e.id
+                       OR c.document_id IN (SELECT dl.document_id FROM document_links dl
+                                             WHERE dl.transaction_id = t.id)))
        ORDER BY t.created_at`,
   },
   {

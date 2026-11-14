@@ -29,6 +29,8 @@ The agent is handed only what its job needs: five tools (Bash, Read, Write, Edit
 
 The rules the agent is given are **not** duplicated per prompt: `src/ingest/prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts` and `items-sql.ts` hold the single copy that both the ingest prompt and `reextract-prompt.ts` interpolate (#164).
 
+Wave 1 moves the ledger write from the agent to server code, behind `EXTRACTION_WRITER` (still `agent_sql` in production). The same template renders a second time for it (`writer: 'server_apply'`): the agent reads and reasons exactly as above, then ends its final message with one fenced extraction record (`src/ingest/contract/v1.ts`) instead of writing SQL. It runs with three tools (Bash, Read, Write), the Google key and no database at all; the server finds the record, validates it, sends an invalid one back to the same session once (`claude -p --resume`), and writes the ledger itself. `scripts/check-prompt-render.ts` proves the legacy rendering production runs has not changed by a byte. See "Extraction records" in [`CLAUDE.md`](CLAUDE.md#extraction-records-document_extractions-wave-1).
+
 ### Quality & Business Flags
 
 Every extraction includes metadata stored as PostgreSQL JSONB:
@@ -202,15 +204,18 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | Command | Purpose |
 |---------|---------|
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
-| `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
+| `npm run check:prompt-render` | Fail if a legacy extraction or re-extract prompt rendering differs from its golden hash (also runs before every build) |
+| `npm run check:prompt-budget` | Fail if the extraction prompt, legacy or record rendering, outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
-| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
-| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
+| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants, or if the record rendering contains any SQL (also runs before every build) |
+| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse, the record profile's resumed session included |
+| `npm run check:contract` | Exercise every rule of the extraction record contract, its validator and its hand-back parser on synthetic records (also runs before every build) |
+| `npm run check:apply-decide` | Exercise the server applier's duplicate decision and its projection to postings, line items and metadata on synthetic records (also runs before every build) |
 | `npm run measure:turns` | Turns, billed tokens and model per extraction, from session JSONL (the parser that also fills `agent_runs`) |
 | `npm run eval:dates` | On the sandbox: extraction accuracy (date, total, payee, classification, flow, currency) plus turns and tokens per run, against a document manifest (`scripts/eval-dates.md`) |
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
 
-The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`, and `probe-cli.ts`, which records how the pinned `claude` CLI handles `--resume` and output formats), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
+The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`, and `probe-cli.ts`, which records how the pinned `claude` CLI handles `--resume` and output formats), checks that need a throwaway Postgres (`check-extraction-records.ts`, `check-apply-extraction.ts`, which runs every write branch of the server applier, and `check-http-errors.ts`), a read-only replay of the server applier's projection against a ledger (`check-projection-replay.ts`), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
 
 The sandbox is a second stack (`docker-compose.test.yml`: API on 3001, its own image tag, database and data directories) that shares no state with production. `scripts/sandbox-reset.sh` returns it to an empty ledger without a restart, and `scripts/check-sandbox-reset.sh` checks that the reset still keeps exactly what a boot writes (run it after adding a migration). See [`CLAUDE.md` → Sandbox stack](CLAUDE.md#sandbox-stack-docker-composetestyml).
 

@@ -39,6 +39,7 @@ import {
 } from "../schema/index.js";
 import { buildInfo } from "../generated/build-info.js";
 import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
+import { recomputeProductStats } from "../catalog/product-stats.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   Product,
@@ -810,64 +811,6 @@ productsRouter.get(
 
 // ── POST /v1/products/:id/merge_into ───────────────────────────────────
 
-/**
- * Recompute aggregate stats for one product from its live
- * transaction_items set. Used by merge_into and the admin endpoint.
- * Returns `purchase_count` etc. so callers can echo the new state.
- */
-async function recomputeProductStats(
-  workspaceId: string,
-  productId: string,
-): Promise<{
-  purchase_count: number;
-  total_spent_minor: number;
-  first_purchased_on: string | null;
-  last_purchased_on: string | null;
-}> {
-  const res = await db.execute(
-    sql`
-      WITH stats AS (
-        SELECT
-          MIN(t.occurred_on) AS first_on,
-          MAX(t.occurred_on) AS last_on,
-          COUNT(DISTINCT ti.transaction_id) AS purchases,
-          COALESCE(SUM(ti.effective_total_minor), 0) AS total_minor
-        FROM transaction_items ti
-        JOIN transactions t ON t.id = ti.transaction_id
-        WHERE ti.product_id = ${productId}::uuid
-          AND ti.workspace_id = ${workspaceId}::uuid
-          AND ti.retired_at IS NULL
-          AND ti.line_type = 'product'
-      )
-      UPDATE products p SET
-        first_purchased_on = stats.first_on,
-        last_purchased_on  = stats.last_on,
-        purchase_count     = COALESCE(stats.purchases, 0),
-        total_spent_minor  = stats.total_minor,
-        updated_at         = NOW()
-      FROM stats
-      WHERE p.id = ${productId}::uuid
-        AND p.workspace_id = ${workspaceId}::uuid
-      RETURNING
-        p.purchase_count,
-        p.total_spent_minor,
-        p.first_purchased_on,
-        p.last_purchased_on
-    `,
-  );
-  const r = res.rows[0] as any;
-  return {
-    purchase_count: Number(r?.purchase_count ?? 0),
-    total_spent_minor: Number(r?.total_spent_minor ?? 0),
-    first_purchased_on: r?.first_purchased_on
-      ? toIsoDate(r.first_purchased_on)
-      : null,
-    last_purchased_on: r?.last_purchased_on
-      ? toIsoDate(r.last_purchased_on)
-      : null,
-  };
-}
-
 productsRouter.post(
   "/:id/merge_into",
   async (req: Request, res: Response, next: NextFunction) => {
@@ -985,34 +928,14 @@ productsRouter.post(
               WHERE id = ${body.target_id}::uuid`,
         );
 
-        // No `recomputeProductStats` call inside this txn — it uses
-        // db.execute directly which would deadlock against the same
-        // transaction. Compute via raw sql inline:
-        await tx.execute(
-          sql`
-            WITH stats AS (
-              SELECT
-                MIN(t.occurred_on) AS first_on,
-                MAX(t.occurred_on) AS last_on,
-                COUNT(DISTINCT ti.transaction_id) AS purchases,
-                COALESCE(SUM(ti.effective_total_minor), 0) AS total_minor
-              FROM transaction_items ti
-              JOIN transactions t ON t.id = ti.transaction_id
-              WHERE ti.product_id = ${body.target_id}::uuid
-                AND ti.workspace_id = ${req.ctx.workspaceId}::uuid
-                AND ti.retired_at IS NULL
-                AND ti.line_type = 'product'
-            )
-            UPDATE products p SET
-              first_purchased_on = stats.first_on,
-              last_purchased_on  = stats.last_on,
-              purchase_count     = COALESCE(stats.purchases, 0),
-              total_spent_minor  = stats.total_minor,
-              updated_at         = NOW()
-            FROM stats
-            WHERE p.id = ${body.target_id}::uuid
-          `,
-        );
+        // Inside the merge's own transaction, so the stats see the
+        // re-pointed items. Deleted transactions still count, as in
+        // `POST /:id/recompute` (see src/catalog/product-stats.ts).
+        await recomputeProductStats(tx, {
+          workspaceId: req.ctx.workspaceId,
+          productIds: [body.target_id],
+          liveOnly: false,
+        });
 
         // Re-read target for the audit snapshot.
         const [refreshedTarget] = await tx
@@ -1084,8 +1007,18 @@ productsRouter.post(
           ),
         );
       if (exists.length === 0) throw new NotFoundProblem("Product", id);
-      const stats = await recomputeProductStats(req.ctx.workspaceId, id);
-      res.json({ id, ...stats });
+      const [stats] = await recomputeProductStats(db, {
+        workspaceId: req.ctx.workspaceId,
+        productIds: [id],
+        liveOnly: false,
+      });
+      res.json({
+        id,
+        purchase_count: stats?.purchase_count ?? 0,
+        total_spent_minor: stats?.total_spent_minor ?? 0,
+        first_purchased_on: stats?.first_purchased_on ?? null,
+        last_purchased_on: stats?.last_purchased_on ?? null,
+      });
     } catch (err) {
       next(err);
     }

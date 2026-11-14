@@ -26,6 +26,8 @@ import {
 } from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
 import { getConcurrency, start as startIngestWorker } from "./ingest/worker.js";
+import { extractionWriter } from "./ingest/runs.js";
+import { extractionRepairRounds } from "./ingest/extractor.js";
 import { claudeCliVersion } from "./claude.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
@@ -55,6 +57,7 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10);
 function logPromptSize(): void {
   try {
     const empty = {
+      writer: "agent_sql",
       filePath: "",
       ingestId: "",
       workspaceId: "",
@@ -180,7 +183,13 @@ async function main(): Promise<void> {
   // then sits idle until /v1/ingest/batch enqueues files. Same process
   // as HTTP so the DB pool + v1 services are shared.
   await startIngestWorker();
-  console.log(`⚙️  Ingest worker ready (concurrency ${getConcurrency()})`);
+  // The writer and the repair rounds are read again for every run; this
+  // line says what a run started now would use (and warns on a bad value).
+  const writer = extractionWriter();
+  console.log(
+    `⚙️  Ingest worker ready (concurrency ${getConcurrency()}, writer ${writer}` +
+      (writer === "server_apply" ? `, repair rounds ${extractionRepairRounds()})` : ")"),
+  );
 
   // Read once and kept: every run record carries it as `cli_version`.
   // Not awaited, so a slow or missing CLI never holds up the boot.
