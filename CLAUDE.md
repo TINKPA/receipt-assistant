@@ -34,6 +34,7 @@ Postgres, managed by Drizzle migrations in `drizzle/`. `src/schema/` is the sour
 | `accounts`, `workspaces`, `users`, `workspace_members` | Multi-tenant scaffolding. |
 | `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. `ingests.document_id` is the stored document; `ingests.current_run_id` is the run that owns a `processing` ingest. |
 | `agent_runs` | One row per `claude -p` run for a document (ingest or re-extract), written only by the server: writer, session id, model requested and observed, CLI version, turns, tokens, exit, outcome and error class. See "Run records" under "Agent transcripts". |
+| `document_extractions` | One immutable row per reading of a document: the extraction record a run handed back under the server writer, as validated, with its errors, warnings and normalisations. `transaction_items`, `derivation_events` and `agent_runs` point back at it through `extraction_id`. Nothing writes it while `EXTRACTION_WRITER=agent_sql`. See "Extraction records" below. |
 
 A "receipt" surfaces to the user as the pair `(documents row, linked transaction row(s))`. The agent reads a document, then writes a balanced transaction with its postings and items, and a `document_links` row.
 
@@ -131,6 +132,19 @@ Bump in the **same PR** as the prompt change. Ingest and re-extract share the on
 | Reordering existing instructions without semantic change | **No** |
 
 The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration, `"4.0"` for a clean break). Bumping on every commit floods the field with noise and makes the re-extract eligibility filter useless.
+
+Wave 1 adds two more constants for the server writer, both shipped dark. `RECORD_PROMPT_VERSION` (`prompt-contract.ts`, `"4.0"`) versions the record rendering of the ingest prompt, under the same rules as above. `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, `1`) versions the shape of the extraction record; any change to that shape bumps it, always together with `RECORD_PROMPT_VERSION`. `PROMPT_VERSION` stays the legacy line until the agent-SQL writer is retired.
+
+### Extraction records (`document_extractions`, wave 1)
+
+Under the server writer the agent no longer writes SQL: it ends its final message with an optional ```` ```receipt-text ```` block and one ```` ```json ```` record, and the server derives the ledger from that record. What exists so far, all unused in production while `EXTRACTION_WRITER=agent_sql`:
+
+- `src/ingest/contract/v1.ts`: the record as zod, every object `.strict()` (an unknown key anywhere is refused, which keeps ids, statuses, base amounts and provenance out of the record), and `renderContractForPrompt()`, which builds the prompt's description of the record from the schema's own `.describe()` texts so the two cannot drift.
+- `src/ingest/contract/validate.ts`: normalisations (applied and listed on the record), errors (bounced to one `--resume` repair round, then stored as an invalid record) and warnings (stored), each with a stable rule id; `renderRepairRequest` (names a path and a rule, never a value); `diffRepair` (what a repair changed without being asked). Dates are judged against the upload time, never the clock.
+- `src/ingest/contract/artefact.ts`: finds the record: the last ```` ```json ```` block with a `contract_version` in stdout, else in the session transcript's assistant text, never in a tool result, a tool call, a user turn or a thinking block. Caps: 256 KB record, 64 KB receipt text.
+- `src/ingest/records.ts`: the only writer of `document_extractions`. In the caller's transaction it stores the record (valid or invalid), supersedes the document's current valid one, and sets `agent_runs.extraction_id`.
+
+Rows are immutable: a trigger lets only `superseded_at` change (and the `ON DELETE SET NULL` foreign keys clear a reference to a deleted run, ingest or record). A partial unique index keeps one current valid record per document. A warning found while a record is applied therefore goes on the run's `apply_report`, never back onto the record. `scripts/check-contract.ts` exercises every rule with synthetic records and runs before every build; `scripts/check-extraction-records.ts --disposable --db=<throwaway>` checks the table, the trigger, the index and the writer against a real Postgres.
 
 ### Three ways to re-run a layer
 
