@@ -159,7 +159,8 @@ export type ApplyDecision =
 
 /**
  * The duplicate check with a review flag added for a reason that is not
- * about duplicates (a mixed tender, `project.ts`). `flagged_for_review` is
+ * about duplicates (a mixed tender, `project.ts`; a date booked as printed
+ * or a repair that moved the date or money, `review.ts`). `flagged_for_review` is
  * what the review queue lists (`GET /v1/transactions?flagged=near_dup`)
  * and what its dismiss clears, so a row a person must look at for any
  * reason carries it there. A check that already exists keeps its verdict

@@ -375,7 +375,9 @@ const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
  *      (`runClaude` `resumeSessionId`: `--resume <id>`, the profile's flags
  *      again, the list of problems on stdin, `repairTimeoutMs`), then parse
  *      the new reply only, validate it, and diff it against the record it
- *      replaces (`diffRepair`). A round that hands back no record leaves
+ *      replaces (`diffRepair`); the record's report notes each round with
+ *      what it changed, which the applier reads to flag a transaction whose
+ *      date or money a round moved. A round that hands back no record leaves
  *      the earlier one standing; a round whose spawn fails ends the loop
  *      (`error` is set, and the worker ends the run as that failure). A
  *      reply that resends the json but not the receipt-text block keeps
@@ -448,12 +450,13 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     return result;
   }
 
-  const rounds: { round: number; errors: ValidationError[] }[] = [];
+  const rounds: { round: number; errors: ValidationError[]; changed: ChangedField[] }[] = [];
   const unnamed: ValidationWarning[] = [];
   while (outcome.status === "invalid" && result.repairRounds < maxRounds) {
     const round = ++result.repairRounds;
     const errors = outcome.report.errors;
-    rounds.push({ round, errors });
+    const note = { round, errors, changed: [] as ChangedField[] };
+    rounds.push(note);
     const fromByte = transcriptBytes(transcriptPath);
     console.log(
       `[claude] extract-record repair round ${round}/${maxRounds} ingestId=${input.ingestId} ` +
@@ -485,6 +488,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
         : validateArtefact(next, ctx);
     if (nextOutcome === null) continue; // no record this round; the earlier one stands
     const diff = diffRepair(outcome.parsed, nextOutcome.parsed, errors);
+    note.changed = diff.changed;
     unnamed.push(...diff.warnings);
     result.repairChangedUnnamed.push(...diff.unnamed);
     artefact = next;
@@ -492,7 +496,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     receiptText = nextText;
   }
 
-  for (const r of rounds) noteRepairRound(outcome.report, r.round, r.errors);
+  for (const r of rounds) noteRepairRound(outcome.report, r.round, r.errors, r.changed);
   appendWarnings(outcome.report, unnamed);
 
   result.outcome = outcome;

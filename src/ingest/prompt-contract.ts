@@ -323,7 +323,20 @@ Before committing your YYYY-MM-DD:
      digit that is misread.
      This is a PROMPT, not a veto — genuine old receipts exist (a backfill of
      a 2021 purchase is legitimate). Look again, then keep what the paper
-     actually says.
+     actually says.${forWriter(
+       opts.writer,
+       "",
+       `
+  5. Is your date AFTER today? Look for an earlier charge or transaction
+     date on the document first (Check B). If the document prints none,
+     keep the date exactly as printed and add \`date_unresolved\` to
+     audit.review_flags: the server books it as printed and sends the
+     transaction to a person. Never move a printed date, its year
+     included, to one the document does not show. (Where a lesson says
+     the document prints no charge date and names another source, such as
+     an email's Date header or a PDF's creation date, that source is not
+     an invention.)`,
+     )}
 
 ### Check B — Multi-candidate date enumeration (catches day-digit swaps)
 

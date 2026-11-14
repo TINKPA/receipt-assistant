@@ -27,6 +27,13 @@
  * The upload time is an input (`future_date`, `date_far_past`), never the
  * wall clock, so a record re-validated later reaches the same verdict.
  * Money scale comes from `src/ledger/money.ts` (`printed_total_mismatch`).
+ *
+ * A date after the upload is the one error a record can answer by keeping
+ * its value: the owner's rule is that a printed date is never replaced by
+ * one the document does not show. With `date_unresolved` in
+ * `audit.review_flags` the same condition is the warning
+ * `future_date_unresolved`, the record is booked as printed, and the
+ * applier flags the transaction for review (`src/ingest/apply/review.ts`).
  */
 import { z } from "zod";
 import { currencyExponent, isIsoCurrencyCode } from "../../ledger/money.js";
@@ -71,6 +78,7 @@ export const RECORD_WARNING_RULES = [
   "items_total_residual",
   "printed_total_mismatch",
   "date_far_past",
+  "future_date_unresolved",
   "occurred_at_date_mismatch",
   "email_without_time",
   "raw_text_missing",
@@ -147,6 +155,11 @@ export interface RepairRoundNote {
   round: number;
   /** The errors the round was asked to fix. */
   errors: ValidationError[];
+  /** What the round's reply changed, named or not (`diffRepair`); empty
+   *  when the round handed back no record. The applier flags a booked
+   *  transaction whose date, time or money a round changed. Absent on a
+   *  note written before this was recorded. */
+  changed?: ChangedField[];
 }
 
 /** What `document_extractions.validation` holds. */
@@ -286,6 +299,11 @@ function isRealDateTime(s: string): boolean {
 const ANCIENT_DAY = dayNumber("2000-01-01")!;
 const FUTURE_SLACK_DAYS = 2;
 const FAR_PAST_DAYS = 400;
+
+/** Whether `occurred_on` (a real date's day number) is after the upload,
+ *  past the slack a time zone can explain. */
+const isAfterUpload = (day: number, ctx: ValidationContext) =>
+  day > Math.floor(ctx.uploadedAt.getTime() / DAY_MS) + FUTURE_SLACK_DAYS;
 
 // ── Printed amounts ────────────────────────────────────────────────────
 
@@ -632,15 +650,18 @@ function crossFieldErrors(rec: Record<string, unknown>, ctx: ValidationContext):
     }
   }
 
-  // Dates.
-  const uploadDay = Math.floor(ctx.uploadedAt.getTime() / DAY_MS);
+  // Dates. A date after the upload that the agent flagged date_unresolved
+  // is what the document prints: a warning (`recordWarnings`), not an error.
+  const dateUnresolved = asArr(asObj(rec.audit)?.review_flags).includes("date_unresolved");
   const occurredOn = facts ? asStr(facts.occurred_on) : null;
   if (occurredOn !== null && DATE_RE.test(occurredOn)) {
     const day = dayNumber(occurredOn);
     if (day === null) {
       err("calendar_date", "facts.occurred_on", "this date does not exist on the calendar");
-    } else if (day > uploadDay + FUTURE_SLACK_DAYS) {
-      err("future_date", "facts.occurred_on", `this date is more than ${FUTURE_SLACK_DAYS} days after the document was uploaded`);
+    } else if (isAfterUpload(day, ctx)) {
+      if (!dateUnresolved) {
+        err("future_date", "facts.occurred_on", `this date is more than ${FUTURE_SLACK_DAYS} days after the document was uploaded`);
+      }
     } else if (day < ANCIENT_DAY) {
       err("ancient_date", "facts.occurred_on", "this date is before 2000-01-01");
     }
@@ -847,6 +868,15 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
     if (day !== null && day < uploadDay - FAR_PAST_DAYS) {
       warn("date_far_past", "facts.occurred_on", `more than ${FAR_PAST_DAYS} days before the upload`);
     }
+    // Only a record that flagged date_unresolved gets here with such a
+    // date (`crossFieldErrors`); it is booked as printed and flagged.
+    if (day !== null && isAfterUpload(day, ctx)) {
+      warn(
+        "future_date_unresolved",
+        "facts.occurred_on",
+        `more than ${FUTURE_SLACK_DAYS} days after the upload; flagged date_unresolved, so booked as printed`,
+      );
+    }
     if (facts.occurred_at != null && facts.occurred_at.slice(0, 10) !== facts.occurred_on) {
       warn("occurred_at_date_mismatch", "facts.occurred_at", "its date part differs from occurred_on");
     }
@@ -974,18 +1004,33 @@ export function appendWarnings(report: ValidationReport, warnings: readonly Vali
   return report;
 }
 
-/** Note on a report that a repair round was asked to fix `errors`. */
-export function noteRepairRound(report: ValidationReport, round: number, errors: readonly ValidationError[]): ValidationReport {
-  (report.repairs ??= []).push({ round, errors: [...errors] });
+/** Note on a report that a repair round was asked to fix `errors`, and
+ *  what its reply changed (`diffRepair`'s `changed`). */
+export function noteRepairRound(
+  report: ValidationReport,
+  round: number,
+  errors: readonly ValidationError[],
+  changed: readonly ChangedField[] = [],
+): ValidationReport {
+  (report.repairs ??= []).push({ round, errors: [...errors], changed: [...changed] });
   return report;
 }
 
 // ── The text sent back: the repair request ─────────────────────────────
 
-/** What to look at again, per rule. Never a value. */
+/** What to look at again, per rule. Never a value. `future_date` is the
+ *  one rule a record may answer by keeping its value: a printed date is
+ *  never traded for one the document does not show (the owner's rule;
+ *  see the module header). The derived dates the prompt allows where
+ *  nothing is printed (an email's Date header, a PDF's creation date) are
+ *  readings of the document, not inventions. */
 const REREAD: Partial<Record<ErrorRule, string>> = {
   calendar_date: "Re-read the date on the document.",
-  future_date: "Re-read the date on the document.",
+  future_date:
+    "Re-read the dates on the document. If it shows an earlier charge or transaction date (or, where it prints none, " +
+    "the email's Date header or the PDF's creation date, as the prompt allows), use that one and its time. If the date " +
+    "you gave is the one the document prints, send it again unchanged and add date_unresolved to audit.review_flags. " +
+    "Never change a printed date to one the document does not show.",
   ancient_date: "Re-read the date on the document, the year especially.",
   currency_unknown: "Re-read the currency on the document.",
   sign_flow_mismatch: "Re-read the total, and whether money left the user or came back.",
@@ -1063,17 +1108,26 @@ function leaves(v: unknown, path: Seg[], out: Map<string, unknown>): void {
   }
 }
 
-function covers(errorPath: string, changed: string): boolean {
-  if (errorPath === "") return true;
+/** Paths an error names besides its own: what answering it legitimately
+ *  touches. Re-reading a date after the upload moves its time with it, and
+ *  the self-check that chose it (`audit`, where `date_unresolved` goes). */
+const ALSO_NAMED: Partial<Record<ErrorRule, readonly string[]>> = {
+  future_date: ["facts.occurred_at", "audit"],
+};
+
+function covers(error: ValidationError, changed: string): boolean {
   const under = (a: string, b: string) => a === b || a.startsWith(`${b}.`) || a.startsWith(`${b}[`);
-  return under(changed, errorPath) || under(errorPath, changed);
+  return [error.path, ...(ALSO_NAMED[error.rule] ?? [])].some(
+    (p) => p === "" || under(changed, p) || under(p, changed),
+  );
 }
 
 /**
  * What a repair round changed that its errors did not name. Both records
  * are compared after the same trimming the validator applies, leaf by
  * leaf; a null and a missing key are the same. A change is named when
- * its path is an error's path, inside it, or contains it. When the first
+ * its path is an error's path (or one the error also names, `ALSO_NAMED`),
+ * inside it, or contains it. When the first
  * record could not be read at all (`json_parse`, an oversize block), or
  * an error was about the record as a whole, everything is named.
  * Returns the unnamed changes and one `repair_changed_unnamed` warning
@@ -1095,7 +1149,7 @@ export function diffRepair(
     if (a.get(p) !== b.get(p)) changed.push({ path: p, money: isMoneyPath(p) });
   }
   changed.sort((x, y) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
-  const unnamed = changed.filter((c) => !errors.some((e) => covers(e.path, c.path)));
+  const unnamed = changed.filter((c) => !errors.some((e) => covers(e, c.path)));
   const warnings: ValidationWarning[] = unnamed.map((c) => ({
     rule: "repair_changed_unnamed" as const,
     path: c.path,

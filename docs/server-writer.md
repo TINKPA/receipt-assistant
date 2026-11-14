@@ -176,7 +176,7 @@ Errors cover structure, the contract and impossible values only. They bounce the
 | `schema` | the schema refuses it: a wrong type, enum value or format, a missing required field, a key that is not in the contract (a forbidden key says the server supplies it) |
 | `required_for_classification` | a `receipt_*` record without `facts`, `merchant` or `audit`; `facts` or `merchant` on any other classification; `unsupported` without its block or the block on another classification; `statement_pdf` without `statement_rows` or rows on another classification |
 | `calendar_date` | `occurred_on` or a statement row's date is not a real date; `occurred_at` is not a real date, time and offset |
-| `future_date` | `occurred_on` is more than 2 days after the upload |
+| `future_date` | `occurred_on` is more than 2 days after the upload, and `audit.review_flags` does not carry `date_unresolved` (with it, the warning `future_date_unresolved`) |
 | `ancient_date` | `occurred_on` is before 2000-01-01 |
 | `currency_unknown` | the main currency, the cash part's or a statement row's is neither an ISO 4217 code in the `money.ts` table nor a points code (`ISSUER_PT`) |
 | `sign_flow_mismatch` | a purchase or income with a negative total, or a refund with a positive one |
@@ -196,6 +196,7 @@ Warnings are stored and never bounced. Those decided from the record alone are c
 | `items_total_residual` (money) | record | per currency charged, the lines' effective amounts (`line_total + tax + tip − discount share`, leaving out the tax, tip and discount rows whose money is spread as shares) miss the total by more than max(5 minor units, 1%) |
 | `printed_total_mismatch` (money) | record | `total_printed` cannot be read as an amount at the currency's exponent, or reads as an amount other than the total's |
 | `date_far_past` | record | more than 400 days before the upload |
+| `future_date_unresolved` | record | more than 2 days after the upload, and the record flags `date_unresolved`: the date is what the document prints, booked as printed, and the transaction is flagged for review (see "Review flags from the reading") |
 | `occurred_at_date_mismatch` | record | the date in `occurred_at` differs from `occurred_on` |
 | `email_without_time` | record | an email with no `occurred_at` |
 | `raw_text_missing` | record | a photo or PDF handed back without a receipt-text block |
@@ -232,7 +233,9 @@ What is kept between rounds:
 - A round that hands back no record leaves the earlier one standing.
 - A reply that resends the json without the receipt-text block keeps the earlier transcription.
 - The repaired record is compared with the one it replaces (`diffRepair`): a change at a path no error named is a `repair_changed_unnamed` warning, marked money when the path is an amount, a currency, the classification, the flow, the category, the payment method, the points programme or an income account.
-- The record's report notes each round and the errors it was asked to fix; the run stores `repair_rounds`.
+- The record's report notes each round, the errors it was asked to fix and every path its reply changed (`validation.repairs[].changed`); the run stores `repair_rounds`. A round that changed the date, the time or a money field gets the booked transaction flagged for review (see "Review flags from the reading").
+
+`future_date` is the one error a record may answer by keeping its value. The owner's rule is that a date the document does not print is never booked: a printed date that looks wrong is booked as printed and goes to a person. In the P3 smoke a receipt printing one date three times, months after its upload, was bounced, and the reply moved the year back by one, to a date printed nowhere; the record validated and the transaction showed no trace of it. So the request for `future_date` says: re-read the dates; if the document shows an earlier charge or transaction date, use it (or, where it prints none, the email's Date header or the PDF's creation date the prompt already allows for a prepaid booking); if the date given is the one the document prints, send it again unchanged with `date_unresolved` in `audit.review_flags`; never change a printed date to one the document does not show. The record prompt says the same in its date self-check (Check A, step 5) and in its paragraph on the repair round, so most such records flag the date on the first pass and need no round. Answering it may touch the date's own time and the audit block, so the diff counts `facts.occurred_at` and `audit` as named by a `future_date` error.
 
 Never sent back: a missing record (there is no field to name), and the output of a first spawn that failed (a run that timed out or crashed handed nothing back). A repair round whose spawn fails ends the loop: the earlier, invalid record is stored as evidence, and the run ends `agent_error` with that spawn's class (`agent_report.repair_spawn_failed` names it), because the outage is what happened, not a bad reading.
 
@@ -329,7 +332,7 @@ For a `receipt_*` record, the pure projection runs first (`project(record, catal
 
 ### The attach
 
-When the decision is attach: the target is locked `FOR UPDATE` and the candidates are read and decided again under that lock. A different answer (the target was deleted or changed while the apply waited) is the retryable `attach_target_changed`, so the retry starts over and sees the change. Then the document is linked, an entry is appended to the target's `metadata.merge_audit` (the document, ingest, record and run, the tiebreaker, the reason built by code, `decided_by: 'applier'` and the applier version), a `document_linked` event is written, and the document is stamped. The ingest closes `near_dup` with the target as its transaction; the run finishes `attached`. Nothing is written to the catalog; the record keeps the items as evidence. The UPDATE moves the target's `version`, as the legacy attach did.
+When the decision is attach: the target is locked `FOR UPDATE` and the candidates are read and decided again under that lock. A different answer (the target was deleted or changed while the apply waited) is the retryable `attach_target_changed`, so the retry starts over and sees the change. Then the document is linked, an entry is appended to the target's `metadata.merge_audit` (the document, ingest, record and run, the tiebreaker, the reason built by code, `decided_by: 'applier'` and the applier version), a `document_linked` event is written, and the document is stamped. The ingest closes `near_dup` with the target as its transaction; the run finishes `attached`. Nothing is written to the catalog; the record keeps the items as evidence. The UPDATE moves the target's `version`, as the legacy attach did. The record's own review reasons (see "Review flags from the reading") are listed in `apply_report.review.noted` and flag nothing: the attach booked nothing of this reading.
 
 ### Records that book nothing
 
@@ -405,6 +408,15 @@ Not in applier 1.0, each a measured `APPLIER_VERSION` bump if ever: a "different
 
 An insert's verdict goes in `metadata.near_dup_check`: `candidate_transaction_id`, `candidate_transaction_ids`, `verdict` (`distinct` or `uncertain`), `flagged_for_review`, `reason`, `decided_by: 'applier'` and `applier_version`. `flagged_for_review` is what the review queue lists (`GET /v1/transactions?flagged=near_dup`) and what its dismiss clears. Reconcile reads an open `uncertain` naming a pair as "a person must look", and a typed `metadata.card_last4` before the free-text `payment` string, on every row of either writer.
 
+### Review flags from the reading
+
+Some reasons for a person to look come from the record itself, not from duplicates. `recordReviewReasons` (`src/ingest/apply/review.ts`) reads them off the stored validation report:
+
+- the warning `future_date_unresolved`: the date is after the upload and is booked as printed (see "The repair round");
+- a repair round whose reply changed `facts.occurred_on`, `facts.occurred_at` or a money field (`validation.repairs[].changed`): only the model's second reading stands behind the change. The reason names the paths, never a value.
+
+An insert puts them in `metadata.near_dup_check` the way a mixed tender does (`flagForReview`): a check the decision wrote keeps its verdict and candidates and gets these reasons in front of its own; with no check, the flag names no candidate. The record's reasons come first, then a mixed tender's. The run's `apply_report.review.flagged` lists them. An attach books nothing of the reading, so it flags nothing for these reasons and only lists them in `apply_report.review.noted`.
+
 ## Accounts and postings
 
 `project.ts` turns a valid receipt record into a draft: header, postings, item parameters, parties, owned-item lines, the brand and merchant to upsert, the points account to use or create, and the place. It is pure (no database, no clock, no ids), so a stored record can be projected again later and reach the same rows.
@@ -473,7 +485,7 @@ The record names a Google place id, the result of the agent's Phase 3a judgment.
 | `tax_minor`, `tip_minor`, `printed_totals` | the printed totals; the two top-level keys feed the frontend's Tax and Tip cells |
 | `ocr_audit` | the record's `audit`, plus `payee_as_printed` and `payee_source` |
 | `allocation_audit` | only when the lines miss the total: the effective sum, the total and the residual (other currencies listed after the main one) |
-| `near_dup_check` | the decision's, or a review flag (see "Tenders") |
+| `near_dup_check` | the decision's, or a review flag (see "Tenders" and "Review flags from the reading") |
 | `owned_items_note` | income: why no sold item was retired |
 
 `metadata.extraction` holds `prompt_version`, `prompt_git_sha`, `model` (the model the transcript reports, else the one requested; never `cli-default`), `model_requested`, `source`, `ran_at`, `run_id`, `session_id`, `extraction_id`, `contract_version`, `applier_version` and `writer: 'server_apply'`.
@@ -535,8 +547,8 @@ Kept on purpose: category picks the expense account; a merchant is fixed at firs
 
 | Check | When | What it proves |
 |---|---|---|
-| `scripts/check-contract.ts` | every build | every error rule bounces a synthetic record with the right rule and path; every record warning and normalisation is recorded; every forbidden key is refused at every level; the repair request names paths and rules, never values; the repair diff; the hand-back parser on prose, multiple fences, fences inside the receipt text, the transcript fallback with decoys that must be ignored, unparseable blocks and the caps; the generated contract text names every field |
-| `scripts/check-apply-decide.ts` | every build | every rule of the duplicate decision, every posting shape (purchase, refund, income, points, points plus cash, each tender, JPY and KWD amounts) and the metadata key set, as tables, with no database |
+| `scripts/check-contract.ts` | every build | every error rule bounces a synthetic record with the right rule and path; every record warning and normalisation is recorded; a date after the upload validates only when flagged `date_unresolved`; every forbidden key is refused at every level; the repair request names paths and rules, never values; the repair diff and what each round changed; the hand-back parser on prose, multiple fences, fences inside the receipt text, the transcript fallback with decoys that must be ignored, unparseable blocks and the caps; the generated contract text names every field |
+| `scripts/check-apply-decide.ts` | every build | every rule of the duplicate decision, every posting shape (purchase, refund, income, points, points plus cash, each tender, JPY and KWD amounts), the metadata key set and the record's review reasons, as tables, with no database |
 | `scripts/check-prompt-render.ts` | every build | the legacy rendering has not changed by a byte |
 | `scripts/check-prompt-budget.ts` | every build | neither rendering grew without its baseline moving in the same commit |
 | `scripts/check-agent-grants.ts` | every build | the record rendering has no SQL and no database, web-search or logo-key text |

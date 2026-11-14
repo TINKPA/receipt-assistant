@@ -180,7 +180,10 @@ The code that turns a stored record into ledger rows. The worker calls it under 
 | `catalog.ts`, `places.ts` | the catalog and place writes; every value is a bound parameter |
 | `candidates.ts`, `decide.ts` | the duplicate candidates, read after `takeWorkspaceApplyLock`, and the pure attach-or-insert decision. It reuses `IDENTIFIER_KEYS`, `compareIdentifiers`, `flowsDisagree` and `cardLast4` from `src/reconcile/dedup.ts`; change those there. |
 | `fingerprint.ts` | the fields two writers must agree on for one document, canonicalised and hashed |
+| `review.ts` | the record's own review reasons, read off its stored validation report: a date after the upload booked as printed (`future_date_unresolved`), and a repair round that changed the date, the time or money |
 | `version.ts` | `APPLIER_VERSION` |
+
+**Dates are booked as printed.** A date the document does not print is never booked silently (the owner's rule). A date more than two days after the upload is the error `future_date` unless the record flags `date_unresolved`; then it is the warning `future_date_unresolved`, the transaction is booked on the printed date, and it is flagged for review. The repair request for `future_date` asks for an earlier printed date or the same date flagged, never another. A repair round whose reply changed `facts.occurred_on`, `facts.occurred_at` or a money field also gets the insert flagged (`validation.repairs[].changed` records what each round changed). The flag is the mixed tender's: `metadata.near_dup_check.flagged_for_review` with the reason first; an attach only lists the reasons in `apply_report.review.noted`. See "The repair round" and "Review flags from the reading" in the design doc.
 
 **When an apply fails.** The ingest errors with `apply failed: <code>` (the codes are listed under "Failures and retries" in the design doc), the run ends `failed` / `apply` with the failure in `apply_report`, and the record stays valid and unapplied. `account_missing` is a chart of accounts the applier does not expect, a seeding fault, not a bad reading. The log lines:
 

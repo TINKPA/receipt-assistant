@@ -49,11 +49,12 @@ import { linkDocumentIn, type DecodedEmailHeaders } from "../../routes/documents
 import type { RunOutcome, RunErrorClass } from "../runs.js";
 import type { ExtractionV1 } from "../contract/v1.js";
 import { pgSafeText } from "../contract/artefact.js";
-import type { ValidationWarning } from "../contract/validate.js";
+import type { ValidationReport, ValidationWarning } from "../contract/validate.js";
 import { readAccountCatalog } from "./accounts.js";
 import { findCandidates, takeWorkspaceApplyLock } from "./candidates.js";
 import { decide, type ApplyCandidate, type ApplyDecision } from "./decide.js";
-import { buildTransactionMetadata } from "./metadata.js";
+import { buildTransactionMetadata, transactionReviewReasons } from "./metadata.js";
+import { recordReviewReasons } from "./review.js";
 import { ProjectionError, project, unbalancedCurrencies, type ApplyDraft, type AccountRef } from "./project.js";
 import { writePlace, type PlacePrefetch, type PlaceWrite } from "./places.js";
 import {
@@ -450,6 +451,12 @@ export interface ApplyReport {
   parties?: number;
   ocr_text?: "receipt_text" | "server_decode" | null;
   message_id_stored?: boolean;
+  /** Why a person must look (docs/server-writer.md, "Review flags from the
+   *  reading"): `flagged`, the reasons written into a transaction's
+   *  `near_dup_check` (an insert's own row, or an attach target);
+   *  `noted`, the record's reasons on an attach, which books nothing new.
+   *  Absent when there are none. */
+  review?: { flagged: string[]; noted: string[] };
   warnings: ValidationWarning[];
 }
 
@@ -467,6 +474,9 @@ export interface ApplyContext {
   pro: Prologue;
   extractionId: string;
   record: ExtractionV1;
+  /** The record's stored validation report: its warnings and repair rounds
+   *  give the review reasons (`review.ts`). */
+  validation: ValidationReport | null;
   rawText: string | null;
   source: ServerSource | null;
   phashTransactionIds: readonly string[];
@@ -625,6 +635,9 @@ async function attach(
   });
   const { stamp, kind } = textOf(c);
   const { messageIdStored } = await stampDocument(tx, ids, stamp, c.source?.email);
+  // The record's own review reasons: the attach books nothing of this
+  // reading, so they are noted, not flagged.
+  const noted = recordReviewReasons(c.validation);
   return {
     outcome: "attached",
     status: "near_dup",
@@ -638,6 +651,7 @@ async function attach(
       candidates: candidateReport(candidates),
       ocr_text: kind,
       ...(c.source?.email ? { message_id_stored: messageIdStored } : {}),
+      ...(noted.length > 0 ? { review: { flagged: [], noted } } : {}),
       warnings: [...draft.warnings, ...decision.warnings],
     },
   };
@@ -675,7 +689,10 @@ async function insert(
   });
   if (sold.warning) warnings.push(sold.warning);
 
-  // f: the transaction.
+  // f: the transaction, flagged for review when the reading says a person
+  // must look (`review.ts`) or a mixed tender was booked whole.
+  const recordReasons = recordReviewReasons(c.validation);
+  const flagged = transactionReviewReasons(draft, recordReasons);
   const txId = newId();
   const metadata = buildTransactionMetadata(
     record,
@@ -690,7 +707,12 @@ async function insert(
       modelRequested: c.pro.run.modelRequested,
       ranAt: new Date().toISOString(),
     },
-    { refundOf: decision.refundOf, nearDupCheck: decision.nearDupCheck, ownedItemsNote: sold.note },
+    {
+      refundOf: decision.refundOf,
+      nearDupCheck: decision.nearDupCheck,
+      ownedItemsNote: sold.note,
+      reviewReasons: recordReasons,
+    },
   );
   await tx.execute(sql`
     INSERT INTO transactions (id, workspace_id, occurred_on, occurred_at, payee, status,
@@ -783,6 +805,7 @@ async function insert(
       parties,
       ocr_text: kind,
       ...(c.source?.email ? { message_id_stored: messageIdStored } : {}),
+      ...(flagged.length > 0 ? { review: { flagged, noted: [] } } : {}),
       warnings,
     },
   };

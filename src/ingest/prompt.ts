@@ -346,6 +346,13 @@ and end that reply with the full corrected record again, the
 receipt-text block too if you gave one. It never tells you a value;
 never change a field it did not name to make the list go away.
 
+A date after the upload comes back as \`future_date\`. It is the one
+problem you may answer by keeping your value: if the document shows no
+earlier charge or transaction date, send the date unchanged with
+\`date_unresolved\` in audit.review_flags, and the server books it as
+printed and has a person check it. Never answer it with a date the
+document does not show (another year included) just to pass the check.
+
 ${renderContractForPrompt()}
 
 Remember: your final message ends with the optional \`\`\`receipt-text block

@@ -38,6 +38,10 @@
  *              allocation audit, the dedup keys, a mixed tender's flag in
  *              near_dup_check, and that the keys it introduces are
  *              server-owned.
+ *   review     the record's own review reasons (`review.ts`): a date
+ *              booked as printed, a repair that moved the date, the time
+ *              or money (and one that did not), and their place in front
+ *              of a mixed tender's and a decision's reason.
  *   fingerprint  order and offset independence, and that an amount
  *              change shows.
  *
@@ -64,6 +68,7 @@ import {
   buildTransactionMetadata,
   type MetadataRunContext,
 } from "../src/ingest/apply/metadata.js";
+import { FUTURE_DATE_REVIEW, recordReviewReasons } from "../src/ingest/apply/review.js";
 import { diffFingerprints, fingerprint, fingerprintFromDraft } from "../src/ingest/apply/fingerprint.js";
 import { APPLIER_VERSION } from "../src/ingest/apply/version.js";
 import { RECORD_PROMPT_VERSION } from "../src/ingest/prompt-contract.js";
@@ -1026,6 +1031,59 @@ const RUN: MetadataRunContext = {
   check(
     "metadata: a single tender leaves the decision's check as it is",
     json(buildTransactionMetadata(card, project(card, FULL), RUN, { refundOf: null, nearDupCheck: cardNd }).near_dup_check) === json(cardNd),
+  );
+}
+
+// The record's own review reasons (`review.ts`): a date booked as printed,
+// and a repair round that moved the date, the time or money. They flag the
+// insert ahead of a mixed tender's reason.
+{
+  const later = validateExtraction(
+    (() => {
+      const r = base();
+      r.facts.occurred_on = "2026-10-01";
+      r.facts.occurred_at = null;
+      r.audit.review_flags = ["date_unresolved"];
+      return r;
+    })(),
+    CTX,
+  );
+  check("review: the fixture validates with future_date_unresolved", later.status === "valid" && later.report.warnings.some((w) => w.rule === "future_date_unresolved"));
+  check("review: a date after the upload, booked as printed", json(recordReviewReasons(later.report)) === json([FUTURE_DATE_REVIEW]), json(recordReviewReasons(later.report)));
+  const plain = validateExtraction(base(), CTX);
+  check("review: a plain record needs no one", recordReviewReasons(plain.report).length === 0 && recordReviewReasons(null).length === 0);
+
+  const round = (changed: { path: string; money: boolean }[]) => ({
+    ...plain.report,
+    repairs: [{ round: 1, errors: [{ rule: "future_date" as const, path: "facts.occurred_on", message: "x" }], changed }],
+  });
+  const dated = recordReviewReasons(round([{ path: "facts.occurred_on", money: false }, { path: "audit.chosen_date_reason", money: false }]));
+  check("review: a repair that moved the date names it, and only it", dated.length === 1 && dated[0]!.startsWith("a repair round changed facts.occurred_on:"), json(dated));
+  const money = recordReviewReasons(round([{ path: "items[0].line_total_minor", money: true }, { path: "facts.occurred_at", money: false }]));
+  check("review: a repair that moved money or the time names both", money.length === 1 && /facts\.occurred_at, items\[0\]\.line_total_minor/.test(money[0]!), json(money));
+  check("review: a repair that changed neither flags nothing", recordReviewReasons(round([{ path: "items[0].confidence", money: false }])).length === 0);
+  check("review: a round noted before `changed` existed flags nothing", recordReviewReasons({ ...plain.report, repairs: [{ round: 1, errors: [] }] }).length === 0);
+  const many = recordReviewReasons(round(Array.from({ length: 8 }, (_, i) => ({ path: `items[${i}].line_total_minor`, money: true }))));
+  check("review: a long list is cut and counted", /and 3 more:/.test(many[0] ?? ""), json(many));
+
+  const mixed = rec((x) => (x.payment = { method: "mixed" }));
+  const nd = buildTransactionMetadata(mixed, project(mixed, FULL), RUN, { refundOf: null, nearDupCheck: null, reviewReasons: [FUTURE_DATE_REVIEW] })
+    .near_dup_check as Record<string, unknown>;
+  check(
+    "review: the record's reason first, then the mixed tender's, in one flag naming nobody",
+    nd?.flagged_for_review === true && nd.reason === `${FUTURE_DATE_REVIEW}; ${MIXED_TENDER_REVIEW}` && json(nd.candidate_transaction_ids) === "[]",
+    json(nd),
+  );
+  const card = rec();
+  const distinct = decide(card, [sameBrand({ identifiers: { order_number: "A-000200" } })]);
+  const dnd = distinct.action === "insert" ? distinct.nearDupCheck : null;
+  const kept = buildTransactionMetadata(card, project(card, FULL), RUN, { refundOf: null, nearDupCheck: dnd, reviewReasons: dated })
+    .near_dup_check as Record<string, unknown>;
+  check(
+    "review: a decision's check keeps its verdict and candidates, the reason goes in front",
+    kept.verdict === "distinct" && kept.flagged_for_review === true && kept.reason === `${dated[0]}; ${dnd?.reason}` &&
+      json(kept.candidate_transaction_ids) === json(dnd?.candidate_transaction_ids),
+    json(kept),
   );
 }
 

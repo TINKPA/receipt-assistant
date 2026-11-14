@@ -56,7 +56,7 @@ import { normalizeFxSafely } from "../../fx/normalize.js";
 import { valuePointsSafely } from "../../points/valuation.js";
 import { summarizeSessionById } from "../../session-transcript.js";
 import { ExtractionV1Schema, isReceiptClassification, type ExtractionV1 } from "../contract/v1.js";
-import type { ValidationOutcome } from "../contract/validate.js";
+import type { ValidationOutcome, ValidationReport } from "../contract/validate.js";
 import { currentExtractionRecord, insertExtractionRecord, type ExtractionOrigin } from "../records.js";
 import { RECORD_PROMPT_VERSION } from "../prompt-contract.js";
 import type { RunErrorClass, RunOutcome } from "../runs.js";
@@ -276,16 +276,17 @@ async function closeFailure(
 }
 
 /** The stored record, re-read through the schema (it is the validator's
- *  output, so it parses as it is). */
+ *  output, so it parses as it is), and its validation report. */
 async function loadRecord(
   ids: Pick<ApplyIds, "workspaceId" | "documentId">,
   extractionId: string,
-): Promise<{ record: ExtractionV1; rawText: string | null }> {
+): Promise<{ record: ExtractionV1; rawText: string | null; validation: ValidationReport | null }> {
   const rows = await db
     .select({
       status: documentExtractions.status,
       result: documentExtractions.result,
       rawText: documentExtractions.rawText,
+      validation: documentExtractions.validation,
     })
     .from(documentExtractions)
     .where(
@@ -300,7 +301,7 @@ async function loadRecord(
   if (row.status !== "valid") throw new ApplyError("record_unusable", `record ${extractionId} is invalid`);
   const parsed = ExtractionV1Schema.safeParse(row.result);
   if (!parsed.success) throw new ApplyError("record_unusable", `record ${extractionId} no longer parses as contract v1`);
-  return { record: parsed.data, rawText: row.rawText ?? null };
+  return { record: parsed.data, rawText: row.rawText ?? null, validation: (row.validation as ValidationReport | null) ?? null };
 }
 
 async function applyStored(input: ApplyInput, outcomeOverride?: RunOutcome): Promise<ApplyResult> {
@@ -311,13 +312,13 @@ async function applyStored(input: ApplyInput, outcomeOverride?: RunOutcome): Pro
     documentId: input.documentId,
   };
   const stats = await runStatsFor(ids, input.stats);
-  let loaded: { record: ExtractionV1; rawText: string | null };
+  let loaded: Awaited<ReturnType<typeof loadRecord>>;
   try {
     loaded = await loadRecord(ids, input.extractionId);
   } catch (err) {
     return closeFailure(ids, err, 0, input.extractionId, stats);
   }
-  const { record, rawText } = loaded;
+  const { record, rawText, validation } = loaded;
   const receipt = isReceiptClassification(record.classification);
   // Network, outside any transaction: a cache miss is fetched now.
   const place =
@@ -334,6 +335,7 @@ async function applyStored(input: ApplyInput, outcomeOverride?: RunOutcome): Pro
       pro,
       extractionId: input.extractionId,
       record,
+      validation,
       rawText,
       source: input.source ?? null,
       phashTransactionIds: input.phashTransactionIds ?? [],
