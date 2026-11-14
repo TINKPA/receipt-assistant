@@ -9,7 +9,11 @@
 #
 #   Image            receipt-assistant:sandbox    (production: :local)
 #   Containers       receipt-assistant-test, receipts-test-postgres
-#   Ports            3001 (API), 5433 (postgres) on the host
+#   Ports            3001 (API), 5433 (postgres), on 127.0.0.1 only: the
+#                    sandbox holds copies of real receipts after an eval,
+#                    its API has no credential and its postgres password is
+#                    `postgres`. From another machine, tunnel:
+#                    ssh -L 3001:127.0.0.1:3001 -L 5433:127.0.0.1:5433 <mini>
 #   Postgres data    ~/Developer/receipt-assistant-data/test-postgres/
 #   /data            ~/Developer/receipt-assistant-data/test-uploads/
 #                    The whole of /data is this ONE directory: uploads/,
@@ -85,7 +89,7 @@ services:
       TZ: UTC
       PGTZ: UTC
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - ${HOME}/Developer/receipt-assistant-data/test-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -105,14 +109,16 @@ services:
       receipts-postgres:
         condition: service_healthy
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@receipts-postgres:5432/receipts
       # Passwords for the agents' database roles (receipts_agent,
-      # receipts_ro). Same wiring as production; unset uses the built-in
-      # development password, which is fine for a sandbox.
-      RECEIPTS_AGENT_DB_PASSWORD: ${RECEIPTS_AGENT_DB_PASSWORD:-}
-      RECEIPTS_RO_DB_PASSWORD: ${RECEIPTS_RO_DB_PASSWORD:-}
+      # receipts_ro). Deliberately NOT production's RECEIPTS_*_DB_PASSWORD
+      # from the shared `.env`: this cluster's superuser password is public,
+      # so it must not hold verifiers of production's secrets. Unset uses
+      # the built-in development password, which is fine for a sandbox.
+      RECEIPTS_AGENT_DB_PASSWORD: ${SANDBOX_AGENT_DB_PASSWORD:-}
+      RECEIPTS_RO_DB_PASSWORD: ${SANDBOX_RO_DB_PASSWORD:-}
       CLAUDE_CONFIG_DIR: /home/node/.claude
       # Same variable, same `.env`, same setup-token as production. When set
       # it is the only thing `claude -p` authenticates with, so the sandbox

@@ -615,8 +615,9 @@ meets apply and undo in cases `cd` and `cs`):
 # sandbox up + reset first:
 #   docker compose -p receipts-test -f docker-compose.test.yml up -d --build
 #   ./scripts/sandbox-reset.sh
-npx tsx scripts/eval-dedup.ts --base=http://<mini>:3001 \
-  --pg=postgresql://postgres:postgres@<mini>:5433/receipts --with-claude
+# on the mini (the sandbox listens on 127.0.0.1; from elsewhere, ssh -L both ports)
+npx tsx scripts/eval-dedup.ts --base=http://localhost:3001 \
+  --pg=postgresql://postgres:postgres@localhost:5433/receipts --with-claude
 ```
 
 Stub cases are deterministic and take about a minute: `g1-g4` worker
