@@ -28,15 +28,29 @@
  *        - the same merchant: equal `brand_id` (through the merchant row),
  *          or equal normalised payee, or equal normalised
  *          `metadata.merchant.canonical_name`;
- *        - no identifier conflict (a shared key with different values),
- *          unless some identifier also matches;
+ *        - no identifier conflict: no shared key carries different values;
  *        - one tiebreaker: an identifier match (the same value under the
  *          same key, or the same value of 6 or more characters under two
- *          different keys), or the hard tuple (both card last-4 present
- *          and equal, both times present and equal to the minute, equal
- *          total, equal multisets of line totals with items on both).
+ *          different keys) with the same total in the record's currency
+ *          and no conflicting card last-4, or the hard tuple (both card
+ *          last-4 present and equal, both times present and equal to the
+ *          minute, equal total, equal multisets of line totals with items
+ *          on both).
  *      Exactly one strong candidate: attach to it. More than one: insert,
  *      `uncertain`, flagged ("several candidates match").
+ *
+ *      An identifier alone never attaches. The plan let a match outweigh a
+ *      conflict and took any total; both lose money. An order number is
+ *      shared by every partial refund and split shipment of the order, and
+ *      a subscription's id by every month of it, so the second refund, the
+ *      second charge or next month's invoice would be filed as evidence for
+ *      the first and never booked. A different total, a different card, or
+ *      a key that disagrees (a second invoice or approval code on the same
+ *      order) is what tells those apart, so each one blocks the attach and
+ *      leaves the record to rule 3 or 4: inserted, and flagged when a
+ *      person must look. This is reconcile's own line (`scorePair` in
+ *      `src/reconcile/dedup.ts` folds only equal totals, and a conflicting
+ *      key or card sends a pair to review).
  *   3. EVERY REMAINING CANDIDATE HAS AN IDENTIFIER CONFLICT: insert,
  *      `distinct`, naming them.
  *   4. OTHERWISE: insert, `uncertain`, `flagged_for_review` (the legacy
@@ -95,6 +109,10 @@ export interface CandidateVerdict {
   sameMerchant: "brand_id" | "payee" | "canonical_name" | null;
   identifierMatches: string[];
   identifierConflicts: IdentifierKey[];
+  /** Its P&L total in the record's currency equals the record's total. */
+  sameTotal: boolean;
+  /** Both sides carry a card last-4, and they differ. */
+  cardConflict: boolean;
   hardTuple: boolean;
   strong: boolean;
 }
@@ -215,10 +233,12 @@ function judge(record: ExtractionV1, rec: DedupSide, c: ApplyCandidate): Candida
   }
 
   const ids = identifierMatches(rec, c);
-  const noConflict = ids.conflicts.length === 0 || ids.matches.length > 0;
+  const noConflict = ids.conflicts.length === 0;
 
   const recCard = cardLast4(rec);
   const candCard = cardLast4(c);
+  const cardConflict = recCard !== null && candCard !== null && recCard !== candCard;
+  const sameTotal = c.native_total !== null && c.native_total === facts.total_minor;
   const recItems = record.items.map((it) => it.line_total_minor);
   const hardTuple =
     recCard !== null &&
@@ -226,19 +246,21 @@ function judge(record: ExtractionV1, rec: DedupSide, c: ApplyCandidate): Candida
     facts.occurred_at != null &&
     c.occurred_at !== null &&
     sameMinute(facts.occurred_at, c.occurred_at) &&
-    c.native_total !== null &&
-    c.native_total === facts.total_minor &&
+    sameTotal &&
     recItems.length > 0 &&
     c.item_totals.length > 0 &&
     sameMultiset(recItems, c.item_totals);
+  const identifierTiebreak = ids.matches.length > 0 && sameTotal && !cardConflict;
 
   return {
     id: c.id,
     sameMerchant,
     identifierMatches: ids.matches,
     identifierConflicts: ids.conflicts,
+    sameTotal,
+    cardConflict,
     hardTuple,
-    strong: sameMerchant !== null && noConflict && (ids.matches.length > 0 || hardTuple),
+    strong: sameMerchant !== null && noConflict && (identifierTiebreak || hardTuple),
   };
 }
 
@@ -339,7 +361,7 @@ export function decide(record: ExtractionV1, candidates: readonly ApplyCandidate
   // 2. Strong match.
   if (strong.length === 1) {
     const v = strong[0]!;
-    const tiebreaker = v.identifierMatches.length > 0 ? "identifier" : "hard_tuple";
+    const tiebreaker = v.identifierMatches.length > 0 && v.sameTotal && !v.cardConflict ? "identifier" : "hard_tuple";
     const evidence =
       tiebreaker === "identifier"
         ? `identifier match (${v.identifierMatches.join(", ")})`
@@ -388,8 +410,18 @@ export function decide(record: ExtractionV1, candidates: readonly ApplyCandidate
     };
   }
 
-  // 4. Otherwise.
-  const reason = "a candidate matches without a strong tiebreaker";
+  // 4. Otherwise. An identifier that matches where the total, the card or
+  // another key does not is said so: it is the partial refund, the split
+  // charge or the next invoice of one order, which a person tells apart.
+  const blocked = verdicts.find(
+    (v) => v.sameMerchant !== null && v.identifierMatches.length > 0 && (!v.sameTotal || v.cardConflict || v.identifierConflicts.length > 0),
+  );
+  const differing = blocked
+    ? [...(!blocked.sameTotal ? ["the total"] : []), ...(blocked.cardConflict ? ["the card"] : []), ...blocked.identifierConflicts]
+    : [];
+  const reason = blocked
+    ? `an identifier matches (${blocked.identifierMatches.join(", ")}) but ${differing.join(", ")} ${differing.length === 1 ? "differs" : "differ"}`
+    : "a candidate matches without a strong tiebreaker";
   return {
     ...base,
     action: "insert",

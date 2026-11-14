@@ -197,6 +197,17 @@ export const MIRROR_BY_METHOD: Readonly<Record<PaymentMethod, "Cash" | "Checking
 
 const MIRROR_TYPE = { Cash: "asset", Checking: "asset", "Credit Card": "liability" } as const;
 
+/**
+ * Owned instances one line may add, and one receipt in all. The legacy
+ * SQL had no bound: one durable line with quantity 300000 made 300,000
+ * `owned_items` rows. A real purchase of tracked things stays far below
+ * these (a set of plates, a box of glasses); a quantity above is a
+ * misreading (a weight, a code) or a record steered to flood the
+ * inventory, and the line is left untracked with `owned_items_skipped`.
+ */
+export const OWNED_INSTANCES_PER_LINE_MAX = 100;
+export const OWNED_INSTANCES_PER_RECEIPT_MAX = 500;
+
 /** Postgres's `numeric::int`: round half away from zero. */
 function roundHalfAway(n: number): number {
   return Math.sign(n) * Math.round(Math.abs(n));
@@ -393,8 +404,19 @@ export function project(
       warnings.push({ rule: "owned_items_skipped", path: `items[${i}].track_as_owned`, message: why });
       return;
     }
+    const count = Math.max(0, roundHalfAway(it.quantity ?? 1));
+    const over =
+      count > OWNED_INSTANCES_PER_LINE_MAX
+        ? `quantity ${count} is over the ${OWNED_INSTANCES_PER_LINE_MAX} owned instances one line may add`
+        : owned.instanceCount + count > OWNED_INSTANCES_PER_RECEIPT_MAX
+          ? `the receipt would add more than ${OWNED_INSTANCES_PER_RECEIPT_MAX} owned instances`
+          : null;
+    if (over) {
+      warnings.push({ rule: "owned_items_skipped", path: `items[${i}].track_as_owned`, message: `${over}; the line is not tracked` });
+      return;
+    }
     owned.lineNos.push(it.line_no);
-    owned.instanceCount += Math.max(0, roundHalfAway(it.quantity ?? 1));
+    owned.instanceCount += count;
   });
 
   // One row per (line, role, name): the identity the table keeps unique.

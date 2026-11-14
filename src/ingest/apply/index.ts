@@ -10,10 +10,12 @@
  *                          with no repair round left also errors the
  *                          ingest and finishes the run (`invalid_record`).
  *   closeRunWithoutRecord  the same close for a run that handed back no
- *                          record at all (`artefact_missing`).
+ *                          record at all (`artefact_missing`); a run that
+ *                          no longer owns its ingest finishes `fenced_out`.
  *   applyExtraction        T2: pre-fetch the place outside any
  *                          transaction, then ONE transaction (`write.ts`):
- *                          prologue and fence, project, candidates,
+ *                          prologue and fence, the Message-ID check again
+ *                          (X9 under the lock), project, candidates,
  *                          decide, the branch's writes, the document stamp,
  *                          the ingest close and the run finish, all or
  *                          nothing. 40001, 40P01, 55P03 and a changed
@@ -27,7 +29,9 @@
  *   applyMessageIdDuplicate  X9, before any spawn: link a re-forwarded
  *                          email to the live transaction(s) of the earlier
  *                          copy and close the ingest `dedup`. Null when
- *                          the Message-ID is not in the ledger.
+ *                          the Message-ID is not in the ledger. The run
+ *                          is finished with no session, model or CLI:
+ *                          nothing was spawned.
  *   reapplyRecord          apply a record that is already stored (an
  *                          apply-only attempt, P6; re-projection, P7). The
  *                          run's outcome is `reapplied`; `apply_report`
@@ -51,7 +55,7 @@ import { ExtractionV1Schema, isReceiptClassification, type ExtractionV1 } from "
 import type { ValidationOutcome } from "../contract/validate.js";
 import { currentExtractionRecord, insertExtractionRecord, type ExtractionOrigin } from "../records.js";
 import { RECORD_PROMPT_VERSION } from "../prompt-contract.js";
-import type { RunOutcome } from "../runs.js";
+import type { RunErrorClass, RunOutcome } from "../runs.js";
 import { readAccountCatalog } from "./accounts.js";
 import { findCandidates } from "./candidates.js";
 import { decide, type ApplyDecision } from "./decide.js";
@@ -197,6 +201,13 @@ async function withRetries<T>(
  * and finish the run, in one short transaction. A fenced-out apply only
  * finishes its own run, if that is still running; the ingest belongs to
  * whoever fenced it out.
+ *
+ * The run's finish runs under a savepoint: whatever goes wrong there,
+ * the ingest's close still commits. Before that, a document hard-deleted
+ * between T1 and T2 took its record with it, the finish named the gone
+ * record, the foreign key refused it, and the whole close rolled back,
+ * leaving the ingest `processing` and the batch waiting for a restart.
+ * (`finishRunIn` now names a record only while it exists.)
  */
 async function closeFailure(
   ids: ApplyIds,
@@ -227,14 +238,22 @@ async function closeFailure(
           RETURNING id`);
         if (closed.rows.length === 1) ingestStatus = "error";
       }
-      await finishRunIn(tx, ids.runId, {
-        outcome: "failed",
-        errorClass: fenced ? "fenced_out" : "apply",
-        error,
-        applyReport: report,
-        extractionId,
-        stats,
-      });
+      try {
+        await tx.transaction((sp) =>
+          finishRunIn(sp, ids.runId, {
+            outcome: "failed",
+            errorClass: fenced ? "fenced_out" : "apply",
+            error,
+            applyReport: report,
+            extractionId,
+            stats,
+          }),
+        );
+      } catch (finishErr) {
+        // The run stays `running`; boot recovery abandons it. The ingest's
+        // close above is what must not be lost.
+        console.error(`[apply] could not finish run ${ids.runId} after its failure:`, finishErr);
+      }
     });
   } catch (closeErr) {
     console.error(`[apply] could not record the failure of run ${ids.runId}:`, closeErr);
@@ -316,7 +335,14 @@ async function applyStored(input: ApplyInput, outcomeOverride?: RunOutcome): Pro
       place,
       stats,
     };
-    const branch: BranchResult = receipt ? await applyReceipt(tx, c) : await applyNotBooked(tx, c);
+    // X9 again, under the apply lock: the pre-spawn check cannot see a copy
+    // of the same email that was applied while this run read (two copies
+    // in flight at once). Linked like the pre-spawn case, never inserted
+    // twice; the record stays stored as this document's reading.
+    const dup = input.source?.email?.messageId
+      ? await messageIdDuplicateIn(tx, { ids, pro, source: input.source })
+      : null;
+    const branch: BranchResult = dup ?? (receipt ? await applyReceipt(tx, c) : await applyNotBooked(tx, c));
     const out = produced(ids, branch.transactionIds, input.extractionId);
     await closeIngest(tx, ids, {
       status: branch.status,
@@ -399,7 +425,14 @@ export async function applyMessageIdDuplicate(input: MessageIdDuplicateInput): P
     const out = produced(ids, branch.transactionIds, null);
     await closeIngest(tx, ids, { status: branch.status, classification: "receipt_email", produced: out, error: branch.error });
     const report: ApplyReport = { ...branch.report, attempts: attempt };
-    await finishRunIn(tx, ids.runId, { outcome: branch.outcome, produced: out, applyReport: report, stats, required: true });
+    await finishRunIn(tx, ids.runId, {
+      outcome: branch.outcome,
+      produced: out,
+      applyReport: report,
+      stats,
+      required: true,
+      noAgent: true,
+    });
     return { branch, report };
   });
   if (!run.ok) {
@@ -433,6 +466,14 @@ export interface RecordInput extends ApplyIds {
   stats?: RunStats | null;
   /** True when no repair round is left: an invalid record then closes the run. */
   final?: boolean;
+  /**
+   * A repair round's spawn failed (auth, quota, timeout, a crash) and left
+   * the earlier, invalid record standing. The record is stored as evidence
+   * all the same, but the run ends `agent_error` with this class and the
+   * ingest carries the agent's error: the outage is what happened, not a
+   * bad reading, and the watch query must count it as one.
+   */
+  agentFailure?: { errorClass: RunErrorClass; error: string } | null;
 }
 
 export interface RecordResult {
@@ -441,13 +482,19 @@ export interface RecordResult {
   status: "valid" | "invalid" | null;
   /** True when the ingest was errored and the run finished here. */
   closed: boolean;
+  /** The ingest's error when `closed`. */
+  error: string | null;
 }
 
-/** The ingest's error for a rejected record: the first error's path and rule. */
+/** Longest `ingests.error` / `agent_runs.error` written here. */
+const ERROR_TEXT_MAX = 2000;
+
+/** The ingest's error for a rejected record: the first error's path and
+ *  rule (a path quotes any key that is not a plain name; see `formatPath`). */
 export function rejectedText(outcome: ValidationOutcome): string {
   const [first, ...rest] = outcome.report.errors;
   const head = first ? `${first.path === "" ? "record" : first.path}: ${first.rule}` : "record: schema";
-  return `extraction record rejected: ${head}${rest.length > 0 ? ` (+${rest.length} more)` : ""}`;
+  return `extraction record rejected: ${head}${rest.length > 0 ? ` (+${rest.length} more)` : ""}`.slice(0, ERROR_TEXT_MAX);
 }
 
 /**
@@ -455,7 +502,10 @@ export function rejectedText(outcome: ValidationOutcome): string {
  * stores nothing. A valid record supersedes the document's current one
  * (`records.ts`). An invalid record is stored as evidence; when `final`,
  * the ingest errors and the run finishes `invalid_record` /
- * `artefact_invalid` in the same transaction.
+ * `artefact_invalid` (or `agent_error` with `agentFailure`'s class) in the
+ * same transaction. A document hard-deleted while the agent read has no
+ * row to hang a record on: the ingest errors `document_missing` and the
+ * run finishes `failed` / `apply`, as T2 would.
  */
 export async function recordExtraction(input: RecordInput): Promise<RecordResult> {
   const ids: ApplyIds = input;
@@ -467,7 +517,40 @@ export async function recordExtraction(input: RecordInput): Promise<RecordResult
          AND i.current_run_id = ${ids.runId}::uuid AND i.status = 'processing' AND r.status = 'running'
          FOR UPDATE OF i`);
     const run = fence.rows[0] as { prompt_git_sha: string } | undefined;
-    if (!run) return { fencedOut: true, extractionId: null, status: null, closed: false };
+    if (!run) return { fencedOut: true, extractionId: null, status: null, closed: false, error: null };
+
+    const close = async (
+      extractionId: string | null,
+      f: { outcome: RunOutcome; errorClass: RunErrorClass; error: string },
+    ): Promise<void> => {
+      const out = produced(ids, [], extractionId);
+      await tx.execute(sql`
+        UPDATE ingests
+           SET status = 'error', error = ${f.error},
+               produced = ${JSON.stringify(out)}::jsonb,
+               completed_at = now()
+         WHERE id = ${ids.ingestId}::uuid AND current_run_id = ${ids.runId}::uuid AND status = 'processing'`);
+      await finishRunIn(tx, ids.runId, {
+        outcome: f.outcome,
+        errorClass: f.errorClass,
+        error: f.error,
+        extractionId,
+        produced: out,
+        stats: input.stats ?? null,
+        required: true,
+      });
+    };
+
+    const doc = await tx.execute(sql`
+      SELECT 1 FROM documents WHERE id = ${ids.documentId}::uuid AND workspace_id = ${ids.workspaceId}::uuid`);
+    if (doc.rows.length === 0) {
+      const error = applyFailureText(
+        new ApplyError("document_missing", `document ${ids.documentId} was deleted before its record was stored`),
+      );
+      await close(null, { outcome: "failed", errorClass: "apply", error });
+      return { fencedOut: false, extractionId: null, status: null, closed: true, error };
+    }
+
     const stored = await insertExtractionRecord(tx, {
       workspaceId: ids.workspaceId,
       documentId: ids.documentId,
@@ -486,53 +569,47 @@ export async function recordExtraction(input: RecordInput): Promise<RecordResult
       await tx.execute(sql`UPDATE agent_runs SET repair_rounds = ${input.repairRounds}::smallint WHERE id = ${ids.runId}::uuid`);
     }
     if (stored.status === "invalid" && input.final) {
-      const error = rejectedText(input.outcome);
-      await tx.execute(sql`
-        UPDATE ingests
-           SET status = 'error', error = ${error},
-               produced = ${JSON.stringify(produced(ids, [], stored.id))}::jsonb,
-               completed_at = now()
-         WHERE id = ${ids.ingestId}::uuid AND current_run_id = ${ids.runId}::uuid AND status = 'processing'`);
-      await finishRunIn(tx, ids.runId, {
-        outcome: "invalid_record",
-        errorClass: "artefact_invalid",
+      const failure = input.agentFailure ?? null;
+      const error = failure ? failure.error.slice(0, ERROR_TEXT_MAX) : rejectedText(input.outcome);
+      await close(stored.id, {
+        outcome: failure ? "agent_error" : "invalid_record",
+        errorClass: failure ? failure.errorClass : "artefact_invalid",
         error,
-        extractionId: stored.id,
-        produced: produced(ids, [], stored.id),
-        stats: input.stats ?? null,
-        required: true,
       });
-      return { fencedOut: false, extractionId: stored.id, status: stored.status, closed: true };
+      return { fencedOut: false, extractionId: stored.id, status: stored.status, closed: true, error };
     }
-    return { fencedOut: false, extractionId: stored.id, status: stored.status, closed: false };
+    return { fencedOut: false, extractionId: stored.id, status: stored.status, closed: false, error: null };
   });
 }
 
 /**
  * A run that handed back no record (`artefact_missing`): error the ingest
  * and finish the run, fenced. Returns false when the run no longer owns
- * the ingest (nothing written but the run's own finish).
+ * the ingest: nothing is written but the run's own finish, as
+ * `failed` / `fenced_out` (the record's absence is not what ended it).
  */
 export async function closeRunWithoutRecord(
   ids: ApplyIds,
   f: { error: string; stats?: RunStats | null },
 ): Promise<boolean> {
+  const error = f.error.slice(0, ERROR_TEXT_MAX);
   return db.transaction(async (tx) => {
     const closed = await tx.execute(sql`
       UPDATE ingests
-         SET status = 'error', error = ${f.error.slice(0, 2000)},
+         SET status = 'error', error = ${error},
              produced = ${JSON.stringify(produced(ids, [], null))}::jsonb,
              completed_at = now()
        WHERE id = ${ids.ingestId}::uuid AND workspace_id = ${ids.workspaceId}::uuid
          AND current_run_id = ${ids.runId}::uuid AND status = 'processing'
       RETURNING id`);
+    const owned = closed.rows.length === 1;
     await finishRunIn(tx, ids.runId, {
-      outcome: "invalid_record",
-      errorClass: "artefact_missing",
-      error: f.error,
+      outcome: owned ? "invalid_record" : "failed",
+      errorClass: owned ? "artefact_missing" : "fenced_out",
+      error: owned ? error : `ingest ${ids.ingestId} is no longer this run's; ${error}`,
       stats: f.stats ?? null,
     });
-    return closed.rows.length === 1;
+    return owned;
   });
 }
 

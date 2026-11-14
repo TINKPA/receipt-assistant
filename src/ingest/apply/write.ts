@@ -23,9 +23,16 @@
  * where the order puts it instead: by `linkDocumentIn` after the new or
  * target transaction row (it re-checks `deleted_at` under the lock), and
  * by the stamp's UPDATE (`... AND deleted_at IS NULL`, zero rows is
- * `document_deleted`) on the branches that link nothing. The ingest row
- * and the advisory lock are outside that order; nothing else holds an
- * ingest row while waiting on a ledger row.
+ * `document_deleted`) on the branches that link nothing. The advisory lock
+ * is outside that order. The ingest row is at its head: T1 and T2 hold it
+ * from the fence on and take the document after it (the record's foreign
+ * key, the link, the stamp). A HARD document delete runs the other way: it
+ * holds the document and then reaches the ingest row through
+ * `ingests.document_id ON DELETE SET NULL`. When the two meet, Postgres
+ * ends one of them with 40P01. Either way nothing is lost: the delete
+ * answers 409 `concurrent-update` (retry), and an apply that loses retries
+ * (`index.ts`), finds the document gone, and errors its ingest
+ * (`document_missing`). Soft deletes do not touch the ingest row.
  *
  * Ids always come from the server's context (the ingest, run and record
  * rows), never from the record.
@@ -35,9 +42,11 @@ import type { db } from "../../db/client.js";
 import { liveTransactions } from "../../db/live.js";
 import { agentRuns } from "../../schema/index.js";
 import { newId } from "../../http/uuid.js";
+import { NotFoundProblem } from "../../http/problem.js";
 import { linkDocumentIn, type DecodedEmailHeaders } from "../../routes/documents.service.js";
 import type { RunOutcome, RunErrorClass } from "../runs.js";
 import type { ExtractionV1 } from "../contract/v1.js";
+import { pgSafeText } from "../contract/artefact.js";
 import type { ValidationWarning } from "../contract/validate.js";
 import { readAccountCatalog } from "./accounts.js";
 import { findCandidates, takeWorkspaceApplyLock } from "./candidates.js";
@@ -208,10 +217,15 @@ export interface StampText {
  * column keeps what it has).
  */
 export function stampText(rawText: string | null, source: ServerSource | null, model: string | null): StampText {
-  if (rawText !== null && rawText.trim() !== "") return { text: rawText, version: model };
-  if (source?.text && source.text.trim() !== "") return { text: source.text, version: SERVER_DECODE_VERSION };
+  if (rawText !== null && rawText.trim() !== "") return { text: pgSafeText(rawText), version: model };
+  // The decode is the sender's text: a U+0000 in it would fail the stamp,
+  // and with it every retry of this document (the decode is deterministic).
+  if (source?.text && source.text.trim() !== "") return { text: pgSafeText(source.text), version: SERVER_DECODE_VERSION };
   return { text: null, version: null };
 }
+
+/** An envelope header as stored: sender text, made storable. */
+const header = (v: string | null | undefined): string | null => (v == null ? null : pgSafeText(v));
 
 /**
  * Stamp the document: this ingest, the text, and for an email the
@@ -228,14 +242,14 @@ export async function stampDocument(
   stamp: StampText,
   email: DecodedEmailHeaders | null | undefined,
 ): Promise<{ messageIdStored: boolean }> {
-  const mid = email?.messageId ?? null;
+  const mid = header(email?.messageId);
   const meta = email
     ? JSON.stringify({
         channel: "eml",
-        sender: email.from,
-        subject: email.subject,
-        received_at: email.date,
-        message_id: email.messageId,
+        sender: header(email.from),
+        subject: header(email.subject),
+        received_at: header(email.date),
+        message_id: mid,
       })
     : null;
   const res = await tx.execute(sql`
@@ -338,6 +352,9 @@ export async function finishRunIn(
     error?: string | null;
     stats?: RunStats | null;
     required?: boolean;
+    /** Nothing was spawned (the X9 link before any spawn): the minted
+     *  session id names no transcript, and no model or CLI ran. */
+    noAgent?: boolean;
   },
 ): Promise<boolean> {
   const rows = await executor
@@ -350,13 +367,39 @@ export async function finishRunIn(
       error: f.error ? f.error.slice(0, 2000) : null,
       produced: f.produced ?? null,
       applyReport: f.applyReport ?? null,
-      ...(f.extractionId ? { extractionId: f.extractionId } : {}),
+      // Only while the record is there: a hard delete of the document
+      // takes its records with it, and naming a gone one would fail the
+      // foreign key and with it whatever else this transaction closes.
+      ...(f.extractionId
+        ? { extractionId: sql`(SELECT id FROM document_extractions WHERE id = ${f.extractionId}::uuid)` }
+        : {}),
+      ...(f.noAgent ? { sessionId: null, modelRequested: null, cliVersion: null } : {}),
       ...statsColumns(f.stats),
     })
     .where(and(eq(agentRuns.id, runId), eq(agentRuns.status, "running")))
     .returning({ id: agentRuns.id });
   if (rows.length === 0 && f.required) throw new ApplyError("fenced_out", `run ${runId} is not running`);
   return rows.length > 0;
+}
+
+/**
+ * `linkDocumentIn` (transaction row, then the document, under their
+ * locks), its refusals turned into the applier's own: the document was
+ * deleted after the prologue read it, which its re-check under the lock
+ * sees, or the transaction is gone. The new row of an insert and the
+ * locked attach target cannot go, so the second is a retryable
+ * `attach_target_changed`, the same answer as a target that moved.
+ */
+async function link(tx: DbTx, ids: ApplyIds, transactionId: string): Promise<void> {
+  try {
+    await linkDocumentIn(tx, { workspaceId: ids.workspaceId, documentId: ids.documentId, transactionId });
+  } catch (err) {
+    if (!(err instanceof NotFoundProblem)) throw err;
+    if (err.title.startsWith("Document")) {
+      throw new ApplyError("document_deleted", `document ${ids.documentId} was deleted during the apply`);
+    }
+    throw new ApplyError("attach_target_changed", `transaction ${transactionId} is gone`, true);
+  }
 }
 
 async function event(
@@ -465,6 +508,8 @@ function decisionReport(d: ApplyDecision): Record<string, unknown> {
     same_merchant: v.sameMerchant,
     identifier_matches: v.identifierMatches,
     identifier_conflicts: v.identifierConflicts,
+    same_total: v.sameTotal,
+    card_conflict: v.cardConflict,
     hard_tuple: v.hardTuple,
     strong: v.strong,
   }));
@@ -541,7 +586,7 @@ async function attach(
   const target = decision.targetId;
   // The target row is held FOR UPDATE (applyReceipt); the link takes the
   // document after it, in the lock order.
-  await linkDocumentIn(tx, { workspaceId: ids.workspaceId, documentId: ids.documentId, transactionId: target });
+  await link(tx, ids, target);
   // The UPDATE moves `version` and `updated_at` (the transactions
   // triggers), as the legacy attach's did.
   const audit = {
@@ -658,7 +703,7 @@ async function insert(
               ${p.amountMinor}::bigint, ${p.currency}, ${p.amountBaseMinor}::bigint)`);
   }
   // h: the link (transaction row, then the document, under their locks).
-  await linkDocumentIn(tx, { workspaceId: ws, documentId: ids.documentId, transactionId: txId });
+  await link(tx, ids, txId);
   // i: products and line items, run 1, pointing at the record.
   const items: WrittenItem[] = await writeItems(tx, {
     workspaceId: ws,
@@ -754,7 +799,7 @@ export async function applyMessageIdDuplicate(
   c: { ids: ApplyIds; pro: Prologue; source: ServerSource },
 ): Promise<BranchResult | null> {
   const { ids } = c;
-  const mid = c.source.email?.messageId ?? null;
+  const mid = header(c.source.email?.messageId);
   if (!mid) return null;
   const found = await tx.execute(sql`
     SELECT DISTINCT t.id, o.id AS original_document_id
@@ -779,7 +824,7 @@ export async function applyMessageIdDuplicate(
   if (kept.length === 0) return null;
   const reason = "duplicate Message-ID: the same email is already in the ledger";
   for (const target of kept) {
-    await linkDocumentIn(tx, { workspaceId: ids.workspaceId, documentId: ids.documentId, transactionId: target });
+    await link(tx, ids, target);
     const audit = {
       attached_document_id: ids.documentId,
       source_ingest_id: ids.ingestId,

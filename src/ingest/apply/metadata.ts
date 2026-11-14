@@ -15,7 +15,7 @@
  *   approval_code?                                             top level, as every reader expects
  *   other_references?, card_last4?, payment?                   `payment`: the legacy dedup reader's string
  *   payment_method?, mirror_account
- *   tax_minor?, printed_totals?
+ *   tax_minor?, tip_minor?, printed_totals?                     the UI's Tax and Tip cells
  *   ocr_audit { …audit, payee_as_printed, payee_source }
  *   allocation_audit?                                          only when the lines miss the total
  *   near_dup_check?                                            from `decide()`
@@ -70,6 +70,7 @@ export const APPLIER_METADATA_KEYS = [
   "payment_method",
   "mirror_account",
   "tax_minor",
+  "tip_minor",
   "printed_totals",
   "ocr_audit",
   "allocation_audit",
@@ -210,7 +211,11 @@ export function buildTransactionMetadata(
   const printed = record.printed_totals
     ? Object.fromEntries(Object.entries(record.printed_totals).filter(([, v]) => v !== null && v !== undefined))
     : {};
+  // The frontend's Tax and Tip cells read these two top-level keys only
+  // (plan §6.4 restores tax_minor; tip_minor is the same case: the legacy
+  // agent wrote it, and without it a restaurant receipt loses its Tip cell).
   if (typeof printed.tax_minor === "number") m.tax_minor = printed.tax_minor;
+  if (typeof printed.tip_minor === "number") m.tip_minor = printed.tip_minor;
   if (Object.keys(printed).length > 0) m.printed_totals = printed;
 
   if (audit) {

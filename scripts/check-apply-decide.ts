@@ -18,8 +18,10 @@
  *   decide()   the direction gate (flow, legs, unknown) and `refund_of`;
  *              no candidate; strong by identifier (same key, cross key,
  *              short cross key), by the hard tuple and each way the tuple
- *              fails; the three same-merchant tests; a conflict outweighed
- *              by a match; several strong; a conflict on every candidate;
+ *              fails; the three same-merchant tests; an identifier match
+ *              blocked by a conflicting key, another total or another
+ *              card (partial refunds, split charges, the next invoice of
+ *              one order); several strong; a conflict on every candidate;
  *              the uncertain residue; a zero total; the pHash-only note.
  *   project()  purchase, refund, income (defaults and named accounts),
  *              points with an existing and a new account, points plus
@@ -340,7 +342,56 @@ function expectDecision(
   const rApproval = rec((x) => {
     x.identifiers = { order_number: "A-000100", approval_code: "YY8" };
   });
-  expectDecision("strong: a conflicting key is outweighed by a matching one", decide(rApproval, [conflictAndMatch]), { action: "attach" });
+  const dApproval = decide(rApproval, [conflictAndMatch]);
+  expectDecision("strong: a conflicting approval code is not outweighed by a matching order number → uncertain", dApproval, {
+    action: "insert",
+    verdict: "uncertain",
+    flagged: true,
+  });
+  check("decide: the reason names the conflicting key", dApproval.reason.includes("approval_code"), dApproval.reason);
+
+  // One order, several money events (an identifier alone never attaches).
+  const subscription = rec((x) => {
+    x.identifiers = { order_number: "A-000100", invoice_number: "INV-000002" };
+  });
+  expectDecision(
+    "strong: same order number, another invoice number, same total (next month's invoice) → uncertain",
+    decide(subscription, [sameBrand({ identifiers: { order_number: "A-000100", invoice_number: "INV-000001" }, matched_on: ["identifier"] })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  const otherTotal = decide(r, [sameBrand({ total: 2000, native_total: 2000, identifiers: { order_number: "A-000100" }, matched_on: ["identifier"] })]);
+  expectDecision("strong: same order number, another total (a split shipment) → uncertain", otherTotal, {
+    action: "insert",
+    verdict: "uncertain",
+    flagged: true,
+  });
+  check("decide: the reason says the total differs", otherTotal.reason.includes("the total differs"), otherTotal.reason);
+  expectDecision(
+    "strong: same order number, no P&L leg in the record's currency → uncertain",
+    decide(r, [sameBrand({ native_total: null, identifiers: { order_number: "A-000100" }, matched_on: ["identifier"] })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  expectDecision(
+    "strong: same order number and total, another card → uncertain",
+    decide(r, [sameBrand({ card_last4: "9999", identifiers: { order_number: "A-000100" }, matched_on: ["amount", "identifier"] })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  expectDecision(
+    "strong: same order number and total, the same card → attach",
+    decide(r, [sameBrand({ card_last4: "0000", identifiers: { order_number: "A-000100" }, matched_on: ["amount", "identifier"] })]),
+    { action: "attach" },
+  );
+  const partial2 = rec((x) => {
+    x.facts.flow = "refund";
+    x.facts.total_minor = -2000;
+    x.identifiers = { order_number: "A-000100" };
+    x.items = [];
+  });
+  expectDecision(
+    "strong: a second partial refund of one order (another amount) is booked → uncertain",
+    decide(partial2, [sameBrand({ id: "r-9", flow: "refund", total: -3000, native_total: -3000, identifiers: { order_number: "A-000100" }, matched_on: ["identifier"] })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
 }
 
 // 2(ii). The hard tuple.
@@ -727,6 +778,31 @@ function validateRecordOrThrow(r: Rec): ExtractionV1 {
     FULL,
   );
   check("project: a refund adds no owned item", refund.owned.instanceCount === 0 && refund.warnings.some((w) => w.rule === "owned_items_skipped"));
+
+  const durable = (line_no: number, quantity: number) => ({
+    line_no,
+    raw_name: `THING ${line_no}`,
+    line_total_minor: 1,
+    item_class: "durable",
+    confidence: "high",
+    product_key: `example-thing-${line_no}`,
+    quantity,
+    track_as_owned: true,
+  });
+  const flood = project(rec((x) => (x.items = [durable(1, 300000), durable(2, 3)])), FULL);
+  check(
+    "project: a line over the per-line owned cap is not tracked, with a warning",
+    json(flood.owned.lineNos) === json([2]) &&
+      flood.owned.instanceCount === 3 &&
+      flood.warnings.some((w) => w.rule === "owned_items_skipped" && w.path === "items[0].track_as_owned"),
+    json(flood.owned),
+  );
+  const many = project(rec((x) => (x.items = [1, 2, 3, 4, 5, 6].map((n) => durable(n, 100)))), FULL);
+  check(
+    "project: lines past the per-receipt owned cap are not tracked",
+    json(many.owned.lineNos) === json([1, 2, 3, 4, 5]) && many.owned.instanceCount === 500,
+    json(many.owned),
+  );
 }
 
 {
@@ -843,6 +919,9 @@ const RUN: MetadataRunContext = {
   check("metadata: cli-default is never the model", (m.extraction as Record<string, unknown>).model === "model-requested");
   const u = rec((x) => (x.payment = { method: "unknown" }));
   check("metadata: an unknown method with nothing printed leaves the cell empty", !("payment_method" in buildTransactionMetadata(u, project(u, FULL), RUN)));
+  const tipped = rec((x) => (x.printed_totals = { subtotal_minor: 1000, tip_minor: 234 }));
+  const mt = buildTransactionMetadata(tipped, project(tipped, FULL), RUN);
+  check("metadata: tip_minor at the top level (the UI's Tip cell), no tax_minor without a tax", mt.tip_minor === 234 && !("tax_minor" in mt));
 }
 
 {

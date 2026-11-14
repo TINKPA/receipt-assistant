@@ -77,7 +77,10 @@
  *   are counted, not compared. A record whose apply failed (its run
  *   finished `failed` / `apply`, the ingest `error`) is explained: the
  *   failure is the run's to report, and the record waits for a re-apply.
- *   Any other receipt record that no transaction names is unexplained.
+ *   A record whose transaction was re-extracted since (a legacy re-extract
+ *   moves the stamp into `metadata.extraction_history`) is explained and
+ *   not compared: a later reading wrote the values. Any other receipt
+ *   record that no transaction names is unexplained.
  *
  * Prints counts per class; `--verbose` adds the transaction ids of each
  * class (ids only, no amounts, names or text).
@@ -726,6 +729,10 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
             (SELECT t.id FROM transactions t
               WHERE t.metadata->'extraction'->>'extraction_id' = e.id::text
               ORDER BY t.created_at LIMIT 1) AS transaction_id,
+            -- A legacy re-extract moves the stamp into extraction_history.
+            (SELECT t.id FROM transactions t
+              WHERE t.metadata->'extraction_history' @> jsonb_build_array(jsonb_build_object('extraction_id', e.id::text))
+              ORDER BY t.created_at LIMIT 1) AS re_extracted_transaction_id,
             (SELECT r.outcome::text || '/' || COALESCE(r.error_class, '') FROM agent_runs r
               WHERE r.extraction_id = e.id
               ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run
@@ -742,6 +749,17 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
   for (const r of recs.rows) {
     if (!isReceiptClassification(r.classification)) {
       tally.add(`no transaction expected (${r.classification})`, r.id, true, "statements and unsupported documents book nothing");
+      continue;
+    }
+    if (!r.transaction_id && r.re_extracted_transaction_id) {
+      // The transaction's current values are a later reading's: the record
+      // is no longer their author, so there is nothing to compare.
+      tally.add(
+        "re-extracted since the apply",
+        r.re_extracted_transaction_id,
+        true,
+        "a re-extract replaced the reading (the record's stamp is in metadata.extraction_history)",
+      );
       continue;
     }
     if (!r.transaction_id) {

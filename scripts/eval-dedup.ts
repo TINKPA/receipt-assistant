@@ -112,6 +112,9 @@
  *   a8   three copies in ONE batch                  → one transaction holding three documents, three
  *                                                     rounds in a row (run it with MAX_CLAUDE_CONCURRENCY=3
  *                                                     to make the copies race; the apply lock is what holds)
+ *   a9   one order number, two money events         → a second partial refund (another amount) and a
+ *                                                     second invoice (another invoice number) are each
+ *                                                     booked, `uncertain` + flagged, never attached
  *
  * Agent decision tree (--with-claude):
  *   b2   re-encoded copy of extracted receipt       → branch-2 attach (near_dup, no new txn)
@@ -2030,6 +2033,51 @@ async function main(): Promise<void> {
     }
     assert(converged === 3, `${converged}/3 rounds converged to one transaction`);
     notes.push("3/3 rounds converged to one transaction holding three documents");
+  });
+
+  // a9 — one order, several money events: a second partial refund (another
+  // amount) and a second charge (another invoice number, the same amount)
+  // share the order number with the first. An identifier alone never
+  // attaches, so each is booked and flagged for a person, never filed as
+  // evidence for the first (where its money would never reach the ledger).
+  await runCase("a9", false, async (notes) => {
+    const base = { brand: `A9 Order ${NONCE}`, card: "0009", date: "2026-10-10" };
+    const refundOrder = { order_number: `A9-${NONCE}-R` };
+    const r1 = await bookedBy(
+      await uploadRecord(recordOf({ ...base, total: -amt(60), flow: "refund", ids: refundOrder })),
+      "first partial refund",
+    );
+    const r2 = await bookedBy(
+      await uploadRecord(recordOf({ ...base, total: -amt(61), flow: "refund", ids: refundOrder })),
+      "second partial refund",
+    );
+    const ndc = (await metadataOf(r2.id)).near_dup_check;
+    assert(
+      ndc?.verdict === "uncertain" && ndc.flagged_for_review === true && (ndc.candidate_transaction_ids ?? []).includes(r1.id),
+      `second refund near_dup_check: ${JSON.stringify(ndc)}`,
+    );
+    const [legs] = await q<{ expense: string }>(
+      `SELECT sum(p.amount_minor)::text AS expense FROM postings p JOIN accounts a ON a.id = p.account_id
+        WHERE p.transaction_id = ANY($1) AND a.type = 'expense'`,
+      [[r1.id, r2.id]],
+    );
+    assert(Number(legs!.expense) === -(amt(60) + amt(61)), `both refunds' money: expense legs ${legs!.expense}`);
+
+    const c1 = await bookedBy(
+      await uploadRecord(recordOf({ ...base, total: amt(62), ids: { order_number: `A9-${NONCE}-C`, invoice_number: `A9-${NONCE}-I1` } })),
+      "first invoice",
+    );
+    const c2 = await bookedBy(
+      await uploadRecord(recordOf({ ...base, total: amt(62), ids: { order_number: `A9-${NONCE}-C`, invoice_number: `A9-${NONCE}-I2` } })),
+      "second invoice",
+    );
+    const ndc2 = (await metadataOf(c2.id)).near_dup_check;
+    assert(
+      ndc2?.verdict === "uncertain" && ndc2.flagged_for_review === true && (ndc2.candidate_transaction_ids ?? []).includes(c1.id),
+      `second invoice near_dup_check: ${JSON.stringify(ndc2)}`,
+    );
+    assert(isLive(await txState(r1.id)) && isLive(await txState(c1.id)), "a first row was removed");
+    notes.push("second partial refund (another amount) and second invoice (another invoice number) of one order → each booked, uncertain + flagged, never attached");
   });
 
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach

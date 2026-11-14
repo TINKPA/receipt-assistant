@@ -35,8 +35,13 @@
  *   Message-ID duplicate (and one whose transaction was deleted) · parties
  *   (channel defaulted, line-level maker) · cached place · uncached place
  *   from a supplied envelope, unprojectable, unfetchable · extras
- *   colliding with metadata keys · missing fence · invalid JSON · a
- *   repair round · double apply and a stale run (fenced) · a missing
+ *   colliding with metadata keys · missing fence (and a stale run's) ·
+ *   invalid JSON · a repair round · a repair round whose spawn failed ·
+ *   an identifier match with another total (booked, flagged) · a
+ *   document hard-deleted between T1 and T2, and before T1 · one
+ *   soft-deleted during the apply · characters Postgres cannot store · a
+ *   Message-ID copy applied while this run read (linked under the lock) ·
+ *   double apply and a stale run (fenced) · a missing
  *   account · an apply failing half-way (nothing left) and one retried
  *   past a serialization failure · re-apply of a stored record · dry run
  *   · uncached place from Google (only with GOOGLE_MAPS_API_KEY and
@@ -814,6 +819,19 @@ await fixture("uncertain: a candidate with no tiebreaker", async () => {
   check("near_dup_check uncertain and flagged", nd?.verdict === "uncertain" && nd?.flagged_for_review === true && nd?.candidate_transaction_id === a, json(nd));
 });
 
+await fixture("an identifier match with another total is booked, flagged (a second partial refund)", async () => {
+  const refundItems = (t: number) => [{ line_no: 1, raw_name: "RETURN", line_total_minor: t, item_class: "consumable", confidence: "high" }];
+  const first = await seed(receipt({ brand: "partial", total: -2000, flow: "refund", ids: { order_number: `P-${N}-15` }, items: refundItems(-2000) }));
+  const r = await ingest(W, receipt({ brand: "partial", total: -1500, flow: "refund", ids: { order_number: `P-${N}-15` }, items: refundItems(-1500) }));
+  const txId = await checkWritten(r);
+  const t = await one(`SELECT metadata FROM transactions WHERE id = $1`, [txId]);
+  const nd = t.metadata.near_dup_check;
+  check("near_dup_check uncertain, flagged, naming the first refund", nd?.verdict === "uncertain" && nd?.flagged_for_review === true &&
+    nd?.candidate_transaction_id === first && /the total differs/.test(nd?.reason ?? ""), json(nd));
+  const ps = await postingsOf(txId);
+  check("its own money is booked", ps.some((p) => p.account === "Shopping" && p.amount_minor === "-1500"), json(ps));
+});
+
 await fixture("unsupported: nothing booked, the text stamped", async () => {
   const expect = await watch(W);
   const outcome = validateExtraction(
@@ -877,8 +895,10 @@ await fixture("Message-ID duplicate: linked to the live transaction, closed dedu
   const doc = await one(`SELECT message_id, source_meta, ocr_text, ocr_model_version FROM documents WHERE id = $1`, [st.documentId]);
   check("the copy keeps the id in source_meta, the column stays with the original", doc.message_id === null &&
     doc.source_meta?.message_id === mid && doc.ocr_model_version === A.SERVER_DECODE_VERSION);
-  const run = await one(`SELECT outcome, status FROM agent_runs WHERE id = $1`, [st.runId]);
+  const run = await one(`SELECT outcome, status, session_id, model_requested, cli_version FROM agent_runs WHERE id = $1`, [st.runId]);
   check("run finished duplicate_skip", run.status === "finished" && run.outcome === "duplicate_skip");
+  check("nothing was spawned: no session, model or CLI on the run", run.session_id === null && run.model_requested === null &&
+    run.cli_version === null, json(run));
   await expect({ document_links: 1, transaction_events: 1 });
 
   // The same id whose transaction is gone: not a duplicate; the copy is
@@ -1042,6 +1062,18 @@ await fixture("missing fence: no record, the ingest errors", async () => {
   check("ingest error, retryable text", ing.status === "error" && /^extraction record missing/.test(ing.error));
   const run = await one(`SELECT outcome, error_class FROM agent_runs WHERE id = $1`, [st.runId]);
   check("run invalid_record / artefact_missing", run.outcome === "invalid_record" && run.error_class === "artefact_missing");
+
+  // A run that lost its ingest to a newer one: not its close to make.
+  const st2 = await stage(W);
+  const newer = await newRun(W, st2.ingestId, st2.documentId);
+  const stale = await A.closeRunWithoutRecord(st2, { error: "extraction record missing: nothing" });
+  check("a stale run closes nothing", stale === false);
+  const old = await one(`SELECT status, outcome, error_class FROM agent_runs WHERE id = $1`, [st2.runId]);
+  check("the stale run finishes failed / fenced_out, not artefact_missing", old.status === "finished" && old.outcome === "failed" &&
+    old.error_class === "fenced_out", json(old));
+  const ing2 = await one(`SELECT status FROM ingests WHERE id = $1`, [st2.ingestId]);
+  check("the ingest is left to the newer run", ing2.status === "processing");
+  check("the newer run closes it", await A.closeRunWithoutRecord({ ...st2, runId: newer }, { error: "extraction record missing: nothing" }));
   await expect({});
 });
 
@@ -1117,6 +1149,129 @@ await fixture("double apply and a stale run are fenced out", async () => {
   await checkWritten(r, "the newer run");
   await expect({ transactions: 1, postings: 2, document_links: 1, transaction_items: 1, products: 1, transaction_parties: 1,
     transaction_events: 1, merchants: 1, brands: 1, document_extractions: 2 });
+});
+
+await fixture("a document hard-deleted between T1 and T2: the ingest still closes", async () => {
+  const st = await stage(W);
+  const outcome = validate(receipt({ brand: "purged", total: 3300 }));
+  const rec = await A.recordExtraction({ ...st, origin: "stub", outcome, rawText: "X", final: true, stats: STATS });
+  check("the record is stored", rec.status === "valid" && rec.extractionId !== null);
+  // The purge a `DELETE /v1/documents/:id?hard=true` does: the record goes
+  // with the document (ON DELETE CASCADE), the run's pointer to it is nulled.
+  await q(`DELETE FROM documents WHERE id = $1`, [st.documentId]);
+  const res = await A.applyExtraction({ ...st, extractionId: rec.extractionId!, stats: STATS, placeFetcher: refuseFetch });
+  check("the apply fails", res.outcome === "failed" && res.errorClass === "apply" && res.ingestStatus === "error", json(res));
+  const ing = await one(`SELECT status, error FROM ingests WHERE id = $1`, [st.ingestId]);
+  check("the ingest is closed error, not left processing", ing.status === "error" && /^apply failed: record_missing/.test(ing.error), json(ing));
+  const run = await one(`SELECT status, outcome, error_class, extraction_id FROM agent_runs WHERE id = $1`, [st.runId]);
+  check("the run finished failed / apply, naming no gone record", run.status === "finished" && run.outcome === "failed" &&
+    run.error_class === "apply" && run.extraction_id === null, json(run));
+
+  // Deleted before T1 could store anything: the same close, from T1.
+  const st2 = await stage(W);
+  await q(`DELETE FROM documents WHERE id = $1`, [st2.documentId]);
+  const rec2 = await A.recordExtraction({ ...st2, origin: "stub", outcome, rawText: "X", final: true, stats: STATS });
+  check("T1 closes the run itself", rec2.closed && rec2.extractionId === null && /^apply failed: document_missing/.test(rec2.error ?? ""), json(rec2));
+  const ing2 = await one(`SELECT status, error FROM ingests WHERE id = $1`, [st2.ingestId]);
+  check("the ingest says the document is missing", ing2.status === "error" && ing2.error === rec2.error);
+  const run2 = await one(`SELECT outcome, error_class FROM agent_runs WHERE id = $1`, [st2.runId]);
+  check("the run finished failed / apply", run2.outcome === "failed" && run2.error_class === "apply");
+});
+
+await fixture("a document soft-deleted during the apply is document_deleted, not internal", async () => {
+  const st = await stage(W);
+  const outcome = validate(receipt({ brand: "softgone", total: 3400 }));
+  const rec = await A.recordExtraction({ ...st, origin: "stub", outcome, rawText: "X", final: true, stats: STATS });
+  // The prologue reads the document without a lock; a delete that lands
+  // after it is seen under the document's lock (the stamp's UPDATE waits
+  // for it, then finds the row deleted).
+  const holder = await pool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("UPDATE documents SET deleted_at = now() WHERE id = $1", [st.documentId]);
+    const pending = A.applyExtraction({ ...st, extractionId: rec.extractionId!, stats: STATS, placeFetcher: refuseFetch });
+    let waiting = false;
+    for (let i = 0; i < 100 && !waiting; i++) {
+      const w = await q(`SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%documents%' AND datname = current_database()`);
+      waiting = w.length > 0;
+      if (!waiting) await new Promise((r) => setTimeout(r, 50));
+    }
+    check("the apply waited on the document's row lock", waiting);
+    await holder.query("COMMIT");
+    const res = await pending;
+    check("the apply fails as document_deleted", res.outcome === "failed" && /^apply failed: document_deleted/.test(res.error ?? ""), json(res));
+    const t = await q(`SELECT 1 FROM transactions WHERE source_ingest_id = $1`, [st.ingestId]);
+    check("nothing booked", t.length === 0);
+  } finally {
+    holder.release();
+  }
+});
+
+await fixture("a repair round whose spawn failed: the record is evidence, the run an agent error", async () => {
+  const expect = await watch(W);
+  const st = await stage(W);
+  const bad = validateExtraction(receipt({ brand: "outage", total: 3500, date: "2026-02-30" }), { uploadedAt: UPLOAD, receiptText: "R" });
+  const rec = await A.recordExtraction({
+    ...st,
+    origin: "stub",
+    outcome: bad,
+    rawText: "R",
+    repairRounds: 1,
+    final: true,
+    stats: STATS,
+    agentFailure: { errorClass: "auth", error: "claude -p exited 1: authentication_error (synthetic)" },
+  });
+  check("stored invalid and closed", rec.status === "invalid" && rec.closed);
+  const ing = await one(`SELECT status, error FROM ingests WHERE id = $1`, [st.ingestId]);
+  check("the ingest carries the agent's error, not 'record rejected'", ing.status === "error" && /authentication_error/.test(ing.error), ing.error);
+  const run = await one(`SELECT outcome, error_class, extraction_id, repair_rounds FROM agent_runs WHERE id = $1`, [st.runId]);
+  check("run agent_error / auth, pointing at the invalid record", run.outcome === "agent_error" && run.error_class === "auth" &&
+    run.extraction_id === rec.extractionId && run.repair_rounds === 1, json(run));
+  await expect({ document_extractions: 1 });
+});
+
+await fixture("characters Postgres cannot store: removed, and the receipt is written", async () => {
+  const raw = receipt({ brand: "nul", total: 3600, classification: "receipt_email", payee: "Example\u0000 Nul" });
+  const outcome = validateExtraction(raw, { uploadedAt: UPLOAD, receiptText: null });
+  check("the record is valid, the NUL removed", outcome.status === "valid" && outcome.record?.facts?.payee === "Example Nul" &&
+    outcome.report.normalizations.some((n) => n.rule === "unsafe_character_removed"));
+  const source: ServerSource = {
+    text: "Receipt\u0000 body with a lone \ud800 surrogate",
+    email: { messageId: `chk-${N}-nul@example.invalid`, from: "Example <a@example.invalid>", subject: "Sub\u0000ject", date: null },
+  };
+  const st = await stage(W, { kind: "receipt_email", mime: "message/rfc822" });
+  const rec = await A.recordExtraction({ ...st, origin: "stub", outcome, rawText: "raw\u0000 text", final: true, stats: STATS });
+  check("T1 stores it", rec.status === "valid");
+  const res = await A.applyExtraction({ ...st, extractionId: rec.extractionId!, source, stats: STATS, placeFetcher: refuseFetch });
+  await checkWritten({ st, outcome, rec, res });
+  const stored = await one(`SELECT raw_text FROM document_extractions WHERE id = $1`, [rec.extractionId]);
+  check("raw_text stored without the NUL", stored.raw_text === "raw text");
+  const doc = await one(`SELECT ocr_text, source_meta FROM documents WHERE id = $1`, [st.documentId]);
+  check("ocr_text and the envelope stamped without them", doc.ocr_text === "raw text" && doc.source_meta?.subject === "Subject", json(doc));
+});
+
+await fixture("Message-ID copy applied while this run read: linked under the lock", async () => {
+  const mid = `chk-${N}-inflight@example.invalid`;
+  const email = { messageId: mid, from: "Example Shop <orders@example.invalid>", subject: "Receipt", date: "2026-06-10T18:30:00.000Z" };
+  const raw = receipt({ brand: "inflight", total: 3700, classification: "receipt_email" });
+  // Both copies pass the pre-spawn check (nothing holds the id yet); the
+  // first is applied while the second is still being read.
+  const stB = await stage(W, { kind: "receipt_email", mime: "message/rfc822" });
+  const preB = await A.applyMessageIdDuplicate({ ...stB, source: { text: "Receipt body", email } });
+  check("the pre-spawn check finds nothing yet", preB === null);
+  const first = await ingest(W, raw, { kind: "receipt_email", mime: "message/rfc822", receiptText: null, source: { text: "Receipt body", email } });
+  const original = await checkWritten(first, "the first copy");
+  const expect = await watch(W);
+  const outcome = validate(raw, null);
+  const rec = await A.recordExtraction({ ...stB, origin: "stub", outcome, final: true, stats: STATS });
+  const res = await A.applyExtraction({ ...stB, extractionId: rec.extractionId!, source: { text: "Receipt body (copy)", email }, stats: STATS, placeFetcher: refuseFetch });
+  check("closed as a duplicate, not inserted", res.outcome === "duplicate_skip" && json(res.transactionIds) === json([original]), json(res));
+  const ing = await one(`SELECT status, produced FROM ingests WHERE id = $1`, [stB.ingestId]);
+  check("ingest dedup, naming the transaction and the record", ing.status === "dedup" &&
+    json(ing.produced.transaction_ids) === json([original]) && json(ing.produced.extraction_ids) === json([rec.extractionId]));
+  const run = await one(`SELECT outcome, session_id FROM agent_runs WHERE id = $1`, [stB.runId]);
+  check("the run keeps its session (the agent did read)", run.outcome === "duplicate_skip" && run.session_id !== null);
+  await expect({ document_links: 1, transaction_events: 1, document_extractions: 1 });
 });
 
 await fixture("a missing account is a failed apply, never a model error", async () => {

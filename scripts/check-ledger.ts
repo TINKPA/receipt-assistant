@@ -83,8 +83,17 @@
  *                           extraction_id` names is valid and current, or
  *                           a document linked to it has a current valid
  *                           record (a later reading superseded the first).
- *                           Skipped on a database without
- *                           `document_extractions` (before migration 0043).
+ *                           A soft-deleted row with no linked document is
+ *                           left out (a dedup apply moved its document to
+ *                           the survivor, and a purge of that document took
+ *                           the record). The one way an owner action still
+ *                           reaches it: purging (`?hard=true`) the document
+ *                           a record belongs to while another document,
+ *                           with no record of its own, keeps the
+ *                           transaction live; its events show the purge
+ *                           (`document_unlinked`). Skipped on a database
+ *                           without `document_extractions` (before
+ *                           migration 0043).
  *   run-without-terminal-ingest
  *                           an ingest run that has ended (`finished`, or
  *                           `abandoned` at boot) belongs to an ingest that
@@ -419,6 +428,11 @@ const CHECKS: Check[] = [
         FROM transactions t
         LEFT JOIN document_extractions e ON e.id::text = t.metadata->'extraction'->>'extraction_id'
        WHERE t.metadata->'extraction'->>'writer' = 'server_apply'
+         -- A deleted row with no document left (a dedup apply moved its
+         -- links to the survivor, then the document was purged) is out of
+         -- the ledger and holds no evidence to lose.
+         AND NOT (t.deleted_at IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM document_links dl WHERE dl.transaction_id = t.id))
          AND NOT EXISTS (
                SELECT 1 FROM document_extractions c
                 WHERE c.status = 'valid' AND c.superseded_at IS NULL

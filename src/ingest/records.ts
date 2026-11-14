@@ -41,6 +41,7 @@ import {
   FLOWS,
 } from "./contract/v1.js";
 import { dayNumber, identifiersOf, type ValidationOutcome } from "./contract/validate.js";
+import { pgSafeText } from "./contract/artefact.js";
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -199,7 +200,9 @@ export async function insertExtractionRecord(
     supersedesId,
     ...promoted,
     result,
-    rawText: input.rawText ?? null,
+    // The parser already made it storable; a caller that did not parse
+    // (a backfill, a person) gets the same treatment here.
+    rawText: input.rawText == null ? null : pgSafeText(input.rawText),
     validation: outcome.report,
   });
 
