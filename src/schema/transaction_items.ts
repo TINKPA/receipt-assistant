@@ -18,11 +18,13 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces.js";
 import { transactions } from "./transactions.js";
 import { products } from "./products.js";
+import { documentExtractions } from "./document_extractions.js";
 
 export const transactionItems = pgTable(
   "transaction_items",
@@ -115,6 +117,13 @@ export const transactionItems = pgTable(
      *  a manually-created row could later be re-derived. Read this
      *  column for "who created it", never `metadata->>'source'`. */
     source: text("source").notNull().default("extraction"),
+    /** Wave 1: the extraction record this line was projected from, when
+     *  the server writer wrote it. NULL on rows the agent's own SQL wrote
+     *  and on manual rows. */
+    extractionId: uuid("extraction_id").references(
+      (): AnyPgColumn => documentExtractions.id,
+      { onDelete: "set null" },
+    ),
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -136,5 +145,8 @@ export const transactionItems = pgTable(
       t.itemClass,
       t.createdAt.desc(),
     ),
+    index("transaction_items_extraction_idx")
+      .on(t.extractionId)
+      .where(sql`extraction_id IS NOT NULL`),
   ],
 );

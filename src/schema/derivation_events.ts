@@ -5,9 +5,11 @@ import {
   jsonb,
   timestamp,
   index,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces.js";
+import { documentExtractions } from "./document_extractions.js";
 
 /**
  * Append-only audit log for Layer 2 re-derivations (#80 / #89).
@@ -80,6 +82,14 @@ export const derivationEvents = pgTable(
      *  that a version bump touched the row even when the new
      *  projection happened to match the old. */
     changedKeys: text("changed_keys").array().notNull(),
+    /** Wave 1: the extraction record a re-extract applied, when it ran on
+     *  records (P7). NULL for every other derivation. */
+    extractionId: uuid("extraction_id").references(
+      (): AnyPgColumn => documentExtractions.id,
+      { onDelete: "set null" },
+    ),
+    /** Wave 1: `APPLIER_VERSION` of the code that projected the record. */
+    applierVersion: text("applier_version"),
   },
   (t) => [
     // Browse-by-entity: "show me every re-derivation of place X".
