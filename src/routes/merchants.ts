@@ -282,6 +282,7 @@ merchantsRouter.get(
         (
           SELECT dl.document_id
           FROM document_links dl
+          JOIN documents d ON d.id = dl.document_id AND d.deleted_at IS NULL
           WHERE dl.transaction_id = t.id
           ORDER BY dl.created_at ASC
           LIMIT 1
