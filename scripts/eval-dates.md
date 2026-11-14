@@ -123,9 +123,12 @@ subscription. A full C1 trial is 24 of them.
 7. **Finds each run's transcript** in `--transcripts` (default the
    sandbox's `~/Developer/receipt-assistant-data/test-claude/projects/-app/`):
    by `agent_runs.session_id` when run records exist (needs `--pg`),
-   otherwise by the ingest id in the prompt. It counts turns and tokens
-   the way `measure-ingest-turns.ts` does (grouped by `message.id`; billed
-   input is fresh + cache read + cache write).
+   otherwise by the ingest id in the prompt. It counts turns, tokens and
+   the model with `summarizeSession` (`src/session-transcript.ts`), the
+   parser that also fills `agent_runs` and `measure-ingest-turns.ts`, so
+   the three agree: turns grouped by `message.id`, billed input is fresh +
+   cache read + cache write, and the model is the one that answered most
+   turns.
 8. **Dumps the rows** with `--dump=<dir> --pg=<url>`: for every fixture the
    ingest, documents, links, transactions, postings (with account name and
    type), items, parties, events, place, merchant, owned items and, once
