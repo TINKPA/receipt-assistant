@@ -4,7 +4,7 @@
   "description": "Personal receipt processing assistant powered by Claude Code CLI",
   "type": "module",
   "scripts": {
-    "prebuild": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-budget.ts && tsx scripts/check-agent-grants.ts",
+    "prebuild": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-render.ts && tsx scripts/check-prompt-budget.ts && tsx scripts/check-agent-grants.ts",
     "build": "tsc",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
@@ -12,6 +12,7 @@
     "db:seed": "tsx scripts/seed.ts",
     "openapi:generate": "node scripts/generate-build-info.mjs && tsx scripts/generate-openapi.ts",
     "eval:dates": "tsx scripts/eval-dates.ts",
+    "check:prompt-render": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-render.ts",
     "check:prompt-budget": "node scripts/generate-build-info.mjs && tsx scripts/check-prompt-budget.ts",
     "check:ingest-classification": "node scripts/generate-build-info.mjs && tsx scripts/check-ingest-classification.ts",
     "check:agent-grants": "node scripts/generate-build-info.mjs && tsx scripts/check-agent-grants.ts",

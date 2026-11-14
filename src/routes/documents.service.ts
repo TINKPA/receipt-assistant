@@ -7,7 +7,7 @@
 import { createHash } from "crypto";
 import { mkdir, writeFile, rename, readFile } from "fs/promises";
 import * as path from "path";
-import { simpleParser } from "mailparser";
+import { simpleParser, type ParsedMail } from "mailparser";
 import sanitizeHtml from "sanitize-html";
 import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -407,52 +407,73 @@ export async function renderDocumentHtml(
   return sanitizeHtml(raw.toString("utf8"), EMAIL_SANITIZE);
 }
 
+type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Link a document to a transaction inside the caller's DB transaction.
+ *
+ * Both must belong to the workspace, and the document must not be
+ * soft-deleted; a missing one is a 404 (`NotFoundProblem`), the document
+ * reported first when both are. Validated explicitly rather than left to
+ * the foreign keys, for a clearer error. Re-linking is a no-op: the
+ * result says whether a row was added.
+ *
+ * LOCK ORDER (CLAUDE.md, "Lock order"): the transaction row, then the
+ * document row, each FOR KEY SHARE — the locks the INSERT's foreign keys
+ * take anyway. Left to the INSERT, they are taken document first (the FK
+ * triggers fire in name order), the other way round from every path that
+ * holds a transaction and then waits for a document. Taking them here
+ * also makes the "not deleted" check hold until the link is in: a cascade
+ * delete holding the document is waited for, and what it decided is what
+ * is read.
+ *
+ * A caller that holds more than this transaction row must have taken its
+ * head-row locks already, and must not have locked the document. Whether
+ * the transaction is live is the caller's question; this only checks the
+ * workspace.
+ */
+export async function linkDocumentIn(
+  tx: DbTx,
+  params: { workspaceId: string; documentId: string; transactionId: string },
+): Promise<{ created: boolean }> {
+  const { workspaceId, documentId, transactionId } = params;
+  const txn = await tx
+    .select({ id: transactions.id })
+    .from(transactions)
+    .where(and(eq(transactions.id, transactionId), eq(transactions.workspaceId, workspaceId)))
+    .for("key share");
+
+  const doc = await tx
+    .select({ id: documents.id })
+    .from(documents)
+    .where(
+      and(
+        eq(documents.id, documentId),
+        eq(documents.workspaceId, workspaceId),
+        isNull(documents.deletedAt),
+      ),
+    )
+    .for("key share");
+  if (doc.length === 0) throw new NotFoundProblem("Document", documentId);
+  if (txn.length === 0) throw new NotFoundProblem("Transaction", transactionId);
+
+  // Composite PK is (document_id, transaction_id) — re-link is a no-op.
+  const inserted = await tx
+    .insert(documentLinks)
+    .values({ documentId, transactionId })
+    .onConflictDoNothing()
+    .returning({ documentId: documentLinks.documentId });
+  return { created: inserted.length > 0 };
+}
+
+/** `POST /v1/documents/:id/links`: `linkDocumentIn` in a DB transaction of its own. */
 export async function linkDocumentToTransaction(params: {
   workspaceId: string;
   documentId: string;
   transactionId: string;
 }): Promise<void> {
-  const { workspaceId, documentId, transactionId } = params;
-
-  // Both must belong to the caller's workspace. Validate explicitly
-  // rather than rely on FK violations — clearer error payload.
-  // Soft-deleted documents cannot be linked.
-  //
-  // LOCK ORDER (CLAUDE.md, "Lock order"): the transaction row, then the
-  // document row, each FOR KEY SHARE — the locks the INSERT's foreign
-  // keys take anyway. Left to the INSERT, they are taken document first
-  // (the FK triggers fire in name order), the other way round from
-  // every path that holds a transaction and then waits for a document.
-  // Taking them here also makes the "not deleted" check hold until the
-  // link is in: a cascade delete holding the document is waited for,
-  // and what it decided is what is read.
   await db.transaction(async (tx) => {
-    const txn = await tx
-      .select({ id: transactions.id })
-      .from(transactions)
-      .where(and(eq(transactions.id, transactionId), eq(transactions.workspaceId, workspaceId)))
-      .for("key share");
-
-    const doc = await tx
-      .select({ id: documents.id })
-      .from(documents)
-      .where(
-        and(
-          eq(documents.id, documentId),
-          eq(documents.workspaceId, workspaceId),
-          isNull(documents.deletedAt),
-        ),
-      )
-      .for("key share");
-    // The document is reported first when both are missing, as before.
-    if (doc.length === 0) throw new NotFoundProblem("Document", documentId);
-    if (txn.length === 0) throw new NotFoundProblem("Transaction", transactionId);
-
-    // Composite PK is (document_id, transaction_id) — re-link is a no-op.
-    await tx
-      .insert(documentLinks)
-      .values({ documentId, transactionId })
-      .onConflictDoNothing();
+    await linkDocumentIn(tx, params);
   });
 }
 
@@ -1129,6 +1150,7 @@ async function extractSourceText(
 
   if (isEmail) {
     const parsed = await simpleParser(await readFile(absPath));
+    const email = emailHeaders(parsed);
     const attachments = attachmentDir
       ? await writePdfAttachments(parsed.attachments ?? [], attachmentDir)
       : [];
@@ -1144,7 +1166,7 @@ async function extractSourceText(
       parsed.date ? `Date (envelope): ${parsed.date.toISOString()}` : null,
     ].filter((l): l is string => l !== null);
     const joined = [headers.join("\n"), body].filter(Boolean).join("\n\n");
-    return { text: joined.length > 0 ? joined : null, attachments };
+    return { text: joined.length > 0 ? joined : null, attachments, email };
   }
 
   if (isHtml) {
@@ -1159,6 +1181,49 @@ async function extractSourceText(
 export interface DecodedSource {
   text: string | null;
   attachments: DecodedAttachment[];
+  /** The envelope headers, for an email the server parsed. Absent for
+   *  HTML, images and PDFs, and when the decode failed. */
+  email?: DecodedEmailHeaders;
+}
+
+/**
+ * An email's envelope as the server's own MIME parse reads it — the
+ * values `documents.message_id` and `documents.source_meta` are stamped
+ * with, so they never have to come from the model.
+ */
+export interface DecodedEmailHeaders {
+  /** Message-ID without its angle brackets (`id@host`), the one form
+   *  `documents.message_id` holds and the Message-ID dedup compares. */
+  messageId: string | null;
+  /** The From header as the parser formats it, `Name <address>`. */
+  from: string | null;
+  subject: string | null;
+  /** The Date header as ISO-8601 (UTC). NULL when absent or unparseable:
+   *  the parser substitutes the current time for a bad date, and that is
+   *  not when the email was sent. */
+  date: string | null;
+}
+
+/** Strip the angle brackets the parser adds (`<id@host>` → `id@host`). */
+export function bareMessageId(raw: string | null | undefined): string | null {
+  const t = (raw ?? "").trim().replace(/^<+/, "").replace(/>+$/, "").trim();
+  return t.length > 0 ? t : null;
+}
+
+function emailHeaders(parsed: ParsedMail): DecodedEmailHeaders {
+  const dateLine = parsed.headerLines?.find((h) => h.key === "date")?.line;
+  let date: string | null = null;
+  if (dateLine) {
+    const raw = dateLine.slice(dateLine.indexOf(":") + 1).replace(/\r?\n[ \t]+/g, " ").trim();
+    const d = new Date(raw);
+    date = Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return {
+    messageId: bareMessageId(parsed.messageId),
+    from: parsed.from?.text?.trim() || null,
+    subject: parsed.subject?.trim() || null,
+    date,
+  };
 }
 
 const MAX_ATTACHMENTS = 5;
@@ -1221,6 +1286,7 @@ export async function decodeSourceForAgent(
     return {
       text: capSourceText(decoded.text, doc.id, label),
       attachments: decoded.attachments,
+      ...(decoded.email ? { email: decoded.email } : {}),
     };
   } catch (err) {
     console.warn(
