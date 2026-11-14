@@ -8,13 +8,18 @@
  * the agent updated to build the SSE event payload.
  *
  * Design notes
- *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 3;
+ *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 1;
  *     production compose pins 1, the sandbox 6). Production is serialized
  *     for CORRECTNESS, not throughput: overlapping extractions of two
  *     documents describing one money event cannot see each other's
  *     not-yet-written transaction, so same-batch dedup misses and the
  *     ledger double counts (#225). Serial extraction closes that window.
- *     Uploads are fire-and-forget, so the wall-clock cost is unfelt.
+ *     Uploads are fire-and-forget, so the wall-clock cost is unfelt. The
+ *     default is the safe value so that a deploy which forgets the env
+ *     var does not quietly turn the window back on.
+ *   - A slot is released only when the agent's process group is gone:
+ *     `runClaude` settles on the child's `close`, after a timeout has
+ *     killed the whole group, so the next job never overlaps the last.
  *   - No resume on restart. On boot we mark every `pending/processing`
  *     batch `failed`; in-flight ingests of those batches flip to `error`
  *     (retryable). Durable queuing is a future concern.
@@ -60,9 +65,9 @@ async function pickExtractor(absPath: string) {
 
 // ── Configuration ─────────────────────────────────────────────────────
 
-const DEFAULT_CONCURRENCY = 3;
+const DEFAULT_CONCURRENCY = 1;
 
-function getConcurrency(): number {
+export function getConcurrency(): number {
   const raw = Number(process.env.MAX_CLAUDE_CONCURRENCY);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONCURRENCY;
 }

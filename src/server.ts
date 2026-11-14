@@ -24,7 +24,7 @@ import {
   type AgentRoleSyncReport,
 } from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
-import { start as startIngestWorker } from "./ingest/worker.js";
+import { getConcurrency, start as startIngestWorker } from "./ingest/worker.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 import { buildExtractorPrompt } from "./ingest/prompt.js";
@@ -178,7 +178,7 @@ async function main(): Promise<void> {
   // then sits idle until /v1/ingest/batch enqueues files. Same process
   // as HTTP so the DB pool + v1 services are shared.
   await startIngestWorker();
-  console.log(`⚙️  Ingest worker ready (concurrency ${process.env.MAX_CLAUDE_CONCURRENCY ?? 3})`);
+  console.log(`⚙️  Ingest worker ready (concurrency ${getConcurrency()})`);
 
   // Background poller that fills place_id / address / lat / lng on
   // newly-canonicalized merchant rows. No-ops when GOOGLE_MAPS_API_KEY

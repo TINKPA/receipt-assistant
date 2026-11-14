@@ -396,13 +396,14 @@ For Ask, what remains: the model reads the whole ledger, including `ocr_text` wr
    Guard rails now in place, do not remove them:
    - `src/claude.ts::assertArgvSafe()` runs before every spawn and
      throws a message naming the offending argument and its byte size.
-   - `src/claude.ts::runClaude` is the only spawn site (the extractor's
-     `runExtractorClaude` calls it). It takes `prompt` as a separate
-     parameter and writes it to stdin. `stdio[0]` must be `"pipe"`, and
-     the `child.stdin.on("error", …)` handler must stay — the child can
-     exit before draining stdin (auth failure, bad flag) and the
-     resulting `EPIPE` would otherwise crash the worker instead of
-     rejecting the promise.
+   - `src/claude.ts::runClaude` is the only `claude` spawn site (the
+     extractor's `runExtractorClaude` calls it). It takes `prompt` as a
+     separate parameter, and `runSupervised`, which does the spawning,
+     writes it to stdin. `stdio[0]` must be `"pipe"`, and the
+     `child.stdin.on("error", …)` handler must stay — the child can exit
+     before draining stdin (auth failure, bad flag) and the resulting
+     `EPIPE` would otherwise crash the worker instead of rejecting the
+     promise.
 
    The same exposure applies to `src/ingest/reextract-prompt.ts`, which
    *does* inline user-sized text (`renderDecodedSource` embeds the
