@@ -4,7 +4,7 @@
     "original_filename": "2026-07-24_Receipt_DeltaHotelsPhiladelphiaAirport_178.71.pdf",
     "bucket": "good",
     "ground_truth": {
-      "date": "2026-07-24",
+      "date": "2026-07-18",
       "merchant_tokens": [
         "delta",
         "philadelphia"
@@ -12,7 +12,7 @@
       "total_minor": 17871
     },
     "expected_status": "done",
-    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, date and total, so #181 lever A must take the text path and never invoke pdftoppm. Ground truth read off the document itself: 'Fri, Jul 24, 2026 - Sat, Jul 25, 2026 / 178.71 USD'. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all."
+    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, stay dates and total, so #181 lever A must take the text path and never invoke pdftoppm. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all. The date is the charge date, not the stay: the confirmation of a prepaid stay says the deposit has been charged to the card but prints no charge date, and the prompt's own rule for prepaid bookings (src/ingest/lessons.md: with no printed charge date, the order time is the date of record; the stay dates are service dates) makes the order time the date to book. A saved page has no email Date header; the PDF's creation date (pdfinfo CreationDate, local time) is when the page was printed at order time, so that date is the truth. Until wave 1's P3 smoke the truth was the check-in date, and both writers, which book the creation date, scored a miss here. Total and merchant read off the document."
   },
   {
     "sha256": "8975c08945295d059a74e37ecea21c32b6641e208a62b9d28c7b16b6302588fb",
