@@ -35,10 +35,10 @@ import {
 } from "../schemas/v1/transaction.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
-  setEtag,
   requireIfMatch,
-  handleIfNoneMatch,
-  parseEtag,
+  ifNoneMatchSatisfied,
+  transactionEtag,
+  parseTransactionEtag,
 } from "../http/etag.js";
 import {
   PreconditionRequiredProblem,
@@ -79,6 +79,28 @@ transactionsRouter.use(
   express.json({ type: "application/merge-patch+json", limit: "25mb" }),
 );
 
+/**
+ * A transaction's ETag is its version plus the state of its linked
+ * documents (`transactionEtag` in http/etag.ts says why). Every response
+ * that returns the full row sets it from that row.
+ */
+function setTransactionEtag(
+  res: Response,
+  row: {
+    version: number;
+    documents: ReadonlyArray<{ id: string; deleted_at: string | null }>;
+  },
+): string {
+  const etag = transactionEtag(row.version, row.documents);
+  res.setHeader("ETag", etag);
+  return etag;
+}
+
+/** If-Match on a transaction: the version part of the tag is what counts. */
+function requireTransactionIfMatch(req: Request, currentVersion: number): void {
+  requireIfMatch(req, currentVersion, parseTransactionEtag);
+}
+
 // Helper: load current version (for If-Match check) before mutation.
 async function loadVersion(
   workspaceId: string,
@@ -111,7 +133,7 @@ transactionsRouter.post(
         body,
       );
       res.setHeader("Location", `/v1/transactions/${result.id}`);
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -167,7 +189,7 @@ transactionsRouter.post(
       for (let i = 0; i < body.operations.length; i++) {
         const op = body.operations[i]!;
         try {
-          const expected = parseEtag(op.if_match);
+          const expected = parseTransactionEtag(op.if_match);
           if (expected === null) {
             throw new VersionMismatchProblem(await loadVersion(req.ctx.workspaceId, op.id), undefined);
           }
@@ -192,7 +214,9 @@ transactionsRouter.post(
         } catch (err) {
           // Same mapping (and the same logging) as a top-level failure:
           // a per-item error must not carry SQL out inside a 200 either.
-          results.push({ index: i, ...renderProblem(err, req) });
+          // (Status and body only: a per-item entry has no headers.)
+          const { status, body } = renderProblem(err, req);
+          results.push({ index: i, status, body });
         }
       }
 
@@ -211,8 +235,13 @@ transactionsRouter.get(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const result = await getTransaction(req.ctx.workspaceId, id);
-      if (handleIfNoneMatch(req, res, result.version)) return;
-      setEtag(res, result.version);
+      // The tag covers the documents too: a revalidation after one of
+      // them was deleted, restored, linked or unlinked must not be a 304.
+      const etag = setTransactionEtag(res, result);
+      if (ifNoneMatchSatisfied(req, etag)) {
+        res.status(304).end();
+        return;
+      }
       res.json(result);
     } catch (err) {
       next(err);
@@ -239,7 +268,7 @@ transactionsRouter.patch(
       }
 
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
 
       const patch = parseOrThrow(UpdateTransactionRequest, req.body);
       const result = await updateTransaction(
@@ -249,7 +278,7 @@ transactionsRouter.patch(
         currentVersion,
         patch,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -276,7 +305,7 @@ transactionsRouter.delete(
       const q = parseOrThrow(TxnDeleteQuery, req.query);
       const hard = q.hard === "true" || q.hard === "1";
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       // Default: reversible soft delete (deleted_at). ?hard=true: physical
       // delete. Reconciled transactions reject either way (unreconcile first).
       if (hard) {
@@ -303,14 +332,14 @@ transactionsRouter.post(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await restoreTransaction(
         req.ctx.workspaceId,
         id,
         currentVersion,
         { userId: req.ctx.userId },
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.status(200).json(result);
     } catch (err) {
       next(err);
@@ -326,14 +355,14 @@ transactionsRouter.post(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await reconcileTransaction(
         req.ctx.workspaceId,
         req.ctx.userId,
         id,
         currentVersion,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -350,7 +379,7 @@ transactionsRouter.post(
       const { id } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(UnreconcileTransactionRequest, req.body ?? {});
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await unreconcileTransaction(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -358,7 +387,7 @@ transactionsRouter.post(
         currentVersion,
         body.reason,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -375,7 +404,7 @@ transactionsRouter.post(
       const { id } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(NewPosting, req.body);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await addPosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -430,7 +459,7 @@ transactionsRouter.patch(
       );
       const patch = parseOrThrow(UpdatePostingRequest, req.body);
       const currentVersion = await loadVersion(req.ctx.workspaceId, params.tid);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await updatePosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -457,7 +486,7 @@ transactionsRouter.delete(
         req.params,
       );
       const currentVersion = await loadVersion(req.ctx.workspaceId, params.tid);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       await deletePosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -566,14 +595,22 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/transactions/{id}",
     summary: "Get a transaction",
+    description:
+      "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does " +
+      "and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted " +
+      "or restored — which `version` alone does not record. Treat it as opaque and send it " +
+      "back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made " +
+      "after a document change is applied rather than refused, and the bare `W/\"<version>\"` " +
+      "form (built from the body's `version`) is accepted as well.",
     tags: ["transactions"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
       200: {
         description: "OK",
+        headers: { ETag: { schema: { type: "string" } } },
         content: { "application/json": { schema: TransactionSchema } },
       },
-      304: { description: "Not Modified" },
+      304: { description: "Not Modified (`If-None-Match` named the current ETag)" },
       404: { description: "Not Found", content: problemContent },
     },
   });

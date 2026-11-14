@@ -6327,6 +6327,7 @@
     "/v1/transactions/{id}": {
       "get": {
         "summary": "Get a transaction",
+        "description": "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted or restored — which `version` alone does not record. Treat it as opaque and send it back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made after a document change is applied rather than refused, and the bare `W/\"<version>\"` form (built from the body's `version`) is accepted as well.",
         "tags": [
           "transactions"
         ],
@@ -6345,6 +6346,13 @@
         "responses": {
           "200": {
             "description": "OK",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -6354,7 +6362,7 @@
             }
           },
           "304": {
-            "description": "Not Modified"
+            "description": "Not Modified (`If-None-Match` named the current ETag)"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
