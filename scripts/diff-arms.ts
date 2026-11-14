@@ -13,8 +13,10 @@
  * the runs counts: every run is rescored with eval-dates's own `score`).
  * It writes, into the campaign directory:
  *
- *   gates.md, gates.json   G1-G9 with the plan's thresholds, pass, fail,
- *                          pending (needs adjudication) or n/a, and the
+ *   gates.md, gates.json   G1-G9 with the plan's thresholds, and C4 (check-
+ *                          apply-extraction, which no gate names): pass,
+ *                          fail, pending (needs adjudication, or a planned
+ *                          unit or step has not run) or n/a, and the
  *                          evidence as counts and fixture aliases.
  *   worksheet.md           PRIVATE. Per fixture: the ground truth, and per
  *                          field the majority value of each arm side by side,
@@ -25,7 +27,23 @@
  *                          marked expected, for a person to fill after
  *                          reading the document: verdict "B-worse",
  *                          "A-worse", "both-wrong", "equal" or "expected",
- *                          and a note. A rerun keeps every verdict given.
+ *                          and a note; one per G1 tie (below): "regression"
+ *                          or "noise"; one per G2 miss: its root cause. A
+ *                          rerun keeps every answer whose values have not
+ *                          moved since; one whose values changed (a later
+ *                          trial, a rerun of a voided pair) is cleared and
+ *                          kept under `previous`, so no answer stands for
+ *                          values nobody read.
+ *
+ * A gate computed from the units (G1-G4, G6-G8) is at most `pending` until
+ * every planned unit (t1-A … t<trials>-B) is done: a pass on part of the
+ * trials is not a pass. A failure found on part of them stands.
+ *
+ * G1 judges each fixture by the majority of its trials. A tie (1 of 2) has
+ * no majority, so a field where one arm passes and the other ties, or one
+ * ties and the other fails, is neither a regression nor a pass: it is
+ * listed for a person (`g1_ties`), in either direction, and G1 is
+ * `pending` until each has an answer.
  *
  * Gate G4 is `pending` until every such disagreement on a money or catalog
  * field has a verdict. Fields compared (from each transaction's
@@ -355,8 +373,20 @@ function expectedFor(field: Field, a: unknown, b: unknown, bRuns: Run[], aRuns: 
       return "X9: a Message-ID duplicate is linked and closed dedup";
     }
     if (b === "unsupported" && bRuns.some((r) => r.agentRun?.outcome === "recorded_only")) return "X10: a statement is recorded, not booked";
-    if (bRuns.some((r) => ["uncertain", "distinct"].includes(String(r.agentRun?.apply_report?.decision?.verdict ?? ""))) || aBranches.includes("near_dup")) {
-      return "X8: duplicates are decided in code";
+    // X8 covers two attach-or-insert differences, each with a flag a
+    // person will see: B booked and flagged (uncertain) a copy A attached,
+    // or B attached by a misread key (the target flagged) where A booked.
+    // Any other is a possible double booking or a lost purchase: read it.
+    const decisions = (status: string) =>
+      bRuns.filter((r) => r.result.ingest_status === status).map((r) => r.agentRun?.apply_report?.decision ?? null);
+    const bInserts = decisions("done");
+    const bAttaches = decisions("near_dup");
+    if (a === "near_dup" && b === "insert" && aBranches.includes("near_dup") && bInserts.length > 0 &&
+      bInserts.every((d) => d?.verdict === "uncertain" && d?.flagged_for_review === true)) {
+      return "X8: B booked and flagged a copy A attached";
+    }
+    if (a === "insert" && b === "near_dup" && bAttaches.length > 0 && bAttaches.every((d) => d?.tiebreaker === "hard_tuple_misread")) {
+      return "X8: B attached by a misread key and flagged the target";
     }
   }
   if (field === "parties" && Array.isArray(b) && b.length && (!Array.isArray(a) || a.length === 0)) {
@@ -416,8 +446,23 @@ interface Adjudication {
   campaign: string;
   instructions: string;
   /** Gate G2: every B run that did not hand back a valid record without
-   *  repair, with the cause read from its transcript. */
-  misses?: Record<string, { root_cause: string; stale?: boolean }>;
+   *  repair, with the cause read from its transcript. `run` is the agent
+   *  run the cause was read for. */
+  misses?: Record<string, { run: string | null; root_cause: string; stale?: boolean; previous?: unknown }>;
+  /** Gate G1: fields where one arm has a majority and the other ties. */
+  g1_ties?: Record<
+    string,
+    {
+      alias: string;
+      field: string;
+      a: Verdict;
+      b: Verdict;
+      verdict: "regression" | "noise" | null;
+      note: string;
+      stale?: boolean;
+      previous?: unknown;
+    }
+  >;
   verdicts: Record<
     string,
     {
@@ -432,9 +477,16 @@ interface Adjudication {
       verdict: "B-worse" | "A-worse" | "both-wrong" | "equal" | "expected" | null;
       note: string;
       stale?: boolean;
+      /** The answer given for earlier values, cleared when they moved. */
+      previous?: { verdict: string | null; note: string; a: unknown; b: unknown };
     }
   >;
 }
+
+const ADJ_INSTRUCTIONS =
+  "verdicts (G4): read the document and set verdict to B-worse, A-worse, both-wrong, equal or expected (an X1-X13 difference the tool did not recognise), with a note. " +
+  "g1_ties (G1): one arm has a majority on the field and the other a tie; read the runs and the document and set verdict to regression (count it against B) or noise. " +
+  "misses (G2): read the run's transcript and write its root cause. An answer is cleared (and kept under previous) when the values it judged change. Then rerun diff-arms.";
 
 const MONEY_TRANSCRIPT_RE = {
   psql: /\bpsql\b/,
@@ -491,6 +543,17 @@ async function main(): Promise<number> {
   const armRuns = (k: string, arm: Arm) => (byKey.get(k) ?? []).filter((r) => r.arm === arm);
   const gates: Gate[] = [];
 
+  // Every answer a person gives is kept in the adjudication file.
+  const adjFile = path.join(dir, "adjudication.json");
+  const adj: Adjudication = existsSync(adjFile)
+    ? readJson<Adjudication>(adjFile)
+    : { campaign: state.id, instructions: ADJ_INSTRUCTIONS, verdicts: {} };
+  adj.instructions = ADJ_INSTRUCTIONS;
+
+  // Every planned unit, both arms; a gate on part of them is not a pass.
+  const plannedUnits = Array.from({ length: state.trials }, (_, i) => [`t${i + 1}-A`, `t${i + 1}-B`]).flat();
+  const missingUnits = plannedUnits.filter((u) => !units.includes(u));
+
   // ── G1 accuracy ──
   const verdicts = new Map<string, Record<Arm, Record<Scored, Verdict>>>();
   for (const f of fxList) {
@@ -502,33 +565,58 @@ async function main(): Promise<number> {
   }
   const hard = (f: FixtureMeta) => f.bucket.startsWith("hard_");
   const gatedFx = fxList.filter((f) => f.gated);
-  const g1a: string[] = [];
-  for (const f of gatedFx) {
-    for (const s of ["date", "total", "payee"] as const) {
-      const v = verdicts.get(f.key)!;
-      if (v.A[s] === "pass" && v.B[s] !== "pass" && v.B[s] !== "n/a") g1a.push(`${f.alias}:${s}`);
+  // A regression is a majority pass in A against a majority fail in B. A
+  // tie on one side against a majority on the other has no majority to
+  // judge, in either direction: a person reads it (`g1_ties`).
+  adj.g1_ties ??= {};
+  const liveTies = new Set<string>();
+  const regressions = (set: FixtureMeta[], fields: readonly Scored[]): string[] => {
+    const out: string[] = [];
+    for (const f of set) {
+      for (const s of fields) {
+        const v = verdicts.get(f.key)!;
+        const a = v.A[s];
+        const b = v.B[s];
+        if (a === "pass" && b === "fail") out.push(`${f.alias}:${s}`);
+        const tie = (a === "pass" && b === "split") || (a === "split" && b === "fail");
+        if (!tie) continue;
+        const id = `${f.key}:${s}`;
+        liveTies.add(id);
+        const old = adj.g1_ties![id];
+        const moved = old !== undefined && (old.a !== a || old.b !== b);
+        adj.g1_ties![id] = {
+          alias: f.alias,
+          field: s,
+          a,
+          b,
+          verdict: moved ? null : (old?.verdict ?? null),
+          note: moved ? "" : (old?.note ?? ""),
+          ...(moved && old?.verdict ? { previous: { a: old.a, b: old.b, verdict: old.verdict, note: old.note } } : old?.previous ? { previous: old.previous } : {}),
+        };
+      }
     }
-  }
+    return out;
+  };
+  const g1a = regressions(gatedFx, ["date", "total", "payee"]);
   const correct = (arm: Arm, s: Scored, set: FixtureMeta[]) => set.filter((f) => verdicts.get(f.key)![arm][s] === "pass").length;
   const g1b = (["date", "total", "payee"] as const).map((s) => ({ s, a: correct("A", s, gatedFx), b: correct("B", s, gatedFx), aAll: correct("A", s, fxList), bAll: correct("B", s, fxList) }));
-  const g1c: string[] = [];
-  for (const f of fxList) {
-    for (const s of ["classification", "flow", "currency"] as const) {
-      const v = verdicts.get(f.key)!;
-      if (v.A[s] === "pass" && v.B[s] !== "pass" && v.B[s] !== "n/a") g1c.push(`${f.alias}:${s}`);
-    }
-  }
+  const g1c = regressions(fxList, ["classification", "flow", "currency"]);
+  for (const [id, t] of Object.entries(adj.g1_ties)) if (!liveTies.has(id)) t.stale = true;
+  const ties = [...liveTies].map((id) => adj.g1_ties![id]!);
+  const tieRegressions = ties.filter((t) => t.verdict === "regression").map((t) => `${t.alias}:${t.field}`);
+  const tiesOpen = ties.filter((t) => t.verdict === null).map((t) => `${t.alias}:${t.field} (A ${t.a}, B ${t.b})`);
   const hardFx = fxList.filter(hard);
-  const g1Pass = g1a.length === 0 && g1b.every((x) => x.b >= x.a - 1) && g1c.length === 0;
+  const g1Pass = g1a.length === 0 && g1b.every((x) => x.b >= x.a - 1) && g1c.length === 0 && tieRegressions.length === 0;
   const comparable = fxList.filter((f) => armRuns(f.key, "A").length && armRuns(f.key, "B").length).length;
   gates.push({
     gate: "G1 accuracy",
     threshold:
-      "(a) B fails no gated (good or C2) fixture on date/total/payee that A passes; (b) per field B correct >= A - 1; (c) classification, flow, currency: B right wherever A is; (d) hard reported",
-    status: comparable === 0 ? "n/a" : g1Pass ? "pass" : "fail",
+      "(a) B fails no gated (good or C2) fixture on date/total/payee that A passes; (b) per field B correct >= A - 1; (c) classification, flow, currency: B right wherever A is; (d) hard reported; a tie (no majority) against a majority is read by a person",
+    status: comparable === 0 ? "n/a" : !g1Pass ? "fail" : tiesOpen.length ? "pending" : "pass",
     evidence:
       `${comparable} fixtures with runs in both arms (${gatedFx.length} gated, ${hardFx.length} hard). ` +
-      `(a) ${g1a.length} B regressions${list(g1a)}. (b) gated pass A/B: ${g1b.map((x) => `${x.s} ${x.a}/${x.b}`).join(", ")}; ` +
+      `(a) ${g1a.length} B regressions${list(g1a)}. Ties against a majority: ${ties.length}, ${tiesOpen.length} without an answer` +
+      `${list(tiesOpen)}, ${tieRegressions.length} judged a regression${list(tieRegressions)}. (b) gated pass A/B: ${g1b.map((x) => `${x.s} ${x.a}/${x.b}`).join(", ")}; ` +
       `all fixtures: ${g1b.map((x) => `${x.s} ${x.aAll}/${x.bAll}`).join(", ")}. (c) ${g1c.length}${list(g1c)}. ` +
       `(d) hard A/B: ${(["date", "total", "payee"] as const).map((s) => `${s} ${correct("A", s, hardFx)}/${correct("B", s, hardFx)}`).join(", ")}. ` +
       `Detection limit: about 36 fixtures x 2-3 trials detects a loss of about 3 fixtures, not small drift.`,
@@ -542,23 +630,22 @@ async function main(): Promise<number> {
     ((r.record?.validation?.warnings ?? []) as { rule: string; money?: boolean }[]).some((w) => w.rule === "repair_changed_unnamed" && w.money),
   );
   const share = bRuns.length ? cleanFirst.length / bRuns.length : 0;
-  const misses = [...new Set([...bRuns.filter((r) => !cleanFirst.includes(r)).map((r) => `${r.fixture.alias}/t${r.trial}`)])];
+  const misses = new Map(bRuns.filter((r) => !cleanFirst.includes(r)).map((r) => [`${r.fixture.alias}/t${r.trial}`, (r.agentRun?.id as string | undefined) ?? null]));
   // Root causes are read from the transcripts by a person and kept in the
-  // adjudication file, next to the G4 verdicts.
-  const adjFile = path.join(dir, "adjudication.json");
-  const adj: Adjudication = existsSync(adjFile)
-    ? readJson<Adjudication>(adjFile)
-    : {
-        campaign: state.id,
-        instructions:
-          "verdicts (G4): read the document and set verdict to B-worse, A-worse, both-wrong, equal or expected (an X1-X13 difference the tool did not recognise), with a note. " +
-          "misses (G2): read the run's transcript and write its root cause. Then rerun diff-arms.",
-        verdicts: {},
-      };
+  // adjudication file; a cause read for another run of the same fixture
+  // and trial (a rerun after a void) no longer applies.
   adj.misses ??= {};
-  for (const m of misses) adj.misses[m] = { root_cause: adj.misses[m]?.root_cause ?? "" };
-  for (const [k, v] of Object.entries(adj.misses)) if (!misses.includes(k)) v.stale = true;
-  const unexplained = misses.filter((m) => !adj.misses![m]!.root_cause.trim());
+  for (const [m, run] of misses) {
+    const old = adj.misses[m];
+    const moved = old !== undefined && (old.run ?? null) !== run;
+    adj.misses[m] = {
+      run,
+      root_cause: moved ? "" : (old?.root_cause ?? ""),
+      ...(moved && old?.root_cause ? { previous: { run: old.run ?? null, root_cause: old.root_cause } } : old?.previous ? { previous: old.previous } : {}),
+    };
+  }
+  for (const [k, v] of Object.entries(adj.misses)) if (!misses.has(k)) v.stale = true;
+  const unexplained = [...misses.keys()].filter((m) => !adj.misses![m]!.root_cause.trim());
   gates.push({
     gate: "G2 hand-back",
     threshold: ">= 95% of B runs valid without repair; <= 1 B run without a valid record after repair; 0 repair_changed_unnamed on money; every miss root-caused from its transcript",
@@ -573,17 +660,27 @@ async function main(): Promise<number> {
     evidence:
       `${bRuns.length} B runs (Message-ID duplicates, which read nothing, left out): ${cleanFirst.length} valid without repair ` +
       `(${(share * 100).toFixed(1)}%), ${noValid.length} without a valid record after repair, ${moneyUnnamed.length} with an unasked money change. ` +
-      `Misses ${misses.length}, ${unexplained.length} without a root cause in adjudication.json${list(unexplained)}.`,
+      `Misses ${misses.size}, ${unexplained.length} without a root cause in adjudication.json${list(unexplained)}.`,
   });
 
   // ── G3 ledger invariants ──
   const unitResults = units.map((u) => ({ u, r: state.items[u]!.attempts.at(-1)!.results }));
   const ledgerBad = unitResults.filter((x) => x.r.check_ledger_exit !== 0).map((x) => x.u);
   const replayBad = unitResults.filter((x) => x.u.endsWith("-B") && x.r.replay_records_exit !== 0).map((x) => x.u);
-  const bTx = runs.filter((r) => r.arm === "B" && r.tx && r.tx.metadata?.extraction?.writer === "server_apply");
-  const fails: Record<string, string[]> = { balance: [], created: [], channel: [], writer_model: [] };
+  // Every B transaction is the server writer's, and every run is its arm's
+  // writer: a mismatch fails, it is not skipped. (A rehearsal's legacy
+  // stubs run as writer `stub`.)
+  const bTx = runs.filter((r) => r.arm === "B" && r.tx);
+  const fails: Record<string, string[]> = { balance: [], created: [], channel: [], writer_model: [], writer: [], run_writer: [] };
+  for (const r of runs) {
+    const w = r.agentRun?.writer;
+    if (w === undefined || w === null) continue;
+    const ok = r.arm === "B" ? w === "server_apply" : w === "agent_sql" || (rehearsal && w === "stub");
+    if (!ok) fails.run_writer!.push(`${r.arm}:${r.fixture.alias}/t${r.trial}`);
+  }
   for (const r of bTx) {
     const id = r.tx!.id;
+    if (r.tx!.metadata?.extraction?.writer !== "server_apply") fails.writer!.push(`${r.fixture.alias}/t${r.trial}`);
     const legs = (r.rows!.postings ?? []).filter((p) => p.transaction_id === id);
     const sums = new Map<string, number>();
     for (const p of legs) sums.set(p.currency, (sums.get(p.currency) ?? 0) + Number(p.amount_minor));
@@ -621,7 +718,8 @@ async function main(): Promise<number> {
     evidence:
       `${units.length} units: check-ledger not clean in ${ledgerBad.length}${list(ledgerBad)}; --records not clean in ${replayBad.length}${list(replayBad)}. ` +
       `${bTx.length} B transactions: unbalanced ${fails.balance!.length}${list(fails.balance!)}, created events not 1 ${fails.created!.length}${list(fails.created!)}, ` +
-      `no channel party ${fails.channel!.length}${list(fails.channel!)}, no real model ${fails.writer_model!.length}${list(fails.writer_model!)}. ` +
+      `no channel party ${fails.channel!.length}${list(fails.channel!)}, no real model ${fails.writer_model!.length}${list(fails.writer_model!)}, ` +
+      `writer not server_apply ${fails.writer!.length}${list(fails.writer!)}. Runs whose writer is not their arm's: ${fails.run_writer!.length}${list(fails.run_writer!)}. ` +
       `Layer 3 written: ${layer3.length}${list(layer3)}. B documents without ocr_text or a current valid record: ${docFails.length}/${bDocs.length}${list(docFails)}. ` +
       `Runs without a dump: ${missingDumps}.`,
   });
@@ -666,6 +764,9 @@ async function main(): Promise<number> {
     if (d.expected && !adj.verdicts[d.id]) continue;
     live.add(d.id);
     const old = adj.verdicts[d.id];
+    // A verdict judged the values written next to it; once either arm's
+    // value moves, it is cleared and kept under `previous`.
+    const moved = old !== undefined && (canon(old.a) !== canon(d.a) || canon(old.b) !== canon(d.b));
     adj.verdicts[d.id] = {
       fixture: d.key,
       alias: d.alias,
@@ -675,8 +776,13 @@ async function main(): Promise<number> {
       b: d.b,
       truth: fixtures.get(d.key)!.truth,
       auto_expected: d.expected,
-      verdict: old?.verdict ?? null,
-      note: old?.note ?? "",
+      verdict: moved ? null : (old?.verdict ?? null),
+      note: moved ? "" : (old?.note ?? ""),
+      ...(moved && old?.verdict
+        ? { previous: { verdict: old.verdict, note: old.note, a: old.a, b: old.b } }
+        : old?.previous
+          ? { previous: old.previous }
+          : {}),
     };
   }
   for (const [id, v] of Object.entries(adj.verdicts)) if (!live.has(id)) v.stale = true;
@@ -884,10 +990,31 @@ async function main(): Promise<number> {
       : "c5 not done.",
   });
 
+  // ── C4 (no gate names it; reported so a failure is seen) ──
+  const c4 = step("c4") as { exit?: number; summary?: string | null } | null;
+  gates.push({
+    gate: "C4 apply fixtures",
+    threshold: "check-apply-extraction on a throwaway Postgres: every fixture passes",
+    status: !c4 ? "pending" : c4.exit === 0 ? "pass" : "fail",
+    evidence: c4 ? `exit ${c4.exit ?? "-"}; ${c4.summary ?? "no summary line"}.` : "c4 not done.",
+  });
+
+  // A gate computed from the units is at most pending until every planned
+  // unit is done: a pass on part of the trials is not a pass.
+  const UNIT_GATES = ["G1", "G2", "G3", "G4", "G6", "G7", "G8"];
+  if (missingUnits.length) {
+    for (const g of gates) {
+      if (!UNIT_GATES.includes(g.gate.split(" ")[0]!)) continue;
+      if (g.status === "pass" || g.status === "n/a") g.status = "pending";
+      g.evidence += ` Units not done: ${missingUnits.length}${list(missingUnits)}.`;
+    }
+  }
+
   // ── Output ──
   const header =
     `# A/B gates: campaign ${state.id}${rehearsal ? " (REHEARSAL: stand-in claude, stub documents; not evidence about either writer)" : ""}\n\n` +
-    `Image ${state.sha.slice(0, 12)} · units done ${units.length} (${units.join(", ")}) · voids ${state.voids.length} · ` +
+    `Image ${state.sha.slice(0, 12)} · units done ${units.length} of ${plannedUnits.length} (${units.join(", ")})` +
+    `${missingUnits.length ? ` · NOT DONE ${missingUnits.join(", ")}` : ""} · voids ${state.voids.length} · ` +
     `runs A ${runs.filter((r) => r.arm === "A").length}, B ${runs.filter((r) => r.arm === "B").length}\n`;
   const table =
     "| Gate | Status | Threshold | Evidence |\n|---|---|---|---|\n" +

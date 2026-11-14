@@ -73,16 +73,24 @@
  *                           diff-arms gates every c2 fixture and the c1
  *                           `good` ones). Default c1 for the first manifest,
  *                           c2 for the others.
- *   --trials=<n>            Trials to run, 1-3. Default 3.
+ *   --trials=<n>            Trials to run, 1-3. Default 3. Fixed when the
+ *                           campaign begins; a resume refuses another value.
  *   --steps=<list>          Any of units,c5,c3,c4 (default all), or single
- *                           items: t2-B, c3:race-A, …
- *   --stop-after=HH:MM      Local time. No item starts after it, nor a unit
- *                           whose run the median of the finished units says
- *                           cannot end by then. The run stops cleanly
- *                           (exit 3) and resumes on the next invocation.
+ *                           items: t2-B, c3:race-A, …; an unknown name is
+ *                           refused.
+ *   --stop-after=<when>     HH:MM (the next such local time, refused when
+ *                           that is more than 16 h away, as when the night's
+ *                           command is re-run the next morning) or
+ *                           YYYY-MM-DDTHH:MM (local). No item starts after
+ *                           it, nor one whose run the median of the finished
+ *                           items of its kind says cannot end by then. The
+ *                           run stops cleanly (exit 3) and resumes on the
+ *                           next invocation.
  *   --race-concurrency=<n>  MAX_CLAUDE_CONCURRENCY for c3:race-*. Default 6,
  *                           the sandbox's normal value (the plan's "race at
- *                           normal concurrency": two copies in flight at once).
+ *                           normal concurrency": two copies in flight at
+ *                           once). Fixed when the campaign begins, like
+ *                           --trials, so race-A and race-B run alike.
  *   --c5-keys=<k1,k2,k3>    Fixtures whose arm-B transactions c5 edits.
  *                           Default the first three `good` ones that booked.
  *   --dedup-manifest=<path> eval-dedup's --claude-manifest (its default).
@@ -149,10 +157,14 @@ const EST = {
 
 /** Run errors that void a trial pair (plan §12.1: an infrastructure error). */
 const OUTAGE_CLASSES = ["quota", "overloaded", "auth"];
-/** App-log lines that do the same. A bare "429" is too common a number to
- *  stop on by itself, so it needs an HTTP or error word near it. */
+/** App-log lines that do the same, in the words `classifyAgentFailure`
+ *  (`src/ingest/runs.ts`) reads for quota, overloaded and auth. The
+ *  agent_runs look cannot see a run whose rows a reset has emptied (c3's
+ *  race rounds reset between rounds), so the log must catch all three. A
+ *  bare "429" or "529" is too common a number to stop on by itself, so it
+ *  needs an HTTP or error word near it. */
 const OUTAGE_LOG_RE =
-  /rate[ _-]?limit|too many requests|usage limit|session limit|(?:status|error|code|http)\D{0,20}\b429\b|\b429\b\D{0,20}(?:too many|rate)/i;
+  /rate[ _-]?limit|too many requests|usage limit|session limit|limit reached|overloaded|failed to authenticate|authentication_error|oauth access token is invalid|oauth session expired|(?:status|error|code|http)\D{0,20}\b(?:429|529|401)\b|\b(?:429|529)\b\D{0,20}(?:too many|rate|overloaded)/i;
 
 type Arm = "A" | "B";
 const WRITER: Record<Arm, "agent_sql" | "server_apply"> = { A: "agent_sql", B: "server_apply" };
@@ -229,8 +241,15 @@ function parseArgs(argv: string[]) {
   const id = single.id ?? `ab-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomBytes(2).toString("hex")}`;
   if (!/^[A-Za-z0-9._-]{1,60}$/.test(id)) throw new Error("--id may hold letters, digits, '.', '_' and '-' only");
   const stopAfter = single["stop-after"] ?? null;
-  if (stopAfter !== null && !/^([01]\d|2[0-3]):[0-5]\d$/.test(stopAfter)) throw new Error("--stop-after is HH:MM, 24-hour local time");
+  if (stopAfter !== null && !/^(?:\d{4}-\d{2}-\d{2}T)?([01]\d|2[0-3]):[0-5]\d$/.test(stopAfter)) {
+    throw new Error("--stop-after is HH:MM or YYYY-MM-DDTHH:MM, 24-hour local time");
+  }
   const steps = single.steps ? single.steps.split(",").map((s) => s.trim()).filter(Boolean) : null;
+  if (steps) {
+    const known = new Set(["units", "c3", "c4", "c5", ...workItems(3).map((i) => i.id)]);
+    const unknown = steps.filter((x) => !known.has(x));
+    if (unknown.length) throw new Error(`--steps names nothing called ${unknown.join(", ")} (known: ${[...known].join(", ")})`);
+  }
   return {
     id,
     idGiven: single.id !== undefined,
@@ -243,9 +262,11 @@ function parseArgs(argv: string[]) {
     })),
     defaultUploads,
     trials: int("trials", 3, 1, 3),
+    trialsGiven: single.trials !== undefined,
     steps,
     stopAfter,
     raceConcurrency: int("race-concurrency", 6, 1, 6),
+    raceConcurrencyGiven: single["race-concurrency"] !== undefined,
     c5Keys: single["c5-keys"] ? single["c5-keys"].split(",").map((s) => s.trim()).filter(Boolean) : null,
     dedupManifest: single["dedup-manifest"] ? path.resolve(single["dedup-manifest"]) : null,
     envFile: path.resolve(single["env-file"] ?? path.join(HOME, "Developer/receipt-assistant/.env")),
@@ -454,6 +475,24 @@ const now = () => new Date().toISOString();
 function sh(cmd: string, args: string[], opts: { env?: NodeJS.ProcessEnv; input?: string } = {}) {
   const r = spawnSync(cmd, args, { encoding: "utf8", env: opts.env ?? process.env, input: opts.input, maxBuffer: 256 * 1024 * 1024 });
   return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/**
+ * eval-dates's dump (`src/ingest/apply/fingerprint.ts`), check-ledger and
+ * check-projection-replay --records run from this checkout against rows
+ * the image wrote, and diff-arms reads their output: the checkout's `src/`
+ * (working tree included) must be the image commit's. Scripts and docs
+ * may differ.
+ */
+function checkCheckout(sha: string): void {
+  const r = sh("git", ["-C", REPO_ROOT, "diff", "--quiet", sha, "--", "src"]);
+  if (r.code === 0) return;
+  if (r.code === 1) {
+    throw new Refusal(
+      `this checkout's src/ differs from the image's commit ${sha.slice(0, 12)}: run from a checkout of that commit, or rebuild the sandbox from this one (a new campaign)`,
+    );
+  }
+  throw new Refusal(`cannot compare this checkout with the image's commit ${sha.slice(0, 12)}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
 }
 
 function mustSh(cmd: string, args: string[], what: string, opts: { env?: NodeJS.ProcessEnv } = {}): string {
@@ -863,7 +902,7 @@ async function runUnit(ctx: Ctx, item: WorkItem, attempt: Attempt): Promise<Reco
 async function runC3(ctx: Ctx, item: WorkItem, attempt: Attempt): Promise<Record<string, unknown>> {
   const part = item.part!;
   const dir = attempt.dir;
-  const concurrency = "race" in part && part.race ? ctx.args.raceConcurrency : "concurrency" in part ? part.concurrency : 1;
+  const concurrency = "race" in part && part.race ? ctx.state.race_concurrency : "concurrency" in part ? part.concurrency : 1;
   await recreate({ arm: part.arm, concurrency }, ctx);
   await resetLedger(ctx, path.join(dir, "step.log"));
   const json = path.join(dir, "eval-dedup.json");
@@ -1106,12 +1145,31 @@ async function runC5(ctx: Ctx, attempt: Attempt): Promise<Record<string, unknown
 
 // ── Stop-after ─────────────────────────────────────────────────────────
 
-/** The next local HH:MM after `from`. */
-function nextLocal(hhmm: string, from: Date): Date {
-  const [h, m] = hhmm.split(":").map(Number) as [number, number];
+/** A bare HH:MM further away than this is refused: it is most likely the
+ *  night's command re-run after its stop time, which would run the
+ *  campaign through the day on the shared token. */
+const STOP_AFTER_MAX_HOURS = 16;
+
+/** --stop-after as a local instant: YYYY-MM-DDTHH:MM as given, HH:MM the
+ *  next such time after `from`. */
+function resolveStopAfter(when: string, from: Date): Date {
+  const full = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(when);
+  if (full) {
+    const [, y, mo, d, h, mi] = full.map(Number) as [number, number, number, number, number, number];
+    const at = new Date(y, mo - 1, d, h, mi, 0, 0);
+    if (at.getTime() <= from.getTime()) throw new Refusal(`--stop-after=${when} is already past`);
+    return at;
+  }
+  const [h, m] = when.split(":").map(Number) as [number, number];
   const d = new Date(from);
   d.setHours(h, m, 0, 0);
   if (d.getTime() <= from.getTime()) d.setDate(d.getDate() + 1);
+  const hours = (d.getTime() - from.getTime()) / 3_600_000;
+  if (hours > STOP_AFTER_MAX_HOURS) {
+    throw new Refusal(
+      `--stop-after=${when} is ${hours.toFixed(1)} h from now (${d.toLocaleString()}): pass it as YYYY-MM-DDTHH:MM if that is meant`,
+    );
+  }
   return d;
 }
 
@@ -1127,12 +1185,17 @@ function stopAfterSays(ctx: Ctx, item: WorkItem, deadline: Date | null): string 
   if (!deadline) return null;
   const t = Date.now();
   if (t >= deadline.getTime()) return `it is past --stop-after (${deadline.toLocaleTimeString()})`;
+  // Like with like: a stub matrix takes a minute, a race round a quarter
+  // of an hour.
+  const kindOf = (w: WorkItem) =>
+    w.kind !== "c3" ? w.kind : w.part && "race" in w.part && w.part.race ? "c3 race" : w.part?.claude ? "c3 claude" : "c3 stub";
+  const byId = new Map(workItems(ctx.state.trials).map((w) => [w.id, w]));
   const durations = Object.entries(ctx.state.items)
-    .filter(([id, s]) => (item.kind === "unit" ? /^t\d-[AB]$/.test(id) : id.split(":")[0] === item.id.split(":")[0]) && s.status === "done")
+    .filter(([id, s]) => byId.has(id) && kindOf(byId.get(id)!) === kindOf(item) && s.status === "done")
     .map(([, s]) => s.attempts.at(-1)!.duration_ms ?? 0);
   const m = median(durations);
   if (m !== null && t + m > deadline.getTime()) {
-    return `the median of the finished ${item.kind === "unit" ? "units" : item.kind + " steps"} (${Math.round(m / 60_000)} min) would end after --stop-after (${deadline.toLocaleTimeString()})`;
+    return `the median of the finished ${item.kind === "unit" ? "units" : `${kindOf(item)} steps`} (${Math.round(m / 60_000)} min) would end after --stop-after (${deadline.toLocaleTimeString()})`;
   }
   return null;
 }
@@ -1299,6 +1362,7 @@ async function main(): Promise<number> {
       throw new Refusal("the sandbox image says gitSha unknown: build it with GIT_SHA, GIT_SHORT_SHA and GIT_BRANCH set (scripts/ab-campaign.md)");
     }
     if (args.sha && !v.gitSha.startsWith(args.sha)) throw new Refusal(`the sandbox runs ${v.gitSha}, not --sha=${args.sha}`);
+    checkCheckout(v.gitSha);
     state = {
       version: 1,
       id: args.id,
@@ -1323,6 +1387,13 @@ async function main(): Promise<number> {
     }
     if (state.rehearsal && state.rehearsal.stand_in_sha256 !== standInSha) throw new Refusal("--stand-in-claude is not the file the rehearsal began with");
     if (args.sha && !state.sha.startsWith(args.sha)) throw new Refusal(`this campaign runs ${state.sha}, not --sha=${args.sha}`);
+    if (args.trialsGiven && args.trials !== state.trials) {
+      throw new Refusal(`this campaign runs ${state.trials} trial(s); --trials=${args.trials} would make it another campaign`);
+    }
+    if (args.raceConcurrencyGiven && args.raceConcurrency !== state.race_concurrency) {
+      throw new Refusal(`this campaign races at concurrency ${state.race_concurrency}; --race-concurrency=${args.raceConcurrency} would make race-A and race-B differ`);
+    }
+    checkCheckout(state.sha);
     // Ground-truth corrections are allowed (diff-arms rescores with the
     // current truth); a different set of fixtures is a different campaign.
     const rec = await manifestRecord();
@@ -1391,7 +1462,7 @@ async function main(): Promise<number> {
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
-  const deadline = args.stopAfter ? nextLocal(args.stopAfter, new Date()) : null;
+  const deadline = args.stopAfter ? resolveStopAfter(args.stopAfter, new Date()) : null;
   ctx.say(
     `campaign ${state.id}: image ${state.sha.slice(0, 12)}, ${state.trials} trial(s), out ${args.out}` +
       (deadline ? `, stop after ${deadline.toLocaleString()}` : "") +

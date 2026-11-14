@@ -155,11 +155,12 @@
  *        extractions to agree on an identifier; without one it is a 0.9 proposal for a
  *        person, and this case then fails by design). Under server_apply the applier
  *        also attaches a copy whose reading differs in one character of one identifier
- *        when the hard tuple and two other keys agree (`hard_tuple_misread`), and flags
- *        the target
+ *        when the hard tuple and two other keys agree, one of them the approval code or
+ *        the payment id (`hard_tuple_misread`), and flags the target
  */
 import "dotenv/config";
-import { readFile, mkdtemp, writeFile } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -832,11 +833,18 @@ async function rerunReconcile(batchId: string): Promise<void> {
   assert(res.json.status === "reconciled", `reconcile left batch ${res.json.status}`);
 }
 
+/** Scratch for re-encoded copies of the receipts, some of them private
+ *  (the Claude cases'): each copy is removed once read, and the directory
+ *  when the process exits. */
 let tmp = "";
 async function reencode(src: string, quality: number): Promise<Buffer> {
   const out = path.join(tmp, `${quality}-${randomUUID().slice(0, 8)}.jpg`);
   execFileSync("sips", ["-s", "format", "jpeg", "-s", "formatOptions", String(quality), src, "--out", out], { stdio: "ignore" });
-  return readFile(out);
+  try {
+    return await readFile(out);
+  } finally {
+    await rm(out, { force: true });
+  }
 }
 
 /** Wait until nothing is queued, processing or reconciling: a reset under
@@ -957,6 +965,8 @@ function assert(cond: unknown, msg: string): asserts cond {
 async function main(): Promise<void> {
   await db.connect();
   tmp = await mkdtemp(path.join(tmpdir(), "eval-dedup-"));
+  const scratch = tmp;
+  process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
   console.log(
     `# eval-dedup  base=${BASE}  writer=${WRITER}  claude-cases=${WITH_CLAUDE ? "ON" : "off"}` +
       (REPEAT > 1 ? `  rounds=${REPEAT}${RESET_BETWEEN ? " (reset between)" : ""}` : "") +

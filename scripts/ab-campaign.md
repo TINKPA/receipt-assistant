@@ -19,7 +19,10 @@ plus 6 re-extracts (`--plan` prints the estimate).
 
 From the main checkout, on the commit under test (a worktree build cannot
 name its commit without the `GIT_*` variables, and the campaign refuses an
-image whose `/version` says `unknown`):
+image whose `/version` says `unknown`). The campaign also refuses a
+checkout whose `src/` differs from the image's commit: the dumps, the
+fingerprints and `check-projection-replay --records` run from the
+checkout against rows the image wrote.
 
 ```bash
 cd ~/Developer/receipt-assistant
@@ -35,7 +38,9 @@ GIT_BRANCH=$(git branch --show-current) MAX_CLAUDE_CONCURRENCY=1 \
 npx tsx scripts/ab-campaign.ts --id=ab-1 --plan
 
 # 3. The night. --stop-after is local time; no item starts after it, and no
-#    unit the median of the finished ones says cannot end by then.
+#    item the median of the finished ones of its kind says cannot end by
+#    then. A bare HH:MM more than 16 h away is refused (the night's command
+#    re-run in the morning would run through the day); give a date then.
 caffeinate -i npx tsx scripts/ab-campaign.ts --id=ab-1 --stop-after=07:30
 
 # 4. The next nights: the same command resumes at the first unfinished item.
@@ -104,7 +109,7 @@ survived, and how many `derivation_events` rows each run added.
 
 | Event | What happens | Exit |
 |---|---|---|
-| A run ends with `error_class` quota, overloaded or auth, or the app log shows a 429, a rate-limit or a usage-limit line | the step is interrupted, the sandbox app is stopped (its queue would keep calling the API), the unit and its trial pair are marked **void**, and the campaign stops. The next run redoes both units of that trial. | 4 |
+| A run ends with `error_class` quota, overloaded or auth, or the app log shows the words those classes are read from (a 429 or 529, a rate, usage or session limit, overloaded, a failed authentication or a 401); the log is what catches a run whose `agent_runs` row a race round's reset has emptied | the step is interrupted, the sandbox app is stopped (its queue would keep calling the API), the unit and its trial pair are marked **void**, and the campaign stops. The next run redoes both units of that trial. | 4 |
 | `--stop-after` | no new item starts | 3 |
 | a unit fails (eval-dates gave up, the stack misbehaved, the image changed) | the campaign stops; the unit is redone on the next run | 3 |
 | a step's own tool fails (c3, c4, c5) | recorded; the campaign goes on to the next item | 3 |
@@ -152,9 +157,16 @@ truth corrected after the run counts) with eval-dates's own `score`.
 | G8 | the arm-B transcripts' `tool_use` inputs (and tool results, for permission errors) |
 | G9 | `c5.json` |
 
-A gate is `pass`, `fail`, `pending` (it needs a person: a G4 verdict, a G2
-root cause, a step not run yet) or `n/a`. Exit 0 every gate passes, 1 a
-gate fails, 2 one is pending or n/a.
+A gate is `pass`, `fail`, `pending` (it needs a person: a G4 verdict, a G1
+tie, a G2 root cause; or a step or planned unit has not run yet) or `n/a`.
+A gate computed from the units (G1-G4, G6-G8) never passes until every
+planned unit of both arms is done; a failure found earlier stands. G1
+judges a fixture by the majority of its trials; a tie (1 of 2) against a
+majority in the other arm, in either direction, is listed in
+`adjudication.json` under `g1_ties` for a person to call `regression` or
+`noise`. `gates.md` also reports c4 (`check-apply-extraction`), which no
+gate names. Exit 0 every gate passes, 1 a gate fails, 2 one is pending or
+n/a.
 
 **Adjudication.** `worksheet.md` lists, per fixture, the truth and every
 field of both arms side by side, the disagreements marked, and the ones
@@ -162,8 +174,11 @@ field of both arms side by side, the disagreements marked, and the ones
 marked expected. Read each remaining disagreement against the document,
 then set its `verdict` in `adjudication.json` (`B-worse`, `A-worse`,
 `both-wrong`, `equal`, or `expected` for an expected difference the tool
-did not recognise) with a note, write each G2 miss's root cause, and run
-`diff-arms` again; it keeps what was written. Both files hold values from
+did not recognise) with a note, answer each G1 tie, write each G2 miss's
+root cause, and run `diff-arms` again; it keeps what was written as long
+as the values it judged stay the same. When a later trial or a rerun of a
+voided pair moves them, the answer is cleared (kept under `previous`) and
+the gate is pending again. Both files hold values from
 real receipts: keep them in the private notes. Stdout and `gates.md` carry
 counts and fixture aliases (`m2-c2#04`) only, so they can go into a pull
 request.
