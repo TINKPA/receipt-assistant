@@ -1,0 +1,95 @@
+{
+  "_comment": "SHA-256 of the legacy (agent_sql) extraction and re-extract prompt renderings for fixed contexts, taken before wave 1 touched any prompt file. Checked in prebuild by scripts/check-prompt-render.ts. Never edit by hand, and never update it to make the check pass: a difference means the rendering production runs has changed.",
+  "writer": "agent_sql",
+  "pinned": [
+    "buildInfo.gitSha, gitShortSha, gitBranch, builtAt -> <GIT_SHA>, <GIT_SHORT_SHA>, <GIT_BRANCH>, <BUILT_AT>",
+    "EXTRACTION_MODEL -> <EXTRACTION_MODEL>",
+    "curated lessons body -> <LESSONS_BODY>",
+    "clock -> 2026-01-15T12:00:00.000Z",
+    "PROMPT_LESSONS_FILE, PROMPT_LESSONS_PROPOSED, PROMPT_ICON_PIPELINE_FILE unset"
+  ],
+  "ingest": {
+    "image": {
+      "sha256": "9d1c4f1d2568f7dc3dcdad4f7498aa6944c4c0ef8d2f12530a42690960707e6b",
+      "bytes": 142956
+    },
+    "image-neighbours-absent": {
+      "sha256": "fbe4f5ede58c3954bfb3b3ec96d8a6f527df469c5c203cb9d9b36a803a191ebe",
+      "bytes": 142956
+    },
+    "image-one-neighbour": {
+      "sha256": "9b45c367c227b4aaee9a4dc14739e28e8158bde2ce83fe3165bac20f1b4ad565",
+      "bytes": 142956
+    },
+    "image-three-neighbours": {
+      "sha256": "cb35a406a9133aa679c8373b736534fe4523db7b17a20011f8dd57709d195952",
+      "bytes": 143205
+    },
+    "pdf-text": {
+      "sha256": "72d3ba1f323728bc72f25193c297fa611cfa33f272a8b83618c7fd21a6f1ec53",
+      "bytes": 142956
+    },
+    "pdf-scanned": {
+      "sha256": "72d3ba1f323728bc72f25193c297fa611cfa33f272a8b83618c7fd21a6f1ec53",
+      "bytes": 142956
+    },
+    "pdf-statement": {
+      "sha256": "72d3ba1f323728bc72f25193c297fa611cfa33f272a8b83618c7fd21a6f1ec53",
+      "bytes": 142956
+    },
+    "eml-decoded": {
+      "sha256": "ebf21c14c56b31961f925a5a33ec5cb2f5edf5b402a895ed66a29e5c170e9f51",
+      "bytes": 144073
+    },
+    "eml-decoded-attachments": {
+      "sha256": "904ec8848da150fdd45d336172537c6fce88839a815408809c09d3853b285507",
+      "bytes": 144654
+    },
+    "eml-attachments-only": {
+      "sha256": "86bc2b05f77befb3af7b4947c9a8ac0104f9630cab08065c7bd18f582343c07c",
+      "bytes": 143539
+    },
+    "eml-undecoded": {
+      "sha256": "ccd957a468da4797039d91a86d970512e2b15f1f21e05da173ff1bc4085b2219",
+      "bytes": 142956
+    },
+    "eml-blank-text": {
+      "sha256": "ccd957a468da4797039d91a86d970512e2b15f1f21e05da173ff1bc4085b2219",
+      "bytes": 142956
+    },
+    "html-decoded": {
+      "sha256": "19960cb7a279ce8efb1a94da45b282c1e6a7bf55903d05caceeeba861088d6e3",
+      "bytes": 143858
+    },
+    "html-decoded-neighbour": {
+      "sha256": "ebebd1e2ae9d3348b9dbc8b1f3b4f4f5a7b0c15a8d8cac5a275de97b3336b432",
+      "bytes": 143858
+    }
+  },
+  "reextract": {
+    "image": {
+      "sha256": "8441f0f27666f1c006bde9d399aa07b8ced6e074a43905f2d699520477caceea",
+      "bytes": 74859
+    },
+    "pdf": {
+      "sha256": "f9797708edf5367b6c7a1023cd642555245b8d324afc214ba35b4f04aa0ecdd5",
+      "bytes": 74859
+    },
+    "eml-decoded": {
+      "sha256": "d10957abdd259a34dccfe5fc40f81dd7619475087be609ce12f733d04be9a3f5",
+      "bytes": 75976
+    },
+    "eml-decoded-attachments": {
+      "sha256": "57a8b1f796837f468d2e0cd6ba41a16814f12375132e960ba1ec392ed9a90626",
+      "bytes": 76557
+    },
+    "eml-attachments-only": {
+      "sha256": "a2419f8ce0b855e55f11137326f48418de57a3f9df443a210170da7929f0dd7c",
+      "bytes": 75435
+    },
+    "html-decoded": {
+      "sha256": "c3e2b4361038aaf3b6e4ddf3c4cec18c64d46de3ff6d46ff35f25ad413b740db",
+      "bytes": 75761
+    }
+  }
+}

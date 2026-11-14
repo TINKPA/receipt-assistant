@@ -132,6 +132,8 @@ Bump in the **same PR** as the prompt change. Ingest and re-extract share the on
 
 The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration, `"4.0"` for a clean break). Bumping on every commit floods the field with noise and makes the re-extract eligibility filter useless.
 
+**The legacy rendering is frozen while wave 1 is in flight.** `npm run build` runs `scripts/check-prompt-render.ts`, which renders the ingest prompt (`writer: 'agent_sql'`) and the re-extract prompt for fixed contexts that reach every branch the templates take on their context, and compares SHA-256 hashes with `scripts/prompt-render.golden.json`. The golden was taken before wave 1 touched a prompt file. The git sha, `EXTRACTION_MODEL`, the curated lessons body and the clock are pinned or normalised first, so only template text counts. A failure means the text production runs has changed: take the change out of the legacy rendering. Never update the golden to make it pass; `--update-golden` exists for the day the legacy writer is retired. `--dump=<dir>` writes the normalised renderings for a `diff -r` against the base commit.
+
 ### Three ways to re-run a layer
 
 | Endpoint | Re-runs | Calls out to | Writes |

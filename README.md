@@ -202,6 +202,7 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | Command | Purpose |
 |---------|---------|
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
+| `npm run check:prompt-render` | Fail if a legacy extraction or re-extract prompt rendering differs from its golden hash (also runs before every build) |
 | `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
 | `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
