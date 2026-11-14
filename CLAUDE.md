@@ -107,12 +107,14 @@ Every transaction the agent writes carries the prompt and model it ran under:
   "extraction": {
     "prompt_version": "<PROMPT_VERSION>",       // src/ingest/prompt-contract.ts
     "prompt_git_sha": "<build-info gitSha>",
-    "model":          "<EXTRACTION_MODEL>",     // CLAUDE_MODEL env, else "cli-default"
+    "model":          "<EXTRACTION_MODEL>",     // CLAUDE_MODEL env (both compose files pin it), else "cli-default"
     "source":         "ingest" | "re-extract",
     "ran_at":         "<wall-clock at COMMIT>"
   }
 }
 ```
+
+`CLAUDE_MODEL` is pinned to `claude-sonnet-5` in both compose files and is passed as `--model` to both agents. Before the pin it was unset, the CLI chose, and rows said `cli-default`; the surviving transcripts (from 2026-09-25) show that default ran `claude-opus-5` until the switch to the setup-token on 2026-10-08 and `claude-sonnet-5` since. An override in `.env` must be a full model id, never an alias such as `sonnet`, because the stamp is the literal string.
 
 Rows whose `prompt_version` differs from the source tree's are the ones worth re-extracting. Rows ingested before this existed have `metadata.extraction = NULL`; treat that as "unknown version, eligible". `documents.ocr_model_version` records the model that produced `ocr_text` (NULL on old rows; no backfill is possible). `places.metadata.derivation` is the same idea for a place row.
 
@@ -293,7 +295,7 @@ Both agents are `claude -p` children of the server, and both read text a strange
 
 Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`.
 
-The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` (below) with every bump.
+The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` and `probe-cli` (below) with every bump.
 
 ### Database roles
 
@@ -343,6 +345,16 @@ npx tsx scripts/check-agent-sandbox.ts --db-only   # database half only, no mode
 It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Every database statement is inside a transaction that is rolled back.
 
 A check that could not be carried out (usually because `claude` cannot authenticate in the sandbox) is reported as INCONCLUSIVE and fails the run. A green run means every claim was exercised.
+
+### CLI behaviour the repair round needs — `scripts/probe-cli.ts`
+
+Wave 1 has the agent hand back a record and, when it is invalid, sends the errors to the same session once with `claude -p --resume <session id>`. `scripts/probe-cli.ts` asks the pinned CLI, inside the sandbox container and with the profile's own `buildClaudeArgs` / `buildClaudeEnv`, whether that is safe: the `CLAUDE_MODEL` pin is accepted and is what the transcript shows; a resumed run offers exactly the profile's tools, still knows the conversation, and reads it from the prompt cache instead of paying for it again. It also records whether `--output-format json` changes anything but the envelope and whether `--input-format stream-json` takes a second message. About nine short model calls; it refuses the production container.
+
+```bash
+npx tsx scripts/probe-cli.ts --out=<private notes>/p0-cli-probes.md
+```
+
+On 2.1.251 (2026-11-13) all of it held, with three facts the implementation must respect: the resuming spawn's `--tools` decides the tool list, not the session's history, so the profile flags must be re-applied on resume; `--session-id` together with `--resume` is refused unless `--fork-session` is also given, so a resume spawn passes no `--session-id`; and a plain resume continues the same session id and JSONL file, so one run keeps one transcript. Keep `EXTRACTION_REPAIR_ROUNDS` at 0 for any CLI on which the probe's gating checks fail.
 
 ### What this does not bound
 
@@ -601,6 +613,15 @@ for line in sys.stdin:
                         inner = ' '.join(x.get('text','') for x in inner if x.get('type')=='text')
                     print(f'  result: {str(inner)[:120]}')
 "
+```
+
+### Accuracy eval — `scripts/eval-dates.ts`
+
+Uploads a manifest of real documents to the sandbox, waits for extraction, and scores date, total, payee, classification, flow and currency per document, with the model, turns and tokens of each run. It defaults to the sandbox and refuses any stack whose container lacks `EXTRACTOR_STUB_ALLOWED=1` (or a base on port 3000) without `--allow-production`, and any with `MAX_CLAUDE_CONCURRENCY` other than 1 without `--allow-concurrency`; the model, writer and concurrency it read off the container go on the report. With `--reset` it waits for the sandbox to go idle and empties it before every trial (a copy of a document the ledger already holds is attached as a near-duplicate, not extracted). The report is rewritten after every trial, so a trial that fails or is interrupted keeps the ones before it. Corpus C1 is `scripts/eval-dates.fixtures.json`; private corpora live outside the repo. Every real extraction costs about a million tokens of quota. Usage, manifest format and scoring: `scripts/eval-dates.md`.
+
+```bash
+npm run eval:dates -- --dry-run            # resolve and copy only; no upload
+npm run eval:dates -- --reset --limit=6    # the six-fixture sanity set
 ```
 
 ### Dedup regression matrix — `scripts/eval-dedup.ts`

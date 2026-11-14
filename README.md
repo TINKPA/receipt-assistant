@@ -200,10 +200,10 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
 | `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
 | `npm run measure:turns` | Turns and billed tokens per extraction, from session JSONL |
-| `npm run eval:dates` | Date-accuracy eval against the fixture set (`scripts/eval-dates.md`) |
+| `npm run eval:dates` | On the sandbox: extraction accuracy (date, total, payee, classification, flow, currency) plus turns and tokens per run, against a document manifest (`scripts/eval-dates.md`) |
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
 
-The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
+The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`, and `probe-cli.ts`, which records how the pinned `claude` CLI handles `--resume` and output formats), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
 
 The sandbox is a second stack (`docker-compose.test.yml`: API on 3001, its own image tag, database and data directories) that shares no state with production. `scripts/sandbox-reset.sh` returns it to an empty ledger without a restart, and `scripts/check-sandbox-reset.sh` checks that the reset still keeps exactly what a boot writes (run it after adding a migration). See [`CLAUDE.md` → Sandbox stack](CLAUDE.md#sandbox-stack-docker-composetestyml).
 
