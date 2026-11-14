@@ -12,7 +12,7 @@ Under the legacy writer one `claude -p` run reads the document and then writes e
 
 - **What an injection can reach.** The agent logs in as `receipts_agent`, which may insert into and update the tables the legacy prompt writes, on any row. A document is text a stranger wrote, and it is pasted into the prompt. A record carries one document's reading and nothing else: ids come from the server's context, the attach target is chosen by code from live candidates of the same direction, every statement is parameterised, every size is capped, and the free-form bags are never read by duplicate detection. The record agent has no `DATABASE_URL`, no WebSearch and no logo key.
 - **Partial writes.** The write was several psql calls over several turns, and some of it (parties, the place, the document stamp) ran after the ledger transaction committed. A failure part way left a transaction without them. The server writes the ledger, the catalog, the parties, the place, the document stamp, the events, the ingest close and the run finish in one database transaction.
-- **Lost evidence.** When the agent attached a document to an existing transaction, or rejected it as unsupported, its reading was thrown away. Every reading is now stored, unchanged, before anything is derived from it. A failed write is retried by applying the stored reading again, never by reading the document again, and a rule change can be measured by re-projecting stored readings.
+- **Lost evidence.** When the agent attached a document to an existing transaction, or rejected it as unsupported, its reading was thrown away. Every reading is now stored, unchanged, before anything is derived from it. A failed write leaves the stored reading valid and unapplied: a transient failure is retried in-process from that reading, and an apply-only retry of a later failure, which would apply the stored reading again instead of reading the document again, arrives with the durable queue (P6; see "The run flow"). Until then a manual retry reads the document again. A rule change can be measured by re-projecting stored readings.
 - **Duplicate decisions.** The agent decided attach or insert from a candidate read that gave it payee, date and the five identifiers. Code sees those plus card last-4, the time of day and the line items, decides the same way every time, and decides under a lock, so two copies in flight cannot both insert.
 - **Turns.** The candidate read, the write and the close-out were turns of their own. They are gone from the record run.
 
@@ -66,7 +66,7 @@ Both writers start the same way. The worker claims an ingest, and in one short t
 5. **Store: T1** (`recordExtraction`). The record is stored, valid or invalid (see "The evidence store"). A record still invalid after the last round errors the ingest and finishes the run in the same transaction.
 6. **Place prefetch**, outside any transaction (see "The place").
 7. **Apply: T2** (`applyExtraction`). One fenced transaction derives and writes the ledger, closes the ingest and finishes the run (see "applyExtraction").
-8. **After commit.** The points valuation, then the FX pass, on what the apply wrote (both idempotent, neither can fail the ingest); the SSE event; the batch's completion, which starts reconcile; and the record's `lesson_proposal`, appended to the proposed-lessons file after a successful apply, stripped of control characters.
+8. **After commit.** The points valuation, then the FX pass, on what the apply wrote (both idempotent, neither can fail the ingest); the SSE event; the batch's completion, which starts reconcile; and the record's `lesson_proposal`, appended after a successful apply, stripped of control characters, to the proposed-lessons file the legacy agent also appends to (`PROMPT_LESSONS_PROPOSED`, `lessons.proposed.md`; `src/ingest/prompt.ts`).
 
 Every exit finishes the run before the SSE event and the batch bookkeeping. A run that has lost its ingest to a newer run finishes `failed` / `fenced_out`, touches nothing else, and sends no `job.error`: the ingest is its new owner's to report.
 
@@ -194,7 +194,7 @@ Warnings are stored and never bounced. Those decided from the record alone are c
 | Rule | Where | Condition |
 |---|---|---|
 | `items_total_residual` (money) | record | per currency charged, the lines' effective amounts (`line_total + tax + tip − discount share`, leaving out the tax, tip and discount rows whose money is spread as shares) miss the total by more than max(5 minor units, 1%) |
-| `printed_total_mismatch` (money) | record | `total_printed` cannot be read as an amount, or reads as another magnitude at the currency's exponent |
+| `printed_total_mismatch` (money) | record | `total_printed` cannot be read as an amount at the currency's exponent, or reads as an amount other than the total's |
 | `date_far_past` | record | more than 400 days before the upload |
 | `occurred_at_date_mismatch` | record | the date in `occurred_at` differs from `occurred_on` |
 | `email_without_time` | record | an email with no `occurred_at` |
@@ -231,7 +231,7 @@ What is kept between rounds:
 - Only what the round added is parsed: the new stdout, and the transcript from the byte offset it had before the resume, so the earlier record is never taken for the repaired one.
 - A round that hands back no record leaves the earlier one standing.
 - A reply that resends the json without the receipt-text block keeps the earlier transcription.
-- The repaired record is compared with the one it replaces (`diffRepair`): a change at a path no error named is a `repair_changed_unnamed` warning, marked money when the path is an amount, a currency, the classification, the flow, the category, the payment method or an income account.
+- The repaired record is compared with the one it replaces (`diffRepair`): a change at a path no error named is a `repair_changed_unnamed` warning, marked money when the path is an amount, a currency, the classification, the flow, the category, the payment method, the points programme or an income account.
 - The record's report notes each round and the errors it was asked to fix; the run stores `repair_rounds`.
 
 Never sent back: a missing record (there is no field to name), and the output of a first spawn that failed (a run that timed out or crashed handed nothing back). A repair round whose spawn fails ends the loop: the earlier, invalid record is stored as evidence, and the run ends `agent_error` with that spawn's class (`agent_report.repair_spawn_failed` names it), because the outage is what happened, not a bad reading.
@@ -243,7 +243,7 @@ Never sent back: a missing record (there is no field to name), and the output of
 - **Columns.** The record as validated (`result`; for an invalid one, what was handed back), the receipt text (`raw_text`), the validation report, the origin (`agent`, `stub`, `ledger_backfill`, `manual`), the run, ingest and document, the prompt version and git sha, the model that answered (never `cli-default`), a hash of the decoded source text the agent was shown, `input_meta` (the pHash neighbours, attachment sizes and hashes, the prompt size), and promoted copies for lookups: classification, flow, date, total, currency, payee, identifiers, card last-4. For an invalid record only the well-formed values are promoted.
 - **Immutable.** A trigger refuses every UPDATE that changes anything but `superseded_at`, except an `ON DELETE SET NULL` foreign key clearing a reference to a run, ingest or record that is gone.
 - **Supersession.** A newer valid reading of the same document is a new row that names the old one in `supersedes_id`; the old one gets `superseded_at`. A partial unique index keeps at most one current valid record per document. An invalid record supersedes nothing: it is evidence of what the agent handed back, not a reading the ledger can use. Writes for one document are serialised by a transaction-scoped advisory lock on the document id, not a row lock, so they stay out of the ledger's lock order.
-- **Pointers.** Derived rows name their record: `agent_runs.extraction_id`, `transaction_items.extraction_id`, `derivation_events.extraction_id` (with `applier_version`, for re-extract on records), the transaction's `metadata.extraction.extraction_id`, the `created` and `document_linked` event payloads, a `merge_audit` entry, and `ingests.produced.extraction_ids`.
+- **Pointers.** Derived rows name their record: `agent_runs.extraction_id`, `transaction_items.extraction_id`, `derivation_events.extraction_id` (with `applier_version`, for re-extract on records), the transaction's `metadata.extraction.extraction_id`, the `created` and `document_linked` event payloads, a `merge_audit` entry, and `ingests.produced.extraction_ids`. The Message-ID link is the exception: its `merge_audit` entry and `document_linked` event carry `extraction_id: null`, inside T2 too, because the server's own Message-ID match linked the document, not the record.
 - **Deletion.** Deleting the document deletes its records: a hard delete is a purge.
 - **Roles.** `receipts_agent` has no grant on the table; `receipts_ro` (Ask) reads it like every other table.
 
@@ -387,7 +387,7 @@ Each candidate carries what the decision needs: its direction (`directionLateral
 ### The decision
 
 0. **Direction gate.** A candidate whose money moved the other way is dropped: its direction is `metadata.flow`, else its legs (an income leg is income; a negative expense total a refund; otherwise a purchase), with `flowsDisagree` as the second test. A candidate whose direction cannot be read is dropped too, because attaching across directions loses a money event. So is a candidate found only by amount when the total is 0. A refund whose dropped candidates include exactly one purchase sharing an identifier value names it in `metadata.refund_of`; several such purchases give the warning `refund_of_dropped`.
-1. **No candidate left**: insert. `near_dup_check` is written only when a pHash neighbour was dropped by the gate (verdict `distinct`, not flagged).
+1. **No candidate left**: insert. The decision writes `near_dup_check` only when a pHash neighbour was dropped by the gate (verdict `distinct`, not flagged); a mixed tender adds a flagged one with no candidate (see "Tenders").
 2. **Strong match.** A candidate is strong when all three hold:
    - the same merchant: equal `brand_id` through its merchant row, or equal payee, or equal `metadata.merchant.canonical_name` (compared after Unicode normalisation, trimming, collapsing spaces and lower-casing);
    - no identifier conflict: no key both sides carry has different values;
@@ -498,10 +498,10 @@ The record names a Google place id, the result of the agent's Phase 3a judgment.
 | `reapplied` | | as its branch | `reapplyRecord` |
 | `invalid_record` | `artefact_invalid` | `error` | still invalid after the last round; the record is stored |
 | `invalid_record` | `artefact_missing` | `error` | no record anywhere; nothing stored |
-| `agent_error` | `auth`, `quota`, `overloaded`, `timeout`, `spawn`, `crash` | `error` | the first spawn failed, or a repair round's (then the invalid record is stored) |
+| `agent_error` | `auth`, `quota`, `overloaded`, `timeout`, `spawn`, `config`, `crash` | `error` | the first spawn failed, or a repair round's (then the invalid record is stored); `config` is a flag or argument the CLI refused |
 | `failed` | `apply` | `error` | T2 or T1 failed; a stored record stays valid and unapplied |
 | `failed` | `fenced_out` | untouched | the run lost its ingest |
-| `interrupted` (run `abandoned`) | | `error` | the server restarted during the run |
+| `interrupted` (run `abandoned`) | `crash` | `error` | the server restarted during the run |
 
 The other values of the enum belong to other paths: `no_change` to re-extract, `adopted` to the durable queue (not built). The legacy writer uses `agent_reported`, `guard` and `no_closeout`.
 
@@ -527,7 +527,7 @@ The A/B comparison treats these as intended, not as regressions. The code cites 
 
 The tenders (debit card to Checking, gift card or balance to Cash, a mixed tender flagged) also differ from the legacy agent, which mostly kept its Credit Card default.
 
-X13 reaches the legacy side as soon as this code is deployed: reconcile's `cardLast4` reads a typed `card_last4` first on every row. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one).
+X13 already reaches the legacy side: since d224b7b, which production runs, reconcile's `cardLast4` reads a typed `card_last4` first on every row, legacy rows included. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one), and a recent change in what reconcile proposes may come from it rather than from the writer flip.
 
 Kept on purpose: category picks the expense account; a merchant is fixed at first sight; the model's tax, tip and discount allocation; the agent's `brand_id`; signed totals; Phase 3a and Check C.
 
@@ -586,7 +586,9 @@ Arm A is `agent_sql` on the legacy prompt; arm B is `server_apply` on the record
 
 The corpus: the public fixtures of `scripts/eval-dates.fixtures.json`; a private set kept outside the repository with hand-read ground truth, chosen to cover what the public set lacks (emails with attachments, a Message-ID duplicate pair, a foreign currency, a refund, a points stay, a saved HTML page, a marketplace order with several parties, a zero-decimal currency, a two-level receipt); the `eval-dedup` cases in both writer modes; `check-apply-extraction`; and legacy re-extract run twice on arm-B transactions that carry user edits and a manual item. Each fixture runs several trials per arm.
 
-The instruments: `eval-dates` scores date, total, payee, classification, flow and currency per document, with the run, model, turns and tokens; the fingerprint (`src/ingest/apply/fingerprint.ts`) compares what the two arms booked for one document field by field; `npm run measure:turns` gives the cost. Disagreements are settled by reading the document, in private notes.
+The instruments: `eval-dates` scores date, total, payee, classification, flow and currency per document, with the run, model, turns and tokens; the fingerprint (`src/ingest/apply/fingerprint.ts`) is what compares what the two arms booked for one document field by field; `npm run measure:turns` gives the cost. Disagreements are settled by reading the document, in private notes.
+
+Not built yet: the cross-arm comparison itself. Today the fingerprint is used only by `check-projection-replay --records`, `check-apply-decide` and `check-apply-extraction`, each within one writer. A script that pairs arm A's and arm B's transactions for each fixture, fingerprints both and prints the field-by-field table G4 adjudicates is a P4 prerequisite.
 
 ### Gates
 
