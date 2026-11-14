@@ -1,11 +1,27 @@
 /**
  * In-process async worker for `/v1/ingest/batch`.
  *
- * Phase 2 of #32 (landed 2026-04-20): the worker no longer calls
- * `createTransaction()` / `linkDocumentToTransaction()` / `upsertPlace`.
- * It spawns `claude -p` with a prompt that teaches the agent to write
- * directly to the ledger via psql, then reads back the `ingests` row
- * the agent updated to build the SSE event payload.
+ * Two writers, chosen per run by `EXTRACTION_WRITER` (`extractionWriter`
+ * in `./runs.ts`) and recorded on the run as `agent_runs.writer`:
+ *
+ *   agent_sql (default)  Phase 2 of #32 (landed 2026-04-20): the worker
+ *       spawns `claude -p` with a prompt that teaches the agent to write
+ *       directly to the ledger via psql, then reads back the `ingests` row
+ *       the agent updated, puts it through the #125 / #133 / #134 guards
+ *       and builds the SSE event from it (`extractAndClose`).
+ *   server_apply (wave 1, plan §2)  the agent reads and hands back an
+ *       extraction record; the server writes (`extractRecordAndApply`):
+ *       the pre-spawn Message-ID check (X9), the decode and the pHash
+ *       neighbours, `runRecordExtraction` (spawn, parse, validate, repair
+ *       round), T1 (`recordExtraction`: the record is stored, valid or
+ *       not), T2 (`applyExtraction`: one fenced transaction writes the
+ *       ledger, closes the ingest and finishes the run), then the
+ *       post-commit passes, the SSE event, the batch and the lesson
+ *       append. The agent has no database, so none of the guards apply.
+ *
+ * A stub upload (sandbox only, `EXTRACTOR_STUB_ALLOWED=1`) carries its own
+ * path whatever the variable says: a `terminal` stub the legacy one (run
+ * writer `stub`), a `record` stub the server writer's (`server_apply`).
  *
  * Design notes
  *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 1;
@@ -29,6 +45,8 @@
  *     (retryable), and their runs become `abandoned`. Durable queuing is
  *     a later phase of wave 1.
  */
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { liveTransactions } from "../db/live.js";
@@ -42,6 +60,8 @@ import { normalizeFxSafely } from "../fx/normalize.js";
 import { valuePointsSafely } from "../points/valuation.js";
 import {
   defaultClaudeExtractor,
+  runRecordExtraction,
+  type Extractor,
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
@@ -50,9 +70,27 @@ import {
   resolveUploadPath,
   type DocumentKindValue,
 } from "../routes/documents.service.js";
-import { ingestScratchDir } from "./document-read-prompt.js";
+import { ingestScratchDir, type DecodedAttachment } from "./document-read-prompt.js";
 import { phashDistance } from "../images/phash.js";
-import { isStubFile, stubFileExtractor } from "./stub-extractor.js";
+import {
+  readStubMode,
+  recordStubSpawn,
+  stubFileExtractor,
+  type RecordStub,
+} from "./stub-extractor.js";
+import { appendLessonProposal } from "./prompt.js";
+import {
+  applyExtraction,
+  applyMessageIdDuplicate,
+  closeRunWithoutRecord,
+  recordExtraction,
+  runPostCommitPasses,
+  statsFromSession,
+  type ApplyIds,
+  type ApplyResult,
+  type RunStats,
+  type ServerSource,
+} from "./apply/index.js";
 import {
   abandonInterruptedRuns,
   agentFailure,
@@ -68,16 +106,34 @@ import {
 } from "./runs.js";
 
 /**
+ * How one ingest is extracted: by an extractor that writes the ledger and
+ * closes the ingest itself (the agent's SQL, or a legacy stub), or by a
+ * record handed back to the server writer (the agent, or a record stub).
+ */
+type ExtractionPath =
+  | { writer: "agent_sql" | "stub"; extractor: Extractor }
+  | { writer: "server_apply"; stub: RecordStub | null };
+
+/**
+ * `EXTRACTION_WRITER`, read per run, unless the upload is a stub.
+ *
  * Test-only escape hatch (#134/#135 hardening): when the sandbox sets
  * EXTRACTOR_STUB_ALLOWED=1 AND the uploaded file is a stub instruction
- * JSON, route to the stub extractor instead of `claude -p`. Both
- * conditions are required; production compose never sets the env, so
- * this is dead code there. Real receipts in the sandbox still go to
- * the real agent — the two coexist per-file.
+ * JSON, route to the stub instead of `claude -p`, on the path the stub
+ * names. Both conditions are required; production compose never sets the
+ * env, so this is dead code there. Real receipts in the sandbox still go
+ * to the real agent — the two coexist per-file. Throws on a record stub
+ * whose fields are malformed.
  */
-async function pickExtractor(absPath: string) {
-  if (process.env.EXTRACTOR_STUB_ALLOWED !== "1") return defaultClaudeExtractor;
-  return (await isStubFile(absPath)) ? stubFileExtractor : defaultClaudeExtractor;
+async function pickPath(absPath: string): Promise<ExtractionPath> {
+  if (process.env.EXTRACTOR_STUB_ALLOWED === "1") {
+    const stub = await readStubMode(absPath);
+    if (stub?.mode === "legacy") return { writer: "stub", extractor: stubFileExtractor };
+    if (stub?.mode === "record") return { writer: "server_apply", stub: stub.stub };
+  }
+  return extractionWriter() === "server_apply"
+    ? { writer: "server_apply", stub: null }
+    : { writer: "agent_sql", extractor: defaultClaudeExtractor };
 }
 
 // ── Configuration ─────────────────────────────────────────────────────
@@ -372,9 +428,17 @@ async function runOne(item: QueueItem): Promise<void> {
   const absPath = resolveUploadPath(filePath);
 
   // Known before the claim, because the run row records the writer.
-  const extractor = await pickExtractor(absPath);
-  const writer: RunWriter =
-    extractor === stubFileExtractor ? "stub" : extractionWriter();
+  let path: ExtractionPath;
+  try {
+    path = await pickPath(absPath);
+  } catch (err) {
+    console.error(`[ingest worker] ingest=${ingestId} has an unusable stub file:`, err);
+    await markError(ingestId, workspaceId, err);
+    busEmit("job.error", { batchId, ingestId, error: ingestErrorText(err) });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+  const writer: RunWriter = path.writer;
 
   // T0: the run row and `processing` in one transaction, with a session id
   // minted here, so a run that dies at once still has both. Nothing has
@@ -388,6 +452,8 @@ async function runOne(item: QueueItem): Promise<void> {
       documentId,
       writer,
       trigger: item.trigger ?? "upload",
+      // A stub, of either kind, runs no CLI: no model or CLI version on its run.
+      agent: "extractor" in path ? path.writer !== "stub" : path.stub === null,
     });
   } catch (err) {
     console.error(`[ingest worker] ingest=${ingestId} could not start its run:`, err);
@@ -405,19 +471,20 @@ async function runOne(item: QueueItem): Promise<void> {
     finished = true;
     await finishRun(run, f);
   };
+  const base = {
+    item,
+    documentId,
+    documentKind: (docRows[0]?.kind ?? null) as DocumentKindValue | null,
+    userId,
+    absPath,
+    run,
+  };
   try {
-    await extractAndClose(
-      {
-        item,
-        documentId,
-        documentKind: (docRows[0]?.kind ?? null) as DocumentKindValue | null,
-        userId,
-        absPath,
-        extractor,
-        run,
-      },
-      finish,
-    );
+    if ("extractor" in path) {
+      await extractAndClose({ ...base, extractor: path.extractor }, finish);
+    } else {
+      await extractRecordAndApply({ ...base, stub: path.stub }, finish);
+    }
   } catch (err) {
     // A failure of the server's own after the run started (the agent's
     // failures are handled inside). Record it, and close the ingest if it
@@ -437,14 +504,17 @@ async function runOne(item: QueueItem): Promise<void> {
   }
 }
 
-interface ExtractContext {
+interface ClaimedIngest {
   item: QueueItem;
   documentId: string;
   documentKind: DocumentKindValue | null;
   userId: string;
   absPath: string;
-  extractor: Awaited<ReturnType<typeof pickExtractor>>;
   run: RunHandle;
+}
+
+interface ExtractContext extends ClaimedIngest {
+  extractor: Extractor;
 }
 
 /**
@@ -726,6 +796,269 @@ function closedOutcome(terminal: {
   if (terminal.produced.transaction_ids.length > 0) return "written";
   if ((terminal.error ?? "").startsWith("duplicate Message-ID")) return "duplicate_skip";
   return "no_change";
+}
+
+// ── The server writer (EXTRACTION_WRITER=server_apply) ─────────────────
+
+interface RecordContext extends ClaimedIngest {
+  /** The record stub standing in for the agent, or null for a real run. */
+  stub: RecordStub | null;
+}
+
+const sha256 = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
+
+/** When the document was uploaded, as this ingest saw it: record dates
+ *  are judged against it, never against the clock (`validate.ts`). */
+async function ingestUploadedAt(ingestId: string): Promise<Date> {
+  const rows = await db
+    .select({ createdAt: ingests.createdAt })
+    .from(ingests)
+    .where(eq(ingests.id, ingestId));
+  return rows[0]?.createdAt ?? new Date();
+}
+
+/** `document_extractions.input_meta`: what the run was shown besides the
+ *  document (plan §8.2). Attachment hashes are best effort. */
+async function recordInputMeta(
+  neighbours: { documentId: string; transactionId: string; distance: number }[],
+  attachments: DecodedAttachment[],
+  promptBytes: number | null,
+): Promise<Record<string, unknown>> {
+  const files: { bytes: number; sha256: string | null }[] = [];
+  for (const a of attachments) {
+    let digest: string | null = null;
+    try {
+      digest = sha256(await readFile(a.path));
+    } catch {
+      /* the scratch copy is gone; the size is still worth keeping */
+    }
+    files.push({ bytes: a.bytes, sha256: digest });
+  }
+  return {
+    phash_neighbors: neighbours.map((n) => ({
+      document_id: n.documentId,
+      transaction_id: n.transactionId,
+      distance: n.distance,
+    })),
+    attachments: files,
+    prompt_bytes: promptBytes,
+  };
+}
+
+/**
+ * Error the ingest of a run whose agent failed before handing anything
+ * back, fenced: only while the ingest is still this run's and open.
+ */
+async function errorIngestOfRun(ids: ApplyIds, err: unknown): Promise<boolean> {
+  const rows = await db.execute(sql`
+    UPDATE ingests
+       SET status = 'error',
+           error = ${ingestErrorText(err).slice(0, 2000)},
+           produced = ${JSON.stringify({ receipt_ids: [], transaction_ids: [], document_ids: [ids.documentId] })}::jsonb,
+           completed_at = now()
+     WHERE id = ${ids.ingestId}::uuid AND workspace_id = ${ids.workspaceId}::uuid
+       AND current_run_id = ${ids.runId}::uuid AND status IN ('queued','processing')
+    RETURNING id`);
+  return rows.rows.length > 0;
+}
+
+/**
+ * One ingest under the server writer (plan §2). The agent reads; the
+ * server stores what it handed back and writes the ledger. Every exit
+ * finishes the run before the SSE event and the batch bookkeeping, as the
+ * legacy path does; here the run is finished by the transaction that
+ * closes the ingest (T1 for a rejected record, T2 for an applied one).
+ *
+ *   1. Decode an email or HTML upload (the text the agent is shown, and
+ *      the envelope from the server's own MIME parse; a record stub may
+ *      supply the envelope).
+ *   2. X9: when another document carries the email's Message-ID and its
+ *      purchase is still live, link this document to it and close `dedup`
+ *      without spawning anything.
+ *   3. The pHash neighbours: candidates for the applier's dedup decision,
+ *      never a decision.
+ *   4. `runRecordExtraction`: spawn, parse, validate, repair rounds.
+ *   5. T1 (`recordExtraction`): store the record, valid or invalid. An
+ *      invalid one is final here, so the ingest errors with
+ *      `extraction record rejected: <path>: <rule>` and the run finishes
+ *      `invalid_record` / `artefact_invalid`. No record at all finishes it
+ *      `invalid_record` / `artefact_missing`.
+ *   6. T2 (`applyExtraction`): the place pre-fetch outside any
+ *      transaction, then one transaction for the ledger, the ingest close
+ *      and the run finish. A failure leaves the record valid and unapplied
+ *      and errors the ingest (`apply failed: <code>`).
+ *   7. After commit: points, then FX, the SSE event, the batch (and so
+ *      reconcile), and the record's lesson proposal, best effort.
+ */
+async function extractRecordAndApply(
+  ctx: RecordContext,
+  finish: (f: RunFinish) => Promise<void>,
+): Promise<void> {
+  const { item, documentId, userId, absPath, run, stub } = ctx;
+  const { ingestId, workspaceId, batchId, mimeType } = item;
+  const ids: ApplyIds = { workspaceId, ingestId, runId: run.runId, documentId };
+  const failed = async (error: string): Promise<void> => {
+    busEmit("job.error", { batchId, ingestId, error });
+    await onBatchChildTerminated(batchId, workspaceId);
+  };
+
+  // 1. Never throws; images and PDFs come back empty.
+  const decoded = await decodeSourceForAgent(
+    { id: documentId, kind: ctx.documentKind, mimeType },
+    absPath,
+    ingestScratchDir(ingestId),
+    "ingest",
+  );
+  const source: ServerSource = {
+    text: decoded.text,
+    email: stub ? stub.email : (decoded.email ?? null),
+  };
+
+  // 2. X9, before any spawn.
+  if (source.email?.messageId) {
+    const dup = await applyMessageIdDuplicate({ ...ids, source, stats: null });
+    if (dup) {
+      await closeApplied(ctx, dup, "receipt_email", null);
+      return;
+    }
+  }
+
+  // 3. A record stub stands in for an image upload's pHash.
+  if (stub?.phash) {
+    await db.execute(sql`
+      UPDATE documents SET phash = ${stub.phash}
+       WHERE id = ${documentId}::uuid AND workspace_id = ${workspaceId}::uuid`);
+  }
+  const neighbours = await findPhashNeighbors(workspaceId, documentId);
+
+  // 4. Spawn, parse, validate, repair. Writes nothing.
+  const res = await runRecordExtraction({
+    filePath: absPath,
+    ingestId,
+    workspaceId,
+    documentId,
+    userId,
+    sourceText: decoded.text,
+    attachments: decoded.attachments,
+    sessionId: run.sessionId,
+    uploadedAt: await ingestUploadedAt(ingestId),
+    ...(stub ? { spawn: recordStubSpawn(stub) } : {}),
+  });
+  // A stub renders the prompt but sends it nowhere: no prompt size, and
+  // no transcript to read.
+  const promptBytes = stub ? null : res.promptBytes;
+
+  if (res.status === "agent_error") {
+    // Load-bearing log line, as on the legacy path (#194).
+    console.error(`[ingest worker] ingest=${ingestId} FAILED:`, res.error);
+    await errorIngestOfRun(ids, res.error);
+    await finish(agentFailure(res.error, { promptBytes, agentReport: res.stdoutTail }));
+    await failed(ingestErrorText(res.error));
+    return;
+  }
+
+  // `agent_report`: where the record was found, and whether the message
+  // went on after it. The stdout tail only when no valid record came back:
+  // a valid one is stored whole, and its tail would be the record again.
+  const stats: RunStats = {
+    ...(stub ? {} : (statsFromSession(run.sessionId) ?? {})),
+    exitCode: 0,
+    promptBytes,
+    repairRounds: res.repairRounds,
+    agentReport: {
+      artefact_source: res.artefactSource,
+      trailing_text: res.trailingText,
+      ...(res.status === "valid" ? {} : (res.stdoutTail ?? {})),
+    },
+  };
+
+  if (res.status === "missing") {
+    const error = res.errorText ?? "extraction record missing";
+    console.warn(`[ingest worker] ingest=${ingestId} handed back no extraction record`);
+    await closeRunWithoutRecord(ids, { error, stats });
+    await failed(error);
+    return;
+  }
+
+  // 5. T1. The outcome is final: the repair rounds are behind us.
+  const stored = await recordExtraction({
+    ...ids,
+    origin: stub ? "stub" : "agent",
+    outcome: res.outcome!,
+    rawText: res.rawText,
+    sourceTextSha256: decoded.text ? sha256(decoded.text) : null,
+    inputMeta: await recordInputMeta(neighbours, decoded.attachments, promptBytes),
+    repairRounds: res.repairRounds,
+    stats,
+    final: true,
+  });
+  if (stored.fencedOut) {
+    const error = `ingest ${ingestId} is no longer this run's; the record was not stored`;
+    console.error(`[ingest worker] ${error} (run ${run.runId})`);
+    await finish({ outcome: "failed", errorClass: "fenced_out", error, exitCode: 0, promptBytes });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+  if (stored.closed) {
+    console.warn(`[ingest worker] ingest=${ingestId} ${res.errorText ?? "extraction record rejected"}`);
+    await failed(res.errorText ?? "extraction record rejected");
+    return;
+  }
+
+  if (stub && stub.pauseAfterRecordS > 0) {
+    console.log(
+      `[ingest worker] ingest=${ingestId} stub pause: record ${stored.extractionId} stored, ` +
+        `applying in ${stub.pauseAfterRecordS} s`,
+    );
+    await new Promise((r) => setTimeout(r, stub.pauseAfterRecordS * 1000));
+  }
+
+  // 6. T2.
+  const applied = await applyExtraction({
+    ...ids,
+    extractionId: stored.extractionId!,
+    source,
+    phashTransactionIds: neighbours.map((n) => n.transactionId),
+    stats,
+  });
+  await closeApplied(ctx, applied, res.record!.classification, res.record!.lesson_proposal ?? null);
+}
+
+/**
+ * After an apply (or the X9 link) has committed or failed: the post-commit
+ * passes, the SSE event, the batch, and the lesson proposal (plan §6.1).
+ * The run is already finished, by the apply's own transaction.
+ */
+async function closeApplied(
+  ctx: ClaimedIngest,
+  applied: ApplyResult,
+  classification: string,
+  lessonProposal: string | null,
+): Promise<void> {
+  const { ingestId, workspaceId, batchId } = ctx.item;
+  if (applied.outcome === "failed") {
+    // A fenced-out apply left the ingest to whoever owns it now.
+    if (applied.ingestStatus === "error") {
+      busEmit("job.error", { batchId, ingestId, error: applied.error ?? "apply failed" });
+    }
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
+  // #184 / #206: points valuation, then FX, on what the apply wrote,
+  // before job.done so no client sees a pre-conversion total.
+  await runPostCommitPasses(applied, workspaceId);
+  busEmit("job.done", {
+    batchId,
+    ingestId,
+    classification,
+    produced: {
+      receipt_ids: [],
+      transaction_ids: applied.transactionIds,
+      document_ids: [ctx.documentId],
+    },
+  });
+  await onBatchChildTerminated(batchId, workspaceId);
+  if (lessonProposal) appendLessonProposal(classification, lessonProposal);
 }
 
 // ── Batch state machine ───────────────────────────────────────────────

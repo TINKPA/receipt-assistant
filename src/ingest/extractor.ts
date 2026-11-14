@@ -254,7 +254,25 @@ export interface RecordExtractorInput {
   repairRounds?: number;
   timeoutMs?: number;
   repairTimeoutMs?: number;
+  /**
+   * What runs in place of `claude -p`: the sandbox stub's record mode
+   * (`stub-extractor.ts`), whose child prints the stub's record, so the
+   * parser, the validator and the repair loop below run on it unchanged.
+   * Production leaves it out.
+   */
+  spawn?: RecordSpawn;
 }
+
+/**
+ * One spawn of a record run: the first (`{sessionId}`, a new session) or a
+ * repair round (`{resumeSessionId}`, the same session again). Resolves with
+ * the child's stdout; rejects as `runClaude` does.
+ */
+export type RecordSpawn = (
+  prompt: string,
+  session: { sessionId: string } | { resumeSessionId: string },
+  timeoutMs: number,
+) => Promise<string>;
 
 /**
  * How a record run ended, for the worker:
@@ -333,15 +351,11 @@ export function recordRejectedText(errors: readonly ValidationError[]): string {
   return `extraction record rejected: ${first.path === "" ? "record" : first.path}: ${first.rule}${more}`;
 }
 
-async function runRecordClaude(
-  prompt: string,
-  session: { sessionId: string } | { resumeSessionId: string },
-  timeoutMs: number,
-): Promise<string> {
+const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
   const profile: AgentProfileName = "extraction_record";
   const { stdout } = await runClaude(prompt, { profile, args: extractorArgs(), timeoutMs, ...session });
   return stdout;
-}
+};
 
 /**
  * One ingest under the server writer, up to the record (plan §2, §5): the
@@ -371,6 +385,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
   const transcriptPath = getSessionJsonlPath(sessionId);
   const maxRounds = Math.min(MAX_REPAIR_ROUNDS, Math.max(0, input.repairRounds ?? extractionRepairRounds()));
   const ctx = { uploadedAt: input.uploadedAt };
+  const spawn = input.spawn ?? runRecordClaude;
 
   const prompt = buildExtractorPrompt({
     writer: "server_apply",
@@ -407,7 +422,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
 
   let stdout: string;
   try {
-    stdout = await runRecordClaude(prompt, { sessionId }, input.timeoutMs ?? CLAUDE_TIMEOUT_MS);
+    stdout = await spawn(prompt, { sessionId }, input.timeoutMs ?? CLAUDE_TIMEOUT_MS);
   } catch (err) {
     result.error = err;
     result.errorText = err instanceof Error ? err.message : String(err);
@@ -437,7 +452,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     );
     let repaired: string;
     try {
-      repaired = await runRecordClaude(
+      repaired = await spawn(
         renderRepairRequest(errors),
         { resumeSessionId: sessionId },
         input.repairTimeoutMs ?? REPAIR_TIMEOUT_MS,

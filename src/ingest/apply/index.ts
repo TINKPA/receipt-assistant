@@ -1,8 +1,9 @@
 /**
  * The server applier's entry points (wave 1, plan §6): what the worker
- * calls under `EXTRACTION_WRITER=server_apply` once an agent (or a stub)
- * has handed back an extraction record. Shipped dark: nothing calls these
- * while the writer is `agent_sql`.
+ * (`extractRecordAndApply` in `../worker.ts`) calls under
+ * `EXTRACTION_WRITER=server_apply`, or for a record stub, once an agent (or
+ * the stub) has handed back an extraction record. Nothing calls them on the
+ * `agent_sql` path.
  *
  *   recordExtraction       T1 (§6.1): store the record, valid or invalid,
  *                          in one fenced transaction. An invalid record

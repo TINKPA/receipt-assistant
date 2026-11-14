@@ -334,7 +334,7 @@ export async function finishRunIn(
     produced?: unknown;
     applyReport?: unknown;
     extractionId?: string | null;
-    errorClass?: RunErrorClass | "fenced_out" | "artefact_missing" | "artefact_invalid" | null;
+    errorClass?: RunErrorClass | null;
     error?: string | null;
     stats?: RunStats | null;
     required?: boolean;

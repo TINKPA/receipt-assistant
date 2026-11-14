@@ -19,7 +19,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { agentRuns, ingests, type agentRunOutcomeEnum } from "../schema/index.js";
 import { buildInfo } from "../generated/build-info.js";
-import { PROMPT_VERSION } from "./prompt-contract.js";
+import { PROMPT_VERSION, RECORD_PROMPT_VERSION } from "./prompt-contract.js";
 import { ClaudeRunError, claudeCliVersion } from "../claude.js";
 import { requestedModel } from "./extractor.js";
 import { summarizeSessionById } from "../session-transcript.js";
@@ -28,8 +28,10 @@ import { newId } from "../http/uuid.js";
 
 export type RunOutcome = (typeof agentRunOutcomeEnum.enumValues)[number];
 export type RunWriter = "agent_sql" | "server_apply" | "stub";
+/** The two values `EXTRACTION_WRITER` may name. */
+export type ExtractionWriter = Exclude<RunWriter, "stub">;
 export type RunTrigger = "upload" | "retry" | "api";
-/** The classes P1 writes; `src/schema/agent_runs.ts` lists the rest. */
+/** The classes written so far; `src/schema/agent_runs.ts` lists the rest. */
 export type RunErrorClass =
   | "auth"
   | "quota"
@@ -41,7 +43,12 @@ export type RunErrorClass =
   | "guard"
   | "no_closeout"
   | "apply"
-  | "config";
+  | "config"
+  // The server writer's (`server_apply`): no record handed back, a record
+  // still invalid after the repair rounds, and a run that lost its ingest.
+  | "artefact_missing"
+  | "artefact_invalid"
+  | "fenced_out";
 
 /** This process, as `agent_runs.worker_id`. */
 export const WORKER_ID = `${os.hostname()}:${process.pid}`;
@@ -65,20 +72,22 @@ export function ingestErrorText(err: unknown): string {
 let warnedWriter: string | null = null;
 
 /**
- * The writer an agent run uses, from `EXTRACTION_WRITER`, read per run.
- *
- * Only `agent_sql` exists yet: the server writer (`server_apply`) is wave
- * 1's next phase. Until it lands, any other value runs `agent_sql` and is
- * said so once in the log, so the run record always names the writer that
- * actually wrote.
+ * The writer an agent run uses, from `EXTRACTION_WRITER`, read per run:
+ * `agent_sql` (the agent writes the ledger with psql, the default) or
+ * `server_apply` (the agent hands back an extraction record and the
+ * server writes, `src/ingest/apply/`). Any other value runs `agent_sql`
+ * and is said so once in the log, so the run record always names the
+ * writer that actually wrote. A stub upload does not ask: it carries its
+ * own path (see the worker).
  */
-export function extractionWriter(): "agent_sql" {
+export function extractionWriter(): ExtractionWriter {
   const raw = (process.env.EXTRACTION_WRITER ?? "").trim();
+  if (raw === "server_apply") return "server_apply";
   if (raw !== "" && raw !== "agent_sql" && warnedWriter !== raw) {
     warnedWriter = raw;
     console.warn(
-      `[agent-runs] EXTRACTION_WRITER=${JSON.stringify(raw)} is not available in this build; ` +
-        `running agent_sql`,
+      `[agent-runs] EXTRACTION_WRITER=${JSON.stringify(raw)} is not a writer ` +
+        `(agent_sql | server_apply); running agent_sql`,
     );
   }
   return "agent_sql";
@@ -128,6 +137,8 @@ interface RunInsert {
   workspaceId: string;
   writer: RunWriter;
   trigger: RunTrigger;
+  /** False when no CLI is spawned (a stub); default: the writer is not `stub`. */
+  agent?: boolean;
   ingestId?: string | null;
   documentId?: string | null;
   transactionId?: string | null;
@@ -137,8 +148,9 @@ interface RunInsert {
 async function runValues(r: RunInsert, handle: RunHandle) {
   // A stub run spawns no CLI and asks for no model; recording the
   // server's CLI and `CLAUDE_MODEL` on it would say something that did
-  // not happen.
-  const agent = r.writer !== "stub";
+  // not happen. That holds for a record stub too, whose writer is
+  // `server_apply` because the server applier writes its ledger rows.
+  const agent = r.agent ?? r.writer !== "stub";
   const now = new Date();
   return {
     id: handle.runId,
@@ -152,7 +164,9 @@ async function runValues(r: RunInsert, handle: RunHandle) {
     writer: r.writer,
     sessionId: handle.sessionId,
     workerId: WORKER_ID,
-    promptVersion: PROMPT_VERSION,
+    // The server writer renders the record prompt; everything else the
+    // legacy line (re-extract included, until it runs on records).
+    promptVersion: r.writer === "server_apply" ? RECORD_PROMPT_VERSION : PROMPT_VERSION,
     promptGitSha: buildInfo.gitSha,
     modelRequested: agent ? requestedModel() : null,
     cliVersion: agent ? await claudeCliVersion() : null,
@@ -174,6 +188,8 @@ export async function startIngestRun(p: {
   documentId: string;
   writer: RunWriter;
   trigger: RunTrigger;
+  /** False for a record stub: no CLI runs, so no model or CLI is recorded. */
+  agent?: boolean;
 }): Promise<RunHandle> {
   const handle: RunHandle = { runId: newId(), sessionId: randomUUID() };
   const values = await runValues(
@@ -182,6 +198,7 @@ export async function startIngestRun(p: {
       workspaceId: p.workspaceId,
       writer: p.writer,
       trigger: p.trigger,
+      agent: p.agent,
       ingestId: p.ingestId,
       documentId: p.documentId,
     },

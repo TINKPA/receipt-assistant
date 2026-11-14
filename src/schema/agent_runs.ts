@@ -68,10 +68,14 @@ import { documentExtractions } from "./document_extractions.js";
  *   guard            a worker guard (#125 / #134) refused what the agent
  *                    reported
  *   no_closeout      the agent exited 0 without closing the ingest
- *   apply            the server's own step after the agent failed
+ *   apply            the server's own step after the agent failed, or
+ *                    (server writer) the apply transaction failed
  *   config           the run could not be set up (missing workspace, …)
- *   shutdown | stall | artefact_missing | artefact_invalid | fenced_out
- *                    reserved for the later phases
+ *   artefact_missing the server writer's agent handed back no record
+ *   artefact_invalid its record was still invalid after the repair rounds
+ *   fenced_out       the run no longer owned its ingest when it went to
+ *                    store or apply its record
+ *   shutdown | stall reserved for the durable queue
  *   An abandoned run carries `crash`: nothing marked a clean shutdown.
  */
 export const agentRuns = pgTable(
@@ -97,8 +101,9 @@ export const agentRuns = pgTable(
     attempt: integer("attempt").notNull().default(1),
     /** upload | retry | api | auto_retry | recovery | apply_only */
     trigger: text("trigger").notNull(),
-    /** Which code path wrote the ledger: the agent's own SQL, the server
-     *  applier (wave 1, P2 onward), or the sandbox stub extractor. */
+    /** Which code path wrote the ledger: the agent's own SQL (`agent_sql`),
+     *  the server applier (`server_apply`, wave 1; also a sandbox record
+     *  stub's runs), or a legacy sandbox stub that wrote it itself (`stub`). */
     writer: text("writer").notNull(),
     /** Minted by the server before the spawn; NULL only when nothing was
      *  spawned. Names the transcript (`getSessionJsonlPath`). */
