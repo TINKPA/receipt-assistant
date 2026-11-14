@@ -16,3 +16,5 @@ src/generated/
 /scripts/smoke-v1-ingest.report.json
 /scripts/eval-dates.report.json
 /scripts/eval-dates.report.md
+/scripts/eval-dates.*.report.json
+/scripts/eval-dates.*.report.md

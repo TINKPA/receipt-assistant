@@ -1,202 +1,238 @@
-# `eval-dates` — Date-OCR evaluation harness
+# `eval-dates`: extraction accuracy harness
 
-`scripts/eval-dates.ts` round-trips a manifest of receipt fixtures through
-the live `/v1/ingest/batch` worker pipeline and scores the extracted
-`(date, total, payee)` per fixture against committed ground truth. It's
-the durable AC#3 deliverable for [receipt-assistant#27].
+`scripts/eval-dates.ts` uploads a manifest of real documents to a running
+stack, waits for the worker to extract them, and scores what landed in the
+ledger against ground truth. It began as the date harness for
+[receipt-assistant#27] and is the instrument for the wave-1 A/B, which
+compares the agent writing the ledger itself (`agent_sql`) with the server
+writing it from the agent's record (`server_apply`) on the same documents.
 
 [receipt-assistant#27]: https://github.com/TINKPA/receipt-assistant/issues/27
+
+Per document it scores **date, total, payee, classification, flow
+(purchase / refund / income) and currency**, and records the model the run
+was stamped with, the model its transcript shows, turns and billed tokens.
 
 ## TL;DR
 
 ```bash
-# from inside ~/Developer/receipt-assistant/
-docker compose up -d                # backend + postgres + claude container
-npm run eval:dates                  # ~5-10 min for the default 23 fixtures
-cat scripts/eval-dates.report.md    # human-readable table
+# The sandbox, never production (a fixture is a real transaction in the
+# ledger it is sent to). From a worktree add
+# --env-file ~/Developer/receipt-assistant/.env so the agent can log in.
+docker compose -f docker-compose.test.yml up -d --build
+
+npm run eval:dates -- --dry-run          # check the manifest; no upload, no quota
+npm run eval:dates -- --reset            # one trial of corpus C1, about 1 hour
+npm run eval:dates -- --reset --limit=6  # the six-fixture sanity set
 ```
 
-Reports land at `scripts/eval-dates.report.{json,md}` (gitignored — the
-manifest is committed, the per-run report is not).
+Reports land next to the manifest as
+`eval-dates.<run id>.report.{json,md}` (gitignored in `scripts/`), or in
+`--out=<dir>`.
+
+Each real extraction costs about a million tokens of the owner's Claude
+subscription. A full C1 trial is 24 of them.
 
 ## How it works
 
-1. Reads `scripts/eval-dates.fixtures.json`.
-2. For each fixture, locates the source JPG at
-   `${UPLOADS_DIR}/<sha256>.jpg` (default
-   `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/uploads/`).
-3. Re-encodes via `sips -s formatOptions 75` into a tmpdir. The
-   re-encode is **load-bearing**: it bumps each file's SHA past
-   `documents.sha256` dedupe so the worker actually re-runs `claude -p`
-   on every fixture every run. Without this you'd score against cached
-   extractions from weeks ago and miss any current-pipeline regressions.
+1. **Reads the manifest** (`scripts/eval-dates.fixtures.json` unless
+   `--manifest=`) and resolves each entry's source file under
+   `--uploads-dir` (default the iCloud project's `data/uploads/uploads/`,
+   or `$UPLOADS_DIR`). An entry whose file is missing, or that does not
+   validate, is **reported and skipped**; the run goes on. (One deleted
+   photo used to abort the whole corpus at fixture 5.)
+2. **Resets the sandbox** with `--reset` (`scripts/sandbox-reset.sh`),
+   before every trial.
 
-   > ⚠️ **#134 interaction — run evals against a RESET sandbox, never a
-   > populated DB.** The sha-bump trick no longer defeats dedup on its
-   > own: a re-encoded copy keeps its pHash, so against a DB that
-   > already holds the fixture's prior extraction the agent will (by
-   > design) take the Phase 4a.0 attach path and close `near_dup`
-   > instead of re-extracting — and the eval scores nothing. The
-   > sandbox stack + `scripts/sandbox-reset.sh` gives the empty-DB
-   > environment where every fixture genuinely re-extracts:
-   > `docker compose -f docker-compose.test.yml up -d --build`, then
-   > `./scripts/sandbox-reset.sh`, then
-   > `npm run eval:dates -- --base=http://localhost:3001`.
-4. POSTs all fixtures in a single multipart batch to `/v1/ingest/batch`.
-5. Polls `/v1/batches/<id>` every 3 s until every ingest reaches a
-   terminal state (`done` / `unsupported` / `error`). 10 min timeout.
-6. For each `done` ingest, `GET /v1/transactions/<tx_id>` to pull
-   `occurred_on`, `payee`, and `max(|postings.amount_minor|)` (the
-   expense-leg total).
-7. Scores per bucket (table below), emits JSON + Markdown reports.
+   > **Run against a reset sandbox, never a populated ledger.** A copy of
+   > a document the ledger already holds is found as a near-duplicate
+   > (same pHash, same identifiers, same Message-ID) and attached instead
+   > of extracted, so the trial scores nothing. That is why `--trials` above
+   > 1 requires `--reset`, and why the default `--base` is the sandbox
+   > (`http://127.0.0.1:3001`). A base on port 3000 is refused unless you
+   > pass `--allow-production`.
+3. **Copies each fixture under a new sha256** so the upload is never a
+   byte duplicate, without changing what the agent reads:
 
-The harness uses no auth headers — every request hits the seed
-workspace via `contextMiddleware` (`src/http/context.ts`). No
-`--json-schema` is involved anywhere; the worker owns the
-`claude -p` invocation. **No direct DB access**: the harness only
-talks to the HTTP API.
+   | Source | Copy | Uploaded as |
+   |---|---|---|
+   | Image | `sips` re-encode to JPEG at quality 75 (unchanged since #27, so old baselines stay comparable) | `image/jpeg` |
+   | PDF | a comment line appended after the final `%%EOF`; pages and text layer untouched | `application/pdf` |
+   | `.eml` | one `X-Eval-Nonce:` header put before the first line | `message/rfc822` |
+   | HTML | a comment appended at the end | `text/html` |
 
-## CLI flags
+   Until wave 1 every file went through `sips` and was sent as
+   `image/jpeg`, which turned the two text-layer PDF fixtures into photos
+   of a page: they could never exercise the agent's `pdftotext` path. The
+   harness now checks that `pdftotext` reads the same text from a PDF copy
+   as from the original, and after upload that the stored file
+   (`GET /v1/documents/:id/content`) is the copy and still has text
+   (`pdf_text_layer` in the report). Appending to an email body instead
+   of adding a header would corrupt a single-part base64 body.
+4. **Uploads one batch per trial** (`POST /v1/ingest/batch`, at most 50
+   files per batch) and polls until every ingest is terminal (`done`,
+   `unsupported`, `error`, `dedup`, `near_dup`) **and** the batch has
+   finished reconciling, since reconcile can still rewrite transactions.
+5. **Reads each transaction** over the API (`GET /v1/transactions/:id`)
+   and scores it (below).
+6. **Finds each run's transcript** in `--transcripts` (default the
+   sandbox's `~/Developer/receipt-assistant-data/test-claude/projects/-app/`)
+   by the ingest id in the prompt, and counts turns and tokens the way
+   `measure-ingest-turns.ts` does (grouped by `message.id`; billed input is
+   fresh + cache read + cache write).
+7. **Dumps the rows** with `--dump=<dir> --pg=<url>`: for every fixture the
+   ingest, documents, links, transactions, postings (with account name and
+   type), items, parties, events, place, merchant, owned items and, once
+   they exist, `agent_runs`, as whole rows, one JSON file per fixture under
+   `<dir>/<run id>/t<trial>/`. The connection is opened with
+   `default_transaction_read_only=on` and refused otherwise, and a dump
+   directory inside this repository is refused: the rows are real
+   receipts. The wave-1 arm diff reads these.
+8. **Writes the report**: fields and buckets over all trials, cost
+   medians, a per-fixture majority over trials, every run, errors, and the
+   skipped fixtures.
 
-| Flag                | Default                                                                                  | What it does                          |
-|---------------------|------------------------------------------------------------------------------------------|---------------------------------------|
-| `--base=<url>`      | `http://localhost:3000`                                                                  | API base                              |
-| `--manifest=<path>` | `scripts/eval-dates.fixtures.json`                                                       | Alternate manifest (for prompt A/Bs)  |
-| `--uploads-dir=<p>` | `~/Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/uploads`                 | Where the SHA-named JPGs live         |
-| `--limit=<n>`       | all                                                                                      | Run a subset (debug)                  |
-| `--gate`            | off                                                                                      | Exit 1 if date_accuracy < 90% (AC#1)  |
+No auth headers (the seed-workspace middleware), no `--json-schema`.
 
-`UPLOADS_DIR=...` env var is also honored.
+## Flags
 
-## Buckets and pass criteria
+`--key=value`, or a bare `--flag` for the switches. The space form
+(`--limit 5`) and unknown flags are refused.
 
-The manifest assigns each fixture to one of five buckets. The harness
-scores each fixture by the bucket-specific rule below; the aggregate
-`date_accuracy` reported at the top of the report is a uniform metric
-across every extracted fixture and is what AC#1 (≥ 90%) measures
-against.
+| Flag | Default | What it does |
+|---|---|---|
+| `--base=<url>` | `http://127.0.0.1:3001` | API of the stack under test |
+| `--allow-production` | off | Allow a base on port 3000 |
+| `--manifest=<path>` | `scripts/eval-dates.fixtures.json` | Corpus to run |
+| `--uploads-dir=<path>` | iCloud `data/uploads/uploads` | Where sources live (`$UPLOADS_DIR` also works) |
+| `--limit=<n>` | all | First n manifest entries |
+| `--trials=<n>` | 1 | Run the set n times, one batch each; needs `--reset` above 1 |
+| `--reset` | off | `scripts/sandbox-reset.sh` before every trial |
+| `--run-id=<id>` | `ed-<UTC time>-<hex>` | Names the report files and the dump directory |
+| `--label=<text>` | none | Free text on the report, e.g. `arm A` |
+| `--out=<dir>` | the manifest's directory | Where the report goes |
+| `--dump=<dir>` | off | Write each fixture's rows (needs `--pg`; refused inside the repo) |
+| `--pg=<url>` | none | Postgres of the stack under test, opened read-only. Sandbox: `postgresql://postgres:postgres@127.0.0.1:5433/receipts` |
+| `--transcripts=<dir>` | sandbox `test-claude/projects/-app` | Session JSONL directory; `none` to skip |
+| `--timeout-min=<n>` | 60 | Per-trial polling timeout |
+| `--gate` | off | Exit 1 if date accuracy < 90% (#27 AC#1) |
+| `--dry-run` | off | Resolve and copy every fixture, check the copies, upload nothing |
+| `--rescore=<batch id>[,<id>]` | off | Score batches that already ran, with the current manifest and code: no reset, upload or model calls. Items are matched to fixtures by upload filename. Use it after correcting ground truth, or to dump a run after the fact (before the next reset) |
 
-| Bucket          | Pass means                                                                       | Why this exists                                                                                                   |
-|-----------------|----------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `hard_date`     | `transactions.occurred_on == ground_truth.date`                                  | Known-failing date OCR (Wilson 30↔03, etc.). A prompt fix that unsticks any of these moves the needle.            |
-| `hard_total`    | `max(\|postings.amount_minor\|) == ground_truth.total_minor`                     | Subtotal-vs-final / handwritten-tip confusion fixtures.                                                            |
-| `hard_all`      | All three of date, total, payee match                                            | Pathological fixture (WingHopFung). Single image stress-tests three independent dimensions.                       |
-| `good_rejects`  | `ingest_status == "unsupported"`                                                 | Blurry photos where the worker correctly refuses to guess. Currently empty — add fixtures as they surface.        |
-| `good`          | Date + total + payee all match                                                   | Regression guard. A prompt that improves `hard_date` but breaks any of these is net-bad.                          |
+Two arms are two runs: flip the sandbox between them
+(`EXTRACTION_WRITER=server_apply docker compose -f docker-compose.test.yml up -d`)
+and give each its own `--run-id` and `--label`. `--trials=n` repeats one
+arm.
 
-Within each bucket:
-- `date_match` — `occurred_on === ground_truth.date` (string compare,
-  YYYY-MM-DD).
-- `total_match` — `max(|amount_minor|) === ground_truth.total_minor`.
-  Null if the manifest entry has no total or the ingest didn't produce
-  a transaction.
-- `payee_match` — case-insensitive substring of **any** of the
-  manifest's `merchant_tokens` in the extracted payee. Tokens are
-  lowercase CamelCase splits of the filename merchant slug (e.g.
-  `WingHopFung` → `["wing", "hop", "fung"]`). The match passes if the
-  worker resolves the payee to *anything* recognizable — store
-  numbers, district names, and the canonical brand name all match.
+## Corpora
 
-## Adding a fixture to the manifest
+| Set | Manifest | Contents |
+|---|---|---|
+| C1 | `scripts/eval-dates.fixtures.json` (in the repo) | 25 photos and PDFs of the owner's receipts; 24 runnable (one source photo is gone and is reported as skipped) |
+| C2 | private, outside the repo (wave-1 notes) | 13 documents chosen from production by kind: emails (PDF attachment, a Message-ID duplicate pair, non-USD, refund, income, marketplace, two plain), saved HTML pages (a points stay, an order page), a JPY email and a two-level package photo. Named by document id and stored path; ground truth hand-read from each document |
 
-1. Identify the receipt in the live DB:
+**The first six C1 entries are the sanity set**: five `good` fixtures and
+the hard text-layer PDF, two PDFs in all. `--limit=6` runs exactly those,
+for a quick check that the pipeline still works end to end. Keep a
+text-layer PDF among the first six when editing the manifest.
+
+## Manifest entries
+
+```jsonc
+{
+  "key": "refund-email",             // optional; default document_id, else sha256[:12]
+  "sha256": "<64 hex>",              // source <uploads-dir>/<sha256>.<ext>   (C1)
+  "stored_path": "<file>.eml",       // source <uploads-dir>/<stored_path>   (C2; documents.file_path)
+  "document_id": "<uuid>",           // provenance only
+  "original_filename": "x.jpeg",     // optional upload filename; never in the prompt
+  "bucket": "good",                  // hard_date | hard_total | hard_all | good_rejects | good | duplicate
+  "ground_truth": {
+    "date": "YYYY-MM-DD",            // null: not scored (nothing printed says when)
+    "merchant_tokens": ["acme"],     // lowercase; the payee passes if it contains any
+    "total_minor": -4250,            // signed as the ledger books it; scored on magnitude; null skips
+    "currency": "USD",               // default USD; points use the ledger code, e.g. HYATT_PT
+    "flow": "refund",                // default purchase
+    "classification": "receipt_email", // default from the file type; may be a list
+    "duplicate_of": "<key>"          // bucket duplicate only: the twin in the same manifest
+  },
+  "expected_status": "done",         // or a list of acceptable statuses
+  "notes": "Why it is in the set; how the truth was read."
+}
+```
+
+The source's extension decides the copy and the content type. Classification
+defaults: image → `receipt_image`, PDF → `receipt_pdf`, email →
+`receipt_email`, HTML → either `receipt_email` or `receipt_pdf` (production
+has filed saved pages under both). A `good_rejects` fixture expects
+`unsupported`.
+
+### Adding a C1 fixture
+
+1. Find the receipt read-only in production:
    ```bash
-   docker exec receipts-postgres psql -U postgres -d receipts -c "
-     SELECT i.filename, d.sha256, t.occurred_on, t.payee
-     FROM ingests i
-     JOIN documents d ON d.source_ingest_id = i.id
-     LEFT JOIN transactions t ON t.source_ingest_id = i.id
-     WHERE i.filename ILIKE '%PARTIAL%' AND i.status = 'done';
-   "
+   docker exec -e PGOPTIONS='-c default_transaction_read_only=on' receipts-postgres \
+     psql -U postgres -d receipts -c "
+       SELECT i.filename, d.sha256, d.file_path, t.occurred_on, t.payee
+         FROM ingests i
+         JOIN documents d ON d.source_ingest_id = i.id
+         LEFT JOIN transactions t ON t.source_ingest_id = i.id
+        WHERE i.filename ILIKE '%PARTIAL%' AND i.status = 'done';"
    ```
-2. Confirm `${UPLOADS_DIR}/<sha>.jpg` exists on disk.
-3. Decide the bucket. Rules of thumb:
-   - DB `occurred_on` ≠ filename date → `hard_date`
-   - DB total ≠ filename total → `hard_total`
-   - Both wrong + payee also drifts → `hard_all`
-   - Status returns `unsupported` → `good_rejects` (rare — add when
-     a deliberately-blurry photo is part of the corpus)
-   - Otherwise → `good`
-4. Add an entry to `scripts/eval-dates.fixtures.json`:
-   ```jsonc
-   {
-     "sha256": "<from query>",
-     "original_filename": "<from query>",
-     "bucket": "<bucket>",
-     "ground_truth": {
-       "date": "YYYY-MM-DD",                       // from filename
-       "merchant_tokens": ["lower", "case", "tokens"],
-       "total_minor": 1234                          // null if filename has no total
-     },
-     "expected_status": "done",                     // or "unsupported"
-     "notes": "Why this fixture is in the manifest — one short sentence."
-   }
-   ```
-5. Re-run `npm run eval:dates` and verify the new entry shows in
-   the report.
+2. Read the ground truth **off the document**, not off the ledger row: the
+   ledger is what is being tested.
+3. Pick the bucket: date wrong in the ledger → `hard_date`; total wrong →
+   `hard_total`; both and the payee → `hard_all`; refused as not a receipt
+   → `good_rejects`; otherwise `good`.
+4. Add the entry, then `npm run eval:dates -- --dry-run` to check it
+   resolves.
 
-The manifest is the durable artifact. The JPGs themselves stay in
-`data/uploads/uploads/` (iCloud, gitignored per the
-three-data-locations invariant — these are real PII receipts).
-Anyone with access to that uploads dir can run the eval; the manifest
-defines what "correct" means.
+The repository is public. C1 entries name the fixture by sha256 and carry
+the merchant tokens and totals the ground truth needs; nothing else about
+the receipt (no addresses, card digits or order numbers) goes in the file.
+Documents that are more personal than a till receipt, such as emails, go
+in a private manifest outside the repo, like C2.
 
-## Interpreting the report
+## Scoring
 
-The Markdown report has three sections:
+| Field | Correct when | Not scored when |
+|---|---|---|
+| `date` | `occurred_on` equals `ground_truth.date` | no transaction, or the truth is null |
+| `total` | the largest posting magnitude in the scored currency equals `|total_minor|` (that is the mirror leg, so a split across expense accounts still scores once) | no transaction, or the truth is null |
+| `payee` | the payee contains any merchant token (case-insensitive) | no transaction, or no tokens |
+| `classification` | `ingests.classification` is one of the expected values | the agent never classified (e.g. a byte duplicate) |
+| `flow` | income leg present → `income`; else expense legs summing negative → `refund`; else `purchase` (#221: never read the sign of a leg picked by sign) | no transaction |
+| `currency` | the spend leg's currency (a `_PT` currency when there is one: a points stay with a cash part has two) | no transaction |
 
-- **Aggregate**: top-line `date_accuracy`. Compare against the 90% AC#1
-  threshold. Numerator = fixtures whose extracted date matches ground
-  truth. Denominator = fixtures with *any* extraction (so
-  `good_rejects` don't dilute the metric).
-- **By bucket**: pass counts per bucket. Use this to localize a
-  regression — e.g. if `hard_date` passes drop from 2/5 to 0/5 but
-  `good` passes drop from 14/14 to 12/14, the prompt change has a
-  *different* failure mode than just "couldn't fix the hard ones".
-- **Per-fixture**: every row shows extracted vs ground-truth date and
-  total side-by-side. `✅`/`❌` mark match/mismatch; `—` means
-  the dimension wasn't applicable (e.g. no total in filename, or no
-  extraction at all).
+**Bucket pass** keeps the #27 rules: `good` needs date, total and payee
+(a field the truth leaves null is skipped); `hard_date` the date;
+`hard_total` the total; `hard_all` all three; `good_rejects` status
+`unsupported`; `duplicate` an acceptable status and no transaction of its
+own (none, or its twin's). Classification, flow and currency are reported
+on their own and not folded into the pass.
 
-### Known stragglers (do not panic)
+With several trials the report adds, per fixture and field, the majority
+verdict (`pass`, `fail`, `split` on a tie, `n/a`), which is how the wave-1
+gate G1 compares arms.
 
-- **WingHopFung wine** (`hard_all`) — non-deterministic across runs
-  per the [2026-04-21 issue comment][nd-comment]. Faded thermal
-  paper; pixel-level OCR is beyond what prompt iteration can fix.
-  Expect this to fail on most runs.
-- **Wilson wristband** (`hard_date`) — 09/30 → 09/03 deterministic
-  across 3 rounds of Phase 2.5 self-check iteration. A digit-order
-  read error. Expect this to fail until a model upgrade or image
-  preprocessing lands.
+The aggregate date accuracy is `correct / scored`, so documents that were
+never extracted do not dilute it; `--gate` checks it against 90%.
+
+## Known stragglers (do not panic)
+
+- **WingHopFung wine** (`hard_all`): non-deterministic across runs per the
+  [2026-04-21 issue comment][nd-comment]. Faded thermal paper.
+- **Wilson wristband** (`hard_date`): 09/30 read as 09/03, deterministic
+  across 3 rounds of Phase 2.5 self-check iteration.
+- **Haidilao** (`hard_date`): the source photo is gone from the uploads
+  directory; the entry is kept and reported as skipped.
 
 [nd-comment]: https://github.com/TINKPA/receipt-assistant/issues/27#issuecomment-4285867967
 
 ### When `date_accuracy < 90%`
 
-That's the issue #27 starting condition. The harness gives you a
-deterministic, repeatable measurement; the next move depends on
-what's failing:
-
-- **All `hard_*` failing, `good` clean** → the prompt is at its
-  current ceiling; pivot to A/B trials with prompt variants (see
-  the original issue body) or to a model bump.
-- **`good` regressed** → a recent prompt or model change has
-  broader cost than the win it was after; revert and investigate.
-- **A new failure mode in a previously-`good` fixture** → promote
-  that fixture to a `hard_*` bucket and continue iterating.
-
-## Bash AC#1 wrapper (per the issue body)
-
-The issue body asks for `scripts/eval-dates.sh`. Since every existing
-script in this repo runs through `tsx`, the package.json `eval:dates`
-script is the canonical entry point and what gets used in practice.
-If a CI runner needs an exact `.sh` filename to invoke, this
-single-line wrapper is the bridge:
-
-```bash
-#!/usr/bin/env bash
-exec npm run eval:dates -- --gate "$@"
-```
-
-(Not committed by default — add `scripts/eval-dates.sh` only if a
-specific CI integration demands it.)
+- **All `hard_*` failing, `good` clean**: the prompt is at its ceiling;
+  A/B prompt variants or a model change.
+- **`good` regressed**: a recent prompt or model change costs more than it
+  wins; revert and investigate.
+- **A new failure in a previously `good` fixture**: promote it to a
+  `hard_*` bucket and keep iterating.

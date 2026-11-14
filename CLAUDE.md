@@ -615,6 +615,15 @@ for line in sys.stdin:
 "
 ```
 
+### Accuracy eval — `scripts/eval-dates.ts`
+
+Uploads a manifest of real documents to the sandbox, waits for extraction, and scores date, total, payee, classification, flow and currency per document, with the model, turns and tokens of each run. It defaults to the sandbox, refuses port 3000 without `--allow-production`, and with `--reset` empties the sandbox before every trial (a copy of a document the ledger already holds is attached as a near-duplicate, not extracted). Corpus C1 is `scripts/eval-dates.fixtures.json`; private corpora live outside the repo. Every real extraction costs about a million tokens of quota. Usage, manifest format and scoring: `scripts/eval-dates.md`.
+
+```bash
+npm run eval:dates -- --dry-run            # resolve and copy only; no upload
+npm run eval:dates -- --reset --limit=6    # the six-fixture sanity set
+```
+
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
 The dedup system (#134/#135) has a dedicated regression harness that
