@@ -35,7 +35,22 @@ export interface PgProblemSpec {
   title: string;
   detail: string;
   extras: Record<string, unknown>;
+  /** Set for a failure that retrying the same request will get past;
+   *  sent as `Retry-After`. */
+  retryAfterSeconds?: number;
 }
+
+/**
+ * The two SQLSTATEs with which Postgres ends a statement that was itself
+ * correct, to let a concurrent one through: `40P01` deadlock_detected
+ * (two transactions each held a row the other needed) and `40001`
+ * serialization_failure. The whole DB transaction rolled back, so
+ * nothing was written and the same request can be sent again.
+ */
+export const RETRYABLE_PG_CODES: ReadonlySet<string> = new Set(["40P01", "40001"]);
+
+/** How long a client is told to wait before repeating such a request. */
+export const CONCURRENT_UPDATE_RETRY_AFTER_SECONDS = 1;
 
 const SQLSTATE_RE = /^[0-9A-Z]{5}$/;
 
@@ -113,6 +128,22 @@ export function classifyPgError(pg: PgErrorInfo): PgProblemSpec | null {
         ? `A value in the request is not a valid ${valueType}.`
         : "A value in the request is malformed or out of range for its type.",
       extras: valueType ? { value_type: valueType } : {},
+    };
+  }
+
+  if (RETRYABLE_PG_CODES.has(pg.code)) {
+    // Not a fault in the request and not one in the server: two requests
+    // reached for the same rows and Postgres stopped this one. The lock
+    // order in CLAUDE.md is what keeps this rare; when it happens anyway
+    // the honest answer is "nothing changed, send it again", not a 500.
+    return {
+      status: 409,
+      type: "concurrent-update",
+      title: "Concurrent update",
+      detail:
+        "Another request was changing the same records at the same moment, and this one was stopped. Nothing was changed. Retry the request.",
+      extras: { retry_after_seconds: CONCURRENT_UPDATE_RETRY_AFTER_SECONDS },
+      retryAfterSeconds: CONCURRENT_UPDATE_RETRY_AFTER_SECONDS,
     };
   }
 

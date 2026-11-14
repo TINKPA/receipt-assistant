@@ -33,6 +33,11 @@
  *     move its links back, mark the proposal `reverted`. Applies that
  *     built on each other (C folded into B, then B into A) are undone
  *     newest first; undo refuses the inner one until the outer is undone.
+ *     It also refuses to restore a duplicate none of whose documents is
+ *     still live (`no_live_document`), or to take the moved documents
+ *     off a survivor whose own have all been deleted since
+ *     (`survivor_no_live_document`): either would leave a live
+ *     transaction with no live document.
  *   - REJECT and STALE never touch the ledger.
  *
  * Auto-apply and a person's apply run the same function, so a duplicate
@@ -602,6 +607,73 @@ async function resolveMovedLinks(
 }
 
 /**
+ * Would taking `toRemove` off the surviving row leave it a live
+ * transaction with no live document? Returns undo's refusal reason, or
+ * null when the undo may go ahead.
+ *
+ * Only a change the undo itself makes counts: the survivor has a live
+ * document now and would have none once the moved ones are gone. And
+ * only a survivor that had a document of its own: one that never did (a
+ * manual entry the duplicate was folded into) goes back to having none,
+ * which is where it started. "Had one" is read from the traces a
+ * document leaves, the same ones `scripts/check-ledger.ts` reads for
+ * `txn-has-live-document`: a link to a deleted document, a
+ * `document_unlinked` event (a hard cascade kept the row and removed the
+ * link), an ingest that produced the row, a dedup apply that moved
+ * documents off it. So undo never creates a row that check reports.
+ *
+ * FOR SHARE on the survivor's documents, after its head row (which the
+ * caller holds): the lock order, and a plain delete or restore of one of
+ * them waits for the undo, so what is read here is still true at commit.
+ */
+async function survivorLeftWithoutEvidence(
+  tx: DbTx,
+  args: { canonicalId: string; survivorDeleted: boolean; toRemove: Set<string> },
+): Promise<string | null> {
+  if (args.survivorDeleted || args.toRemove.size === 0) return null;
+  const res = await tx.execute(sql`
+    SELECT d.id, d.deleted_at IS NULL AS live
+      FROM document_links dl
+      JOIN documents d ON d.id = dl.document_id
+     WHERE dl.transaction_id = ${args.canonicalId}::uuid
+     ORDER BY d.id
+       FOR SHARE OF d`);
+  const docs = res.rows as Array<{ id: string; live: boolean }>;
+  const leaving = docs.filter((d) => d.live && args.toRemove.has(d.id));
+  if (leaving.length === 0) return null; // no live document leaves: nothing changes
+  const own = docs.filter((d) => !args.toRemove.has(d.id));
+  if (own.some((d) => d.live)) return null;
+
+  let hadOwn = own.length > 0; // its own documents are there, all deleted
+  if (!hadOwn) {
+    const tr = await tx.execute(sql`
+      SELECT (EXISTS (SELECT 1 FROM transaction_events e
+                       WHERE e.transaction_id = t.id
+                         AND e.event_type = 'document_unlinked')
+              OR t.source_ingest_id IS NOT NULL
+              OR EXISTS (SELECT 1 FROM ingests i
+                          WHERE i.workspace_id = t.workspace_id
+                            AND jsonb_exists(COALESCE(i.produced->'transaction_ids', '[]'::jsonb), t.id::text))
+              OR EXISTS (SELECT 1 FROM reconcile_proposals rp
+                          WHERE rp.kind = 'dedup'
+                            AND rp.payload->>'duplicate' = t.id::text
+                            AND jsonb_typeof(rp.payload->'applied'->'links') = 'array'
+                            AND jsonb_array_length(rp.payload->'applied'->'links') > 0)
+             ) AS had
+        FROM transactions t
+       WHERE t.id = ${args.canonicalId}::uuid`);
+    hadOwn = (tr.rows[0] as { had: boolean } | undefined)?.had === true;
+  }
+  if (!hadOwn) return null;
+  return (
+    `survivor_no_live_document: undo would take ${leaving.length} document(s) back off ` +
+    `transaction ${args.canonicalId}, and none of its own is live any more ` +
+    `(${own.length > 0 ? `${own.length} deleted` : "removed for good"}); ` +
+    "restore one of its own documents, or delete that transaction, then undo again"
+  );
+}
+
+/**
  * Undo one applied dedup proposal: restore the duplicate and give it its
  * documents back. One database transaction, like apply.
  *
@@ -609,12 +681,25 @@ async function resolveMovedLinks(
  * not this proposal's doing (it was restored and then removed again for
  * another reason), when a proposal applied before links were recorded
  * leaves no trace of which documents moved — restoring a transaction
- * without its evidence is the failure this function exists to end — and
- * when the surviving row has since been folded into a third row by
- * another applied proposal. That later apply carried this duplicate's
- * documents onward, so they are no longer where this proposal put them;
- * undoing out of order would leave a document linked to two
- * transactions. The refusal names the proposal to undo first.
+ * without its evidence is the failure this function exists to end —
+ * when every document the apply moved has since been deleted
+ * (`no_live_document`: the same failure, reached through a cascade
+ * delete of the moved document), when taking the moved documents back
+ * would leave the SURVIVOR live with no live document because its own
+ * have been deleted since (`survivor_no_live_document`, the mirror
+ * image), and when the surviving row has since
+ * been folded into a third row by another applied proposal. That later
+ * apply carried this duplicate's documents onward, so they are no longer
+ * where this proposal put them; undoing out of order would leave a
+ * document linked to two transactions. The refusal names the proposal to
+ * undo first.
+ *
+ * LOCK ORDER, here and in apply: the proposal row, the two transaction
+ * head rows in id order, then documents — the last only through the
+ * `document_links` foreign key (KEY SHARE) and the liveness reads below
+ * (FOR SHARE).
+ * Never a document before a transaction row: the cascade delete in
+ * documents.service.ts follows the same order (CLAUDE.md, "Lock order").
  */
 async function undoDedupProposal(params: {
   workspaceId: string;
@@ -734,8 +819,70 @@ async function undoDedupProposal(params: {
       return { outcome: "refused", reason: "no_link_record" };
     }
 
+    // A transaction does not come back to life without live evidence.
+    // The cascade delete keeps to that rule from its side (it removes a
+    // transaction with its last live document); undo has to keep to it
+    // from this one. The documents the apply moved may have been deleted
+    // since — soft, leaving a tombstone, or hard, leaving nothing — and
+    // restoring the duplicate then would put a purchase back in the
+    // ledger whose receipt the user threw away.
+    //
+    // Only a restore is held to this. A duplicate that had no document
+    // when it was folded (`links` empty) goes back as it was, and one
+    // that is already live (`wasDeleted` false) is not being revived:
+    // the undo only moves its links home.
+    //
+    // FOR SHARE, taken after both head rows (the lock order): a cascade
+    // delete holding one of these documents is waited for and its
+    // outcome is what is read, and a plain document delete or restore,
+    // which locks nothing else, waits for this undo instead of changing
+    // the answer under it. It covers the KEY SHARE the link INSERT below
+    // takes anyway.
+    if (wasDeleted && links.length > 0) {
+      const docRes = await tx.execute(sql`
+        SELECT d.id, d.deleted_at
+          FROM documents d
+         WHERE d.workspace_id = ${workspaceId}::uuid
+           AND d.id IN (${sql.join(
+             links.map((l) => sql`${l.document_id}::uuid`),
+             sql`, `,
+           )})
+         ORDER BY d.id
+           FOR SHARE OF d`);
+      const found = docRes.rows as Array<{ id: string; deleted_at: Date | string | null }>;
+      if (!found.some((d) => d.deleted_at === null)) {
+        const moved = new Set(links.map((l) => l.document_id)).size;
+        return {
+          outcome: "refused",
+          reason:
+            `no_live_document: none of the ${moved} document(s) this apply moved is live ` +
+            `(${found.length} deleted, ${moved - found.length} gone); ` +
+            (found.length > 0
+              ? "restore one of them, then undo again"
+              : "to bring the transaction back without them, restore it directly"),
+        };
+      }
+    }
+
+    // The same rule from the survivor's side. Undo takes the moved
+    // documents back off the surviving row. If the survivor's own
+    // documents have been deleted since the apply, the moved ones are
+    // all that keep it in the ledger: a cascade delete of its own receipt
+    // KEPT it because of them, and would have deleted it had the undo
+    // run first. Taking them away now would leave a live transaction
+    // with no live document, and the result would depend on the order of
+    // two clicks. Refuse instead, and say what settles it: bring the
+    // survivor's own document back, or delete the survivor, then undo.
+    const survivorRefusal = await survivorLeftWithoutEvidence(tx, {
+      canonicalId,
+      survivorDeleted: !canon || canon.deleted_at !== null,
+      toRemove: new Set(links.filter((l) => !l.canonical_had_link).map((l) => l.document_id)),
+    });
+    if (survivorRefusal) return { outcome: "refused", reason: survivorRefusal };
+
     // Put the evidence back. A document deleted outright since the apply
-    // has no row to link and is skipped.
+    // has no row to link and is skipped; a soft-deleted one is linked
+    // again as the tombstone it is.
     const relinked: string[] = [];
     const removed: string[] = [];
     for (const l of links) {

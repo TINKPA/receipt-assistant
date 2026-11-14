@@ -21,7 +21,11 @@ import type { Request, Response, NextFunction } from "express";
 import { randomUUID } from "crypto";
 import { STATUS_CODES } from "http";
 import { ZodError } from "zod";
-import { classifyPgError, findPgError } from "./pg-error.js";
+import {
+  CONCURRENT_UPDATE_RETRY_AFTER_SECONDS,
+  classifyPgError,
+  findPgError,
+} from "./pg-error.js";
 
 const TYPE_BASE = "https://receipts.dev/errors";
 
@@ -44,6 +48,10 @@ export interface ProblemBody {
 }
 
 export class HttpProblem extends Error {
+  /** Response headers this problem asks `problemHandler` to send with
+   *  it, e.g. `Retry-After`. Empty for almost every problem. */
+  public headers: Record<string, string> = {};
+
   constructor(
     public readonly status: number,
     public readonly type: string,
@@ -94,12 +102,15 @@ export class NotFoundProblem extends HttpProblem {
 }
 
 export class VersionMismatchProblem extends HttpProblem {
-  constructor(current: number, supplied?: number) {
+  /** `detail` replaces the default sentence when the version matched
+   *  and something else the tag covers did not (a transaction's
+   *  documents, see `transactionEtag`). */
+  constructor(current: number, supplied?: number, detail?: string) {
     super(
       412,
       "version-mismatch",
       "Resource version mismatch",
-      `If-Match supplied version=${supplied ?? "?"}, current=${current}. Re-fetch and retry.`,
+      detail ?? `If-Match supplied version=${supplied ?? "?"}, current=${current}. Re-fetch and retry.`,
       { current_version: current, supplied_version: supplied ?? null },
     );
   }
@@ -249,6 +260,27 @@ export class DocumentHasLinksProblem extends HttpProblem {
       `Document ${documentId} is linked to ${linkCount} transaction(s). Unlink first, then DELETE.`,
       { document_id: documentId, link_count: linkCount },
     );
+  }
+}
+
+/**
+ * 409 for a request that lost to a concurrent one over the same rows and
+ * changed nothing: retry it. `renderProblem` answers a Postgres deadlock
+ * or serialization failure (SQLSTATE 40P01 / 40001) with the same type
+ * and `Retry-After`; code that gives up on its own retry loop throws
+ * this, so a client sees one contract for "collided, send it again".
+ */
+export class ConcurrentUpdateProblem extends HttpProblem {
+  constructor(detail?: string) {
+    super(
+      409,
+      "concurrent-update",
+      "Concurrent update",
+      detail ??
+        "Another request was changing the same records at the same moment, and this one was stopped. Nothing was changed. Retry the request.",
+      { retry_after_seconds: CONCURRENT_UPDATE_RETRY_AFTER_SECONDS },
+    );
+    this.headers = { "Retry-After": String(CONCURRENT_UPDATE_RETRY_AFTER_SECONDS) };
   }
 }
 
@@ -476,6 +508,8 @@ function scrub<T>(value: T): T {
 export interface RenderedProblem {
   status: number;
   body: ProblemBody;
+  /** Headers to send with it (`Retry-After` on a retryable 409). */
+  headers: Record<string, string>;
 }
 
 /**
@@ -488,6 +522,8 @@ export interface RenderedProblem {
  *   HttpProblem / ZodError  → as thrown
  *   framework 4xx           → 400 / 413 / 415 (malformed JSON, oversize, …)
  *   Postgres client faults  → 400 / 409 / 422 (see `pg-error.ts`)
+ *   Postgres deadlock or serialization failure
+ *                           → 409 `concurrent-update` + `Retry-After`
  *   everything else         → 500, a fixed sentence and the trace id
  *
  * A 500 body never carries `err.message`: for a failed query that is the
@@ -517,6 +553,9 @@ export function renderProblem(err: unknown, req: Request): RenderedProblem {
           spec.detail,
           spec.extras,
         );
+        if (spec.retryAfterSeconds !== undefined) {
+          problem.headers = { "Retry-After": String(spec.retryAfterSeconds) };
+        }
         // One line, not a stack: this is the caller's mistake (or a
         // validation we have yet to write), and the SQLSTATE plus the
         // driver's sentence is all it takes to find it.
@@ -535,12 +574,14 @@ export function renderProblem(err: unknown, req: Request): RenderedProblem {
     return {
       status: problem.status,
       body: scrub(problem.toBody(instance, traceId)),
+      headers: problem.headers,
     };
   }
 
   console.error(`[http] trace_id=${traceId} ${where} → 500 unhandled:`, err);
   return {
     status: 500,
+    headers: {},
     body: {
       type: `${TYPE_BASE}/internal`,
       title: "Internal Server Error",
@@ -628,6 +669,7 @@ export function problemHandler(
   // being sent; left in place, a browser would cache this error for as
   // long as the image was meant to live.
   for (const name of SUCCESS_ONLY_HEADERS) res.removeHeader(name);
-  const { status, body } = renderProblem(err, req);
+  const { status, body, headers } = renderProblem(err, req);
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
   res.status(status).type("application/problem+json").json(body);
 }

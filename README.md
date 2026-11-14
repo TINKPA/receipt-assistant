@@ -150,6 +150,7 @@ Every error is an RFC 7807 `application/problem+json` document. Branch on `type`
 | 400 | `malformed-body`, `malformed-upload`, `invalid-cursor`, `invalid-parameter`, `invalid-idempotency-key` | Body is not JSON / not parseable multipart; cursor was not issued by this API; a value cannot be read as its type; `Idempotency-Key` is over 255 characters |
 | 404 | `not-found` · `route-not-found` | The record does not exist · no such URL or method |
 | 409 | `conflict`, `still-referenced`, `idempotency-conflict`, `idempotency-in-progress`, … | The request collides with current state |
+| 409 | `concurrent-update` | Another request was changing the same records at the same moment (a database deadlock or serialization failure). Nothing was written; send the same request again after `Retry-After` seconds |
 | 412 / 428 | `version-mismatch` / `precondition-required` | `If-Match` is stale / missing |
 | 413 | `payload-too-large` | Body or upload over the endpoint's limit |
 | 422 | `validation`, `invalid-reference`, `constraint-violation`, … | The body is well-formed but not acceptable |

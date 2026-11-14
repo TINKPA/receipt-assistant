@@ -201,7 +201,18 @@ export const UndoResult = z
     skipped: z.array(
       z.object({
         id: Uuid,
-        reason: z.string(),
+        reason: z.string().openapi({
+          description:
+            "Why nothing was changed for this proposal. Starts with one of: " +
+            "`not_found`, `already_reverted`, `not_applied`, `malformed_payload`, " +
+            "`duplicate_missing`, `not_deleted_by_this_proposal`, `no_link_record`, " +
+            "`no_live_document` (every document the apply moved has since been deleted, " +
+            "so restoring the transaction would leave it without evidence), " +
+            "`survivor_no_live_document` (the surviving transaction's own documents have all been " +
+            "deleted since, so taking the moved ones back would leave it in the ledger with no live " +
+            "document; restore one of its own, or delete it, then undo again), " +
+            "`survivor_folded`, or `undo_failed`.",
+        }),
       }),
     ),
   })

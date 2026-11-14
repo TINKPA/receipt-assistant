@@ -41,6 +41,7 @@ import { resolvePointsValuation } from "../points/valuation.js";
 import { toBaseMinor } from "../ledger/money.js";
 
 import { newId } from "../http/uuid.js";
+import { transactionEtag } from "../http/etag.js";
 import {
   HttpProblem,
   NotFoundProblem,
@@ -1755,11 +1756,58 @@ export async function updateTransaction(
 
 // ── Delete ─────────────────────────────────────────────────────────────
 
+/**
+ * A delete sent with the whole transaction ETag (`W/"<version>-<documents
+ * tag>"`, see `transactionEtag`) must match it whole: the documents part
+ * as well as the version. Call it with the head row locked.
+ *
+ * Every other If-Match write compares the version only, because a
+ * document change does not touch what it writes. A delete is the one
+ * write that does: a hard delete takes the document links with it, and
+ * either kind removes the purchase a newly attached receipt was added
+ * to. A client that read the transaction, missed a document being
+ * linked to it since, and deletes with that tag would silently undo the
+ * other side's attach; it gets 412 instead and re-reads. A delete sent
+ * with the bare `W/"<version>"` form named no documents and is held to
+ * the version only.
+ *
+ * The documents are read under FOR SHARE, after the head row (the lock
+ * order): a link insert already waits on the head row lock (its foreign
+ * key's KEY SHARE), and this makes a plain document delete or restore
+ * wait too, so the tag compared is still the truth when the delete
+ * commits.
+ */
+async function assertDocumentsMatchEtag(
+  tx: DbTx,
+  id: string,
+  version: number,
+  expectedEtag: string,
+): Promise<void> {
+  const docs = await tx
+    .select({ id: documents.id, deletedAt: documents.deletedAt })
+    .from(documentLinks)
+    .innerJoin(documents, eq(documents.id, documentLinks.documentId))
+    .where(eq(documentLinks.transactionId, id))
+    .orderBy(documents.id)
+    .for("share", { of: documents });
+  const current = transactionEtag(
+    version,
+    docs.map((d) => ({ id: d.id, deleted_at: d.deletedAt ? toIsoString(d.deletedAt) : null })),
+  );
+  if (current !== expectedEtag) {
+    throw new VersionMismatchProblem(
+      version,
+      version,
+      `The transaction's documents changed after this ETag was issued (one was linked, unlinked, deleted or restored). Re-fetch the transaction and retry.`,
+    );
+  }
+}
+
 export async function deleteTransaction(
   workspaceId: string,
   id: string,
   expectedVersion: number,
-  opts: { userId?: string } = {},
+  opts: { userId?: string; expectedEtag?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
     // The DELETE below takes the postings through the FK cascade; lock
@@ -1768,6 +1816,9 @@ export async function deleteTransaction(
     const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
+    }
+    if (opts.expectedEtag) {
+      await assertDocumentsMatchEtag(tx, id, Number(current.version), opts.expectedEtag);
     }
     // Reconciled rows must be unreconciled first — a deliberate gate so
     // bank-matched entries aren't destroyed by accident.
@@ -1794,6 +1845,9 @@ export async function deleteTransaction(
       payload: {
         reason: "hard_delete",
         prior_status: current.status,
+        // Since when the row had been soft-deleted, if it was: the row's
+        // last word on whether it was live at an earlier moment.
+        prior_deleted_at: current.deletedAt ? current.deletedAt.toISOString() : null,
         transaction_id: id,
       },
     });
@@ -1815,12 +1869,15 @@ export async function softDeleteTransaction(
   workspaceId: string,
   id: string,
   expectedVersion: number,
-  opts: { userId?: string; reason?: string } = {},
+  opts: { userId?: string; reason?: string; expectedEtag?: string } = {},
 ): Promise<void> {
   await db.transaction(async (tx) => {
     const current = await lockTransactionRow(tx, workspaceId, id);
     if (Number(current.version) !== expectedVersion) {
       throw new VersionMismatchProblem(Number(current.version), expectedVersion);
+    }
+    if (opts.expectedEtag) {
+      await assertDocumentsMatchEtag(tx, id, Number(current.version), opts.expectedEtag);
     }
     if (current.deletedAt) throw new NotFoundProblem("Transaction", id);
     if (current.status === "reconciled") {
