@@ -20,6 +20,33 @@
  * Instruction shape (the uploaded file's content):
  * {
  *   "__stub__": true,
+ *   "child": {                        // optional: run a fake agent process
+ *                                     // first, through the same supervisor
+ *                                     // as `claude -p` (src/claude.ts
+ *                                     // runAgentChild): own process group,
+ *                                     // group kill on timeout, settle on close
+ *     "sleep_s": 30,                  // how long the child runs (0..3600)
+ *     "exit_code": 0,                 // its exit status; non-zero fails the
+ *                                     // run like a crashed agent (0..255)
+ *     "grandchild_s": 60,             // also start a background `sleep` of
+ *                                     // this many seconds (0..3600), which
+ *                                     // may outlive the child itself
+ *     "escaped_s": 60,                // also start a process in a session
+ *                                     // of its own, as CLI 2.1.251's Bash
+ *                                     // tool runs every command, that lives
+ *                                     // this many seconds (0..3600) with its
+ *                                     // own stdio; the group kill does not
+ *                                     // reach it, the timeout's descendant
+ *                                     // sweep does
+ *     "ignore_term": true,            // child and (escaped) grandchildren
+ *                                     // ignore SIGTERM, so only the SIGKILL
+ *                                     // step ends them
+ *     "timeout_ms": 5000              // this run's timeout; default and
+ *                                     // ceiling CLAUDE_TIMEOUT_MS
+ *   },
+ *   When the child times out or exits non-zero the stub stops there, as a
+ *   dead agent would: nothing below is written and the run fails with the
+ *   same error text a real run gets.
  *   "write_transaction": {            // optional ledger seed
  *     "payee": "...", "occurred_on": "YYYY-MM-DD",
  *     "total_minor": 1234, "currency": "USD",
@@ -39,14 +66,40 @@
  * }
  */
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { newId } from "../http/uuid.js";
-import type { Extractor } from "./extractor.js";
+import { runAgentChild } from "../claude.js";
+import { CLAUDE_TIMEOUT_MS, type Extractor } from "./extractor.js";
+
+interface StubChild {
+  sleep_s?: number;
+  exit_code?: number;
+  grandchild_s?: number;
+  escaped_s?: number;
+  ignore_term?: boolean;
+  timeout_ms?: number;
+}
+
+/**
+ * The `escaped_s` helper, run by `node -e` in the child's group: it starts
+ * `/bin/sh` in a new session (`detached`, which is setsid) with stdio of
+ * its own, and stays its parent until it ends, the way the CLI stays the
+ * parent of a running Bash tool command. Fixed text: the file supplies
+ * only the integers, as environment variables.
+ */
+const ESCAPED_HELPER_JS = [
+  'const { spawn } = require("node:child_process");',
+  'if (process.env.STUB_IGNORE_TERM === "1") process.on("SIGTERM", () => {});',
+  'const c = spawn("/bin/sh", ["-c", "if [ \\"$STUB_IGNORE_TERM\\" = 1 ]; then trap \\"\\" TERM; fi; sleep \\"$STUB_ESCAPED_S\\""],',
+  '  { detached: true, stdio: "ignore" });',
+  'console.log("STUB ESCAPED pid=" + c.pid);',
+  'c.on("exit", () => process.exit(0));',
+].join("\n");
 
 interface StubInstructions {
   __stub__: true;
+  child?: StubChild;
   write_transaction?: {
     payee: string;
     occurred_on: string;
@@ -78,12 +131,64 @@ export async function isStubFile(absPath: string): Promise<boolean> {
   }
 }
 
+/** A bounded integer from the instruction file, or the fallback. Rejects
+ *  anything else rather than interpolating it into a shell. */
+function boundedInt(v: unknown, lo: number, hi: number, fallback: number, name: string): number {
+  if (v === undefined) return fallback;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < lo || v > hi) {
+    throw new Error(`stub-extractor: child.${name} must be an integer in ${lo}..${hi}`);
+  }
+  return v;
+}
+
+/**
+ * Run the fake agent: `/bin/sh` that optionally ignores SIGTERM, optionally
+ * starts a background `sleep` (the grandchild) and a process in a session
+ * of its own (the escaped one), sleeps, and exits with a chosen status.
+ * Only integers from the file reach the script, and they travel as
+ * environment variables, never spliced into it.
+ */
+async function runStubChild(c: StubChild, sessionId: string): Promise<void> {
+  const sleepS = boundedInt(c.sleep_s, 0, 3600, 1, "sleep_s");
+  const exitCode = boundedInt(c.exit_code, 0, 255, 0, "exit_code");
+  const grandchildS = boundedInt(c.grandchild_s, 0, 3600, 0, "grandchild_s");
+  const escapedS = boundedInt(c.escaped_s, 0, 3600, 0, "escaped_s");
+  const timeoutMs = boundedInt(c.timeout_ms, 1, CLAUDE_TIMEOUT_MS, CLAUDE_TIMEOUT_MS, "timeout_ms");
+  const script = [
+    'if [ "$STUB_IGNORE_TERM" = 1 ]; then trap "" TERM; fi',
+    'if [ "$STUB_GRANDCHILD_S" -gt 0 ]; then sleep "$STUB_GRANDCHILD_S" & fi',
+    'if [ "$STUB_ESCAPED_S" -gt 0 ]; then "$STUB_NODE" -e "$STUB_ESCAPED_JS" & fi',
+    'echo "STUB CHILD pid=$$ sleeping $STUB_SLEEP_S s"',
+    'sleep "$STUB_SLEEP_S"',
+    'exit "$STUB_EXIT_CODE"',
+  ].join("\n");
+  await runAgentChild("/bin/sh", ["-c", script], {
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      STUB_SLEEP_S: String(sleepS),
+      STUB_EXIT_CODE: String(exitCode),
+      STUB_GRANDCHILD_S: String(grandchildS),
+      STUB_ESCAPED_S: String(escapedS),
+      STUB_NODE: process.execPath,
+      STUB_ESCAPED_JS: ESCAPED_HELPER_JS,
+      STUB_IGNORE_TERM: c.ignore_term ? "1" : "0",
+    },
+    input: "",
+    timeoutMs,
+    sessionId,
+  });
+}
+
 export const stubFileExtractor: Extractor = async (input) => {
   const raw = await readFile(input.filePath, "utf8");
   const ins = JSON.parse(raw) as StubInstructions;
   if (ins.__stub__ !== true || !ins.terminal) {
     throw new Error("stub-extractor: file is not a valid stub instruction");
   }
+
+  // Throws exactly as `runClaude` would on a timeout or a non-zero exit;
+  // the worker then fails the run and the ingest the same way.
+  if (ins.child) await runStubChild(ins.child, input.sessionId);
 
   let seededTxId: string | null = null;
   if (ins.write_transaction) {
@@ -163,7 +268,8 @@ export const stubFileExtractor: Extractor = async (input) => {
        AND workspace_id = ${input.workspaceId}::uuid`);
 
   return {
-    sessionId: randomUUID(),
+    sessionId: input.sessionId,
     stdout: `STUB ingest=${input.ingestId} terminal=${t.status} tx=${seededTxId ?? "-"}`,
+    exitCode: ins.child ? 0 : null,
   };
 };

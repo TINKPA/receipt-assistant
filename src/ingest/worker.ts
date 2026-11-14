@@ -8,16 +8,26 @@
  * the agent updated to build the SSE event payload.
  *
  * Design notes
- *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 3;
+ *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 1;
  *     production compose pins 1, the sandbox 6). Production is serialized
  *     for CORRECTNESS, not throughput: overlapping extractions of two
  *     documents describing one money event cannot see each other's
  *     not-yet-written transaction, so same-batch dedup misses and the
  *     ledger double counts (#225). Serial extraction closes that window.
- *     Uploads are fire-and-forget, so the wall-clock cost is unfelt.
+ *     Uploads are fire-and-forget, so the wall-clock cost is unfelt. The
+ *     default is the safe value so that a deploy which forgets the env
+ *     var does not quietly turn the window back on.
+ *   - A slot is released only when the agent's process group is gone:
+ *     `runClaude` settles on the child's `close`, after a timeout has
+ *     killed the whole group and the groups its tool commands run in, so
+ *     the next job never overlaps a timed-out one.
+ *   - Every run is recorded in `agent_runs` (`./runs.ts`): inserted before
+ *     the spawn, in the transaction that moves the ingest to `processing`,
+ *     and finished before the SSE event for the ingest goes out.
  *   - No resume on restart. On boot we mark every `pending/processing`
  *     batch `failed`; in-flight ingests of those batches flip to `error`
- *     (retryable). Durable queuing is a future concern.
+ *     (retryable), and their runs become `abandoned`. Durable queuing is
+ *     a later phase of wave 1.
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -35,7 +45,6 @@ import {
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
-import { publicErrorMessage } from "../http/problem.js";
 import {
   decodeSourceForAgent,
   resolveUploadPath,
@@ -44,6 +53,19 @@ import {
 import { ingestScratchDir } from "./document-read-prompt.js";
 import { phashDistance } from "../images/phash.js";
 import { isStubFile, stubFileExtractor } from "./stub-extractor.js";
+import {
+  abandonInterruptedRuns,
+  agentFailure,
+  extractionWriter,
+  finishRun,
+  ingestErrorText,
+  startIngestRun,
+  stdoutTail,
+  type RunFinish,
+  type RunHandle,
+  type RunTrigger,
+  type RunWriter,
+} from "./runs.js";
 
 /**
  * Test-only escape hatch (#134/#135 hardening): when the sandbox sets
@@ -60,9 +82,9 @@ async function pickExtractor(absPath: string) {
 
 // ── Configuration ─────────────────────────────────────────────────────
 
-const DEFAULT_CONCURRENCY = 3;
+const DEFAULT_CONCURRENCY = 1;
 
-function getConcurrency(): number {
+export function getConcurrency(): number {
   const raw = Number(process.env.MAX_CLAUDE_CONCURRENCY);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CONCURRENCY;
 }
@@ -78,6 +100,8 @@ interface QueueItem {
   filePath: string;
   mimeType: string | null;
   filename: string;
+  /** What started this extraction, for the run record. */
+  trigger?: Extract<RunTrigger, "upload" | "retry">;
 }
 
 const queue: QueueItem[] = [];
@@ -148,26 +172,6 @@ async function fetchCountsForEvent(batchId: string): Promise<BatchCountsPayload>
   return counts;
 }
 
-async function markProcessing(ingestId: string, workspaceId: string): Promise<void> {
-  await db
-    .update(ingests)
-    .set({ status: "processing" })
-    .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
-}
-
-/**
- * The text of a failure as it may be stored on the ingest row and sent
- * on the SSE stream. A failed query's message is the statement plus its
- * bound values, so that one is replaced by the caller-safe sentence; the
- * full error is already in the server log. Everything else (timeouts,
- * auth failures, guard messages) is kept, because `category` and
- * `retryable` are derived from it at read time.
- */
-function ingestErrorText(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.includes("Failed query:") ? publicErrorMessage(err) : message;
-}
-
 async function markError(
   ingestId: string,
   workspaceId: string,
@@ -183,6 +187,35 @@ async function markError(
       completedAt: new Date(),
     })
     .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
+}
+
+/**
+ * `markError` for an ingest that is still open (`queued` / `processing`),
+ * and only then. True when it closed the row. For a failure that may come
+ * after the agent already closed the ingest, which must not be undone.
+ */
+async function markErrorIfOpen(
+  ingestId: string,
+  workspaceId: string,
+  err: unknown,
+): Promise<boolean> {
+  const rows = await db
+    .update(ingests)
+    .set({
+      status: "error",
+      error: ingestErrorText(err).slice(0, 2000),
+      produced: { receipt_ids: [], transaction_ids: [], document_ids: [] },
+      completedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(ingests.id, ingestId),
+        eq(ingests.workspaceId, workspaceId),
+        inArray(ingests.status, ["queued", "processing"]),
+      ),
+    )
+    .returning({ id: ingests.id });
+  return rows.length > 0;
 }
 
 /**
@@ -334,9 +367,98 @@ async function runOne(item: QueueItem): Promise<void> {
     return;
   }
 
-  await markProcessing(ingestId, workspaceId);
+  // Queue items carry the stored (uploads-relative, #128) path; the
+  // agent needs a container-absolute path it can open.
+  const absPath = resolveUploadPath(filePath);
+
+  // Known before the claim, because the run row records the writer.
+  const extractor = await pickExtractor(absPath);
+  const writer: RunWriter =
+    extractor === stubFileExtractor ? "stub" : extractionWriter();
+
+  // T0: the run row and `processing` in one transaction, with a session id
+  // minted here, so a run that dies at once still has both. Nothing has
+  // been spawned if this fails, and the ingest is errored like any other
+  // failure of ours (retryable).
+  let run: RunHandle;
+  try {
+    run = await startIngestRun({
+      ingestId,
+      workspaceId,
+      documentId,
+      writer,
+      trigger: item.trigger ?? "upload",
+    });
+  } catch (err) {
+    console.error(`[ingest worker] ingest=${ingestId} could not start its run:`, err);
+    await markError(ingestId, workspaceId, err);
+    busEmit("job.error", { batchId, ingestId, error: ingestErrorText(err) });
+    await onBatchChildTerminated(batchId, workspaceId);
+    return;
+  }
   await onBatchChildStarted(batchId, workspaceId);
   busEmit("job.started", { batchId, ingestId });
+
+  let finished = false;
+  const finish = async (f: RunFinish): Promise<void> => {
+    if (finished) return;
+    finished = true;
+    await finishRun(run, f);
+  };
+  try {
+    await extractAndClose(
+      {
+        item,
+        documentId,
+        documentKind: (docRows[0]?.kind ?? null) as DocumentKindValue | null,
+        userId,
+        absPath,
+        extractor,
+        run,
+      },
+      finish,
+    );
+  } catch (err) {
+    // A failure of the server's own after the run started (the agent's
+    // failures are handled inside). Record it, and close the ingest if it
+    // is still open: before run records, such an ingest sat in
+    // `processing` until the next restart errored it.
+    console.error(`[ingest worker] ingest=${ingestId} failed after its run started:`, err);
+    await finish({ outcome: "failed", errorClass: "apply", error: err });
+    if (await markErrorIfOpen(ingestId, workspaceId, err)) {
+      busEmit("job.error", { batchId, ingestId, error: ingestErrorText(err) });
+    }
+    // Also when the agent had already closed the ingest and a query of
+    // ours failed after that: the ingest is terminal either way, and if it
+    // was the batch's last one the batch must not wait for a restart. The
+    // call is guarded (no open child, batch still pending/processing).
+    await onBatchChildTerminated(batchId, workspaceId);
+    throw err;
+  }
+}
+
+interface ExtractContext {
+  item: QueueItem;
+  documentId: string;
+  documentKind: DocumentKindValue | null;
+  userId: string;
+  absPath: string;
+  extractor: Awaited<ReturnType<typeof pickExtractor>>;
+  run: RunHandle;
+}
+
+/**
+ * Spawn the agent for one claimed ingest, verify what it reports, and
+ * finish its run. Every exit records the run (`finish`) BEFORE the SSE
+ * event and the batch bookkeeping, so a client that sees the batch
+ * complete can read a finished run row.
+ */
+async function extractAndClose(
+  ctx: ExtractContext,
+  finish: (f: RunFinish) => Promise<void>,
+): Promise<void> {
+  const { item, documentId, userId, absPath, extractor, run } = ctx;
+  const { ingestId, workspaceId, batchId, mimeType } = item;
 
   // #134 L2: surface perceptually-near existing documents (pHash d ≤ 2,
   // linked to a live transaction) as candidates for the agent's Phase
@@ -346,16 +468,12 @@ async function runOne(item: QueueItem): Promise<void> {
   // hash. Full scan is fine at corpus scale (~hundreds of rows).
   const phashNeighbors = await findPhashNeighbors(workspaceId, documentId);
 
-  // Queue items carry the stored (uploads-relative, #128) path; the
-  // agent needs a container-absolute path it can open.
-  const absPath = resolveUploadPath(filePath);
-
   // #261: decode an email / HTML upload before the agent starts, as
   // re-extract always has. Never throws; images and PDFs come back empty.
   const source = await decodeSourceForAgent(
     {
       id: documentId,
-      kind: (docRows[0]?.kind ?? null) as DocumentKindValue | null,
+      kind: ctx.documentKind,
       mimeType,
     },
     absPath,
@@ -363,7 +481,7 @@ async function runOne(item: QueueItem): Promise<void> {
     "ingest",
   );
 
-  const extractor = await pickExtractor(absPath);
+  let promptBytes: number | null = null;
   let result: ExtractorResult;
   try {
     result = await extractor({
@@ -377,6 +495,10 @@ async function runOne(item: QueueItem): Promise<void> {
       documentId,
       userId,
       phashNeighbors,
+      sessionId: run.sessionId,
+      onPrompt: (bytes) => {
+        promptBytes = bytes;
+      },
     });
   } catch (err) {
     // Agent died / timed out before closing out the ingest row. Stamp
@@ -391,6 +513,7 @@ async function runOne(item: QueueItem): Promise<void> {
     // ~11h unnoticed: 19 log lines, none of them an error.
     console.error(`[ingest worker] ingest=${ingestId} FAILED:`, err);
     await markError(ingestId, workspaceId, err);
+    await finish(agentFailure(err, { promptBytes }));
     busEmit("job.error", {
       batchId,
       ingestId,
@@ -399,6 +522,13 @@ async function runOne(item: QueueItem): Promise<void> {
     await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
+
+  // What every finish below carries about the agent's own exit.
+  const exited = {
+    exitCode: result.exitCode,
+    promptBytes,
+    agentReport: stdoutTail(result.stdout),
+  };
 
   // The agent is responsible for UPDATE ingests SET status=... at the
   // end of its run (see Phase 5 of prompt.ts).
@@ -410,6 +540,7 @@ async function runOne(item: QueueItem): Promise<void> {
       "agent did not close out ingest row (status still processing). stdout: " +
       result.stdout.slice(0, 500);
     await markError(ingestId, workspaceId, new Error(msg));
+    await finish({ ...exited, outcome: "failed", errorClass: "no_closeout", error: msg });
     busEmit("job.error", {
       batchId,
       ingestId,
@@ -447,6 +578,13 @@ async function runOne(item: QueueItem): Promise<void> {
         .where(
           and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
         );
+      await finish({
+        ...exited,
+        outcome: "failed",
+        errorClass: "guard",
+        error: msg,
+        produced: terminal.produced,
+      });
       busEmit("job.error", { batchId, ingestId, error: msg });
       await onBatchChildTerminated(batchId, workspaceId);
       return;
@@ -504,6 +642,13 @@ async function runOne(item: QueueItem): Promise<void> {
         .where(
           and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)),
         );
+      await finish({
+        ...exited,
+        outcome: "failed",
+        errorClass: "guard",
+        error: msg,
+        produced: terminal.produced,
+      });
       busEmit("job.error", { batchId, ingestId, error: msg });
       await onBatchChildTerminated(batchId, workspaceId);
       return;
@@ -511,6 +656,13 @@ async function runOne(item: QueueItem): Promise<void> {
   }
 
   if (terminal.status === "error") {
+    await finish({
+      ...exited,
+      outcome: "agent_error",
+      errorClass: "agent_reported",
+      error: terminal.error ?? "agent-reported error",
+      produced: terminal.produced,
+    });
     busEmit("job.error", {
       batchId,
       ingestId,
@@ -536,6 +688,11 @@ async function runOne(item: QueueItem): Promise<void> {
   await valuePointsSafely(terminal.produced.transaction_ids, workspaceId);
   await normalizeFxSafely(terminal.produced.transaction_ids, workspaceId);
 
+  await finish({
+    ...exited,
+    outcome: closedOutcome(terminal),
+    produced: terminal.produced,
+  });
   busEmit("job.done", {
     batchId,
     ingestId,
@@ -550,6 +707,25 @@ async function runOne(item: QueueItem): Promise<void> {
     },
   });
   await onBatchChildTerminated(batchId, workspaceId);
+}
+
+/**
+ * The outcome of a run whose agent closed the ingest and passed the
+ * guards. `done` with no transaction is the Message-ID duplicate skip
+ * (the only one production has) or, for a classification the #125 guard
+ * does not cover, a run that changed nothing.
+ */
+function closedOutcome(terminal: {
+  status: "done" | "unsupported" | "near_dup" | "error";
+  produced: { transaction_ids: string[] };
+  error: string | null;
+}): RunFinish["outcome"] {
+  if (terminal.status === "error") return "agent_error"; // handled before; kept total
+  if (terminal.status === "near_dup") return "attached";
+  if (terminal.status === "unsupported") return "unsupported";
+  if (terminal.produced.transaction_ids.length > 0) return "written";
+  if ((terminal.error ?? "").startsWith("duplicate Message-ID")) return "duplicate_skip";
+  return "no_change";
 }
 
 // ── Batch state machine ───────────────────────────────────────────────
@@ -663,7 +839,9 @@ async function triggerAutoReconcile(
 /**
  * Scan for batches that were left mid-flight by a prior crash and mark
  * them `failed`. Their stuck ingests flip to `error` so clients stop
- * polling forever.
+ * polling forever, and every run still `running` becomes `abandoned` /
+ * `interrupted` (`abandonInterruptedRuns`). All three in one transaction,
+ * so a finished-looking run never points at an ingest still open.
  *
  * Runs once at server boot (from `src/server.ts`), BEFORE the HTTP server
  * listens. BOOT-ONLY: the queue lives in this process's memory, so at
@@ -679,47 +857,65 @@ async function triggerAutoReconcile(
 export async function recoverStaleBatches(): Promise<{
   failedBatches: number;
   erroredIngests: number;
+  abandonedRuns: { ingest: number; re_extract: number };
 }> {
-  const stale = await db
-    .select({ id: batches.id })
-    .from(batches)
-    .where(sql`status IN ('pending','processing')`);
-  if (stale.length === 0) return { failedBatches: 0, erroredIngests: 0 };
+  return db.transaction(async (tx) => {
+    const abandonedRuns = await abandonInterruptedRuns(tx);
+    const stale = await tx
+      .select({ id: batches.id })
+      .from(batches)
+      .where(sql`status IN ('pending','processing')`);
+    if (stale.length === 0) {
+      return { failedBatches: 0, erroredIngests: 0, abandonedRuns };
+    }
 
-  const batchIds = stale.map((b) => b.id);
-  await db
-    .update(batches)
-    .set({ status: "failed", completedAt: new Date() })
-    .where(inArray(batches.id, batchIds));
-  const erroredRes = await db
-    .update(ingests)
-    .set({
-      status: "error",
-      error: "worker restart: batch abandoned",
-      completedAt: new Date(),
-    })
-    .where(
-      and(
-        inArray(ingests.batchId, batchIds),
-        inArray(ingests.status, ["queued", "processing"]),
-      ),
-    )
-    .returning({ id: ingests.id });
+    const batchIds = stale.map((b) => b.id);
+    await tx
+      .update(batches)
+      .set({ status: "failed", completedAt: new Date() })
+      .where(inArray(batches.id, batchIds));
+    const erroredRes = await tx
+      .update(ingests)
+      .set({
+        status: "error",
+        error: "worker restart: batch abandoned",
+        completedAt: new Date(),
+      })
+      .where(
+        and(
+          inArray(ingests.batchId, batchIds),
+          inArray(ingests.status, ["queued", "processing"]),
+        ),
+      )
+      .returning({ id: ingests.id });
 
-  return {
-    failedBatches: batchIds.length,
-    erroredIngests: erroredRes.length,
-  };
+    return {
+      failedBatches: batchIds.length,
+      erroredIngests: erroredRes.length,
+      abandonedRuns,
+    };
+  });
 }
 
 /**
  * Start the worker. Call once, at boot (see `recoverStaleBatches`). For
  * Phase 1 there's nothing async to spin up; the queue drains on its own
  * once `enqueue` is called.
+ *
+ * Always logs what recovery did, zeros included: a restart that cut
+ * runs short is otherwise visible only in the rows it touched.
  */
 export async function start(): Promise<void> {
-  await recoverStaleBatches().catch((err) => {
+  try {
+    const r = await recoverStaleBatches();
+    console.log(
+      `[ingest worker] boot recovery: ${r.failedBatches} batch(es) failed, ` +
+        `${r.erroredIngests} ingest(s) errored, ` +
+        `${r.abandonedRuns.ingest + r.abandonedRuns.re_extract} run(s) abandoned ` +
+        `(ingest ${r.abandonedRuns.ingest}, re-extract ${r.abandonedRuns.re_extract})`,
+    );
+  } catch (err) {
     // eslint-disable-next-line no-console
     console.warn("[ingest worker] recovery failed:", err);
-  });
+  }
 }

@@ -81,6 +81,42 @@ export const ingestStatusEnum = pgEnum("ingest_status", [
   "near_dup",
 ]);
 
+// One `claude -p` run (or a stub standing in for one), recorded by the
+// server in `agent_runs`. See `src/schema/agent_runs.ts` for what each
+// value means and who writes it.
+export const agentRunKindEnum = pgEnum("agent_run_kind", ["ingest", "re_extract"]);
+
+//   queued    → reserved for the durable queue (wave 1, P6); nothing writes it yet
+//   running   → the run row exists and the child was (about to be) spawned
+//   finished  → the server saw the child exit and recorded the outcome
+//   abandoned → the server restarted while the run was `running`; nobody
+//               saw it end. Set at boot (`abandonInterruptedRuns`).
+export const agentRunStatusEnum = pgEnum("agent_run_status", [
+  "queued",
+  "running",
+  "finished",
+  "abandoned",
+]);
+
+// Created whole in migration 0042 so later phases add no enum value;
+// P1 writes written / attached / unsupported / duplicate_skip / no_change /
+// agent_error / failed / interrupted. The rest belong to the server writer
+// (recorded_only, invalid_record, reapplied) and the durable queue (adopted).
+export const agentRunOutcomeEnum = pgEnum("agent_run_outcome", [
+  "written",
+  "attached",
+  "unsupported",
+  "recorded_only",
+  "duplicate_skip",
+  "no_change",
+  "adopted",
+  "reapplied",
+  "invalid_record",
+  "agent_error",
+  "failed",
+  "interrupted",
+]);
+
 // Background-enrichment state for merchant rows (#64). New merchants land
 // as `pending`; the Places worker advances to `success`/`not_found`/`failed`
 // after one round-trip to Google Places. `failed` retries on backoff.

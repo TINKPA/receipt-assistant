@@ -1,11 +1,11 @@
 # smoke-v1-ingest — host-side `/v1/*` API ingestion smoke test
 
-Black-box end-to-end test of the new `/v1/*` ledger API against the already-running Docker stack. Uploads N real receipt images, extracts structured fields with host-side `claude -p` (plain-text + fenced JSON, **no** `--json-schema`), creates balanced 2-posting transactions, links the documents, and reports extraction accuracy against ground truth parsed from filenames.
+Black-box end-to-end test of the new `/v1/*` ledger API against the already-running sandbox stack. Uploads N real receipt images, extracts structured fields with host-side `claude -p` (plain-text + fenced JSON, **no** `--json-schema`), creates balanced 2-posting transactions, links the documents, and reports extraction accuracy against ground truth parsed from filenames.
 
 ## Prerequisites
 
-- `receipt-assistant` container running on `localhost:3000` and `receipts-postgres` healthy. Check with `docker ps`.
-- Accounts seeded (`Expenses:Groceries`, `Expenses:Dining`, `Expenses:Transport`, `Expenses:Other`, `Liabilities:Credit Card`). Run `npm run db:seed` once if the target DB is fresh.
+- The sandbox stack up (`receipt-assistant-test` on `127.0.0.1:3001`, `docker-compose.test.yml`). Never point it at production: every run books real transactions.
+- Accounts seeded (`Expenses:Food & Drinks`, `Expenses:Shopping`, `Expenses:Transportation`, `Expenses:Services`, `Liabilities:Credit Card`: the boot seed in `src/db/seed.ts`).
 - `claude` CLI v2.x on host PATH, logged in (subscription auth).
 - Node 22 (for built-in `fetch`, `FormData`, `Blob`).
 
@@ -21,7 +21,7 @@ npx tsx scripts/smoke-v1-ingest.ts
 
 | Flag                  | Default                                 | Meaning                                      |
 |-----------------------|-----------------------------------------|----------------------------------------------|
-| `--base=<url>`        | `http://localhost:3000`                 | API base URL                                 |
+| `--base=<url>`        | `http://127.0.0.1:3001` (the sandbox)   | API base URL                                 |
 | `--files=<glob>`      | hard-coded 15 diverse receipts          | Override file selection (e.g. `/path/*.jpeg`)|
 | `--concurrency=<n>`   | `3`                                     | Parallel `claude -p` workers                 |
 | `--limit=<n>`         | `15`                                    | Cap the number processed                     |
@@ -32,7 +32,7 @@ For each receipt:
 
 1. `POST /v1/documents` with multipart `file`, `kind=receipt_image` — 201 on new, 200 on dedup.
 2. `claude -p` extracts `{payee, occurred_on, total_minor, category_hint}` — plain text reasoning, trailing ` ```json ` fence parsed by the harness.
-3. `category_hint` → expense account (groceries/dining/cafe/retail/transport/other). Fallback is `Expenses:Other`. "cafe" folds into `Expenses:Dining` (no dedicated cafe seed).
+3. `category_hint` → expense account: groceries, dining and cafe → `Expenses:Food & Drinks`, retail → `Expenses:Shopping`, transport → `Expenses:Transportation`, anything else → `Expenses:Services` (the seed has no expense `Other`).
 4. `POST /v1/transactions` with a balanced pair (expense debit, credit-card credit) and a deterministic `Idempotency-Key: smoke-<sha256(filename|file-sha256)[:24]>`. Re-running the harness on the same receipts is therefore idempotent — the tx is not duplicated.
 5. `POST /v1/documents/:id/links` — exercises the explicit link endpoint even though `document_ids` on the transaction already links it. Must return 204.
 

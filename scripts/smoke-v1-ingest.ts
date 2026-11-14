@@ -2,7 +2,8 @@
  * smoke-v1-ingest.ts — host-side ingestion harness for the `/v1/*` ledger API.
  *
  * Runs an end-to-end extraction + ingestion round-trip against the already-
- * running Docker stack (receipt-assistant on :3000). For each receipt file:
+ * running sandbox stack (receipt-assistant-test on 127.0.0.1:3001; it writes
+ * real transactions, so never production). For each receipt file:
  *
  *   1. POST /v1/documents            (multipart upload, sha256-dedupes)
  *   2. claude -p on the host         (plain-text reasoning + fenced JSON)
@@ -22,7 +23,8 @@
  *        --fixtures=<dir>         Directory holding the receipt corpus
  *                                 (or set RECEIPT_FIXTURE_DIR). Required
  *                                 unless --files is given.
- *        --base=<url>             API base URL (default http://localhost:3000)
+ *        --base=<url>             API base URL (default the sandbox,
+ *                                 http://127.0.0.1:3001)
  *        --concurrency=<n>        Parallel workers (default 3)
  *        --limit=<n>              Cap processed count (default 15)
  */
@@ -46,7 +48,7 @@ function parseArgs(argv: string[]): Args {
     const m = /^--([^=]+)=(.*)$/.exec(a);
     if (m) args[m[1]!] = m[2]!;
   }
-  const base = args.base ?? "http://localhost:3000";
+  const base = args.base ?? "http://127.0.0.1:3001";
   const concurrency = Number(args.concurrency ?? "3");
   const limit = Number(args.limit ?? "15");
 
@@ -255,21 +257,24 @@ async function fetchAccountsMap(base: string): Promise<AccountsMap> {
     return a.id;
   };
 
-  const groceries = find((a) => a.type === "expense" && a.name === "Groceries", "Expenses:Groceries");
-  const dining = find((a) => a.type === "expense" && a.name === "Dining", "Expenses:Dining");
-  const transport = find((a) => a.type === "expense" && a.name === "Transport", "Expenses:Transport");
-  // There are two "Other" rows (one expense, one income); pick the expense side.
-  const other = find((a) => a.type === "expense" && a.name === "Other", "Expenses:Other");
+  // The seed's chart (src/db/seed.ts) has no Groceries / Dining /
+  // Transport accounts; food of every kind books to "Food & Drinks".
+  const food = find((a) => a.type === "expense" && a.name === "Food & Drinks", "Expenses:Food & Drinks");
+  const shopping = find((a) => a.type === "expense" && a.name === "Shopping", "Expenses:Shopping");
+  const transport = find((a) => a.type === "expense" && a.name === "Transportation", "Expenses:Transportation");
+  // No expense "Other" exists (the only "Other" is income); the seven
+  // spending categories have "Services" as the catch-all.
+  const other = find((a) => a.type === "expense" && a.name === "Services", "Expenses:Services");
   const creditCard = find(
     (a) => a.type === "liability" && a.subtype === "credit_card",
     "Liabilities:Credit Card",
   );
 
   return {
-    groceries,
-    dining,
-    cafe: dining, // no dedicated cafe account — fold into Dining
-    retail: other,
+    groceries: food,
+    dining: food,
+    cafe: food,
+    retail: shopping,
     transport,
     other,
     credit_card: creditCard,

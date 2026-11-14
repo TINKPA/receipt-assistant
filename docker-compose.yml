@@ -109,6 +109,28 @@ services:
       # to speed up an eval — the sandbox (docker-compose.test.yml) keeps
       # 6 for exactly that, on throwaway data where dedup doesn't matter.
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-1}
+      # The model both `claude -p` agents run, passed as `--model` and
+      # stamped on every row the extraction agent writes
+      # (`metadata.extraction.model`, `documents.ocr_model_version`).
+      # Unset, the CLI picked its own default and every row said
+      # "cli-default", which names no model. claude-sonnet-5 is what that
+      # default has resolved to in every production session since
+      # 2026-10-08, so pinning it changes no behaviour; it makes the rows
+      # say what ran. An override in .env must be a full model id
+      # (claude-…), never an alias like `sonnet`: the stamp is the literal
+      # string, and an alias moves when the CLI is bumped.
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      # Who writes an extraction into the ledger (wave 1). `agent_sql`: the
+      # agent does, through psql, as it always has. `server_apply`: the
+      # agent hands back a record and the server writes it. Read per run
+      # and recorded on `agent_runs.writer`; until the server writer ships,
+      # any other value is logged once and `agent_sql` runs. The default
+      # stays `agent_sql` until the A/B passes.
+      EXTRACTION_WRITER: ${EXTRACTION_WRITER:-agent_sql}
+      # How many times a `server_apply` run may send an invalid record
+      # back to the same session (`claude -p --resume`) before the ingest
+      # errors. 0–2. Inert under `agent_sql`.
+      EXTRACTION_REPAIR_ROUNDS: ${EXTRACTION_REPAIR_ROUNDS:-1}
       # logo.dev API keys for #101 Phase 2 brand-icon acquisition. The
       # secret key (sk_…) authorizes api.logo.dev/search, which Phase 4b
       # uses search-first to avoid the letter-fallback bug (blind GET

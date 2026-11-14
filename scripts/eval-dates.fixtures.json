@@ -1,5 +1,96 @@
 [
   {
+    "sha256": "13116686efd5219fd0cfd8f5262dbbb823c09ea7aa2f1891fc04912922d7ccec",
+    "original_filename": "2026-07-24_Receipt_DeltaHotelsPhiladelphiaAirport_178.71.pdf",
+    "bucket": "good",
+    "ground_truth": {
+      "date": "2026-07-24",
+      "merchant_tokens": [
+        "delta",
+        "philadelphia"
+      ],
+      "total_minor": 17871
+    },
+    "expected_status": "done",
+    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, date and total, so #181 lever A must take the text path and never invoke pdftoppm. Ground truth read off the document itself: 'Fri, Jul 24, 2026 - Sat, Jul 25, 2026 / 178.71 USD'. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all."
+  },
+  {
+    "sha256": "8975c08945295d059a74e37ecea21c32b6641e208a62b9d28c7b16b6302588fb",
+    "original_filename": "2025-09-10_Receipt_WingOnMarket_charge_slip_64.85.jpeg",
+    "bucket": "good",
+    "ground_truth": {
+      "date": "2025-09-10",
+      "merchant_tokens": [
+        "wing",
+        "on",
+        "market"
+      ],
+      "total_minor": 6485
+    },
+    "expected_status": "done",
+    "notes": "Asian-grocery thermal, lots of Chinese characters — historically extracts cleanly."
+  },
+  {
+    "sha256": "127a4e07980756252e7a4ee64abf80c9ed1ec926bb54c2fe56b09b2a53c18ff3",
+    "original_filename": "2025-09-28_Receipt_DongTingXian_dine_in_135.22.jpeg",
+    "bucket": "good",
+    "ground_truth": {
+      "date": "2025-09-28",
+      "merchant_tokens": [
+        "dong",
+        "ting",
+        "xian"
+      ],
+      "total_minor": 13522
+    },
+    "expected_status": "done",
+    "notes": "Dine-in receipt with tip line — historically clean."
+  },
+  {
+    "sha256": "38278bbaf8f85d97cc9d7b74824ebaab869aae73ce1041b1a54782d69cb96514",
+    "original_filename": "2025-11-02_Receipt_KellysCoffeeAndFudge_cafe_latte_5.75.jpeg",
+    "bucket": "good",
+    "ground_truth": {
+      "date": "2025-11-02",
+      "merchant_tokens": [
+        "kelly",
+        "coffee"
+      ],
+      "total_minor": 575
+    },
+    "expected_status": "done",
+    "notes": "Small total — guards against truncation/zero-pad errors."
+  },
+  {
+    "sha256": "86c4005c35cbe4a1b779eddc2753aa12be4853091831cc0263d61ca9ff472061",
+    "original_filename": "2026-03-06_Receipt_Costco_gas_marina_del_rey_73.78.jpeg",
+    "bucket": "good",
+    "ground_truth": {
+      "date": "2026-03-06",
+      "merchant_tokens": [
+        "costco",
+        "gas"
+      ],
+      "total_minor": 7378
+    },
+    "expected_status": "done",
+    "notes": "CLAUDE.md-flagged historically-hard fixture (gas pump receipts), but extracts cleanly under current pipeline — guards against regressions if prompt evolves."
+  },
+  {
+    "sha256": "ab93da29a9718dc916d26b0c50551e09dbb8ed57bc3a7a39694b9f7fcc7ca6ae",
+    "original_filename": "2026-07-10_Receipt_ValvolineInstantOilChange_184.25.pdf",
+    "bucket": "hard_total",
+    "ground_truth": {
+      "date": "2026-07-10",
+      "merchant_tokens": [
+        "valvoline"
+      ],
+      "total_minor": 18425
+    },
+    "expected_status": "done",
+    "notes": "TEXT-LAYER PDF (#189), 5,460 B. Deliberately a hard_total: the invoice prints FOUR competing subtotals in one column — Subtotal 176.55, Parts Subtotal 102.29, Labor Subtotal 74.26, Total 184.25 — so a text-layer read that linearizes the column badly picks the wrong one. This is the case that catches lever A degrading accuracy rather than merely skipping a render. Ground truth from the document: invoice date 07/10/2026, Total 184.25."
+  },
+  {
     "sha256": "8e4239477e236ffa798d742f51c45b7c3e46fc590810de647f735d4e0c288a04",
     "original_filename": "2025-09-30_Receipt_Wilson_wristband_classic_navy_x2_26.28.jpeg",
     "bucket": "hard_date",
@@ -117,38 +208,6 @@
     "notes": "Total read as half of correct value (13.00 → 6.50). Likely a unit-price vs line-total confusion."
   },
   {
-    "sha256": "8975c08945295d059a74e37ecea21c32b6641e208a62b9d28c7b16b6302588fb",
-    "original_filename": "2025-09-10_Receipt_WingOnMarket_charge_slip_64.85.jpeg",
-    "bucket": "good",
-    "ground_truth": {
-      "date": "2025-09-10",
-      "merchant_tokens": [
-        "wing",
-        "on",
-        "market"
-      ],
-      "total_minor": 6485
-    },
-    "expected_status": "done",
-    "notes": "Asian-grocery thermal, lots of Chinese characters — historically extracts cleanly."
-  },
-  {
-    "sha256": "127a4e07980756252e7a4ee64abf80c9ed1ec926bb54c2fe56b09b2a53c18ff3",
-    "original_filename": "2025-09-28_Receipt_DongTingXian_dine_in_135.22.jpeg",
-    "bucket": "good",
-    "ground_truth": {
-      "date": "2025-09-28",
-      "merchant_tokens": [
-        "dong",
-        "ting",
-        "xian"
-      ],
-      "total_minor": 13522
-    },
-    "expected_status": "done",
-    "notes": "Dine-in receipt with tip line — historically clean."
-  },
-  {
     "sha256": "db9ed4575a388b2c1928d97d69f091ebb262f3611129bd243fbc57ac616262a8",
     "original_filename": "2025-10-18_Receipt_99Ranch_san_gabriel_groceries_131.12.jpeg",
     "bucket": "good",
@@ -207,21 +266,6 @@
     },
     "expected_status": "done",
     "notes": ""
-  },
-  {
-    "sha256": "38278bbaf8f85d97cc9d7b74824ebaab869aae73ce1041b1a54782d69cb96514",
-    "original_filename": "2025-11-02_Receipt_KellysCoffeeAndFudge_cafe_latte_5.75.jpeg",
-    "bucket": "good",
-    "ground_truth": {
-      "date": "2025-11-02",
-      "merchant_tokens": [
-        "kelly",
-        "coffee"
-      ],
-      "total_minor": 575
-    },
-    "expected_status": "done",
-    "notes": "Small total — guards against truncation/zero-pad errors."
   },
   {
     "sha256": "725c65febd2c3d1ccdcb6dff2f74917252dc5b81c4b2d4e125dc67ebbc059d51",
@@ -312,21 +356,6 @@
     "notes": ""
   },
   {
-    "sha256": "86c4005c35cbe4a1b779eddc2753aa12be4853091831cc0263d61ca9ff472061",
-    "original_filename": "2026-03-06_Receipt_Costco_gas_marina_del_rey_73.78.jpeg",
-    "bucket": "good",
-    "ground_truth": {
-      "date": "2026-03-06",
-      "merchant_tokens": [
-        "costco",
-        "gas"
-      ],
-      "total_minor": 7378
-    },
-    "expected_status": "done",
-    "notes": "CLAUDE.md-flagged historically-hard fixture (gas pump receipts), but extracts cleanly under current pipeline — guards against regressions if prompt evolves."
-  },
-  {
     "sha256": "3a81863b580828192134c22afed6989bac5b9bec0ae010fb6e892ac446a94450",
     "original_filename": "2026-03-25_Receipt_EuclidCoffee_iced_latte_8.00.jpeg",
     "bucket": "hard_total",
@@ -340,34 +369,5 @@
     },
     "expected_status": "done",
     "notes": "Handwritten tip on small cafe receipt; pipeline reads pre-tip $5.59 / $6.59 lines as total instead of the final $8.00. Non-deterministic across runs (2026-04-19 issue comment)."
-  },
-  {
-    "sha256": "13116686efd5219fd0cfd8f5262dbbb823c09ea7aa2f1891fc04912922d7ccec",
-    "original_filename": "2026-07-24_Receipt_DeltaHotelsPhiladelphiaAirport_178.71.pdf",
-    "bucket": "good",
-    "ground_truth": {
-      "date": "2026-07-24",
-      "merchant_tokens": [
-        "delta",
-        "philadelphia"
-      ],
-      "total_minor": 17871
-    },
-    "expected_status": "done",
-    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, date and total, so #181 lever A must take the text path and never invoke pdftoppm. Ground truth read off the document itself: 'Fri, Jul 24, 2026 - Sat, Jul 25, 2026 / 178.71 USD', confirmation 93934392. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all."
-  },
-  {
-    "sha256": "ab93da29a9718dc916d26b0c50551e09dbb8ed57bc3a7a39694b9f7fcc7ca6ae",
-    "original_filename": "2026-07-10_Receipt_ValvolineInstantOilChange_184.25.pdf",
-    "bucket": "hard_total",
-    "ground_truth": {
-      "date": "2026-07-10",
-      "merchant_tokens": [
-        "valvoline"
-      ],
-      "total_minor": 18425
-    },
-    "expected_status": "done",
-    "notes": "TEXT-LAYER PDF (#189), 5,460 B. Deliberately a hard_total: the invoice prints FOUR competing subtotals in one column — Subtotal 176.55, Parts Subtotal 102.29, Labor Subtotal 74.26, Total 184.25 — so a text-layer read that linearizes the column badly picks the wrong one. This is the case that catches lever A degrading accuracy rather than merely skipping a render. Ground truth from the document: Invoice 129724, 07/10/2026, Total 184.25."
   }
 ]
