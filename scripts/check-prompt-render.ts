@@ -39,7 +39,10 @@
  *                     `<EXTRACTION_MODEL>`
  *   lessons body      the curated lessons between the lessons preamble and
  *                     the next section header become `<LESSONS_BODY>`: the
- *                     lessons are curated data, not template text
+ *                     lessons are curated data, not template text. How the
+ *                     template reads them (the `[write]` / `[record]` tags)
+ *                     is checked separately against lessons.md itself
+ *                     (`checkLegacyLessons`)
  *   clock             `Date` is pinned to FIXED_NOW, because the date
  *                     self-check prints today's date and year
  *
@@ -293,6 +296,39 @@ function renderAll(): { ingest: Record<string, Rendering>; reextract: Record<str
   return { ingest, reextract, texts };
 }
 
+// ── The lessons body, which the golden normalises away ────────────────
+
+const LESSONS_PATH = path.join(HERE, "../src/ingest/lessons.md");
+const TAGGED = /^(\s*-\s+)\[(write|record)\]\s+/;
+
+/**
+ * The golden replaces the curated lessons with `<LESSONS_BODY>`, so it
+ * cannot see how the template reads `lessons.md`. Wave 1 tags some lessons
+ * `[write]` (shown to the legacy agent, tag removed) or `[record]` (record
+ * rendering only). This checks the legacy body against the file directly:
+ * every untagged and `[write]` lesson, in order, tag removed, comment lines
+ * out, and no `[record]` lesson and no tag text at all. A slip in the tag
+ * handling would change what production's agent reads and pass the golden.
+ */
+function checkLegacyLessons(rendered: string, label: string): string[] {
+  const start = rendered.indexOf(LESSONS_PREAMBLE_END);
+  if (start < 0) return [`${label}: no curated-lessons block`];
+  const bodyStart = start + LESSONS_PREAMBLE_END.length;
+  const bodyEnd = rendered.indexOf("\n── ", bodyStart);
+  const body = rendered.slice(bodyStart, bodyEnd).trim();
+  const expected = readFileSync(LESSONS_PATH, "utf8")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .filter((line) => TAGGED.exec(line)?.[2] !== "record")
+    .map((line) => line.replace(TAGGED, "$1"))
+    .join("\n")
+    .trim();
+  const problems: string[] = [];
+  if (body !== expected) problems.push(`${label}: the legacy lessons body is not lessons.md's untagged and [write] lessons, in order`);
+  if (/\[(write|record)\]/.test(body)) problems.push(`${label}: a writer tag reached the legacy lessons body`);
+  return problems;
+}
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 interface Golden {
@@ -309,6 +345,13 @@ function main(): void {
   const dumpArg = argv.find((a) => a.startsWith("--dump="));
 
   const { ingest, reextract, texts } = renderAll();
+  globalThis.Date = FixedDate as DateConstructor;
+  let lessonProblems: string[];
+  try {
+    lessonProblems = checkLegacyLessons(buildExtractorPrompt(INGEST_CASES[Object.keys(INGEST_CASES)[0]!]!), "ingest lessons");
+  } finally {
+    globalThis.Date = RealDate;
+  }
 
   if (dumpArg) {
     const dir = path.resolve(dumpArg.slice("--dump=".length));
@@ -370,10 +413,11 @@ function main(): void {
   };
   compare("ingest", ingest);
   compare("reextract", reextract);
+  problems.push(...lessonProblems);
 
   const count = Object.keys(ingest).length + Object.keys(reextract).length;
   if (problems.length > 0) {
-    console.error(`prompt render — ${problems.length} of ${count} legacy renderings differ from the golden:`);
+    console.error(`prompt render — ${problems.length} problem(s) with the ${count} legacy renderings:`);
     for (const p of problems) console.error(`  ${p}`);
     console.error(
       `\nFAIL: the legacy (agent_sql) prompt is what production runs, and it must not change ` +
@@ -383,7 +427,7 @@ function main(): void {
     );
     process.exit(1);
   }
-  console.log(`prompt render — ${count} legacy renderings match the golden`);
+  console.log(`prompt render — ${count} legacy renderings match the golden; the legacy lessons body matches lessons.md`);
 }
 
 main();

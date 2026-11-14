@@ -49,10 +49,31 @@ export interface DecodedAttachment {
   bytes: number;
 }
 
+/** Characters of a sender-chosen attachment name the record rendering shows. */
+const ATTACHMENT_NAME_MAX = 80;
+
+/** The sender's name for an attachment as the record rendering prints it:
+ *  quoted, cut, and with control, format and line-separator characters
+ *  escaped, so the name (written by whoever sent the email, and outside
+ *  the decoded block's delimiter) stays one short quoted value on its
+ *  line. Readable characters, CJK included, are kept. */
+function attachmentName(filename: string): string {
+  const chars = [...filename];
+  const cut = chars.length > ATTACHMENT_NAME_MAX ? `${chars.slice(0, ATTACHMENT_NAME_MAX).join("")}…` : filename;
+  return JSON.stringify(cut).replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, (c) =>
+    Array.from({ length: c.length }, (_, i) => `\\u${c.charCodeAt(i).toString(16).padStart(4, "0")}`).join(""),
+  );
+}
+
 function renderAttachments(attachments: DecodedAttachment[], writer?: PromptWriter): string {
   if (attachments.length === 0) return "";
   const list = attachments
-    .map((a) => `  ${a.path}   (${a.bytes} bytes, sent as ${JSON.stringify(a.filename)})`)
+    .map(
+      (a) =>
+        `  ${a.path}   (${a.bytes} bytes, sent as ${
+          writer === "server_apply" ? attachmentName(a.filename) : JSON.stringify(a.filename)
+        })`,
+    )
     .join("\n");
   return `
 The email also carries PDF attachment(s), already saved for you:

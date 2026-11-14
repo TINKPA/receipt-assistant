@@ -145,7 +145,17 @@ const PROPOSED_LESSONS_PATH =
  */
 export function appendLessonProposal(classification: string, lesson: string): boolean {
   const kind = classification.replace(/[^a-z_]/g, "").slice(0, 40) || "unknown";
-  const text = lesson.replace(/\s+/g, " ").trim().slice(0, 600);
+  // Control and format characters out (terminal escapes, bidi overrides,
+  // lone surrogates): a curator reads this file in a terminal, and none of
+  // them belongs in a one-line lesson.
+  const text = [
+    ...lesson
+      .replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  ]
+    .slice(0, 600)
+    .join("");
   if (text === "") return false;
   try {
     appendFileSync(PROPOSED_LESSONS_PATH, `- [${kind}] ${text}\n`, "utf8");
@@ -247,11 +257,13 @@ a file, print it with a command, or send it anywhere.
 
 End your FINAL message with, in this order, and nothing after it:
 
-  1. ONLY for a photo, or a PDF you had to read as page images: one
+  1. For a photo or a PDF (text layer or page images): one
      \`\`\`receipt-text block with your full transcription of the
      document as you read it, line by line (at most 64 KB). Leave it out
-     for an email, an HTML page, or a PDF whose text layer you read: the
-     server already has that text.
+     for an email or an HTML page: the server already has that text. If
+     a line of the document starts with three backticks, open and close
+     the block with a fence longer than any run of backticks in it
+     (\`\`\`\`receipt-text … \`\`\`\`), so that line stays text.
   2. Exactly ONE \`\`\`json block holding the extraction record: one
      JSON object that starts with "contract_version": 1.
   3. Nothing after the json block's closing fence.
@@ -498,7 +510,7 @@ record's \`facts\` block, unless noted)`,
                   )}
   raw_text      : full transcription (${w(
     "written to \`documents.ocr_text\`",
-    "the \`\`\`receipt-text block of the\n                  hand-back, for a photo or a scanned PDF",
+    "the \`\`\`receipt-text block of the\n                  hand-back, for a photo or a PDF",
   )})
 
 ${w(ITEM_SCHEMA, ITEM_SCHEMA_RECORD)}

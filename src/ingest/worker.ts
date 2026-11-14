@@ -881,8 +881,13 @@ async function errorIngestOfRun(ids: ApplyIds, err: unknown): Promise<boolean> {
  *   5. T1 (`recordExtraction`): store the record, valid or invalid. An
  *      invalid one is final here, so the ingest errors with
  *      `extraction record rejected: <path>: <rule>` and the run finishes
- *      `invalid_record` / `artefact_invalid`. No record at all finishes it
- *      `invalid_record` / `artefact_missing`.
+ *      `invalid_record` / `artefact_invalid`; when a repair round's spawn
+ *      failed, the record is stored the same way but the run finishes
+ *      `agent_error` with that spawn's class (auth, quota, timeout, …)
+ *      and the ingest carries its error. No record at all finishes it
+ *      `invalid_record` / `artefact_missing`. A run that has lost its
+ *      ingest (fenced out) finishes `failed` / `fenced_out` and sends no
+ *      `job.error`: the ingest is its new owner's to report.
  *   6. T2 (`applyExtraction`): the place pre-fetch outside any
  *      transaction, then one transaction for the ledger, the ingest close
  *      and the run finish. A failure leaves the record valid and unapplied
@@ -951,23 +956,32 @@ async function extractRecordAndApply(
   if (res.status === "agent_error") {
     // Load-bearing log line, as on the legacy path (#194).
     console.error(`[ingest worker] ingest=${ingestId} FAILED:`, res.error);
-    await errorIngestOfRun(ids, res.error);
+    const owned = await errorIngestOfRun(ids, res.error);
     await finish(agentFailure(res.error, { promptBytes, agentReport: res.stdoutTail }));
-    await failed(ingestErrorText(res.error));
+    // A run that no longer owns the ingest says nothing about it: the
+    // ingest row carries whatever its owner wrote.
+    if (owned) await failed(ingestErrorText(res.error));
+    else await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
 
   // `agent_report`: where the record was found, and whether the message
   // went on after it. The stdout tail only when no valid record came back:
   // a valid one is stored whole, and its tail would be the record again.
+  // A repair round whose spawn failed (auth, quota, timeout, a crash) left
+  // the earlier, invalid record standing: the run ends as that failure,
+  // with its exit, not as a bad record (the record is still stored).
+  const repairFailure = res.status === "invalid" && res.error != null ? agentFailure(res.error) : null;
   const stats: RunStats = {
     ...(stub ? {} : (statsFromSession(run.sessionId) ?? {})),
-    exitCode: 0,
+    exitCode: repairFailure ? (repairFailure.exitCode ?? null) : 0,
+    ...(repairFailure ? { exitSignal: repairFailure.exitSignal ?? null } : {}),
     promptBytes,
     repairRounds: res.repairRounds,
     agentReport: {
       artefact_source: res.artefactSource,
       trailing_text: res.trailingText,
+      ...(repairFailure ? { repair_spawn_failed: repairFailure.errorClass } : {}),
       ...(res.status === "valid" ? {} : (res.stdoutTail ?? {})),
     },
   };
@@ -975,8 +989,8 @@ async function extractRecordAndApply(
   if (res.status === "missing") {
     const error = res.errorText ?? "extraction record missing";
     console.warn(`[ingest worker] ingest=${ingestId} handed back no extraction record`);
-    await closeRunWithoutRecord(ids, { error, stats });
-    await failed(error);
+    if (await closeRunWithoutRecord(ids, { error, stats })) await failed(error);
+    else await onBatchChildTerminated(batchId, workspaceId);
     return;
   }
 
@@ -991,6 +1005,9 @@ async function extractRecordAndApply(
     repairRounds: res.repairRounds,
     stats,
     final: true,
+    agentFailure: repairFailure
+      ? { errorClass: repairFailure.errorClass ?? "crash", error: ingestErrorText(res.error) }
+      : null,
   });
   if (stored.fencedOut) {
     const error = `ingest ${ingestId} is no longer this run's; the record was not stored`;
@@ -1000,8 +1017,9 @@ async function extractRecordAndApply(
     return;
   }
   if (stored.closed) {
-    console.warn(`[ingest worker] ingest=${ingestId} ${res.errorText ?? "extraction record rejected"}`);
-    await failed(res.errorText ?? "extraction record rejected");
+    const error = stored.error ?? res.errorText ?? "extraction record rejected";
+    console.warn(`[ingest worker] ingest=${ingestId} ${error}`);
+    await failed(error);
     return;
   }
 

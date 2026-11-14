@@ -96,6 +96,10 @@
  *   "child": { … },                   // optional, as above: the printing
  *                                     // child sleeps (or fails, or times
  *                                     // out) first, on every spawn
+ *   "repair_child": { … },            // optional: the repair round's
+ *                                     // child in place of `child` (e.g.
+ *                                     // {"exit_code": 1}: a repair spawn
+ *                                     // that fails, as an outage would)
  *   "pause_after_record_s": 30        // optional (0..600): wait between the
  *                                     // record's storage (T1) and its apply
  *                                     // (T2), so a check can kill the
@@ -345,6 +349,8 @@ export interface RecordStub {
   /** Stamped on the document before the pHash neighbour scan. */
   phash: string | null;
   child: StubChild;
+  /** The repair round's child, when it differs from `child`. */
+  repairChild: StubChild | null;
   /** Seconds between T1 and T2 (0 = none). */
   pauseAfterRecordS: number;
 }
@@ -389,6 +395,10 @@ export async function readStubMode(absPath: string): Promise<StubMode | null> {
   if (typeof child !== "object" || child === null || Array.isArray(child)) {
     throw new Error("stub-extractor: child must be an object");
   }
+  const repairChild = ins.repair_child ?? null;
+  if (repairChild !== null && (typeof repairChild !== "object" || Array.isArray(repairChild))) {
+    throw new Error("stub-extractor: repair_child must be an object");
+  }
   return {
     mode: "record",
     stub: {
@@ -399,6 +409,7 @@ export async function readStubMode(absPath: string): Promise<StubMode | null> {
       email: stubEmail(ins.email_meta),
       phash,
       child: { sleep_s: 0, ...(child as StubChild) },
+      repairChild: repairChild === null ? null : { sleep_s: 0, ...(repairChild as StubChild) },
       pauseAfterRecordS: boundedInt(ins.pause_after_record_s, 0, 600, 0, "pause_after_record_s"),
     },
   };
@@ -440,6 +451,6 @@ export function recordStubSpawn(stub: RecordStub): RecordSpawn {
     const print = resume
       ? stubFinalMessage(stub.repairRecord, stub.repairReceiptText, "repair round")
       : stubFinalMessage(stub.record, stub.receiptText, "first read");
-    return runStubChild(stub.child, id, { print, timeoutMs });
+    return runStubChild(resume ? (stub.repairChild ?? stub.child) : stub.child, id, { print, timeoutMs });
   };
 }

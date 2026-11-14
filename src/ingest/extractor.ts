@@ -33,6 +33,7 @@ import {
 import {
   STDOUT_TAIL_MAX_BYTES,
   parseArtefact,
+  pgSafeText,
   utf8Tail,
   type ArtefactResult,
   type ArtefactSource,
@@ -330,7 +331,7 @@ export interface RecordExtractionResult {
 
 function stdoutTailOf(stdout: string): { stdout_tail: string } | null {
   const t = stdout.trim();
-  return t === "" ? null : { stdout_tail: utf8Tail(t, STDOUT_TAIL_MAX_BYTES) };
+  return t === "" ? null : { stdout_tail: pgSafeText(utf8Tail(t, STDOUT_TAIL_MAX_BYTES)) };
 }
 
 /** The transcript's size now, so a repair round's parse skips what the
@@ -348,7 +349,7 @@ export function recordRejectedText(errors: readonly ValidationError[]): string {
   const first = errors[0];
   if (!first) return "extraction record rejected";
   const more = errors.length > 1 ? ` (+${errors.length - 1} more)` : "";
-  return `extraction record rejected: ${first.path === "" ? "record" : first.path}: ${first.rule}${more}`;
+  return `extraction record rejected: ${first.path === "" ? "record" : first.path}: ${first.rule}${more}`.slice(0, 2000);
 }
 
 const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
@@ -373,7 +374,10 @@ const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
  *      again, the list of problems on stdin, `repairTimeoutMs`), then parse
  *      the new reply only, validate it, and diff it against the record it
  *      replaces (`diffRepair`). A round that hands back no record leaves
- *      the earlier one standing; a round whose spawn fails ends the loop.
+ *      the earlier one standing; a round whose spawn fails ends the loop
+ *      (`error` is set, and the worker ends the run as that failure). A
+ *      reply that resends the json but not the receipt-text block keeps
+ *      the transcription an earlier reply gave.
  *
  * A missing record is not sent back: there is no field to name, and the
  * plan counts it as its own failure class. A first spawn that fails is
@@ -432,6 +436,9 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
 
   let artefact: ArtefactResult = parseArtefact({ stdout, transcriptPath });
   let outcome = validateArtefact(artefact, ctx);
+  // The receipt text in force: a repair reply that resends only the
+  // corrected json keeps the transcription the first reply gave.
+  let receiptText = artefact.receiptText;
   if (outcome === null) {
     result.status = "missing";
     result.errorClass = "artefact_missing";
@@ -467,20 +474,27 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     }
     result.stdoutTail = stdoutTailOf(repaired);
     const next = parseArtefact({ stdout: repaired, transcriptPath, transcriptFromByte: fromByte });
-    const nextOutcome = validateArtefact(next, ctx);
+    // A reply without a receipt-text block is validated against the one in
+    // force, so `raw_text_missing` is not raised for a block it kept.
+    const nextText = next.receiptText ?? receiptText;
+    const nextOutcome =
+      next.ok && next.receiptText === null && nextText !== null
+        ? validateArtefact({ ...next, receiptText: nextText }, ctx)
+        : validateArtefact(next, ctx);
     if (nextOutcome === null) continue; // no record this round; the earlier one stands
     const diff = diffRepair(outcome.parsed, nextOutcome.parsed, errors);
     unnamed.push(...diff.warnings);
     result.repairChangedUnnamed.push(...diff.unnamed);
     artefact = next;
     outcome = nextOutcome;
+    receiptText = nextText;
   }
 
   for (const r of rounds) noteRepairRound(outcome.report, r.round, r.errors);
   appendWarnings(outcome.report, unnamed);
 
   result.outcome = outcome;
-  result.rawText = artefact.ok ? artefact.receiptText : null;
+  result.rawText = receiptText;
   result.artefactSource = artefact.source;
   result.trailingText = artefact.ok && artefact.trailingText;
   if (outcome.status === "valid") {
