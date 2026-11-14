@@ -18,6 +18,16 @@
 # lesson to one tight sentence or two; prefer deleting a lesson the code has
 # since fixed over letting the block grow.
 #
+# Two renderings read this file (wave 1). The legacy one has the agent write
+# SQL; the record one has it hand back an extraction record and write
+# nothing. A lesson about SQL or template mechanics (Turn A, an UPDATE, the
+# near-dup attach/insert tree) starts "- [write] [<kind>] …": the legacy
+# rendering injects it with the tag removed, the record rendering leaves it
+# out. When such a lesson also teaches something about READING the
+# document, add that half on its own line as "- [record] [<kind>] …", which
+# only the record rendering injects. Untagged lessons go to both, verbatim.
+# See renderActiveLessons() in prompt-contract.ts.
+#
 # ── Batch 1, promoted 2026-07-19 ──────────────────────────────────────
 
 - [receipt_pdf] The printed transaction date can differ from the PDF's CreationDate metadata (the template/software date). Trust the printed receipt date, not the file metadata. (Promoted 2026-07-19 from an AAA/Club Assist invoice.)
@@ -48,8 +58,10 @@
 - [unsupported] Packing lists and slips with zero or absent prices (often stamped "DO NOT INCLUDE THIS PACKING SLIP") mean prices were SUPPRESSED, not that the goods were free. Unsupported, not a $0 receipt.
 - [unsupported] Booking confirmations and vouchers whose Total cells are empty (salon appointments, GetYourGuide, "Your Bill Is Ready" emails that only carry a login link) announce a future or unbilled event. Unsupported.
 - [unsupported] A checkout page still showing a "Submit order" step ahead of it has NOT been paid, even though it prints a real "DUE TODAY" figure. Read the breadcrumb (e.g. T-Mobile "Shipping & payment › Review order › Submit order"): no confirmation number, no order number, no "thank you" — it is a cart, and the amount is a quote. Unsupported.
-- [income] A buyback QUOTE or packing slip ("Quote: $470.00", "carefully package your device", a prepaid shipping label) is an offer, not a payout. The money event is the CHECK or payout confirmation that follows weeks later, usually for a DIFFERENT amount after inspection. Book only the payout; attach the packing slip to that same transaction. reCell.io quoted $470 on 11/23 and paid $400 on 12/03 for one iPhone — booking both double-counted the sale.
-- [income] One payout is often documented twice: the insurer's/processor's "Your Payment Confirmation" email AND the bank portal's "Payment Confirmed" screen. They share a Confirmation # and differ in payee string and printed date, so neither payee+date dedup nor a same-batch reconcile catches them. Always store the confirmation number, and when two inbound documents share one, they are ONE transaction — attach, do not insert.
+- [write] [income] A buyback QUOTE or packing slip ("Quote: $470.00", "carefully package your device", a prepaid shipping label) is an offer, not a payout. The money event is the CHECK or payout confirmation that follows weeks later, usually for a DIFFERENT amount after inspection. Book only the payout; attach the packing slip to that same transaction. reCell.io quoted $470 on 11/23 and paid $400 on 12/03 for one iPhone — booking both double-counted the sale.
+- [record] [income] A buyback QUOTE or packing slip ("Quote: $470.00", "carefully package your device", a prepaid shipping label) is an offer, not a payout. The money event is the CHECK or payout confirmation that follows weeks later, usually for a DIFFERENT amount after inspection. Book only the payout. reCell.io quoted $470 on 11/23 and paid $400 on 12/03 for one iPhone — booking both double-counted the sale.
+- [write] [income] One payout is often documented twice: the insurer's/processor's "Your Payment Confirmation" email AND the bank portal's "Payment Confirmed" screen. They share a Confirmation # and differ in payee string and printed date, so neither payee+date dedup nor a same-batch reconcile catches them. Always store the confirmation number, and when two inbound documents share one, they are ONE transaction — attach, do not insert.
+- [record] [income] One payout is often documented twice: the insurer's/processor's "Your Payment Confirmation" email AND the bank portal's "Payment Confirmed" screen. They share a Confirmation # and differ in payee string and printed date, so neither payee+date dedup nor a same-batch reconcile catches them. Always store the confirmation number.
 - [unsupported] Priceless shop printouts (wheel-alignment / CEMB reports, CA Smog Check VIR certificates) are certificates, not receipts, despite the automotive context. Do not invent a service fee.
 - [receipt_pdf] A hotel folio whose charges table is entirely BLANK (not a printed "0.00") has no amount to post: unsupported. But if that same blank folio names an award/points redemption ("World of Hyatt Award"), it IS a real stay: record it in POINTS (#206) — total_minor = the points redeemed, currency = the programme code — never as a $0 stay, and never as unsupported.
 
@@ -96,7 +108,8 @@
 # Refunds and income (extends the direction-of-money test above)
 - [refund] Amazon "Order Details" pages for a returned order print a Grand Total and an equal Refund Total plus "Your refund has been issued" — the banner is the flow signal, not the equal totals. No refund date is printed, so occurred_on is the "Order placed" date, never the browser print stamp. A "Return received / No current charges" page at $0.00 is a postable printed zero, not a suppressed price.
 - [refund] On a refund check or state warrant (CA DMV), the field labelled "Payee:" is the USER receiving the money — the ledger payee is the ISSUING agency on the check face. Never copy the check's Payee field into transactions.payee.
-- [income] Buyback mechanics: recover the payee from the order-number prefix when no company name is printed (IGO-31176233 → iGotOffer), and an order number that is a Unix epoch (1669179848 = 2022-11-23) corroborates a genuinely old date. A business check to the user is income — the payer block is the counterparty, the MEMO line (device + IMEI) is the item. Retire owned_items by explicit product_id from Turn A, never an ILIKE name match; with no serial printed and several live instances, record metadata.owned_items_note rather than guessing.
+- [write] [income] Buyback mechanics: recover the payee from the order-number prefix when no company name is printed (IGO-31176233 → iGotOffer), and an order number that is a Unix epoch (1669179848 = 2022-11-23) corroborates a genuinely old date. A business check to the user is income — the payer block is the counterparty, the MEMO line (device + IMEI) is the item. Retire owned_items by explicit product_id from Turn A, never an ILIKE name match; with no serial printed and several live instances, record metadata.owned_items_note rather than guessing.
+- [record] [income] Buyback mechanics: recover the payee from the order-number prefix when no company name is printed (IGO-31176233 → iGotOffer), and an order number that is a Unix epoch (1669179848 = 2022-11-23) corroborates a genuinely old date. A business check to the user is income — the payer block is the counterparty, the MEMO line (device + IMEI) is the item.
 
 # Totals, discounts and tax
 - [receipt] Savings annotations are usually ALREADY netted into the printed price, so emitting them as discount rows double-subtracts: Kroger "Annual Card Savings" is a year-to-date total, 99 Ranch "You Saved" is informational (only its "Item Store Coupon" is real), Great Wall "Qty Spl/Pkg Disc." is netted. The sign is not guaranteed either — H Mart's "10 CENT DISC FOR O" ADDS a bag charge. Verify every candidate discount against the printed subtotal by arithmetic first.
@@ -122,7 +135,7 @@
 - [receipt_image] A locality mismatch is not automatically a bad OCR read: Google returns the USPS postal city where the receipt prints the municipal one (Costco #479 prints "Culver City", Google returns "Marina Del Rey, CA 90292"). Validate on ZIP/street before giving up. Only when you still cannot tell WHICH branch — a chain's own internal store label sitting between two branches in different cities — is it ambiguous, and only then skip Phase 3.
 
 # Dedup
-- [receipt] Some duplicates share no bytes and no Message-ID: Lyft re-sends a ride receipt with a different Message-ID, and airline e-receipts arrive as both PDF and confirmation email. Only the Phase 4a.0 amount+date near-dup check catches these — corroborate with ride details (driver, pickup time and address, distance) or, on a voucher/eCredit split, with the residual charge + card last-4 + the ticket/eCredit/residual triple, never the pre-voucher total. Attach, do not insert.
+- [write] [receipt] Some duplicates share no bytes and no Message-ID: Lyft re-sends a ride receipt with a different Message-ID, and airline e-receipts arrive as both PDF and confirmation email. Only the Phase 4a.0 amount+date near-dup check catches these — corroborate with ride details (driver, pickup time and address, distance) or, on a voucher/eCredit split, with the residual charge + card last-4 + the ticket/eCredit/residual triple, never the pre-voucher total. Attach, do not insert.
 
 # OCR arbitration
 - [receipt_image] When a glyph is doubtful, let arithmetic arbitrate rather than the glyph: CVS prints TOTAL in bold double-strike and smeared 14.54 into 19.59 (the CHARGE line below it and subtotal+tax both settle it), and a total rendered "2O.72" was 26.72 once 24.80 × 7.75% was checked — the font slashed no other zero on that receipt. The same test settles column alignment: never re-align an offset price column by eye, test the mapping against the printed SubTotal.

@@ -17,6 +17,34 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /**
+ * Which rendering of the ingest prompt (wave 1, plan §9.1). One template,
+ * two renderings, so the reading text both arms share has one source:
+ *
+ *   agent_sql     the legacy rendering (`PROMPT_VERSION`): the agent writes
+ *                 the ledger itself through psql. Production's arm until
+ *                 the A/B passes, and pinned byte for byte by
+ *                 `scripts/check-prompt-render.ts`.
+ *   server_apply  the record rendering (`RECORD_PROMPT_VERSION`): the agent
+ *                 reads, then hands back one extraction record
+ *                 (`src/ingest/contract/v1.ts`); the server writes. No
+ *                 SQL, no database, no WebSearch.
+ *
+ * The values are those of `EXTRACTION_WRITER`, so a run's writer selects
+ * its rendering directly.
+ */
+export type PromptWriter = "agent_sql" | "server_apply";
+
+/**
+ * The legacy text or the record rendering's text of one write-specific
+ * block. Anything but `server_apply` renders the legacy text, so a caller
+ * that never heard of the record rendering (re-extract, the budget check's
+ * empty context) keeps getting today's prompt.
+ */
+export function forWriter(writer: PromptWriter | undefined, legacy: string, record: string): string {
+  return writer === "server_apply" ? record : legacy;
+}
+
+/**
  * The ONE prompt-version stamp, written into
  * `transactions.metadata.extraction.prompt_version` and
  * `transaction_items.extraction_version` by BOTH the ingest and the
@@ -51,6 +79,10 @@ export const PROMPT_VERSION = "3.4";
  * collapse into one `PROMPT_VERSION = "4.0"`.
  */
 export const RECORD_PROMPT_VERSION = "4.0";
+
+/** The record's shape version, kept with the prompt versions it moves with
+ *  (defined in `contract/v1.ts`, where the shape is). */
+export { EXTRACTION_CONTRACT_VERSION } from "./contract/v1.js";
 
 /**
  * The model identifier stamped into `transactions.metadata.extraction.model`
@@ -120,9 +152,20 @@ export function agentHygiene(opts: {
    *  a Google place resolve. Telling a re-extract agent to "close the ingest
    *  in Phase 5" points it at a step that does not exist in its own prompt. */
   path: "ingest" | "re-extract";
+  /** The ingest prompt's rendering. The record rendering's agent has no
+   *  database, no icon pipeline and no place cache to consult, so the
+   *  budget names its own core and its own enrichment. Ignored for
+   *  re-extract, which has one rendering. */
+  writer?: PromptWriter;
 }): string {
-  const core =
-    opts.path === "ingest"
+  const record = opts.path === "ingest" && opts.writer === "server_apply";
+  const w = (legacy: string, rec: string) => (record ? rec : legacy);
+  const core = record
+    ? `classify → read the fields → hand back ONE extraction record at the
+  end of your final message ("Hand back your record", at the end). A run
+  that hands back a correct record is a SUCCESS even if it did zero
+  enrichment.`
+    : opts.path === "ingest"
       ? `classify → extract fields → write the balanced double-entry transaction
   (+ postings + line items + document link) → close the ingest in Phase 5.
   A run that commits a correct, balanced transaction and closes the ingest
@@ -131,12 +174,23 @@ export function agentHygiene(opts: {
   → replace its line items (retiring the previous run) → stamp
   metadata.extraction. A run that commits a correct in-place update is a
   SUCCESS even if it did zero enrichment.`;
-  const enrichment =
-    opts.path === "ingest"
+  const enrichment = record
+    ? `Phase 3 (resolving the merchant's Google place id) and the Check C
+  payee cross-check that rides on it.`
+    : opts.path === "ingest"
       ? `Phase 3 (Google place resolve / multilingual fetch / storefront photos)
   and the brand-icon resolution pipeline.`
       : `the brand refresh and the brand-icon resolution pipeline.`;
-  return `Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
+  return `${w(
+    "",
+    `Your tools are Bash, Read and Write; there is no database connection
+and no web search, and you need neither. Bash is for reading the
+document (pdftotext, pdftoppm, python3) and for the Google lookups of
+Phase 3a and Check C (curl with $GOOGLE_MAPS_API_KEY). Nothing you run
+writes to the ledger: your record is the only output.
+
+`,
+  )}Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
 concurrently in this container and /tmp is shared: a generic name like
 /tmp/receipt_rot.jpg WILL be overwritten by a sibling agent mid-run,
 and you will silently read someone else's receipt (#143 — this
@@ -166,24 +220,29 @@ Trace evidence: routine receipts finish in ~7 tool calls, but some balloon
 to 40+ turns — and the extra 30 turns are almost always merchant enrichment
 (Google fetches, storefront photos, brand icons), NOT harder extraction.
 
-CORE — required. Do this and commit it no matter what:
+CORE — required. Do this ${w("and commit it ", "")}no matter what:
   ${core}
 
 ENRICHMENT — best-effort, SECONDARY. You may abbreviate or SKIP any of it:
   ${enrichment} These are polish and a cache.
   You have full authority to skip them. They must NEVER:
-    • block, delay, or fail the core write;
-    • trigger a self-correction loop — if a step errors or a column/table
+    • block, delay, or fail the ${w("core write", "record")};
+    • trigger a self-correction loop — if a step errors or a ${w("column/table", "response")}
       surprises you, do NOT grind on it; record it briefly and move on;
-    • keep you working once the core is committed and marginal value is low.
+    • keep you working once the ${w("core is committed", "reading is settled")} and marginal value is low.
 
 Spend effort PROPORTIONAL to difficulty and value. A routine receipt from
 an obvious merchant should finish in a handful of tool calls. If you notice
-you are many turns deep and the core is already committed, STOP enriching
-and go close the ingest.
+you are many turns deep and the ${w(
+    `core is already committed, STOP enriching
+and go close the ingest.`,
+    `reading is settled, STOP enriching
+and hand back the record.`,
+  )}
 
 Skip heuristics — YOUR judgment, examples not an exhaustive rulebook:
-  • Place already cached (Phase 3b hit) → make zero outbound Google calls.
+${w(
+  `  • Place already cached (Phase 3b hit) → make zero outbound Google calls.
   • Globally English-first brand with no CJK anywhere on the receipt →
     skip storefront-photo OCR AND skip downloading photos; there is nothing
     Chinese to find, so the fetch is pure waste.
@@ -192,15 +251,23 @@ Skip heuristics — YOUR judgment, examples not an exhaustive rulebook:
     they are a nice-to-have cache, not part of a complete extraction.
   • Brand-icon resolution is optional visual polish. Do it when it is quick
     and the asset is readily found; skip it when the core is done and it is
-    not. Never chase an icon across many fallback providers.
+    not. Never chase an icon across many fallback providers.`,
+  `  • No printed address or locality (only a bare chain name) → skip Phase 3
+    and with it Check C: a guessed branch is worse than none (3a (d)).`,
+)}
   • The FREE checks stay ON: receipt-OCR CJK (Phase 3e) and the date
     self-check (Phase 3.5 Checks A/B) cost no extra calls — always do them.
     (Phase 3.5 Check C reuses an existing geocode, so it is naturally
     skipped whenever you skipped Phase 3 — it never forces a new call.)
 
-When you deliberately skip an enrichment step, record it so the trace shows
+${w(
+  `When you deliberately skip an enrichment step, record it so the trace shows
 a decision, not a failure:
-  metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok`;
+  metadata.enrichment_skipped = ['photos','brand_icon', ...]   -- reasons ok`,
+  `When you deliberately skip an enrichment step, say so in one line of your
+reasoning (and in audit.note on a receipt), so the trace shows a decision,
+not a failure.`,
+)}`;
 }
 
 /** Today, in the agent's own terms. Computed per render, never baked in —
@@ -227,7 +294,7 @@ function currentYear(): number {
  * Phase 3 geocode that only the ingest path performs, so it stays in
  * `prompt.ts`.
  */
-export function dateSelfCheck(): string {
+export function dateSelfCheck(opts: { writer?: PromptWriter } = {}): string {
   return `── Phase 3.5 — Targeted OCR self-check (date + payee only) ────────────
 
 Round 1 + Round 2 (40 receipts total) showed that **failures cluster
@@ -278,30 +345,49 @@ Before picking ONE \`occurred_on\`:
      Day must be 1–31; month must be 1–12. If either violates, the
      digits are swapped.
 
-Emit your date-candidate list in metadata:
+Emit your date-candidate list in ${forWriter(opts.writer, "metadata", "the record's audit block")}:
 
   "date_candidates": ["09/30/2025", "12/31/2025"],
   "chosen_date_reason": "top of receipt adjacent to transaction time"`;
 }
 
-/** The mandatory `metadata.ocr_audit` provenance key. */
-export const OCR_AUDIT_REQUIREMENT = `### REQUIRED metadata.ocr_audit shape
+/** The mandatory self-check block: `metadata.ocr_audit` in the legacy
+ *  rendering, the record's `audit` object in the record rendering. One
+ *  text, so the two cannot drift; the record's has the review flags the
+ *  contract added. */
+function ocrAuditRequirement(writer: PromptWriter): string {
+  const w = (legacy: string, record: string) => forWriter(writer, legacy, record);
+  return `### REQUIRED ${w("metadata.ocr_audit shape", "audit block")}
 
-You MUST populate this key on every receipt ingest (not optional):
+You MUST ${w("populate this key on every receipt ingest", "fill the record's `audit` object on every receipt")} (not optional):
 
-  "ocr_audit": {
+  "${w("ocr_audit", "audit")}": {
     "ocr_raw_payee": "<what you read from the receipt header>",
     "google_name": "<what Google returned, or null if no geocode>",
     "correction_applied": true | false,
     "date_candidates": [ "...", "..." ],
     "chosen_date_reason": "...",
     "year_sanity_ok": true | false,
-    "note": "optional freeform observation (e.g., thermal-paper faded, bilingual name, etc.)"
+    "note": "optional freeform observation (e.g., thermal-paper faded, bilingual name, etc.)"${w(
+      "",
+      `,
+    "review_flags": [ "date_unresolved" | "total_unresolved" | "handwritten_amount" | "partial_document" | "needs_review" ]`,
+    )}
   }
 
-An ingest without this key is considered incomplete. Emit it even
+${w("An ingest without this key is considered incomplete", "A receipt record without it is refused")}. Emit it even
 when no corrections were needed (correction_applied=false,
-note="clean extraction").`;
+note="clean extraction").${w(
+    "",
+    ` review_flags names only the problems a person
+should look at; leave it out when there are none.`,
+  )}`;
+}
+
+/** The mandatory `metadata.ocr_audit` provenance key (legacy rendering). */
+export const OCR_AUDIT_REQUIREMENT = ocrAuditRequirement("agent_sql");
+/** The record rendering's `audit` block requirement. */
+export const OCR_AUDIT_REQUIREMENT_RECORD = ocrAuditRequirement("server_apply");
 
 /**
  * Curated self-evolution loop (#prompt-lessons).
@@ -330,17 +416,42 @@ const ACTIVE_LESSONS_PATH =
   process.env.PROMPT_LESSONS_FILE ??
   fileURLToPath(new URL("./lessons.md", import.meta.url));
 
-export function renderActiveLessons(): string {
+/**
+ * The writer tags of `lessons.md` (wave 1). A lesson line may start with
+ * one, right after its `- `:
+ *
+ *   `- [write] [income] …`   SQL or template mechanics (Turn A, an UPDATE,
+ *                            the near-dup tree). The legacy rendering gets
+ *                            the line with the tag removed, so its text is
+ *                            exactly what it was before tags existed; the
+ *                            record rendering, whose agent writes nothing,
+ *                            leaves it out.
+ *   `- [record] [income] …`  the reading half of a `[write]` lesson, for
+ *                            the record rendering only.
+ *
+ * Every other lesson is a reading lesson and both renderings inject it
+ * unchanged.
+ */
+const WRITER_TAG = /^(\s*-\s+)\[(write|record)\]\s+/;
+
+export function renderActiveLessons(opts: { writer?: PromptWriter } = {}): string {
   let raw = "";
   try {
     raw = readFileSync(ACTIVE_LESSONS_PATH, "utf8");
   } catch {
     return "";
   }
+  const record = opts.writer === "server_apply";
   // Drop comment lines (start with '#') and blanks; keep only lesson lines.
   const body = raw
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("#"))
+    .flatMap((line) => {
+      const tag = WRITER_TAG.exec(line);
+      if (!tag) return [line];
+      const keep = tag[2] === (record ? "record" : "write");
+      return keep ? [line.replace(WRITER_TAG, "$1")] : [];
+    })
     .join("\n")
     .trim();
   if (!body) return "";

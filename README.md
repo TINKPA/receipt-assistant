@@ -29,6 +29,8 @@ The agent is handed only what its job needs: five tools (Bash, Read, Write, Edit
 
 The rules the agent is given are **not** duplicated per prompt: `src/ingest/prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts` and `items-sql.ts` hold the single copy that both the ingest prompt and `reextract-prompt.ts` interpolate (#164).
 
+Wave 1 moves the ledger write from the agent to server code, behind `EXTRACTION_WRITER` (still `agent_sql` in production). The same template renders a second time for it (`writer: 'server_apply'`): the agent reads and reasons exactly as above, then ends its final message with one fenced extraction record (`src/ingest/contract/v1.ts`) instead of writing SQL. It runs with three tools (Bash, Read, Write), the Google key and no database at all; the server finds the record, validates it, sends an invalid one back to the same session once (`claude -p --resume`), and writes the ledger itself. `scripts/check-prompt-render.ts` proves the legacy rendering production runs has not changed by a byte. See "Extraction records" in [`CLAUDE.md`](CLAUDE.md#extraction-records-document_extractions-wave-1).
+
 ### Quality & Business Flags
 
 Every extraction includes metadata stored as PostgreSQL JSONB:
@@ -203,10 +205,10 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 |---------|---------|
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
 | `npm run check:prompt-render` | Fail if a legacy extraction or re-extract prompt rendering differs from its golden hash (also runs before every build) |
-| `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
+| `npm run check:prompt-budget` | Fail if the extraction prompt, legacy or record rendering, outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
-| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
-| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
+| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants, or if the record rendering contains any SQL (also runs before every build) |
+| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse, the record profile's resumed session included |
 | `npm run check:contract` | Exercise every rule of the extraction record contract, its validator and its hand-back parser on synthetic records (also runs before every build) |
 | `npm run check:apply-decide` | Exercise the server applier's duplicate decision and its projection to postings, line items and metadata on synthetic records (also runs before every build) |
 | `npm run measure:turns` | Turns, billed tokens and model per extraction, from session JSONL (the parser that also fills `agent_runs`) |

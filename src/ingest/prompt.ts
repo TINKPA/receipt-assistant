@@ -1,15 +1,30 @@
 /**
- * Phase 2 extractor prompt — the agent writes to the v1 double-entry
- * ledger directly via the `psql` Bash tool. Node is no longer involved
- * in field parsing or DB writes; it only spawns the agent, waits for
- * the ingest row to reach a terminal status, and relays SSE events.
+ * The ingest extractor prompt: one template, two renderings (wave 1, plan
+ * §9). `ctx.writer` picks one, and every write-specific block is wrapped
+ * in `forWriter(writer, legacyText, recordText)` so the reading text the
+ * two share has one source and the arms cannot drift.
  *
- * See `receipt-assistant#49` for the architectural move from Phase 1
- * (Node-side coerce + service-layer writes) to Phase 2.
+ *   agent_sql     (legacy, `PROMPT_VERSION`) — the agent writes the v1
+ *                 double-entry ledger directly via the `psql` Bash tool;
+ *                 Node only spawns it, waits for the ingest row to reach a
+ *                 terminal status, and relays SSE events (#49). Production
+ *                 runs this, and `scripts/check-prompt-render.ts` pins it
+ *                 byte for byte: a change to it fails the build.
+ *   server_apply  (record, `RECORD_PROMPT_VERSION`) — the agent reads and
+ *                 decides, then ends its final message with one extraction
+ *                 record (`src/ingest/contract/v1.ts`); the server
+ *                 validates it and writes the ledger in code. No SQL, no
+ *                 database, no web search, no place fetch, no icons.
+ *
+ * Opening words: both renderings start with "You are a v1 double-entry
+ * ledger extractor", which is how `src/session-transcript.ts` tells an
+ * ingest transcript from a re-extract one.
  */
+import { appendFileSync } from "node:fs";
 import { buildInfo } from "../generated/build-info.js";
 import {
   PHASE_2_6_BRAND_DISCOVERY,
+  PHASE_2_6_BRAND_NAME_RECORD,
   PHASE_4B_4C_ICON_GATE,
 } from "./brand-icon-prompt.js";
 import {
@@ -19,23 +34,32 @@ import {
   PSQL_DISCIPLINE,
   dateSelfCheck,
   OCR_AUDIT_REQUIREMENT,
+  OCR_AUDIT_REQUIREMENT_RECORD,
   agentHygiene,
+  forWriter,
   renderActiveLessons,
+  type PromptWriter,
 } from "./prompt-contract.js";
 import {
   ingestScratchDir,
   phase0DocumentRead,
+  randomSourceDelimiter,
   renderDecodedSource,
   type DecodedAttachment,
 } from "./document-read-prompt.js";
 import {
   ITEM_SCHEMA,
+  ITEM_SCHEMA_RECORD,
   LINE_TYPE_VOCAB_AND_NAMES,
+  LINE_TYPE_VOCAB_AND_NAMES_RECORD,
   LINE_ITEM_TWO_LEVEL_RULE,
   LINE_ITEM_COVERAGE_AND_BRIDGE,
+  LINE_ITEM_COVERAGE_AND_BRIDGE_RECORD,
   ALLOCATION_LOGIC,
+  ALLOCATION_LOGIC_RECORD,
   LINE_ITEM_WORKED_EXAMPLES,
 } from "./line-item-prompt.js";
+import { renderContractForPrompt } from "./contract/v1.js";
 import {
   itemsCte,
   brandFkGuard,
@@ -45,11 +69,16 @@ import {
 } from "./items-sql.js";
 
 export interface ExtractorPromptContext {
+  /** Which rendering: `agent_sql` (the agent writes the ledger through
+   *  psql) or `server_apply` (the agent hands back an extraction record
+   *  and the server writes). See the module header. */
+  writer: PromptWriter;
   /** Absolute path inside the container where the file was staged. */
   filePath: string;
   /** The UUID of the `ingests` row this extraction is tied to. */
   ingestId: string;
-  /** Workspace scope (required for every INSERT). */
+  /** Workspace scope (required for every INSERT). Not rendered in the
+   *  record rendering, whose agent never handles a ledger id. */
   workspaceId: string;
   /** Pre-existing `documents` row for the uploaded file. */
   documentId: string;
@@ -57,7 +86,9 @@ export interface ExtractorPromptContext {
   userId: string;
   /** Perceptually-near existing documents (#134), pHash d ≤ 2, each
    *  linked to a live transaction. Injected by the worker; candidate-
-   *  surfacing evidence for the near-dup decision in Phase 4a.0. */
+   *  surfacing evidence for the near-dup decision in Phase 4a.0. The
+   *  record rendering ignores them: there the server decides duplicates
+   *  and takes the neighbours as candidates itself. */
   phashNeighbors?: {
     documentId: string;
     transactionId: string;
@@ -100,19 +131,215 @@ const PROPOSED_LESSONS_PATH =
   process.env.PROMPT_LESSONS_PROPOSED ??
   "/data/prompt-lessons/lessons.proposed.md";
 
+/**
+ * Phase 6 for the record rendering: its agent hands a lesson back in the
+ * record's `lesson_proposal` instead of appending it itself, and the
+ * server appends it here after the record is applied, in the line format
+ * the legacy agent writes (`- [<classification>] <lesson>`), so the
+ * curator reads one file. Best effort, like the agent's own append: an
+ * unwritable file is logged and the run goes on.
+ *
+ * The text is untrusted and goes to a human, never back into a prompt.
+ * It is still kept to one line of at most 600 characters, so one
+ * proposal is one line and a document cannot fake a run of them.
+ */
+export function appendLessonProposal(classification: string, lesson: string): boolean {
+  const kind = classification.replace(/[^a-z_]/g, "").slice(0, 40) || "unknown";
+  const text = lesson.replace(/\s+/g, " ").trim().slice(0, 600);
+  if (text === "") return false;
+  try {
+    appendFileSync(PROPOSED_LESSONS_PATH, `- [${kind}] ${text}\n`, "utf8");
+    return true;
+  } catch (err) {
+    console.warn(`[lessons] could not append a lesson proposal: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * Record rendering: what Phase 4's write becomes. The legacy Phase 4 is a
+ * schema primer, a turn plan and SQL templates; here it is the handful of
+ * judgments the server cannot make (category, signs, how it was paid,
+ * where income landed), stated as the record fields that carry them.
+ */
+const RECORD_PHASE_4_INTRO = `── Phase 4 — The money, as fields ─────────────────────────────────────
+
+You write no SQL and no postings. From your record the server derives
+the transaction, its balanced postings, the catalog rows, the place link
+and the document stamp, in one database transaction. What it needs from
+you is the reading below, as fields.
+
+Money is ALWAYS integer minor units, never a float. Never convert it:
+record the currency actually printed on the receipt, and amounts in that
+currency's own units — a CNY, JPY or EUR receipt, or a points redemption,
+keeps its own currency. The server converts to the base currency from the
+published rate for the receipt's own date (#184), or from the
+programme's valuation for points (#206). A rate you guessed, or a total
+you converted yourself, would be booked as if the receipt had printed it.
+
+`;
+
+/** Record rendering: Phase 4a.0's place. The decision tree, the pHash list
+ *  and the candidate query are the server's now (plan §7). */
+const RECORD_DUPLICATES = `**Duplicates are the server's call (#134).** The same purchase may
+already be in the ledger through another copy (a re-shot photo, a
+re-scanned PDF) or another evidence channel (the email for a PDF, the
+invoice for a receipt). The server decides attach or insert in code,
+from the identifiers, card last-4, time, total and items you hand back,
+and recognises a re-forwarded email by its Message-ID itself. You do not
+look for duplicates and you never say "attach": read those fields
+accurately. An identifier left out, or put under the wrong key, is a
+duplicate the server cannot see.
+
+`;
+
+/** Record rendering: how the total was paid, which decides the paying
+ *  account (plan §3.3), and the printed totals. Legacy has no counterpart:
+ *  its template always credited Credit Card. */
+const RECORD_PAYMENT = `**payment** — how the total was paid, read off the tender line. The
+server picks the paying account from \`payment.method\`: \`cash\` → Cash;
+\`check\` and \`bank_transfer\` → Checking; \`points\` → the programme's
+points account; anything else (\`card\`, \`gift_card\`, \`mixed\`,
+\`other\`, \`unknown\`) → Credit Card. \`unknown\` when the document does
+not say. Copy card_last4 (exactly four digits), card_network and the
+tender line itself (as_printed) when they are printed.
+
+**printed_totals** — the document's printed subtotal, tax, tip, discount
+and fees (service, delivery and surcharges added together), in minor
+units, each only when printed. The tax and the tip rows still go in
+items[] as well.`;
+
+/** Record rendering: points and miles (#206), which the legacy template
+ *  teaches as a commented-out CTE. */
+const RECORD_POINTS = `
+
+**points** — an award redemption (Phase 2): facts.currency is the
+programme code, facts.total_minor the points redeemed (never 0),
+\`points.programme_name\` the programme as printed, and payment.method
+\`points\`. When the folio ALSO charges cash (a resort fee, parking), add
+\`cash_component\` {amount_minor, currency} for the cash part; a line
+priced in that cash currency says so in its own \`currency\`.`;
+
+/**
+ * Record rendering: the hand-back (plan §5). It replaces the legacy Phase
+ * 5 close-out, Output and Rules: the ending rule, "omit rather than
+ * invent", the one repair round, and the contract itself, rendered from
+ * the zod schema the validator enforces so the two cannot drift.
+ */
+function recordHandBack(): string {
+  return `── Rules ──────────────────────────────────────────────────────────────
+
+- \`.eml\` with a PDF attachment: prefer the source with richer data
+  (usually the attachment). Say which in source_used.
+- Reason in plain text BEFORE writing the record. Show your arithmetic
+  (the lines against the printed subtotal, tax, tip and total) so
+  mistakes are visible in the session transcript.
+- Every run ends with a record, an unsupported document and a statement
+  included. If you cannot read the document at all, hand back
+  classification \`unsupported\` with reason \`unreadable\` and a one-line
+  note.
+
+── Hand back your record ──────────────────────────────────────────────
+
+The record is the ONE required output of this run. The server reads it
+from your final message; there is no other channel. Do not write it to
+a file, print it with a command, or send it anywhere.
+
+End your FINAL message with, in this order, and nothing after it:
+
+  1. ONLY for a photo, or a PDF you had to read as page images: one
+     \`\`\`receipt-text block with your full transcription of the
+     document as you read it, line by line (at most 64 KB). Leave it out
+     for an email, an HTML page, or a PDF whose text layer you read: the
+     server already has that text.
+  2. Exactly ONE \`\`\`json block holding the extraction record: one
+     JSON object that starts with "contract_version": 1.
+  3. Nothing after the json block's closing fence.
+
+The shape of that ending (every value comes from the document):
+
+  ...your reasoning, the arithmetic and the self-checks...
+
+  \`\`\`receipt-text
+  <the document's text, as printed>
+  \`\`\`
+
+  \`\`\`json
+  {"contract_version": 1, "classification": "receipt_image", "source_used": "image", "facts": {...}, ...}
+  \`\`\`
+
+Writing the record:
+
+  - Reason first, then write it once, at the very end. It is the
+    conclusion of the reading above, written after it: not the
+    structured-output mode ruled out after Phase 1b, and not a form to
+    fill in instead of reading.
+  - Strict JSON: double quotes, no comments, no trailing commas, no
+    "..." placeholders. (The worked examples above carry // notes for
+    you; the record never does.)
+  - OMIT RATHER THAN INVENT. A field the document does not show is left
+    out, or null where null is allowed. Never fill one with a guess to
+    make the record look complete: an empty field is honest, an invented
+    one is a silent lie the ledger keeps.
+  - Only the keys listed below, nested as shown. A metadata key named in
+    an earlier section or a lesson is not a record key: a printed
+    reference goes in other_references, any other printed fact worth
+    keeping (operator entity, table number, total basis) in
+    receipt_facts, a problem for a person in audit.review_flags
+    (date_unresolved, needs_review, …), an observation in audit.note.
+  - source_used says what you read: image, pdf_text, pdf_raster,
+    email_body, email_attachment or html.
+  - Where the earlier sections' names go:
+        payee, occurred_on, occurred_at, total_minor, currency  → facts
+        the Phase 1b money direction                            → facts.flow
+        category_hint, the Phase 2.5/2.6 fields, Phase 3e       → merchant
+        Phase 3a's place id                                     → place
+        the Phase 3.5 / Check C self-check                      → audit
+        order, confirmation, invoice, payment, approval numbers → identifiers
+        4a-bis owned items              → items[].track_as_owned, sold_item
+        4a-ter parties                                          → parties
+        4b statement rows                                       → statement_rows
+        raw_text                                                → receipt-text block
+        the Phase 6 lesson                                      → lesson_proposal
+
+The server may send ONE list of problems back. It validates the record,
+and when something structural is wrong (a key the contract does not
+have, a date that does not exist, a sign that contradicts the flow) it
+replies in this same session with a list naming each field and rule.
+Then re-read the document where it says, fix ONLY the fields it names,
+and end that reply with the full corrected record again, the
+receipt-text block too if you gave one. It never tells you a value;
+never change a field it did not name to make the list go away.
+
+${renderContractForPrompt()}
+
+Remember: your final message ends with the optional \`\`\`receipt-text block
+and exactly one \`\`\`json record, with nothing after it.
+`;
+}
+
 export function buildExtractorPrompt(ctx: ExtractorPromptContext): string {
   const scratchDir = ingestScratchDir(ctx.ingestId);
+  /** This block's legacy text, or the record rendering's. */
+  const w = (legacy: string, record: string) => forWriter(ctx.writer, legacy, record);
+  const record = ctx.writer === "server_apply";
   return `You are a v1 double-entry ledger extractor. You will classify a
 financial document, extract its fields, optionally geocode the merchant,
-and **write the result directly into Postgres** via the psql Bash tool.
-Node is not doing any DB writes — you are the only writer.
+and ${w(
+    `**write the result directly into Postgres** via the psql Bash tool.
+Node is not doing any DB writes — you are the only writer.`,
+    `**hand the result back as one extraction record** at the end of your
+final message. You read and decide; the server writes. You have no
+database. Never write SQL.`,
+  )}
 
 ── Context ─────────────────────────────────────────────────────────────
 
 File path (inside this container):
   ${ctx.filePath}
 
-Context variables for SQL:
+${w(
+  `Context variables for SQL:
   INGEST_ID     = '${ctx.ingestId}'
   WORKSPACE_ID  = '${ctx.workspaceId}'
   DOCUMENT_ID   = '${ctx.documentId}'
@@ -125,12 +352,20 @@ Optional: if you want to discover schema details, \`\\d\` works:
 
 Do NOT spend a turn listing \`accounts\`. The names are fixed (Phase 4
 primer) and every id is resolved inline as a CTE in the write, so that
-query cannot tell you anything the prompt has not already told you.
+query cannot tell you anything the prompt has not already told you.`,
+  `The server already knows which upload, document and workspace this is,
+and supplies every id itself. You never see a ledger id and never write
+one, in the record or anywhere else.`,
+)}
 
-${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest" })}
-${renderActiveLessons()}
+${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest", writer: ctx.writer })}
+${renderActiveLessons({ writer: ctx.writer })}
 ${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
-${renderDecodedSource(ctx.sourceText, ctx.attachments)}
+${renderDecodedSource(
+  ctx.sourceText,
+  ctx.attachments,
+  record ? { writer: ctx.writer, delimiter: randomSourceDelimiter(ctx.sourceText) } : {},
+)}
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
 Follow the document-reading rules above FIRST — for a PDF that means
@@ -162,8 +397,12 @@ is \`receipt_email\` + \`refund\`.
              person, with nothing bought or sold — Zelle / Venmo /
              WeChat P2P, a gift-card or stored-value top-up, a bank-to-
              bank move. NOT SUPPORTED YET: classify the document
-             \`unsupported\` with reason "transfer — not spend, not
-             income" and stop. Do not force it into one of the others.
+             \`unsupported\` with reason ${w(
+               `"transfer — not spend, not
+             income" and stop`,
+               `\`transfer\` (note: "transfer — not
+             spend, not income") and stop`,
+             )}. Do not force it into one of the others.
 
 **A refund is NOT income**, and the test that separates them is: **was
 something the user bought being undone?** Returning a drone you bought
@@ -186,14 +425,24 @@ ${NO_JSON_SCHEMA_RULE}
 
 ── Phase 2 — Extract ──────────────────────────────────────────────────
 
-For receipt_image / receipt_email / receipt_pdf, pull out:
+For receipt_image / receipt_email / receipt_pdf, pull out${w(
+  "",
+  ` (into the
+record's \`facts\` block, unless noted)`,
+)}:
 
   payee         : merchant name as printed on the document
   occurred_on   : date in YYYY-MM-DD form (read from the document —
                   NEVER fall back to today's date). If year is missing,
                   infer from nearby context (statement period etc.).
-  occurred_at   : timestamp YYYY-MM-DD HH:MM:SS+TZ if a time is
-                  printed; NULL otherwise
+  occurred_at   : ${w(
+    `timestamp YYYY-MM-DD HH:MM:SS+TZ if a time is
+                  printed; NULL otherwise`,
+    `local date-time with its UTC offset, ISO-8601
+                  (2026-01-31T14:05:00-08:00), if a time is printed;
+                  null otherwise. The offset is the merchant's own on
+                  that date, and the date part equals occurred_on.`,
+  )}
   total_minor   : the receipt's FINAL "Grand Total" — the amount actually
                   charged — in the currency's minor unit (integer cents for
                   USD, whole units for JPY). Include handwritten tips.
@@ -206,13 +455,17 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   never zero it: total_minor = the number of points/miles
                   redeemed (40500, not 0) and \`currency\` = the programme
                   code. A stay paid with both points and cash gets BOTH: the
-                  points as total_minor/currency, the cash charge as a second
-                  posting pair (see Phase 4a).
+                  points as total_minor/currency, the cash charge as ${w(
+                    `a second
+                  posting pair (see Phase 4a)`,
+                    `the
+                  record's cash_component (see Phase 4)`,
+                  )}.
                   ⚠ SIGN — a \`refund\` (Phase 1b) carries a NEGATIVE
                   total_minor, and so does every items[] line and its
                   tax: a $28.86 refund is -2886, not 2886. The sign is
                   what nets the money back out of its category, and
-                  Phase 4a's template needs no other change to book it.
+                  ${w("Phase 4a's template needs", "the server needs")} no other change to book it.
                   \`income\` keeps total_minor POSITIVE — that path
                   changes the posting PAIR, not the sign.
   currency      : ISO 4217 code (USD, CNY, EUR, JPY, …). Detect from
@@ -221,8 +474,14 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   For a points/miles redemption use the programme code
                   instead: uppercase issuer + \`_PT\`, ≤16 chars. World of
                   Hyatt → HYATT_PT, Marriott Bonvoy → BONVOY_PT, AA miles →
-                  AA_PT. The same programme MUST always get the same code.
-  category_hint : one of
+                  AA_PT. The same programme MUST always get the same code.${w(
+                    "",
+                    `
+  total_printed : the grand total exactly as printed, symbol and
+                  separators included ("$1,234.56", "¥5,000"). The server
+                  only uses it to check the scale of total_minor.`,
+                  )}
+  category_hint : ${w("", "(in merchant) ")}one of
                   groceries | dining | retail | cafe | transport | other
                   (vehicle repair / maintenance / parts / fuel / parking →
                   transport — the same "car spending" axis as the
@@ -232,25 +491,36 @@ For receipt_image / receipt_email / receipt_pdf, pull out:
                   item is one object with the exact shape below;
                   the array MUST be non-empty for receipt_image /
                   receipt_email / receipt_pdf. Statement PDFs
-                  continue to skip items (each statement row IS a
-                  transaction, no sub-itemization possible).
-  raw_text      : full transcription (written to \`documents.ocr_text\`)
+                  ${w(
+                    `continue to skip items (each statement row IS a
+                  transaction, no sub-itemization possible).`,
+                    `skip items: their rows go in statement_rows (4b).`,
+                  )}
+  raw_text      : full transcription (${w(
+    "written to \`documents.ocr_text\`",
+    "the \`\`\`receipt-text block of the\n                  hand-back, for a photo or a scanned PDF",
+  )})
 
-${ITEM_SCHEMA}
+${w(ITEM_SCHEMA, ITEM_SCHEMA_RECORD)}
 
-${LINE_TYPE_VOCAB_AND_NAMES}
+${w(LINE_TYPE_VOCAB_AND_NAMES, LINE_TYPE_VOCAB_AND_NAMES_RECORD)}
 
-${LINE_ITEM_COVERAGE_AND_BRIDGE}
+${w(LINE_ITEM_COVERAGE_AND_BRIDGE, LINE_ITEM_COVERAGE_AND_BRIDGE_RECORD)}
 
 ${LINE_ITEM_TWO_LEVEL_RULE}
 
 ${LINE_ITEM_WORKED_EXAMPLES}
 
-For statement_pdf, pull rows: { date, payee, amount_minor }.
+${w(
+  `For statement_pdf, pull rows: { date, payee, amount_minor }.
 
-For unsupported, record a short reason.
+For unsupported, record a short reason.`,
+  `For statement_pdf, pull every row into statement_rows (see 4b).
 
-${ALLOCATION_LOGIC}
+For unsupported, fill \`unsupported\`: a reason and a one-line note.`,
+)}
+
+${w(ALLOCATION_LOGIC, ALLOCATION_LOGIC_RECORD)}
 
 ── Phase 2.5 — Merchant canonicalization (#64) ────────────────────────
 
@@ -270,8 +540,13 @@ the most attention-sensitive new ask in the prompt; keep it terse.
                      "Wang Fu 王府饭店"        → "Wang Fu" (drop CJK
                        parenthetical if a Latin name is present; if
                        only CJK, use Hanyu Pinyin without tones)
-  brand_id       : kebab-case stable identifier. ASCII lowercase, digits,
-                   hyphens. Regex: ^[a-z0-9-]+$
+  brand_id       : kebab-case stable identifier. ${w(
+    `ASCII lowercase, digits,
+                   hyphens. Regex: ^[a-z0-9-]+$`,
+    `ASCII lowercase letters
+                   and digits joined by single hyphens (no leading,
+                   trailing or doubled hyphen), at most 64 characters.`,
+  )}
                    The SAME brand MUST always collapse to the SAME id —
                    "Costco", "Costco #479", "COSTCO WHOLESALE" → all
                    "costco". Strip CJK/accents (Pinyin for Chinese,
@@ -315,27 +590,41 @@ the most attention-sensitive new ask in the prompt; keep it terse.
                    services" pull the whole transaction into "Services" —
                    that is the #1 mistake on auto-repair receipts.
 
-The merchant block goes into the transaction's \`metadata.merchant\` JSON
-key (see the Phase 4 template).
+${w(
+  `The merchant block goes into the transaction's \`metadata.merchant\` JSON
+key (see the Phase 4 template).`,
+  `The merchant block is the record's \`merchant\` object: canonical_name,
+brand_id and category always, and category_hint, brand_name, domain_hint
+and name_zh_printed when you have them.`,
+)}
 
-${PHASE_2_6_BRAND_DISCOVERY}
+${w(PHASE_2_6_BRAND_DISCOVERY, PHASE_2_6_BRAND_NAME_RECORD)}
 
 For receipt_image / receipt_email / receipt_pdf only. Skip for
 \`statement_pdf\` (handled per-row in Phase 4b) and \`unsupported\`.
 
-── Phase 3 — Resolve place + fetch multilingual record (#74) ──────────
+${w(
+  "── Phase 3 — Resolve place + fetch multilingual record (#74) ──────────",
+  "── Phase 3 — Resolve the merchant's place (#74) ──────────────────────",
+)}
 
 BUDGET GATE (see the Priority & effort-budget preamble): this ENTIRE
 phase is best-effort enrichment. Skip it whenever the core is what
-matters — a cached place, an obvious non-CJK global brand, or when you
+matters — ${w("a cached place, ", "")}an obvious non-CJK global brand, or when you
 are already many turns deep. Everything below is "do it if it is cheap
 and adds value", never "do it no matter what".
 
-Goal: get a stable \`google_place_id\` for the merchant, fetch its full
+${w(
+  `Goal: get a stable \`google_place_id\` for the merchant, fetch its full
 multilingual record from Google v1, cache locally. If the place is
 Chinese-named and Google text doesn't carry the Chinese, OCR the
 storefront photo for the CJK characters. Local-first — every step
-checks the DB before paying Google.
+checks the DB before paying Google.`,
+  `Goal: a stable \`google_place_id\` for the merchant, and nothing more.
+The server keeps the place cache: it fetches the full multilingual
+Google record for that id itself (or finds it cached), stores it and
+links it. You resolve the id; you never fetch the place record.`,
+)}
 
 For receipt_image / receipt_email / receipt_pdf only. The API key is
 in the GOOGLE_MAPS_API_KEY environment variable.
@@ -351,7 +640,10 @@ Decision tree (stop at first match):
         QS=\$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "\$ADDR")
         curl -sS "https://maps.googleapis.com/maps/api/geocode/json?address=\$QS&language=zh-CN&key=\$GOOGLE_MAPS_API_KEY"
 
-      Use the top result's \`place_id\`. Source = "google_geocode".
+      Use the top result's \`place_id\`. ${w(
+        'Source = "google_geocode".',
+        'place.resolved_via = "geocode_address".',
+      )}
       Note \`language=zh-CN\` — Google returns localized name when it has
       one (e.g. Wing Hop Fung at 725 W Garvey returns
       "Wing Hop Fung(永合丰)Monterey Park Store" instead of plain
@@ -378,7 +670,12 @@ Decision tree (stop at first match):
         QS=\$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read().strip()))' <<< "\$Q")
         curl -sS "https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=\$QS&inputtype=textquery&fields=place_id,name,formatted_address&language=zh-CN&key=\$GOOGLE_MAPS_API_KEY"
 
-      Use candidates[0].place_id. Source = "google_places".
+      Use candidates[0].place_id. ${w(
+        'Source = "google_places".',
+        `place.resolved_via = "find_place_text"
+      ("find_place_phone" when you searched by phone number,
+      inputtype=phonenumber).`,
+      )}
 
   (d) Only merchant name, no locality anywhere on receipt → skip the
       rest of Phase 3. Bare names like "Costco" resolve to random
@@ -388,7 +685,8 @@ Validation: top result's formatted_address MUST contain a locality
 token from the receipt (city, state abbr, or ZIP). No match → skip.
 Any non-OK status / HTTP error → skip. Phase 3 is best-effort.
 
-### Phase 3b — Local-first cache check
+${w(
+  `### Phase 3b — Local-first cache check
 
 Before hitting any v1 endpoint, check whether we already have this
 place cached. Do NOT spend a psql call of your own here: this lookup
@@ -565,17 +863,43 @@ download entirely. When you DID download for OCR, Phase 4 inserts a
 fallback adds the \`ocr_extracted\` jsonb to the photos it read; if you
 skipped the download, skip the \`place_photos\` insert too.
 
-### Phase 3e — Receipt-OCR CJK fallback (last-resort, free)
+`,
+  `Report what you found in the record's \`place\` block:
+\`google_place_id\` (null when nothing passed the checks above),
+\`resolved_via\` (\`none\` when you skipped Phase 3 or nothing passed),
+and \`address_printed\` — the address exactly as the document prints it,
+whenever it prints one, even when you skipped the lookup.
+
+### Phase 3b–3d — The place record is the server's
+
+Do NOT fetch the Google place record (the v1 Places API), do not
+download place photos, and do not OCR storefronts. With your id the
+server checks its cache, fetches the place in English and Chinese,
+derives the names and links it. You never see that record: where a
+lesson checks one of its fields (websiteUri), use only what Phase 3a's
+own responses showed you.
+
+`,
+)}${w(
+  `### Phase 3e — Receipt-OCR CJK fallback (last-resort, free)
 
 When Phase 3c and 3d both leave \`display_name_zh\` NULL, but the
-receipt itself prints the merchant name in CJK, use that. This is
+receipt itself prints the merchant name in CJK, use that.`,
+  `### Phase 3e — The merchant's Chinese name, as printed (free)
+
+When the receipt itself prints the merchant name in CJK, report it: the
+server uses it whenever Google has no Chinese name for the place.`,
+)} This is
 the common case for small vendors inside a plaza: the Google place
 resolves to the plaza's geocoded street address (no displayName.zh,
 no storefront photos), yet the receipt's letterhead shows e.g.
 "小玲锅巴土豆 / XIAO LING CRISPY POTATO BITES".
 
-Trigger when ALL of:
-  - \`display_name_zh\` is still NULL after 3c/3d, AND
+Trigger when ${w(
+  `ALL of:
+  - \`display_name_zh\` is still NULL after 3c/3d, AND`,
+  "BOTH:",
+)}
   - The receipt OCR text contains CJK Unified Ideographs
     (U+4E00–U+9FFF, also U+3400–U+4DBF, U+20000+), AND
   - You can identify a contiguous CJK substring that reads as the
@@ -595,10 +919,11 @@ Procedure:
        "王府饭店 WANG FU"                              → "王府饭店"
   3. If the receipt is partly Chinese but the merchant-name region
      is purely Latin (e.g. only item descriptions are in CJK),
-     leave \`display_name_zh\` NULL. Don't invent a name from item
+     leave ${w("\`display_name_zh\` NULL", "merchant.name_zh_printed out")}. Don't invent a name from item
      text.
 
-When the receipt yields a CJK merchant string:
+${w(
+  `When the receipt yields a CJK merchant string:
   display_name_zh          ← that string (e.g. "小玲锅巴土豆")
   display_name_zh_locale   ← "zh"
   display_name_zh_source   ← "receipt_ocr"
@@ -612,9 +937,14 @@ Also record provenance in metadata:
   }
 
 This phase is FREE — it uses OCR you've already done. Always run
-it before giving up on the Chinese name.
+it before giving up on the Chinese name.`,
+  `When the receipt yields a CJK merchant string, put it in
+\`merchant.name_zh_printed\` (e.g. "小玲锅巴土豆").
 
-${dateSelfCheck()}
+This phase is FREE — it uses OCR you've already done. Always run it.`,
+)}
+
+${dateSelfCheck({ writer: ctx.writer })}
 
 ### Check C — Payee cross-check via Google (KEEP — evidence-proven)
 
@@ -627,21 +957,34 @@ Compare Google's \`name\` with your OCR'd payee:
 
   - If case-insensitive substring OR Levenshtein distance ≤ 2 OR one
     is a longer/shorter form of the other: keep your OCR payee, record
-    Google's name in metadata for provenance. Don't "correct" things
+    Google's name in ${w("metadata", "audit.google_name")} for provenance. Don't "correct" things
     that aren't broken (e.g., "Nijiya Market" ↔ "Nijiya Market
     Sawtelle Store" is fine to keep as "Nijiya Market").
   - If they differ substantially AND Google's name is clearly the
     same business (the address matches): PREFER Google's name.
     Example: OCR "King Hop Fung" + Google "Wing Hop Fung" at same
-    address → correct to "Wing Hop Fung".
+    address → correct to "Wing Hop Fung".${w(
+      "",
+      ` Then facts.payee is Google's
+    name, facts.payee_as_printed what the receipt prints, and
+    facts.payee_source "google_check_c".`,
+    )}
   - If Google returns a bilingual or abbreviated name (e.g.,
     "老广的味道 Sunrise Noodle House" or "GW Supermarket" for "Great
     Wall Supermarket"): prefer the receipt's printed English/full
-    form; record Google's in metadata.ocr_audit.note as context.
+    form; record Google's in ${w("metadata.ocr_audit.note", "audit.note")} as context.
+${w(
+  "",
+  `
+Without a correction, facts.payee_source is "printed" (or "email_sender"
+for an email that names the merchant only as its sender), and
+facts.payee_as_printed the name as printed.
+`,
+)}
+${w(OCR_AUDIT_REQUIREMENT, OCR_AUDIT_REQUIREMENT_RECORD)}
 
-${OCR_AUDIT_REQUIREMENT}
-
-### REQUIRED metadata.extraction shape (provenance stamp — #88 / #80)
+${w(
+  `### REQUIRED metadata.extraction shape (provenance stamp — #88 / #80)
 
 The transaction SQL template below already includes the
 \`extraction\` key under metadata. **Do not change its values** — they
@@ -842,9 +1185,12 @@ psql prints the result sets in order. Read them once, then branch:
 Do NOT re-run any of these queries later in the run. If a result
 surprises you, re-read the output you already have.
 
-### 4a. receipt_image / receipt_email / receipt_pdf
+`,
+  RECORD_PHASE_4_INTRO,
+)}### 4a. receipt_image / receipt_email / receipt_pdf
 
-**Email-only pre/post steps (receipt_email). #122.**
+${w(
+  `**Email-only pre/post steps (receipt_email). #122.**
 For \`receipt_email\`, first parse the \`.eml\` headers: From, Subject,
 Date, Message-ID.
 
@@ -910,13 +1256,15 @@ The same purchase may already be in the ledger via another copy
 for a PDF you're holding, the invoice for a receipt). Inserting again
 double-counts the money. Decide attach-vs-insert as follows.
 
-── Identifier keys — a CLOSED contract, not free choice (#204) ────────
+`,
+  RECORD_DUPLICATES,
+)}── Identifier keys — a CLOSED contract, not free choice (#204) ────────
 
 A printed reference number is the single strongest dedup signal there
 is: it survives a re-shot photo, a different evidence channel, a
 partial refund, and a $0 total, none of which an amount survives. It
 only works if the writer and the reader agree on the key, so the key
-set is fixed. Store every identifier you find under EXACTLY one of:
+set is fixed. Store every identifier you find ${w("under EXACTLY one of:", "in \`identifiers\`, under\nEXACTLY one of:")}
 
   order_number         Amazon/Newegg order refs, restaurant order or
                        check numbers, POS transaction numbers
@@ -932,8 +1280,12 @@ Rules that make this a contract rather than a suggestion:
     invoice_number was on 61 transactions and confirmation_number on 17,
     and the query read neither.
   * When a document prints something that fits none of them, put it in
-    metadata under any name you like, but ALSO copy it to the closest
-    key above. Findable beats tidy.
+    ${w(
+      `metadata under any name you like, but ALSO copy it to the closest
+    key above.`,
+      `\`other_references\` under any snake_case name you like, but ALSO
+    copy it to the closest key above.`,
+    )} Findable beats tidy.
   * Never put a SKU, serial number, tracking number, loyalty number or
     store number in these keys. They identify a product, a shipment or a
     place — not this purchase — and dedup comparing them silently
@@ -941,7 +1293,8 @@ Rules that make this a contract rather than a suggestion:
   * Values are compared as text, verbatim as printed. Do not strip
     leading zeros, dashes or prefixes.
 
-Perceptually-similar existing documents (pHash, candidate-surfacing
+${w(
+  `Perceptually-similar existing documents (pHash, candidate-surfacing
 ONLY — same-app screenshots of DIFFERENT purchases can land here, so
 the extracted fields below always decide, never this list by itself):
 
@@ -1029,7 +1382,13 @@ code / card last-4 > time-of-day > items list):
    to the metadata object. A flagged duplicate is recoverable; a wrong
    merge silently loses a real purchase (#125's failure class).
 
-Write one balanced transaction. The expense account name is **exactly
+Write one balanced transaction. `,
+  `A refund almost always reprints the original's order number: keep it.
+The server links the refund to the purchase it reverses by that number,
+and never attaches one to the other.
+
+`,
+)}The expense account name is **exactly
 the \`merchant.category\` value you emitted in Phase 2.5** — one of the
 seven canonical accounts:
 
@@ -1046,20 +1405,31 @@ must not skip it. If a merchant genuinely doesn't fit the other six
 buckets, use Services as the catch-all. Never invent a new account
 and never leave the category blank.
 
-Mirror side is Credit Card (default).
+${w(
+  `Mirror side is Credit Card (default).`,
+  RECORD_PAYMENT,
+)}
 
-── Which posting pair — by money direction (#221) ─────────────────────
+── ${w("Which posting pair", "The sign")} — by money direction (#221) ${w("─────────────────────", "───────────────────────────────")}
 
-**purchase** — the template below, unchanged. Expense +TOTAL_MINOR,
+${w(
+  `**purchase** — the template below, unchanged. Expense +TOTAL_MINOR,
 Credit Card -TOTAL_MINOR.
 
 **refund** — the same template, with TOTAL_MINOR NEGATIVE (Phase 2).
 Nothing else differs: -2886 yields expense -2886 / card +2886. Use the
-SAME expense account the original purchase used — a returned pair of
+SAME expense account the original purchase used`,
+  `**purchase** — facts.total_minor positive (or 0).
+
+**refund** — facts.total_minor NEGATIVE (Phase 2), and so is every
+items[] line and its tax: -2886, not 2886. Use the SAME merchant.category
+the original purchase used`,
+)} — a returned pair of
 shoes comes out of Shopping, because "what did Shopping actually cost
 me" is the question only netting can answer.
 
-  Do NOT: post to an Income account, invent an \`Expenses:Refunds\`
+${w(
+  `  Do NOT: post to an Income account, invent an \`Expenses:Refunds\`
   account, flip the mirror side, or write ABS() anywhere.
 
 **income** — a DIFFERENT pair. New money has no expense side, so
@@ -1071,7 +1441,13 @@ replace the \`expense\` and \`credit\` CTEs with:
 and the two posting inserts become
 
     p1: deposit.id, <TOTAL_MINOR>     -- asset debit, POSITIVE
-    p2: income.id, -<TOTAL_MINOR>     -- income credit, NEGATIVE
+    p2: income.id, -<TOTAL_MINOR>     -- income credit, NEGATIVE`,
+  `  Do NOT: call it income, or write the total positive.
+
+**income** — facts.total_minor POSITIVE. The server books it to an
+asset account and an income account, which you name in the \`income\`
+block (deposit_account, income_account).`,
+)}
 
 Accounts: \`Other\` unless the document is genuinely payroll;
 \`Checking\` unless it names where the money landed (check or ACH →
@@ -1080,10 +1456,15 @@ processor — PayPal / Venmo / Zelle payouts land in Checking.
 
 Still emit the Phase 2.5 merchant block: the counterparty is a real
 merchant (Jay Brokers, Assurant) and the brand graph wants it.
-\`category\` is simply unused on an income row, since the spend rollups
-join \`a.type = 'expense'\`.
+${w(
+  `\`category\` is simply unused on an income row, since the spend rollups
+join \`a.type = 'expense'\`.`,
+  `\`merchant.category\` is still required; it is simply unused on an
+income row.`,
+)}${w("", RECORD_POINTS)}
 
-Template — **this whole heredoc is Turn B: ONE Bash tool call.**
+${w(
+  `Template — **this whole heredoc is Turn B: ONE Bash tool call.**
 Substitute your extracted values for the placeholders; the subqueries
 resolve account ids inline so you do NOT need to SELECT them first.
 Statements marked OPTIONAL get deleted when they don't apply to this
@@ -1425,11 +1806,21 @@ record \`file_path\` accordingly:
     "
   done
 
-### 4a-bis. owned_items judgment (#84 Phase 2)
+`,
+  "",
+)}### 4a-bis. ${w("owned_items judgment", "Owned items")} (#84 Phase 2)
 
-For each line where you set \`item_class='durable'\` AND assigned a
-\`product_id\` AND judge the item **worth tracking as a real-world
-thing**, insert N owned_items rows (instance_index 1..quantity).
+For each line where you set \`item_class='durable'\` AND ${w(
+  `assigned a
+\`product_id\``,
+  `gave a
+\`product_key\``,
+)} AND judge the item **worth tracking as a real-world
+thing**, ${w(
+  "insert N owned_items rows (instance_index 1..quantity).",
+  `set \`track_as_owned: true\` on it (the server creates one
+owned instance per unit of quantity).`,
+)}
 Pure judgment, no threshold:
 
   - Limited-edition / luxury / high-value goods                  → YES
@@ -1438,7 +1829,8 @@ Pure judgment, no threshold:
   - Cheap commodity durables ($5 hammer, basic kitchenware)       → NO
   - One-time-use durables (party plates that *technically* last)  → NO
 
-Leave \`serial_number\`, \`location\`, \`warranty_until\`, \`condition\`,
+${w(
+  `Leave \`serial_number\`, \`location\`, \`warranty_until\`, \`condition\`,
 \`notes\` blank — the user fills those in. \`acquired_on\` defaults to
 the transaction's \`occurred_on\`.
 
@@ -1451,10 +1843,17 @@ to re-run. Delete Turn B (5) entirely when nothing qualifies — which
 is the common case: non-durable items, durables you judge not worth
 tracking, and product-less lines all fall out.
 
-**Selling it is the other half (#221).** An \`income\` buyback / trade-in
+`,
+  `Serial number, location, warranty and condition are the user's to fill
+in later. Most receipts track nothing: non-durable items, durables you
+judge not worth tracking, and lines without a product_key stay unset.
+
+`,
+)}**Selling it is the other half (#221).** An \`income\` buyback / trade-in
 / resale means the user no longer owns the thing, so leaving it in
 inventory is a lie they have to find and undo by hand. When the flow is
-\`income\` and the document names a specific item, RETIRE the matching
+\`income\` and the document names a specific item, ${w(
+  `RETIRE the matching
 row instead of inserting one — statement (5b) of Turn B:
 
   UPDATE owned_items o
@@ -1485,14 +1884,27 @@ of a tracked durable, note it there too and move on; its owned_items
 row hangs off the ORIGINAL purchase's transaction_item, which the
 refund does not touch. Delete (5b) for purchase and refund flows.
 
-### 4a-ter. transaction_parties — the party graph (#149 P4)
+`,
+  `name it in
+\`sold_item\`: \`name_as_printed\`, plus the \`product_key\` it was bought
+under when you know it. The server retires the owned instance only when
+exactly one live instance of that product is owned: two identical
+iPhones and one buyback receipt cannot say which one left, and retiring
+the wrong instance destroys its serial / warranty / location. An
+un-retired item is a nuisance, a wrongly-retired one is lost data. For a
+\`refund\` of a tracked durable, do nothing here: its owned instance
+hangs off the ORIGINAL purchase, which the refund does not touch.
+\`sold_item\` is for income only.
+
+`,
+)}### 4a-ter. ${w("transaction_parties", "parties")} — the party graph (#149 P4)
 
 The card statement sees one merchant; the receipt sees more. Record
-every party the receipt TEXT states, one row per (role, party):
+every party the receipt TEXT states, ${w("one row", "one \`parties\` entry")} per (role, party):
 
-  - **channel** (tx-level, transaction_item_id NULL): the platform /
+  - **channel** (${w("tx-level, transaction_item_id NULL", "transaction-level, line_no null")}): the platform /
     statement entity that took the order — what shows up as the line on
-    a card statement. ALWAYS write exactly one channel row.
+    a card statement. ALWAYS ${w("write exactly one channel row", "give exactly one channel entry")}.
     · DEFAULT (a normal in-store / single-merchant receipt): the
       channel IS the merchant you resolved in Phase 2.5 — duplicate it
       with its brand_id.
@@ -1521,7 +1933,8 @@ every party the receipt TEXT states, one row per (role, party):
     (DoorDash etc.) is a channel, NEVER an acquirer. Rare; skip when
     absent.
 
-\`display_name\` = the string as printed. \`brand_id\`: reuse the
+${w(
+  `\`display_name\` = the string as printed. \`brand_id\`: reuse the
 channel's resolved brand for the channel row; for sellers/makers, set
 it ONLY when a brands row already exists (check with a SELECT) or the
 party is unambiguously a known brand — then upsert a brands row first
@@ -1539,9 +1952,22 @@ produces just the one channel row. This step is additive — never let a
 parties failure roll back the transaction itself, which is exactly why
 Turn B places it after COMMIT rather than inside the block.
 
-### 4b. statement_pdf
+`,
+  `\`display_name\` = the string as printed. \`brand_id\`: the channel's
+resolved brand for the channel entry; for sellers and makers a slug
+(same rules as merchant.brand_id) ONLY when the party is unambiguously a
+known brand (AnkerDirect → anker). Otherwise leave brand_id null — a
+text-only entry is still useful. \`line_no\`: the item's line_no for a
+line-level party, null for a transaction-level one.
 
-Loop over each row on the statement. Per row: one BEGIN/COMMIT, same
+Don't fabricate parties; a plain single-merchant receipt legitimately
+produces just the one channel entry.
+
+`,
+)}### 4b. statement_pdf
+
+${w(
+  `Loop over each row on the statement. Per row: one BEGIN/COMMIT, same
 shape as 4a (expense side determined by payee name, mirror = Credit
 Card). If a row's payee is ambiguous or zero-amount, skip it but log a
 warning line.
@@ -1610,9 +2036,31 @@ constraint error), catch it and instead:
    WHERE id = '${ctx.ingestId}';
   SQL
 
-── Phase 6 — Propose a lesson (optional, best-effort, human-reviewed) ──
+`,
+  `A statement is recorded, not booked: the server keeps your rows as
+evidence and writes no transaction from them. Give every row on the
+statement as one \`statement_rows\` entry: occurred_on, the description
+as printed, amount_minor, currency and kind. No facts, merchant, items or
+audit on a statement record.
 
-After the ingest is closed, if THIS run hit something genuinely worth
+Statement CREDIT rows (printed as a credit, a minus sign, or in a
+"Payments and Credits" section) take a NEGATIVE amount_minor and kind
+\`credit\`; charges are positive, kind \`charge\` (\`fee\` and
+\`interest\` for those rows). The row that PAYS the card bill is kind
+\`payment\`. Skip nothing: an ambiguous row is still a row.
+
+### 4c. unsupported
+
+No facts, merchant, items or audit. Fill \`unsupported\` with a reason
+(\`not_a_receipt\`, \`transfer\`, \`marketing\`, \`unreadable\` or
+\`other\`) and a one-line note on what the document is, then hand back
+the record.
+
+`,
+)}── Phase 6 — Propose a lesson (optional, best-effort, human-reviewed) ──
+
+${w(
+  `After the ingest is closed, if THIS run hit something genuinely worth
 remembering — a slowdown you could have avoided, an error you had to
 self-correct, a schema surprise, or a skip heuristic that clearly paid
 off or misfired — append ONE concise line to the PROPOSAL file:
@@ -1620,7 +2068,15 @@ off or misfired — append ONE concise line to the PROPOSAL file:
   echo '- [<classification>] <one specific, evidence-based lesson>' \\
     >> ${PROPOSED_LESSONS_PATH} 2>/dev/null || true
 
-This is how the extractor improves itself over time WITHOUT self-poisoning:
+`,
+  `If THIS run hit something genuinely worth remembering — a slowdown you
+could have avoided, an error you had to self-correct, a surprise in the
+document, or a skip heuristic that clearly paid off or misfired — put
+ONE concise lesson in the record's \`lesson_proposal\` field (at most
+600 characters). The server appends it to the proposal file.
+
+`,
+)}This is how the extractor improves itself over time WITHOUT self-poisoning:
   • Proposals are for a HUMAN to review and promote into the curated
     lesson set that gets fed back to future runs. They are NOT active
     rules; never read this file back, never treat your own proposals as
@@ -1629,11 +2085,15 @@ This is how the extractor improves itself over time WITHOUT self-poisoning:
     date as MM/DD in tiny type at the top-right — check there first"), not
     generic ("be careful with dates").
   • Skip this entirely on an unremarkable run. No lesson beats a noise
-    lesson — the reviewer's attention is the bottleneck.
+    lesson — the reviewer's attention is the bottleneck.${w(
+      `
   • Never let this step fail or delay the run. The \`2>/dev/null || true\`
-    drops it silently if the file is not writable. Do not retry.
+    drops it silently if the file is not writable. Do not retry.`,
+      "",
+    )}
 
-── Output ─────────────────────────────────────────────────────────────
+${w(
+  `── Output ─────────────────────────────────────────────────────────────
 
 After all SQL is committed, print ONE summary line to stdout so the
 Node worker can log it:
@@ -1659,5 +2119,7 @@ the database is your output.
   session transcript.
 - On any failure, leave the ingest row with status='error' and a
   helpful one-line error message. Never leave it stuck in 'processing'.
-`;
+`,
+  recordHandBack(),
+)}`;
 }

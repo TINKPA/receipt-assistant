@@ -9,7 +9,7 @@ This file is for whoever is **developing** this repo: a person, or an AI working
 | Reader | What it needs | Where that lives |
 |---|---|---|
 | Developer (you) | How the project is built, deployed and debugged | This file, `README.md`, `docs/` |
-| Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract |
+| Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger (legacy rendering), or how to hand it back as an extraction record (record rendering, wave 1) | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract. The record rendering also carries the contract, generated from `src/ingest/contract/v1.ts` by `renderContractForPrompt()`, and the list of problems `validate.ts::renderRepairRequest` sends back |
 | Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger. It has no tools: it writes SQL and the server runs it as a read-only role | `src/insights/ask.ts` |
 
 Keep them apart:
@@ -135,7 +135,16 @@ The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration,
 
 **The legacy rendering is frozen while wave 1 is in flight.** `npm run build` runs `scripts/check-prompt-render.ts`, which renders the ingest prompt (`writer: 'agent_sql'`) and the re-extract prompt for fixed contexts that reach every branch the templates take on their context, and compares SHA-256 hashes with `scripts/prompt-render.golden.json`. The golden was taken before wave 1 touched a prompt file. The git sha, `EXTRACTION_MODEL`, the curated lessons body and the clock are pinned or normalised first, so only template text counts. A failure means the text production runs has changed: take the change out of the legacy rendering. Never update the golden to make it pass; `--update-golden` exists for the day the legacy writer is retired. `--dump=<dir>` writes the normalised renderings for a `diff -r` against the base commit.
 
-Wave 1 adds three more constants for the server writer, all shipped dark. `RECORD_PROMPT_VERSION` (`prompt-contract.ts`, `"4.0"`) versions the record rendering of the ingest prompt, under the same rules as above. `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, `1`) versions the shape of the extraction record; any change to that shape bumps it, always together with `RECORD_PROMPT_VERSION`. `APPLIER_VERSION` (`src/ingest/apply/version.ts`, `"1.0"`) versions the rules that turn a record into ledger rows: bump it with any change to a projection, dedup or catalog rule, with no prompt bump. `PROMPT_VERSION` stays the legacy line until the agent-SQL writer is retired.
+Wave 1 adds constants for the server writer, all shipped dark. Until the agent-SQL writer is retired two prompt lines are live, told apart by `metadata.extraction.writer`:
+
+| Constant | Value | Versions | Bump when |
+|---|---|---|---|
+| `PROMPT_VERSION` (`prompt-contract.ts`) | `"3.4"`, frozen | the legacy rendering (`writer: 'agent_sql'`) and re-extract | as above; in practice never, because the golden check above refuses any change to that text |
+| `RECORD_PROMPT_VERSION` (`prompt-contract.ts`) | `"4.0"` | the record rendering of the ingest prompt (`writer: 'server_apply'`) | any semantic change to that rendering, under the same rules as above |
+| `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, re-exported by `prompt-contract.ts`) | `1` | the shape of the extraction record | any change to the zod shape, always together with `RECORD_PROMPT_VERSION` |
+| `APPLIER_VERSION` (`src/ingest/apply/version.ts`) | `"1.0"` | the rules that turn a record into ledger rows | any change to a projection, dedup or catalog rule; no prompt bump |
+
+When the legacy writer is retired the prompt constants collapse into one `PROMPT_VERSION = "4.0"`.
 
 ### Extraction records (`document_extractions`, wave 1)
 
@@ -145,6 +154,11 @@ Under the server writer the agent no longer writes SQL: it ends its final messag
 - `src/ingest/contract/validate.ts`: normalisations (applied and listed on the record), errors (bounced to one `--resume` repair round, then stored as an invalid record) and warnings (stored), each with a stable rule id; `renderRepairRequest` (names a path and a rule, never a value); `diffRepair` (what a repair changed without being asked). Dates are judged against the upload time, never the clock.
 - `src/ingest/contract/artefact.ts`: finds the record: the last ```` ```json ```` block with a `contract_version` in stdout, else in the session transcript's assistant text, never in a tool result, a tool call, a user turn or a thinking block. Caps: 256 KB record, 64 KB receipt text.
 - `src/ingest/records.ts`: the only writer of `document_extractions`. In the caller's transaction it stores the record (valid or invalid), supersedes the document's current valid one, and sets `agent_runs.extraction_id`.
+- The record rendering of the prompt: `buildExtractorPrompt({ writer: 'server_apply', … })`. One template serves both writers: every write-specific block of `prompt.ts` and its modules is `forWriter(writer, legacyText, recordText)`, so the reading text the arms share has one source, and `scripts/check-prompt-render.ts` proves the `agent_sql` side has not moved a byte. The record side drops psql, Turn A/B/C, the Message-ID and near-dup steps, Phase 2.6's web search and upsert, the place fetch (3b–3d), the icon gate, Phase 5 and the provenance template, and keeps every reading rule (Phase 0–2.7, the date checks, Phase 3a, Check C, 3e, the identifier contract, the owned-item and party judgments). It ends with "Hand back your record": the ending rule, "omit rather than invent", the one list of problems the server may send back, and the contract itself. The decoded email body sits between a fence name drawn at random per run, so a sender cannot close the block early. Lessons tagged `[write]` in `lessons.md` (SQL or template mechanics) are left out of it, and `[record]` lines are its own; see the file's header.
+- `src/claude.ts`: the `extraction_record` profile (Bash, Read, Write; `GOOGLE_MAPS_API_KEY` only; no `DATABASE_URL`), and `runClaude`'s `resumeSessionId`, which replaces `--session-id` with `--resume <id>`, applies the profile's flags again and keeps the prompt on stdin. Only server code fills it, with the session id it minted for the run.
+- `src/ingest/extractor.ts::runRecordExtraction`: spawns the record rendering on the worker's session id, finds and validates the record, and while it is invalid and rounds are left, resumes the same session with the list of problems on stdin (300 s per round), parses only what the round added to the transcript, re-validates, and records what the repair changed unasked (`repair_changed_unnamed`). It writes nothing: it returns the outcome T1 stores, the receipt text, the rounds, the stdout tail and the failure class (`artefact_missing`, `artefact_invalid`, or the spawn error for `classifyAgentFailure`). A missing record is not sent back, and a first spawn that failed is not parsed.
+
+**The writer flag.** `EXTRACTION_WRITER` (`agent_sql` | `server_apply`, default `agent_sql` in both compose files) is meant to pick, per run, between the legacy path and the server writer; `EXTRACTION_REPAIR_ROUNDS` (0–2, default 1; an integer outside the range is clamped, anything else is the default) is how many times an invalid record goes back to its session. The worker does not read either for the server writer yet: until it is wired, every run takes `agent_sql` and says so once in the log (see "Run records"). Set `EXTRACTION_REPAIR_ROUNDS=0` on a CLI where `probe-cli`'s gating checks fail.
 
 Rows are immutable: a trigger lets only `superseded_at` change (and the `ON DELETE SET NULL` foreign keys clear a reference to a deleted run, ingest or record). A partial unique index keeps one current valid record per document. A warning found while a record is applied therefore goes on the run's `apply_report`, never back onto the record. `scripts/check-contract.ts` exercises every rule with synthetic records and runs before every build; `scripts/check-extraction-records.ts --disposable --db=<throwaway>` checks the table, the trigger, the index and the writer against a real Postgres.
 
@@ -323,14 +337,14 @@ Both agents are `claude -p` children of the server, and both read text a strange
 
 `src/claude.ts` is the only place a child is spawned, and every spawn names a profile:
 
-| | `extraction` (ingest, re-extract) | `ask` | `text` (backfill scripts) |
-|---|---|---|---|
-| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | none | none |
-| Permissions | bypassed: Bash is unrestricted here anyway | `dontAsk`, with nothing to approve | none needed |
-| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: the server runs its SQL, as `receipts_ro` | unset |
-| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | none | none |
+| | `extraction` (ingest, re-extract) | `extraction_record` (ingest under the server writer, wave 1) | `ask` | `text` (backfill scripts) |
+|---|---|---|---|---|
+| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | Bash, Read, Write | none | none |
+| Permissions | bypassed: Bash is unrestricted here anyway | bypassed, as `extraction` | `dontAsk`, with nothing to approve | none needed |
+| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: it hands back a record and the server writes | unset: the server runs its SQL, as `receipts_ro` | unset |
+| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | `GOOGLE_MAPS_API_KEY` (Phase 3a and Check C) | none | none |
 
-Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`.
+Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`. The argv is put together in one place, `claudeSpawnArgs`, which `check-agent-sandbox` uses too: `-p`, the profile's flags, the caller's flags, then `--session-id <id>` for a new session or `--resume <id>` for a repair round, never both (the CLI refuses the pair).
 
 The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` and `probe-cli` (below) with every bump.
 
@@ -345,7 +359,7 @@ To let the extraction agent do something new, edit `AGENT_GRANTS` in the same ch
 
 **Tables added later.** `receipts_ro` can read a new table as soon as it exists (a default privilege, re-asserted at boot) and can never write to it. `receipts_agent` cannot see a new table or view until `AGENT_GRANTS` lists it. Three things keep that from failing quietly:
 
-1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template.
+1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template. It also renders the record rendering of the ingest prompt, whose agent has no database, and fails on any SQL statement, uppercase `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`ALTER`/`DROP`, `psql`, `DATABASE_URL`, `WebSearch`, the logo key or the Google place-record endpoint in it.
 2. Boot logs the tables the role cannot touch, and logs an error for every difference between the live privileges and the file.
 3. `check-agent-sandbox` fails on the same differences.
 
@@ -379,7 +393,7 @@ npx tsx scripts/check-agent-sandbox.ts             # runs inside receipt-assista
 npx tsx scripts/check-agent-sandbox.ts --db-only   # database half only, no model calls
 ```
 
-It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Every database statement is inside a transaction that is rolled back.
+It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the record run prints its `$DATABASE_URL`, which must be unset, and is then resumed with `--resume` the way a repair round is, and the resumed session must offer exactly the profile's tools; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Without any model call it also checks the record profile's configuration: no `DATABASE_URL` or logo key in its environment, no WebSearch, and a resume argv with `--resume` and no `--session-id`. Every database statement is inside a transaction that is rolled back.
 
 A check that could not be carried out (usually because `claude` cannot authenticate in the sandbox) is reported as INCONCLUSIVE and fails the run. A green run means every claim was exercised.
 
@@ -446,9 +460,10 @@ For Ask, what remains: the model reads the whole ledger, including `ocr_text` wr
    - `src/claude.ts::assertArgvSafe()` runs before every spawn and
      throws a message naming the offending argument and its byte size.
    - `src/claude.ts::runClaude` is the only `claude` spawn site (the
-     extractor's `runExtractorClaude` calls it). It takes `prompt` as a
-     separate parameter, and `runSupervised`, which does the spawning,
-     writes it to stdin. `stdio[0]` must be `"pipe"`, and the
+     extractor's `runExtractorClaude` and `runRecordExtraction` call it).
+     It takes `prompt` as a separate parameter, and `runSupervised`,
+     which does the spawning, writes it to stdin; a repair round's
+     `--resume` spawn sends its list of problems the same way. `stdio[0]` must be `"pipe"`, and the
      `child.stdin.on("error", …)` handler must stay — the child can exit
      before draining stdin (auth failure, bad flag) and the resulting
      `EPIPE` would otherwise crash the worker instead of rejecting the
@@ -482,6 +497,16 @@ For Ask, what remains: the model reads the whole ledger, including `ocr_text` wr
    `src/claude.ts::processReceipt` that used to own this was deleted
    in #164; `src/claude.ts` now owns only how a child is spawned:
    `runClaude` and the agent profiles (see "Agent sandbox").
+
+   **The record rendering (wave 1) is not `--json-schema`.** Its agent
+   also ends with JSON, one fenced extraction record, but it is spawned
+   with `--output-format text` and no schema, reasons in plain text
+   first exactly as above, and writes the record once, after the
+   reasoning, as the conclusion of it. That is the thing pitfall 1
+   protects; the forced, reasoning-free mode is what degraded OCR. The
+   prompt keeps `NO_JSON_SCHEMA_RULE` and says the record is not that
+   mode. Do not "simplify" the hand-back into `--json-schema` or
+   `--output-format json` without an A/B.
 
    An earlier two-phase variant (Phase 1: image → plain-text OCR;
    Phase 2: separate `claude -p` call structuring the text into JSON

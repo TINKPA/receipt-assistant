@@ -2,8 +2,12 @@
  * Shared brand-icon acquisition + judgment phases for the extraction
  * and re-extraction prompts (#101).
  *
- * Both prompts inline Phase 2.6 and the Phase 4b/4c GATE verbatim. The
- * 4b/4c procedure itself is NOT inlined (#227): it ships in the image as
+ * Both legacy prompts inline Phase 2.6 and the Phase 4b/4c GATE verbatim.
+ * The record rendering of the ingest prompt (wave 1) has neither: its
+ * Phase 2.6 is `PHASE_2_6_BRAND_NAME_RECORD`, two fields read off the
+ * document, and it does no icon work at all.
+ *
+ * The 4b/4c procedure itself is NOT inlined (#227): it ships in the image as
  * `brand-icon-pipeline.md` and the gate tells the agent to `cat` it only
  * when a brand actually needs icon work. That file is plain text the
  * agent reads as-is — no template escaping applies to it.
@@ -103,6 +107,35 @@ Steps (run once per unique merchant brand_id in this document):
 
 Token cost: discovery dominated by WebSearch (1 call per unseen brand).
 Already-cached brands cost only one SELECT. Most receipts hit cache.`;
+
+/**
+ * Phase 2.6 in the record rendering (wave 1, plan §9.2). Steps 1–2 of the
+ * legacy phase survive as two optional merchant fields; the registry read,
+ * the web search for a domain, the upsert and the icon pipeline do not.
+ * The server keeps the brand row (it never overwrites a real name with a
+ * new one), and icons wait for a server-side enrichment job.
+ *
+ * The domain is taken only from the document: a looked-up domain fed
+ * nothing but icons, and icons are not fetched any more.
+ */
+export const PHASE_2_6_BRAND_NAME_RECORD = `── Phase 2.6 — Brand name and domain (#101) ───────────────────────────
+
+Two optional fields of the merchant block, read off the document and
+never looked up:
+
+  brand_name   the brand's own name when it differs from canonical_name
+               (a franchise or a product line printed under its
+               operator's name). Leave it out when they are the same.
+  domain_hint  the brand's web domain, ONLY when the document prints it
+               (a URL or an email address on the receipt) or when it is
+               the sender's domain of a receipt email (orders@example.com
+               → example.com). Not when the sender is a platform or a
+               payment processor writing on the merchant's behalf
+               (Stripe, Square, Toast, PayPal). Lowercase hostname, no
+               scheme and no path. Never guess one, never search for one.
+
+There is no brand registry to read and no icon to fetch: the server
+keeps the brand row.`;
 
 /**
  * Where the on-demand Phase 4b/4c procedure lives INSIDE the container.
