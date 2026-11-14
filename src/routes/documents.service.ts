@@ -7,7 +7,7 @@
 import { createHash } from "crypto";
 import { mkdir, writeFile, rename, readFile } from "fs/promises";
 import * as path from "path";
-import { simpleParser } from "mailparser";
+import { simpleParser, type ParsedMail } from "mailparser";
 import sanitizeHtml from "sanitize-html";
 import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -1150,6 +1150,7 @@ async function extractSourceText(
 
   if (isEmail) {
     const parsed = await simpleParser(await readFile(absPath));
+    const email = emailHeaders(parsed);
     const attachments = attachmentDir
       ? await writePdfAttachments(parsed.attachments ?? [], attachmentDir)
       : [];
@@ -1165,7 +1166,7 @@ async function extractSourceText(
       parsed.date ? `Date (envelope): ${parsed.date.toISOString()}` : null,
     ].filter((l): l is string => l !== null);
     const joined = [headers.join("\n"), body].filter(Boolean).join("\n\n");
-    return { text: joined.length > 0 ? joined : null, attachments };
+    return { text: joined.length > 0 ? joined : null, attachments, email };
   }
 
   if (isHtml) {
@@ -1180,6 +1181,49 @@ async function extractSourceText(
 export interface DecodedSource {
   text: string | null;
   attachments: DecodedAttachment[];
+  /** The envelope headers, for an email the server parsed. Absent for
+   *  HTML, images and PDFs, and when the decode failed. */
+  email?: DecodedEmailHeaders;
+}
+
+/**
+ * An email's envelope as the server's own MIME parse reads it — the
+ * values `documents.message_id` and `documents.source_meta` are stamped
+ * with, so they never have to come from the model.
+ */
+export interface DecodedEmailHeaders {
+  /** Message-ID without its angle brackets (`id@host`), the one form
+   *  `documents.message_id` holds and the Message-ID dedup compares. */
+  messageId: string | null;
+  /** The From header as the parser formats it, `Name <address>`. */
+  from: string | null;
+  subject: string | null;
+  /** The Date header as ISO-8601 (UTC). NULL when absent or unparseable:
+   *  the parser substitutes the current time for a bad date, and that is
+   *  not when the email was sent. */
+  date: string | null;
+}
+
+/** Strip the angle brackets the parser adds (`<id@host>` → `id@host`). */
+export function bareMessageId(raw: string | null | undefined): string | null {
+  const t = (raw ?? "").trim().replace(/^<+/, "").replace(/>+$/, "").trim();
+  return t.length > 0 ? t : null;
+}
+
+function emailHeaders(parsed: ParsedMail): DecodedEmailHeaders {
+  const dateLine = parsed.headerLines?.find((h) => h.key === "date")?.line;
+  let date: string | null = null;
+  if (dateLine) {
+    const raw = dateLine.slice(dateLine.indexOf(":") + 1).replace(/\r?\n[ \t]+/g, " ").trim();
+    const d = new Date(raw);
+    date = Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return {
+    messageId: bareMessageId(parsed.messageId),
+    from: parsed.from?.text?.trim() || null,
+    subject: parsed.subject?.trim() || null,
+    date,
+  };
 }
 
 const MAX_ATTACHMENTS = 5;
@@ -1242,6 +1286,7 @@ export async function decodeSourceForAgent(
     return {
       text: capSourceText(decoded.text, doc.id, label),
       attachments: decoded.attachments,
+      ...(decoded.email ? { email: decoded.email } : {}),
     };
   } catch (err) {
     console.warn(
