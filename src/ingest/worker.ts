@@ -22,7 +22,9 @@
  *
  * A stub upload (sandbox only, `EXTRACTOR_STUB_ALLOWED=1`) carries its own
  * path whatever the variable says: a `terminal` stub the legacy one (run
- * writer `stub`), a `record` stub the server writer's (`server_apply`).
+ * writer `stub`), a `record` stub the server writer's (`server_apply`),
+ * and a `follow_writer` stub, which has both parts, the one the variable
+ * names.
  *
  * Design notes
  *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 1;
@@ -129,7 +131,7 @@ type ExtractionPath =
  */
 async function pickPath(absPath: string): Promise<ExtractionPath> {
   if (process.env.EXTRACTOR_STUB_ALLOWED === "1") {
-    const stub = await readStubMode(absPath);
+    const stub = await readStubMode(absPath, extractionWriter());
     if (stub?.mode === "legacy") return { writer: "stub", extractor: stubFileExtractor };
     if (stub?.mode === "record") return { writer: "server_apply", stub: stub.stub };
   }

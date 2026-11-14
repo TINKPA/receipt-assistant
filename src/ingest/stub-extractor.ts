@@ -41,8 +41,16 @@
  *     "ignore_term": true,            // child and (escaped) grandchildren
  *                                     // ignore SIGTERM, so only the SIGKILL
  *                                     // step ends them
- *     "timeout_ms": 5000              // this run's timeout; default and
+ *     "timeout_ms": 5000,             // this run's timeout; default and
  *                                     // ceiling CLAUDE_TIMEOUT_MS
+ *     "fail_as": "quota"              // with a non-zero exit_code: print, on
+ *                                     // stderr, a fixed line in the words the
+ *                                     // CLI uses for that outage, so the run
+ *                                     // is classed `quota`, `overloaded` or
+ *                                     // `auth` as a real one would be (an A/B
+ *                                     // campaign stops on those; this is how
+ *                                     // its stop is rehearsed). Only these
+ *                                     // three values; the text is fixed here
  *   },
  *   When the child times out or exits non-zero the stub stops there, as a
  *   dead agent would: nothing below is written and the run fails with the
@@ -105,6 +113,14 @@
  *                                     // (T2), so a check can kill the
  *                                     // server in between
  * }
+ *
+ * FOLLOWING THE WRITER. A file with both `terminal` and `record` and
+ * `"follow_writer": true` takes the path `EXTRACTION_WRITER` names for a
+ * real upload: the legacy one (its `terminal` part) under `agent_sql`, the
+ * record one under `server_apply`. Every other stub keeps choosing its own
+ * path. One manifest of such files rehearses both arms of the wave-1 A/B
+ * (`scripts/ab-campaign.ts`), and the run's writer then proves the
+ * campaign really switched the stack between arms.
  */
 import { readFile } from "node:fs/promises";
 import { sql } from "drizzle-orm";
@@ -121,7 +137,20 @@ interface StubChild {
   escaped_s?: number;
   ignore_term?: boolean;
   timeout_ms?: number;
+  fail_as?: StubOutage;
 }
+
+/**
+ * `child.fail_as`: the line a failing child prints on stderr, in the
+ * CLI's words for that outage, which `classifyAgentFailure` reads. Fixed
+ * text chosen by name; nothing from the file reaches the shell.
+ */
+const STUB_OUTAGE_TEXT = {
+  quota: "Claude AI usage limit reached|resets 4am (stub child: a simulated outage)",
+  overloaded: "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}} (stub child: a simulated outage)",
+  auth: "Failed to authenticate. API Error: 401 authentication_error (stub child: a simulated outage)",
+} as const;
+type StubOutage = keyof typeof STUB_OUTAGE_TEXT;
 
 /**
  * The `escaped_s` helper, run by `node -e` in the child's group: it starts
@@ -209,6 +238,10 @@ async function runStubChild(
     boundedInt(c.timeout_ms, 1, CLAUDE_TIMEOUT_MS, CLAUDE_TIMEOUT_MS, "timeout_ms"),
     opts.timeoutMs ?? CLAUDE_TIMEOUT_MS,
   );
+  if (c.fail_as !== undefined && !Object.hasOwn(STUB_OUTAGE_TEXT, c.fail_as)) {
+    throw new Error(`stub-extractor: child.fail_as must be one of ${Object.keys(STUB_OUTAGE_TEXT).join(", ")}`);
+  }
+  const failText = c.fail_as !== undefined && exitCode !== 0 ? STUB_OUTAGE_TEXT[c.fail_as] : "";
   // Record mode: after the sleep the child copies its stdin (the fenced
   // record) to stdout, as the agent's final message ends up there.
   const print = opts.print !== undefined;
@@ -219,6 +252,7 @@ async function runStubChild(
     'echo "STUB CHILD pid=$$ sleeping $STUB_SLEEP_S s"',
     'sleep "$STUB_SLEEP_S"',
     ...(print ? ["cat"] : []),
+    'if [ -n "$STUB_FAIL_TEXT" ]; then printf "%s\\n" "$STUB_FAIL_TEXT" >&2; fi',
     'exit "$STUB_EXIT_CODE"',
   ].join("\n");
   return runAgentChild("/bin/sh", ["-c", script], {
@@ -231,6 +265,7 @@ async function runStubChild(
       STUB_NODE: process.execPath,
       STUB_ESCAPED_JS: ESCAPED_HELPER_JS,
       STUB_IGNORE_TERM: c.ignore_term ? "1" : "0",
+      STUB_FAIL_TEXT: failText,
     },
     input: opts.print ?? "",
     timeoutMs,
@@ -381,14 +416,23 @@ function stubEmail(v: unknown): DecodedEmailHeaders | null {
 
 /**
  * Which path a stub upload takes, read from the file itself: `record`
- * present is the server writer's stub, anything else the legacy one. Null
- * when the file is not a stub. Throws on a record stub whose fields are
- * malformed (the worker errors that ingest).
+ * present is the server writer's stub, anything else the legacy one; a
+ * `follow_writer` file with both parts takes the path `writer` (the
+ * server's `EXTRACTION_WRITER`) names. Null when the file is not a stub.
+ * Throws on a record stub whose fields are malformed (the worker errors
+ * that ingest).
  */
-export async function readStubMode(absPath: string): Promise<StubMode | null> {
+export async function readStubMode(
+  absPath: string,
+  writer: "agent_sql" | "server_apply",
+): Promise<StubMode | null> {
   const ins = await readStubJson(absPath);
   if (!ins) return null;
   if (!Object.hasOwn(ins, "record")) return { mode: "legacy" };
+  if (ins.follow_writer === true) {
+    if (!ins.terminal) throw new Error("stub-extractor: a follow_writer stub needs both terminal and record");
+    if (writer === "agent_sql") return { mode: "legacy" };
+  }
   const phash = optionalText(ins.phash, "phash");
   if (phash !== null && !PHASH_RE.test(phash)) throw new Error("stub-extractor: phash must be 16 lower-case hex digits");
   const child = ins.child ?? {};

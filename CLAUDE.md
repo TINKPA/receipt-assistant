@@ -237,7 +237,7 @@ SELECT metadata->'extraction' FROM transactions WHERE id = $1;
 
 **Arm B's rows differ from arm A's on purpose.** The list (X1–X13, plus the tenders) is under "Expected differences from the legacy writer" in the design doc; the A/B adjudicates those as expected, not as regressions. One of them already reaches the `agent_sql` side: since d224b7b, which production runs, reconcile's `cardLast4` reads a typed `metadata.card_last4` first on every row, legacy rows included. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one); a change in what reconcile proposes may come from it rather than from the writer. The rollout itself (sandbox check, A/B gates, flip, watch, rollback triggers) is under "Rollout".
 
-**Stubs.** A stub upload (sandbox only) takes the path it names, whatever `EXTRACTION_WRITER` says: a `terminal` stub the legacy one (run writer `stub`), a `record` stub the server writer's (run writer `server_apply`, record origin `stub`, no model or CLI on the run). A record stub's child prints its record as the agent's final message, so the real parser, validator, repair round, T1 and applier run on it; it can also supply the email envelope, a pHash, a pause between T1 and T2, and a failing child for the repair round only (`repair_child`). See RECORD MODE in `src/ingest/stub-extractor.ts`.
+**Stubs.** A stub upload (sandbox only) takes the path it names, whatever `EXTRACTION_WRITER` says: a `terminal` stub the legacy one (run writer `stub`), a `record` stub the server writer's (run writer `server_apply`, record origin `stub`, no model or CLI on the run). The one exception is a `follow_writer` stub, which carries both parts and takes the path the variable names, for rehearsing both arms of the A/B with one manifest. A record stub's child prints its record as the agent's final message, so the real parser, validator, repair round, T1 and applier run on it; it can also supply the email envelope, a pHash, a pause between T1 and T2, and a failing child for the repair round only (`repair_child`). See RECORD MODE in `src/ingest/stub-extractor.ts`.
 
 ### Three ways to re-run a layer
 
@@ -853,7 +853,11 @@ session of its own as the CLI's Bash tool runs commands), for testing the
 timeout and slot-release path without a real run. Its record mode
 (`"record"` instead of `"terminal"`) stands in for the server writer's
 agent: that child prints the record, and a `repair_record` on `--resume`;
-see the header of `src/ingest/stub-extractor.ts`. Don't run the claude cases while
+see the header of `src/ingest/stub-extractor.ts`. A `follow_writer` stub
+carries both parts and takes the path `EXTRACTION_WRITER` names, and a
+failing child can print the CLI's words for an outage (`child.fail_as`:
+`quota`, `overloaded`, `auth`); both exist to rehearse the A/B campaign
+runner without a model. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and
 the auth pool, and harness poll timeouts will fire while queued.
 
