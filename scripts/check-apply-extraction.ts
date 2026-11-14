@@ -745,7 +745,7 @@ await fixture("tenders: a mixed tender is booked whole to Credit Card, warned an
   const queue = await q(`SELECT id FROM transactions WHERE id = $1 AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`, [txId]);
   check("the review queue's predicate lists it", queue.length === 1);
   check("reconcile reads no verdict about any pair from it", verdictAbout({ near_dup_check: nd } as any, randomUUID()) === null);
-  check("the run's report says why", /split not booked/.test(r.res.report?.accounts?.flagged_for_review ?? ""), json(r.res.report?.accounts));
+  check("the run's report says why", /split not booked/.test(String(r.res.report?.accounts?.flagged_for_review ?? "")), json(r.res.report?.accounts));
   check("the dedup decision itself found nothing", r.res.report?.decision?.verdict === "none" && r.res.report?.decision?.flagged_for_review === false);
   await expect({ transactions: 1, postings: 2, document_links: 1, transaction_items: 1, products: 1, transaction_parties: 1,
     transaction_events: 1, merchants: 1, brands: 1, document_extractions: 1 });
