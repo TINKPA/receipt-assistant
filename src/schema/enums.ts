@@ -117,6 +117,20 @@ export const agentRunOutcomeEnum = pgEnum("agent_run_outcome", [
   "interrupted",
 ]);
 
+// Where a `document_extractions` record came from (wave 1, P2): the
+// extraction agent, the sandbox stub, a record synthesised from an
+// existing ledger row (wave 2), or a person.
+export const extractionOriginEnum = pgEnum("extraction_origin", [
+  "agent",
+  "stub",
+  "ledger_backfill",
+  "manual",
+]);
+
+// Whether a stored extraction record passed validation. An invalid one is
+// kept as evidence of what the agent handed back and is never applied.
+export const extractionStatusEnum = pgEnum("extraction_status", ["valid", "invalid"]);
+
 // Background-enrichment state for merchant rows (#64). New merchants land
 // as `pending`; the Places worker advances to `success`/`not_found`/`failed`
 // after one round-trip to Google Places. `failed` retries on backoff.

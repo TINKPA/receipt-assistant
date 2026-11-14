@@ -121,6 +121,52 @@ export function currenciesWithExponent(exponent: number): string[] {
   );
 }
 
+/**
+ * Every ISO 4217 code a receipt can be priced in: the active list
+ * (including the funds and units of account, such as the Chilean UF that
+ * rents are quoted in), without the X-codes that are not money (metals,
+ * SDR, testing, "no currency").
+ */
+const ISO_4217_ACTIVE = (
+  "AED AFN ALL AMD AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BOV BRL " +
+  "BSD BTN BWP BYN BZD CAD CDF CHE CHF CHW CLF CLP CNY COP COU CRC CUP CVE CZK DJF " +
+  "DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG " +
+  "HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK " +
+  "LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MXV MYR MZN " +
+  "NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR " +
+  "SBD SCR SDG SEK SGD SHP SLE SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY " +
+  "TTD TWD TZS UAH UGX USD USN UYI UYU UYW UZS VED VES VND VUV WST XAF XCD XCG XOF " +
+  "XPF YER ZAR ZMW ZWG"
+).split(" ");
+
+/**
+ * Codes withdrawn since 2000, so a receipt from before the switch is not
+ * refused as an unknown currency (a 2022 receipt in kuna, a 2010 one in
+ * kroon). Their exponents are not in the table above; every one of them
+ * defaults to 2, which is wrong for a few (lira, peseta), and that only
+ * affects display and the printed-total cross-check of such a receipt.
+ */
+const ISO_4217_WITHDRAWN_SINCE_2000 = (
+  "ANG ATS AZM BEF BYR CSD CUC CYP DEM EEK ESP FIM FRF GHC GRD HRK IEP ITL LTL LUF " +
+  "LVL MGF MRO MTL MZM NLG PTE ROL SDD SIT SKK SLL SRG STD TMM TRL VEB VEF YUM ZMK " +
+  "ZWD ZWL ZWN ZWR"
+).split(" ");
+
+const ISO_4217_CODES: ReadonlySet<string> = new Set([
+  ...ISO_4217_ACTIVE,
+  ...ISO_4217_WITHDRAWN_SINCE_2000,
+]);
+
+/**
+ * Whether `code` is an ISO 4217 currency a receipt can be priced in. A
+ * points code (`HYATT_PT`) is not; ask `isPointsCurrency` for that. The
+ * exponent table above is a list of exceptions and cannot answer this,
+ * since every unlisted code defaults to two decimals.
+ */
+export function isIsoCurrencyCode(code: string): boolean {
+  return ISO_4217_CODES.has(code);
+}
+
 // ── Decimal helpers (integers only, no floats past the parse) ──────────
 
 function pow10(n: number): bigint {

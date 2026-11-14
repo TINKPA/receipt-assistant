@@ -10,6 +10,7 @@ import {
   index,
   uniqueIndex,
   check,
+  foreignKey,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -23,6 +24,7 @@ import { ingests } from "./ingests.js";
 import { documents } from "./documents.js";
 import { transactions } from "./transactions.js";
 import { derivationEvents } from "./derivation_events.js";
+import { documentExtractions } from "./document_extractions.js";
 
 /**
  * One row per `claude -p` run the server starts for a document: every
@@ -54,8 +56,9 @@ import { derivationEvents } from "./derivation_events.js";
  *
  * Several columns are created now so the later phases of wave 1 only
  * add constraints: the lease and heartbeat (durable queue), the
- * `extraction_id` (its foreign key comes with `document_extractions`),
- * `repair_rounds`, `apply_report`. They stay NULL / 0 until then.
+ * `extraction_id` (its foreign key came with `document_extractions` in
+ * 0043), `repair_rounds`, `apply_report`. They stay NULL / 0 until the
+ * phase that writes them.
  *
  * `error_class` vocabulary (text, not an enum, so a class can be added
  * without a migration):
@@ -134,7 +137,8 @@ export const agentRuns = pgTable(
     produced: jsonb("produced"),
     agentReport: jsonb("agent_report"),
     applyReport: jsonb("apply_report"),
-    /** Foreign key added with `document_extractions` (wave 1, P2). */
+    /** The extraction record this run handed back (`document_extractions`,
+     *  wave 1, P2), set in the transaction that stores it. */
     extractionId: uuid("extraction_id"),
     before: jsonb("before"),
     result: jsonb("result"),
@@ -157,5 +161,12 @@ export const agentRuns = pgTable(
       "agent_runs_writer_check",
       sql`${t.writer} IN ('agent_sql','server_apply','stub')`,
     ),
+    // Declared here rather than with `.references()` so the constraint
+    // keeps the name migration 0043 gives it.
+    foreignKey({
+      name: "agent_runs_extraction_fk",
+      columns: [t.extractionId],
+      foreignColumns: [documentExtractions.id],
+    }).onDelete("set null"),
   ],
 );
