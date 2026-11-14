@@ -17,13 +17,21 @@
  * 94.4%, because its SQL required 11 fields its prose never named.
  *
  * Plain template literals, never `String.raw` — see `prompt-contract.ts`.
+ *
+ * Four blocks mention a write: the catalog binding, the allocation audit
+ * and "before COMMIT". Each is a function of the prompt's writer, exported
+ * twice: the legacy const under its old name, unchanged byte for byte, and
+ * a `_RECORD` const for the record rendering (wave 1), whose agent writes
+ * nothing and hands its reading back in the extraction record.
  */
+import { forWriter, type PromptWriter } from "./prompt-contract.js";
 
 /**
  * The full `items[]` object shape — all 26 fields, including the #84
  * product-catalog and per-line allocation columns the SQL requires.
  */
-export const ITEM_SCHEMA = `── items[] shape (per line on the receipt) ───────────────────────────
+function itemSchema(writer: PromptWriter): string {
+  return `── items[] shape (per line on the receipt) ───────────────────────────
 
 Each \`item\` object has these fields:
 
@@ -138,7 +146,7 @@ Each \`item\` object has these fields:
                                         this merchant (Crunchwrap @
                                         Taco Bell, AYCE @ Sichuan Spicy
                                         Bay, in-store private label).
-                                        Phase 4 binds product.merchant_id
+                                        ${forWriter(writer, "Phase 4", "The server")} binds product.merchant_id
                                         to this receipt's merchant.
                                 false → portable / cross-merchant
                                         (iPhone, Coke, brand-name goods).
@@ -174,7 +182,18 @@ Each \`item\` object has these fields:
   tip_share_minor    int|null    per-line tip share from printed tip.
   discount_share_minor int|null  per-line discount share. Signed
                                 positive (always reduces). NULL when
-                                no discount applies.`;
+                                no discount applies.${forWriter(
+    writer,
+    "",
+    `
+
+  track_as_owned     bool|null  true on a durable product line worth
+                                tracking as something the user now owns
+                                (see 4a-bis); leave it out otherwise.`,
+  )}`;
+}
+export const ITEM_SCHEMA = itemSchema("agent_sql");
+export const ITEM_SCHEMA_RECORD = itemSchema("server_apply");
 
 /**
  * `line_type` is an OPEN vocabulary — there is no DB enum, no zod enum
@@ -186,7 +205,8 @@ Each \`item\` object has these fields:
  * overlaps `service_fee` / `surcharge` and only ever existed because
  * the two prompts disagreed.
  */
-export const LINE_TYPE_VOCAB_AND_NAMES = `── line_type vocabulary + naming (OPEN vocabulary) ────────────────────
+function lineTypeVocabAndNames(writer: PromptWriter): string {
+  return `── line_type vocabulary + naming (OPEN vocabulary) ────────────────────
 
 \`line_type\` says which KIND of money a row is. These are the
 RECOMMENDED values — a starting point, not a closed enum:
@@ -239,9 +259,14 @@ NAME PRESERVATION — the printed name is the only copy.
 Two absolute rules on line_type:
   * NEVER force a row into a label that misdescribes it. 'surcharge' is
     not 'fee'; 'service_fee' is not 'tax'.
-  * NEVER DROP a printed row because you could not label it. 'other'
+  * NEVER ${forWriter(writer, "DROP", "LEAVE OUT")} a printed row because you could not label it. 'other'
     always exists. A dropped row is money that vanishes; a row labelled
     'other' is money that stays auditable.`;
+}
+export const LINE_TYPE_VOCAB_AND_NAMES = lineTypeVocabAndNames("agent_sql");
+/** The record rendering's: the same rules without the one word a SQL
+ *  scan of the rendering would read as DDL. */
+export const LINE_TYPE_VOCAB_AND_NAMES_RECORD = lineTypeVocabAndNames("server_apply");
 
 /** The #162 two-level modifier rule, including BOTH the ADDITIVE and
  *  the INCLUSIVE branch. An agent given only the INCLUSIVE branch has
@@ -388,7 +413,8 @@ no price column at all.
  *
  * PR #165/#166 extends this export with the occlusion-bridge rule.
  */
-export const LINE_ITEM_COVERAGE_AND_BRIDGE = `── Coverage: never silently lose money to a region you cannot read ────
+function lineItemCoverageAndBridge(writer: PromptWriter): string {
+  return `── Coverage: never silently lose money to a region you cannot read ────
 
 Two different failures, two different answers. Do not confuse them.
 
@@ -484,15 +510,26 @@ Two different failures, two different answers. Do not confuse them.
   Off by > \$0.50 WITH a bridge row -> recompute the bridge amount from
     the printed subtotal.
   Within \$0.50 but over 1 cent -> keep it, set confidence='low' on the
-    lines you least trust, and record
+    lines you least trust, and ${forWriter(
+      writer,
+      `record
     transactions.metadata.allocation_audit = {kind, expected, got, delta}.
-  Never block the write on a residual; log it.`;
+  Never block the write on a residual; log it.`,
+      `say so in audit.note (expected, got,
+    delta); the server computes the residual and records it itself.
+  Never hold back the record over a residual; note it.`,
+    )}`;
+}
+export const LINE_ITEM_COVERAGE_AND_BRIDGE = lineItemCoverageAndBridge("agent_sql");
+export const LINE_ITEM_COVERAGE_AND_BRIDGE_RECORD = lineItemCoverageAndBridge("server_apply");
 
 /** Phase 2.7 — per-line tax / tip / discount allocation (#84). The
  *  re-extract SQL writes `tax_minor` / `tip_share_minor` /
  *  `discount_share_minor`, so re-extract needs this text too; before
  *  #164 it did not have it and dropped `tax_minor` on 94.4% of lines. */
-export const ALLOCATION_LOGIC = `── Phase 2.7 — Per-line tax / tip / discount allocation (#84) ─────────
+function allocationLogic(writer: PromptWriter): string {
+  const w = (legacy: string, record: string) => forWriter(writer, legacy, record);
+  return `── Phase 2.7 — Per-line tax / tip / discount allocation (#84) ─────────
 
 Receipts print aggregate tax / tip / discount; users want "what did
 this specific line cost me, all-in." Allocate per-line at ingest.
@@ -517,21 +554,29 @@ Discount allocation:
   Receipt names the target ("20% off Item X") → put it all on that
   line. Whole-order ("\$5 off subtotal") → split proportionally.
   BOGO / "buy 2 get 1 free" / promo edge cases → use judgment;
-  record the reasoning in transactions.metadata.allocation_audit.
+  record the reasoning in ${w("transactions.metadata.allocation_audit", "audit.note")}.
 
 The printed tax / tip / discount rows themselves are emitted as items
 per the line_type vocabulary above. Their tax_minor /
 tip_share_minor / discount_share_minor stay NULL — a tax line is not
 itself taxed.
 
-Final self-check before COMMIT:
-  Σ effective_total_minor (line_type='product') ≈ transactions.total
+Final self-check before ${w("COMMIT", "you hand back the record")}:
+  Σ effective_total_minor (line_type='product') ≈ ${w("transactions.total", "facts.total_minor")}
   Σ tax_minor      ≈ items where line_type='tax'
   Σ tip_share_minor ≈ items where line_type='tip'
   Σ discount_share_minor ≈ items where line_type='discount'
-Discrepancies > 1¢ → record in transactions.metadata.allocation_audit
+${w(
+  `Discrepancies > 1¢ → record in transactions.metadata.allocation_audit
 (structured object: \`{kind, expected, got, delta}\`). Don't block
-ingest — just log.`;
+ingest — just log.`,
+  `Discrepancies > 1¢ → say so in audit.note (kind, expected, got,
+delta); the server computes the residual itself. Don't hold back the
+record — just note it.`,
+)}`;
+}
+export const ALLOCATION_LOGIC = allocationLogic("agent_sql");
+export const ALLOCATION_LOGIC_RECORD = allocationLogic("server_apply");
 
 /**
  * Worked examples, anchored to real fixtures.

@@ -37,6 +37,21 @@
  * which turns an unreviewable +24 KB into a one-line `132731 -> 141002` in the
  * diff, sitting in front of a human.
  *
+ * TWO RENDERINGS (wave 1). The ingest prompt renders twice: the legacy text
+ * (`writer: 'agent_sql'`, the agent writes SQL) and the record rendering
+ * (`writer: 'server_apply'`, the agent hands back an extraction record). They
+ * have separate ratchets, each with the same allowance:
+ *
+ *   legacy   `totals.ingest + totals.reextract`, as before
+ *   record   `totals.ingest_record`, with `record_modules` attributing the
+ *            part this check can name: the contract block that
+ *            `renderContractForPrompt()` generates from the zod schema, which
+ *            grows whenever a field or a describe text does
+ *
+ * The per-module table (`modules`) attributes the legacy ingest rendering, so
+ * a fragment only the record rendering uses (an export whose name ends in
+ * `_RECORD`) is left out of it, and so are the helpers in `NOT_FRAGMENTS`.
+ *
  * Usage:
  *   npm run check:prompt-budget                     check (exit 1 on violation)
  *   npm run check:prompt-budget -- --update-baseline rewrite the baseline
@@ -48,6 +63,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildExtractorPrompt } from "../src/ingest/prompt.js";
 import { buildReExtractPrompt } from "../src/ingest/reextract-prompt.js";
+import { renderContractForPrompt } from "../src/ingest/contract/v1.js";
 
 import * as contract from "../src/ingest/prompt-contract.js";
 import * as docRead from "../src/ingest/document-read-prompt.js";
@@ -77,12 +93,14 @@ const PROMPT_GROWTH_ALLOWANCE = 4_096;
 interface Baseline {
   _comment: string;
   generatedAt: string;
-  totals: { ingest: number; reextract: number };
+  totals: { ingest: number; reextract: number; ingest_record?: number };
   modules: Record<string, number>;
+  record_modules?: Record<string, number>;
 }
 
 /** Empty context — every field blank so the measurement is input-independent. */
 const EMPTY_INGEST_CTX = {
+  writer: "agent_sql",
   filePath: "",
   ingestId: "",
   workspaceId: "",
@@ -90,6 +108,10 @@ const EMPTY_INGEST_CTX = {
   userId: "",
   phashNeighbors: [],
 } as Parameters<typeof buildExtractorPrompt>[0];
+
+/** The same, for the record rendering. No decoded text, so its per-run
+ *  random delimiter never renders and the size is reproducible. */
+const EMPTY_RECORD_CTX = { ...EMPTY_INGEST_CTX, writer: "server_apply" } as Parameters<typeof buildExtractorPrompt>[0];
 
 const EMPTY_REEXTRACT_CTX = {
   filePath: "",
@@ -111,6 +133,14 @@ const bytes = (s: string) => Buffer.byteLength(s, "utf8");
  * investigation scope — the block that is not on the list is the block that
  * grows unwatched.
  */
+/**
+ * Exports of the prompt modules that are not prompt text: `forWriter` picks
+ * between two texts, and `randomSourceDelimiter` returns a fresh random
+ * fence name. Measuring either would attribute bytes the legacy rendering
+ * does not contain.
+ */
+const NOT_FRAGMENTS = new Set(["forWriter", "randomSourceDelimiter"]);
+
 function measureModules(): { module: string; symbol: string; bytes: number }[] {
   const out: { module: string; symbol: string; bytes: number }[] = [];
   const modules: Record<string, Record<string, unknown>> = {
@@ -123,6 +153,7 @@ function measureModules(): { module: string; symbol: string; bytes: number }[] {
 
   for (const [modName, mod] of Object.entries(modules)) {
     for (const [symbol, value] of Object.entries(mod)) {
+      if (symbol.endsWith("_RECORD") || NOT_FRAGMENTS.has(symbol)) continue;
       let rendered: string | null = null;
       if (typeof value === "string") {
         rendered = value;
@@ -174,6 +205,10 @@ function main(): void {
   const ingestBytes = bytes(ingest);
   const reextractBytes = bytes(reextract);
   const total = ingestBytes + reextractBytes;
+  const recordBytes = bytes(buildExtractorPrompt(EMPTY_RECORD_CTX));
+  const recordModules: Record<string, number> = {
+    "contract block (renderContractForPrompt)": bytes(renderContractForPrompt()),
+  };
 
   const blocks = measureModules();
   const byModule: Record<string, number> = {};
@@ -195,16 +230,19 @@ function main(): void {
         "Rendered size of the extraction prompts with an EMPTY context, in bytes. " +
         "Regenerate deliberately with `npm run check:prompt-budget -- --update-baseline` " +
         "in the same commit as the prompt change, so growth arrives as a reviewable diff. " +
+        "ingest_record is the record rendering (wave 1), ratcheted on its own. " +
         "See scripts/check-prompt-budget.ts and issue #197.",
       generatedAt: new Date().toISOString(),
-      totals: { ingest: ingestBytes, reextract: reextractBytes },
+      totals: { ingest: ingestBytes, reextract: reextractBytes, ingest_record: recordBytes },
       modules: byModule,
+      record_modules: recordModules,
     };
-    writeFileSync(BASELINE_PATH, JSON.stringify(next, null, 2) + "\n");
     const prev = readBaseline();
+    writeFileSync(BASELINE_PATH, JSON.stringify(next, null, 2) + "\n");
     console.log(
       `baseline updated: ingest ${prev?.totals.ingest ?? "-"} -> ${ingestBytes}, ` +
-        `reextract ${prev?.totals.reextract ?? "-"} -> ${reextractBytes}`,
+        `reextract ${prev?.totals.reextract ?? "-"} -> ${reextractBytes}, ` +
+        `ingest_record ${prev?.totals.ingest_record ?? "-"} -> ${recordBytes}`,
     );
     return;
   }
@@ -214,19 +252,41 @@ function main(): void {
     ? baseline.totals.ingest + baseline.totals.reextract
     : null;
   const delta = baseTotal === null ? 0 : total - baseTotal;
+  const baseRecord = baseline?.totals.ingest_record ?? null;
+  const recordDelta = baseRecord === null ? 0 : recordBytes - baseRecord;
 
   if (asJson) {
     console.log(
       JSON.stringify(
-        { ingestBytes, reextractBytes, total, baseTotal, delta, modules: byModule, blocks },
+        {
+          ingestBytes,
+          reextractBytes,
+          total,
+          baseTotal,
+          delta,
+          recordBytes,
+          baseRecord,
+          recordDelta,
+          modules: byModule,
+          recordModules,
+          blocks,
+        },
         null,
         2,
       ),
     );
   }
 
-  const overCeiling = ingestBytes > PROMPT_HARD_CEILING_BYTES || reextractBytes > PROMPT_HARD_CEILING_BYTES;
-  const overAllowance = baseTotal !== null && delta > PROMPT_GROWTH_ALLOWANCE;
+  const overCeiling =
+    ingestBytes > PROMPT_HARD_CEILING_BYTES ||
+    reextractBytes > PROMPT_HARD_CEILING_BYTES ||
+    recordBytes > PROMPT_HARD_CEILING_BYTES;
+  const legacyOver = baseTotal !== null && delta > PROMPT_GROWTH_ALLOWANCE;
+  // A baseline from before the record rendering existed has no number for
+  // it: that is "no baseline yet", which must be recorded, not passed.
+  const recordUnbased = baseline !== null && baseRecord === null;
+  const recordOver = baseRecord !== null && recordDelta > PROMPT_GROWTH_ALLOWANCE;
+  const overAllowance = legacyOver || recordOver || recordUnbased;
   const failing = overCeiling || overAllowance;
 
   if (!asJson) {
@@ -238,6 +298,16 @@ function main(): void {
       console.log(`  vs baseline: ${sign}${delta.toLocaleString()} B (allowance ${PROMPT_GROWTH_ALLOWANCE.toLocaleString()} B)`);
     } else {
       console.log("  no baseline committed yet — run with --update-baseline");
+    }
+    const contract = recordModules["contract block (renderContractForPrompt)"]!;
+    console.log(
+      `record rendering — ingest ${recordBytes.toLocaleString()} B, of which the contract block ${contract.toLocaleString()} B`,
+    );
+    if (baseRecord !== null) {
+      const sign = recordDelta >= 0 ? "+" : "";
+      console.log(`  vs baseline: ${sign}${recordDelta.toLocaleString()} B (allowance ${PROMPT_GROWTH_ALLOWANCE.toLocaleString()} B)`);
+    } else {
+      console.log("  no record baseline committed yet — run with --update-baseline");
     }
   }
 
@@ -255,6 +325,12 @@ function main(): void {
     for (const b of blocks.slice(0, 10)) {
       console.log(`    ${b.symbol.padEnd(30)} ${String(b.bytes).padStart(8)} B  ${b.module}`);
     }
+    console.log("\n  record rendering:");
+    for (const [m, b] of Object.entries(recordModules)) {
+      const baseB = baseline?.record_modules?.[m];
+      const d = baseB === undefined ? "" : `  (${b - baseB >= 0 ? "+" : ""}${b - baseB})`;
+      console.log(`    ${m.padEnd(40)} ${String(b).padStart(8)} B${d}`);
+    }
   }
 
   if (overCeiling) {
@@ -266,9 +342,15 @@ function main(): void {
     process.exit(1);
   }
   if (overAllowance) {
+    const what = [
+      legacyOver ? `the legacy prompts grew ${delta.toLocaleString()} B` : null,
+      recordOver ? `the record rendering grew ${recordDelta.toLocaleString()} B` : null,
+    ].filter(Boolean);
     console.error(
-      `\nFAIL: the prompts grew ${delta.toLocaleString()} B past the committed baseline, ` +
-        `over the ${PROMPT_GROWTH_ALLOWANCE.toLocaleString()} B allowance.\n` +
+      (recordUnbased && what.length === 0
+        ? `\nFAIL: the baseline has no size for the record rendering yet.\n`
+        : `\nFAIL: ${what.join(" and ")} past the committed baseline, ` +
+          `over the ${PROMPT_GROWTH_ALLOWANCE.toLocaleString()} B allowance.\n`) +
         `If the growth is intended, record it:\n` +
         `    npm run check:prompt-budget -- --update-baseline\n` +
         `and commit the baseline alongside the prompt change, so the size moves in the diff ` +

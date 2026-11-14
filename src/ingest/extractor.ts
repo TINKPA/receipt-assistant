@@ -131,6 +131,7 @@ async function runExtractorClaude(
 export const defaultClaudeExtractor: Extractor = async (input) => {
   const sessionId = input.sessionId;
   const ctx: ExtractorPromptContext = {
+    writer: "agent_sql",
     filePath: input.filePath,
     ingestId: input.ingestId,
     workspaceId: input.workspaceId,

@@ -55,6 +55,7 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10);
 function logPromptSize(): void {
   try {
     const empty = {
+      writer: "agent_sql",
       filePath: "",
       ingestId: "",
       workspaceId: "",

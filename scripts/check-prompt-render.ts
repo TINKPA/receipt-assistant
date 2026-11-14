@@ -6,7 +6,7 @@
  * WHY THIS EXISTS
  *
  * Wave 1 gives the extraction prompt a second rendering (the record
- * rendering, `writer: 'record'`) built from the same template, and makes
+ * rendering, `writer: 'server_apply'`) built from the same template, and makes
  * `src/ingest/items-sql.ts` serve the server as well as the agent. Until the
  * legacy writer is retired, production keeps running the legacy rendering
  * (`EXTRACTION_WRITER=agent_sql`), and the A/B compares arm B against it. Both

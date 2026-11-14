@@ -9,7 +9,7 @@ This file is for whoever is **developing** this repo: a person, or an AI working
 | Reader | What it needs | Where that lives |
 |---|---|---|
 | Developer (you) | How the project is built, deployed and debugged | This file, `README.md`, `docs/` |
-| Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract |
+| Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger (legacy rendering), or how to hand it back as an extraction record (record rendering, wave 1) | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract. The record rendering also carries the contract, generated from `src/ingest/contract/v1.ts` by `renderContractForPrompt()`, and the list of problems `validate.ts::renderRepairRequest` sends back |
 | Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger. It has no tools: it writes SQL and the server runs it as a read-only role | `src/insights/ask.ts` |
 
 Keep them apart:
@@ -135,7 +135,15 @@ The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration,
 
 **The legacy rendering is frozen while wave 1 is in flight.** `npm run build` runs `scripts/check-prompt-render.ts`, which renders the ingest prompt (`writer: 'agent_sql'`) and the re-extract prompt for fixed contexts that reach every branch the templates take on their context, and compares SHA-256 hashes with `scripts/prompt-render.golden.json`. The golden was taken before wave 1 touched a prompt file. The git sha, `EXTRACTION_MODEL`, the curated lessons body and the clock are pinned or normalised first, so only template text counts. A failure means the text production runs has changed: take the change out of the legacy rendering. Never update the golden to make it pass; `--update-golden` exists for the day the legacy writer is retired. `--dump=<dir>` writes the normalised renderings for a `diff -r` against the base commit.
 
-Wave 1 adds two more constants for the server writer, both shipped dark. `RECORD_PROMPT_VERSION` (`prompt-contract.ts`, `"4.0"`) versions the record rendering of the ingest prompt, under the same rules as above. `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, `1`) versions the shape of the extraction record; any change to that shape bumps it, always together with `RECORD_PROMPT_VERSION`. `PROMPT_VERSION` stays the legacy line until the agent-SQL writer is retired.
+Wave 1 adds constants for the server writer, all shipped dark. Until the agent-SQL writer is retired two prompt lines are live, told apart by `metadata.extraction.writer`:
+
+| Constant | Value | Versions | Bump when |
+|---|---|---|---|
+| `PROMPT_VERSION` (`prompt-contract.ts`) | `"3.4"`, frozen | the legacy rendering (`writer: 'agent_sql'`) and re-extract | as above; in practice never, because the golden below refuses any change to that text |
+| `RECORD_PROMPT_VERSION` (`prompt-contract.ts`) | `"4.0"` | the record rendering of the ingest prompt (`writer: 'server_apply'`) | any semantic change to that rendering, under the same rules as above |
+| `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, re-exported by `prompt-contract.ts`) | `1` | the shape of the extraction record | any change to the zod shape, always together with `RECORD_PROMPT_VERSION` |
+
+The applier's own version (`APPLIER_VERSION`, plan §9.3) moves with projection, dedup and catalog rules and needs no prompt bump. When the legacy writer is retired the prompt constants collapse into one `PROMPT_VERSION = "4.0"`.
 
 ### Extraction records (`document_extractions`, wave 1)
 
@@ -325,7 +333,7 @@ To let the extraction agent do something new, edit `AGENT_GRANTS` in the same ch
 
 **Tables added later.** `receipts_ro` can read a new table as soon as it exists (a default privilege, re-asserted at boot) and can never write to it. `receipts_agent` cannot see a new table or view until `AGENT_GRANTS` lists it. Three things keep that from failing quietly:
 
-1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template.
+1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template. It also renders the record rendering of the ingest prompt, whose agent has no database, and fails on any SQL statement, uppercase `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`ALTER`/`DROP`, `psql`, `DATABASE_URL`, `WebSearch`, the logo key or the Google place-record endpoint in it.
 2. Boot logs the tables the role cannot touch, and logs an error for every difference between the live privileges and the file.
 3. `check-agent-sandbox` fails on the same differences.
 
@@ -462,6 +470,16 @@ For Ask, what remains: the model reads the whole ledger, including `ocr_text` wr
    `src/claude.ts::processReceipt` that used to own this was deleted
    in #164; `src/claude.ts` now owns only how a child is spawned:
    `runClaude` and the agent profiles (see "Agent sandbox").
+
+   **The record rendering (wave 1) is not `--json-schema`.** Its agent
+   also ends with JSON, one fenced extraction record, but it is spawned
+   with `--output-format text` and no schema, reasons in plain text
+   first exactly as above, and writes the record once, after the
+   reasoning, as the conclusion of it. That is the thing pitfall 1
+   protects; the forced, reasoning-free mode is what degraded OCR. The
+   prompt keeps `NO_JSON_SCHEMA_RULE` and says the record is not that
+   mode. Do not "simplify" the hand-back into `--json-schema` or
+   `--output-format json` without an A/B.
 
    An earlier two-phase variant (Phase 1: image → plain-text OCR;
    Phase 2: separate `claude -p` call structuring the text into JSON
