@@ -29,13 +29,20 @@
  * not parse).
  *
  * Which ```json block counts: the last one whose body mentions
- * `contract_version`. Other JSON blocks (an echoed API response) are
- * passed over. The first such block met from the end is THE record, even
- * when it does not parse: an earlier one would be a draft the agent
- * moved past, and quietly taking it would store a reading the agent did
- * not hand back. The ```receipt-text block is the last one before that
- * json block in the same message (or after it, when there is none
- * before).
+ * `contract_version`, found by reading back from the END of the message
+ * (`findRecordBlock`), so a transcribed line of bare backticks that throws
+ * the forward pairing out cannot hide the record or put a block planted
+ * in the document in its place. An opener the forward read places inside
+ * a closed receipt-text block is transcription and is passed over. Other
+ * JSON blocks (an echoed API response) are passed over too. The first
+ * such block met from the end is THE record, even when it does not
+ * parse: an earlier one would be a draft the agent moved past, and
+ * quietly taking it would store a reading the agent did not hand back.
+ * The ```receipt-text block is the last one before that json block in the
+ * same message (or after it, when there is none before); when the forward
+ * pairing was thrown out before the record, it is re-paired from the end
+ * (`receiptTextFor`). The prompt asks for a receipt-text fence longer
+ * than any backtick run inside it, which keeps the forward read in step.
  *
  * Caps: the json block 256 KB, the receipt text 64 KB. Over a cap is
  * `size_cap`, which `validate.ts` turns into a bounced record. A record
@@ -85,6 +92,9 @@ export interface ArtefactFailure {
   jsonText: string | null;
   /** UTF-8 size of the offending block, for `size_cap`. */
   bytes: number | null;
+  /** The receipt-text block handed back with a record that did not parse
+   *  (null when there was none, or it was the oversize part). */
+  receiptText: string | null;
   stdoutTail: { stdout_tail: string } | null;
 }
 
@@ -158,6 +168,32 @@ export function fencedBlocks(text: string): FencedBlock[] {
   return blocks;
 }
 
+/**
+ * What Postgres cannot store: U+0000, which no `text` or `jsonb` value can
+ * hold (22021 / 22P05), and a lone UTF-16 surrogate, which `jsonb` refuses
+ * as an escape and `text` would get as a replacement character anyway.
+ */
+const PG_UNSAFE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * `s` with U+0000 removed and every lone surrogate replaced by U+FFFD:
+ * text that came from a model or a document, made storable. Without it
+ * one such character in a record, a receipt text, a decoded email or a
+ * stdout tail makes every insert that carries it fail, and the evidence
+ * with it.
+ */
+export function pgSafeText(s: string): string {
+  return s.replace(PG_UNSAFE, (c) => (c === "\u0000" ? "" : "\uFFFD"));
+}
+
+/** Whether `s` holds anything `pgSafeText` would change. */
+export function hasPgUnsafe(s: string): boolean {
+  PG_UNSAFE.lastIndex = 0;
+  const found = PG_UNSAFE.test(s);
+  PG_UNSAFE.lastIndex = 0;
+  return found;
+}
+
 function utf8Bytes(s: string): number {
   return Buffer.byteLength(s, "utf8");
 }
@@ -183,31 +219,132 @@ export function utf8Head(s: string, maxBytes: number): string {
 
 function tailOf(stdout: string): { stdout_tail: string } | null {
   const t = stdout.trim();
-  return t === "" ? null : { stdout_tail: utf8Tail(t, STDOUT_TAIL_MAX_BYTES) };
+  return t === "" ? null : { stdout_tail: pgSafeText(utf8Tail(t, STDOUT_TAIL_MAX_BYTES)) };
 }
 
-const isRecordBlock = (b: FencedBlock) => b.lang === "json" && /\bcontract_version\b/.test(b.body);
+const CLOSE_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 type TextScan =
   | { kind: "none" }
   | { kind: "found"; record: Record<string, unknown>; jsonText: string; receiptText: string | null; trailingText: boolean }
-  | { kind: "failed"; reason: "json_parse" | "size_cap"; message: string; block: "json" | "receipt-text"; jsonText: string; bytes: number | null };
+  | {
+      kind: "failed";
+      reason: "json_parse" | "size_cap";
+      message: string;
+      block: "json" | "receipt-text";
+      jsonText: string;
+      bytes: number | null;
+      /** The receipt-text block that came with the failed record, when it was within its cap. */
+      receiptText: string | null;
+    };
+
+interface RecordBlock {
+  /** Line index of the ```json opener. */
+  line: number;
+  body: string;
+  closed: boolean;
+  /** Character offset just past the block. */
+  end: number;
+  /** The forward-read block that swallowed the opener, if one did. */
+  host: FencedBlock | null;
+}
+
+/**
+ * The record block, found from the END of the message: the last ```json
+ * opener whose block (up to its first closing fence) mentions
+ * `contract_version`. The record is the last thing in the message, so
+ * reading back from the end finds it however the fences before it pair
+ * up. Reading forward does not: a transcribed line of bare backticks
+ * closes the receipt-text block early, the agent's own closing fence then
+ * opens a block that swallows the record, and a ```json block planted in
+ * the document becomes "the last record" in its place.
+ *
+ * One exception keeps forward pairing in charge: an opener the forward
+ * read places INSIDE a properly closed receipt-text block is transcribed
+ * text, not a record, and the scan goes on back past it. So a document
+ * that carries a record-like block, transcribed inside a fence the agent
+ * made long enough, is never mistaken for the agent's record.
+ */
+function findRecordBlock(lines: string[], starts: number[], textLength: number, blocks: FencedBlock[]): RecordBlock | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = OPEN_FENCE.exec(lines[i]!);
+    if (!m || (m[2] ?? "").toLowerCase() !== "json") continue;
+    const char = m[1]![0]!;
+    const len = m[1]!.length;
+    let j = i + 1;
+    for (; j < lines.length; j++) {
+      const c = CLOSE_FENCE.exec(lines[j]!);
+      if (c && c[1]![0] === char && c[1]!.length >= len) break;
+    }
+    const body = lines.slice(i + 1, j).join("\n");
+    if (!/\bcontract_version\b/.test(body)) continue;
+    const pos = starts[i]!;
+    const host = blocks.find((b) => b.start < pos && pos < b.end) ?? null;
+    if (host && host.lang === "receipt-text" && host.closed) continue;
+    const closed = j < lines.length;
+    return { line: i, body, closed, end: closed ? starts[j]! + lines[j]!.length + 1 : textLength + 1, host };
+  }
+  return null;
+}
+
+/**
+ * The receipt-text block that goes with the record block: normally the
+ * last one the forward read found before it (or, when none, after it).
+ * When the forward read lost step before the record (the record's opener
+ * sits inside a block it opened on the agent's own closing fence, or
+ * inside a receipt-text block that never closed), the block is re-paired
+ * from the end instead: from the nearest receipt-text opener before the
+ * record to the last bare fence line between the two.
+ */
+function receiptTextFor(rec: RecordBlock, lines: string[], starts: number[], blocks: FencedBlock[]): FencedBlock | null {
+  if (rec.host) {
+    let open = -1;
+    for (let k = rec.line - 1; k >= 0; k--) {
+      const m = OPEN_FENCE.exec(lines[k]!);
+      if (m && (m[2] ?? "").toLowerCase() === "receipt-text") {
+        open = k;
+        break;
+      }
+    }
+    if (open >= 0) {
+      let close = rec.line;
+      for (let k = rec.line - 1; k > open; k--) {
+        if (CLOSE_FENCE.test(lines[k]!)) {
+          close = k;
+          break;
+        }
+      }
+      return {
+        lang: "receipt-text",
+        body: lines.slice(open + 1, close).join("\n"),
+        closed: close < rec.line,
+        start: starts[open]!,
+        end: starts[close]!,
+      };
+    }
+  }
+  const pos = starts[rec.line]!;
+  const before = blocks.filter((b) => b.lang === "receipt-text" && b.end <= pos);
+  const after = blocks.filter((b) => b.lang === "receipt-text" && b.start >= rec.end - 1);
+  return before.at(-1) ?? after.at(-1) ?? null;
+}
 
 /**
  * Look for the record in one message's text. `none` when the text holds
  * no ```json block that mentions `contract_version`.
  */
 export function scanText(text: string): TextScan {
-  const blocks = fencedBlocks(text);
-  let idx = -1;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    if (isRecordBlock(blocks[i]!)) {
-      idx = i;
-      break;
-    }
+  const norm = text.replace(/\r\n?/g, "\n");
+  const lines = norm.split("\n");
+  const starts: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
   }
-  if (idx < 0) return { kind: "none" };
-  const json = blocks[idx]!;
+  const blocks = fencedBlocks(norm);
+  const json = findRecordBlock(lines, starts, norm.length, blocks);
+  if (!json) return { kind: "none" };
   const jsonBytes = utf8Bytes(json.body);
   if (jsonBytes > ARTEFACT_MAX_BYTES) {
     return {
@@ -217,11 +354,10 @@ export function scanText(text: string): TextScan {
       message: `the json block is ${jsonBytes} bytes; at most ${ARTEFACT_MAX_BYTES} are allowed`,
       jsonText: utf8Head(json.body, ARTEFACT_MAX_BYTES),
       bytes: jsonBytes,
+      receiptText: null,
     };
   }
-  const before = blocks.slice(0, idx).filter((b) => b.lang === "receipt-text");
-  const after = blocks.slice(idx + 1).filter((b) => b.lang === "receipt-text");
-  const rt = before.at(-1) ?? after.at(-1) ?? null;
+  const rt = receiptTextFor(json, lines, starts, blocks);
   if (rt) {
     const rtBytes = utf8Bytes(rt.body);
     if (rtBytes > RECEIPT_TEXT_MAX_BYTES) {
@@ -232,9 +368,11 @@ export function scanText(text: string): TextScan {
         message: `the receipt-text block is ${rtBytes} bytes; at most ${RECEIPT_TEXT_MAX_BYTES} are allowed`,
         jsonText: json.body,
         bytes: rtBytes,
+        receiptText: null,
       };
     }
   }
+  const receiptText = rt ? pgSafeText(rt.body) : null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(json.body);
@@ -243,11 +381,15 @@ export function scanText(text: string): TextScan {
       kind: "failed",
       reason: "json_parse",
       block: "json",
-      message: `the json block is not valid JSON${json.closed ? "" : " (the block is never closed)"}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-      jsonText: json.body,
+      // V8 quotes a stretch of the text it choked on: model text, made storable.
+      message: pgSafeText(
+        `the json block is not valid JSON${json.closed ? "" : " (the block is never closed)"}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      ),
+      jsonText: pgSafeText(json.body),
       bytes: null,
+      receiptText,
     };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !("contract_version" in parsed)) {
@@ -258,14 +400,15 @@ export function scanText(text: string): TextScan {
       message: "the json block is not one JSON object with a contract_version key",
       jsonText: json.body,
       bytes: null,
+      receiptText,
     };
   }
-  const trailingText = text.replace(/\r\n?/g, "\n").slice(json.end).trim() !== "";
+  const trailingText = norm.slice(json.end).trim() !== "";
   return {
     kind: "found",
     record: parsed as Record<string, unknown>,
     jsonText: json.body,
-    receiptText: rt ? rt.body : null,
+    receiptText,
     trailingText,
   };
 }
@@ -359,6 +502,7 @@ function fromScan(scan: Exclude<TextScan, { kind: "none" }>, source: ArtefactSou
     source,
     jsonText: scan.jsonText,
     bytes: scan.bytes,
+    receiptText: scan.receiptText,
     stdoutTail: tailOf(stdout),
   };
 }
@@ -388,6 +532,7 @@ export function parseArtefact(input: ParseArtefactInput): ArtefactResult {
     source: null,
     jsonText: null,
     bytes: null,
+    receiptText: null,
     stdoutTail: tailOf(input.stdout),
   };
 }

@@ -32,7 +32,7 @@ import { z } from "zod";
 import { currencyExponent, isIsoCurrencyCode } from "../../ledger/money.js";
 import { isPointsCurrency } from "../../points/codes.js";
 import type { ArtefactResult } from "./artefact.js";
-import { ARTEFACT_MAX_BYTES, utf8Head } from "./artefact.js";
+import { ARTEFACT_MAX_BYTES, hasPgUnsafe, pgSafeText, utf8Head } from "./artefact.js";
 import {
   CONTRACT_IDENTIFIER_KEYS,
   DATE_RE,
@@ -113,6 +113,7 @@ export const NORMALIZATION_RULES = [
   "party_line_dropped",
   "channel_party_added",
   "income_defaulted",
+  "unsafe_character_removed",
 ] as const;
 export type NormalizationRule = (typeof NORMALIZATION_RULES)[number];
 
@@ -185,11 +186,34 @@ export type ValidationOutcome =
 
 type Seg = string | number;
 
+/** A key printed bare in a path; anything else is quoted. */
+const PLAIN_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+/** Characters of a quoted key kept; the rest is cut. */
+const QUOTED_KEY_MAX = 40;
+
+/**
+ * A record path as the error lists, the repair request and the ingest's
+ * error print it: `facts.occurred_on`, `items[3].parent_line_no`. A key the
+ * model invented is model text, and the path carries it into the repair
+ * request on stdin, `ingests.error` and the logs, so a key that is not a
+ * plain name is printed quoted and cut, `["<first 40 chars>…"]`, with
+ * everything outside printable ASCII escaped: a newline in it cannot start
+ * a line that reads as the server's own.
+ */
 export function formatPath(segs: readonly Seg[]): string {
   let out = "";
   for (const s of segs) {
     if (typeof s === "number") out += `[${s}]`;
-    else out += out === "" ? s : `.${s}`;
+    else if (PLAIN_KEY.test(s)) out += out === "" ? s : `.${s}`;
+    else {
+      const chars = [...s];
+      const cut = chars.length > QUOTED_KEY_MAX ? `${chars.slice(0, QUOTED_KEY_MAX).join("")}…` : s;
+      const quoted = JSON.stringify(cut).replace(
+        /[^\x20-\x7e]/g,
+        (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+      );
+      out += `[${quoted}]`;
+    }
   }
   return out;
 }
@@ -345,6 +369,35 @@ export function itemsResidual(record: ExtractionV1): ItemsResidual[] {
 /** Over this, `items_total_residual` fires: max(5 minor units, 1% of the total). */
 export function residualThreshold(totalMinor: number): number {
   return Math.max(5, Math.abs(totalMinor) / 100);
+}
+
+// ── Characters Postgres cannot store ───────────────────────────────────
+
+/**
+ * A copy of the parsed record with every string and key made storable
+ * (`pgSafeText`: U+0000 removed, a lone surrogate replaced). This runs
+ * before anything else, so the record, and what is stored as `parsed`
+ * when it is invalid, can always be written: one such character used to
+ * fail T1 whole, losing the evidence. A key that changes stays a key the
+ * schema does not know, so `.strict()` still refuses it.
+ */
+function storable(v: unknown, path: Seg[], log: NormalizationLog | null): unknown {
+  if (typeof v === "string") {
+    if (!hasPgUnsafe(v)) return v;
+    log?.add("unsafe_character_removed", formatPath(path));
+    return pgSafeText(v);
+  }
+  if (Array.isArray(v)) return v.map((el, i) => storable(el, [...path, i], log));
+  if (isPlainObject(v)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, el] of Object.entries(v)) {
+      const key = hasPgUnsafe(k) ? pgSafeText(k) : k;
+      if (key !== k) log?.add("unsafe_character_removed", formatPath([...path, k]));
+      setOwn(out, key, storable(el, [...path, key], log));
+    }
+    return out;
+  }
+  return v;
 }
 
 // ── Pre-parse normalisation, guided by the schema ──────────────────────
@@ -800,10 +853,19 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
     }
   }
 
-  const scanned = rec.classification === "receipt_image" || rec.source_used === "image" || rec.source_used === "pdf_raster";
+  // The server decodes email and HTML itself; a photo or a PDF, text
+  // layer included, has no transcription but the agent's receipt-text
+  // block, and without one `documents.ocr_text` stays empty.
+  const serverText = rec.source_used === "email_body" || rec.source_used === "email_attachment" || rec.source_used === "html";
+  const agentText =
+    rec.source_used === "image" ||
+    rec.source_used === "pdf_text" ||
+    rec.source_used === "pdf_raster" ||
+    (!serverText &&
+      (rec.classification === "receipt_image" || rec.classification === "receipt_pdf" || rec.classification === "statement_pdf"));
   const hasText = typeof ctx.receiptText === "string" && ctx.receiptText.trim() !== "";
-  if (scanned && rec.classification !== "unsupported" && !hasText) {
-    warn("raw_text_missing", "receipt-text", "an image or scanned PDF handed back without a receipt-text block");
+  if (agentText && rec.classification !== "unsupported" && !hasText) {
+    warn("raw_text_missing", "receipt-text", "a photo or PDF handed back without a receipt-text block");
   }
 
   for (const f of rec.audit?.review_flags ?? []) {
@@ -822,9 +884,10 @@ function emptyReport(): ValidationReport {
  * Validate a parsed record. Never throws. `parsed` is the JSON object the
  * agent handed back; on success `record` is the normalised, typed record.
  */
-export function validateExtraction(parsed: unknown, ctx: ValidationContext): ValidationOutcome {
+export function validateExtraction(handedBack: unknown, ctx: ValidationContext): ValidationOutcome {
   const report = emptyReport();
   const log = new NormalizationLog();
+  const parsed = storable(handedBack, [], log);
   if (!isPlainObject(parsed)) {
     report.errors.push({ rule: "schema", path: "", message: "the record must be one JSON object" });
     return { status: "invalid", record: null, parsed, report };
@@ -875,12 +938,12 @@ export function validateArtefact(artefact: ArtefactResult, ctx: Omit<ValidationC
       const inner = validateExtraction(parsed, { ...ctx, receiptText: null });
       inner.report.errors.unshift(capError);
       inner.report.warnings = [];
-      return { status: "invalid", record: null, parsed, report: inner.report };
+      return { status: "invalid", record: null, parsed: inner.parsed, report: inner.report };
     }
     if (parseError !== null) {
       const report = emptyReport();
-      report.errors.push(capError, { rule: "json_parse", path: "", message: `the json block is not valid JSON: ${parseError}` });
-      return { status: "invalid", record: null, parsed: { unparsed_text: text, bytes: Buffer.byteLength(text, "utf8") }, report };
+      report.errors.push(capError, { rule: "json_parse", path: "", message: pgSafeText(`the json block is not valid JSON: ${parseError}`) });
+      return { status: "invalid", record: null, parsed: { unparsed_text: pgSafeText(text), bytes: Buffer.byteLength(text, "utf8") }, report };
     }
   }
   const report = emptyReport();
@@ -889,7 +952,7 @@ export function validateArtefact(artefact: ArtefactResult, ctx: Omit<ValidationC
   return {
     status: "invalid",
     record: null,
-    parsed: { unparsed_text: utf8Head(text, keep), bytes: Buffer.byteLength(text, "utf8") },
+    parsed: { unparsed_text: pgSafeText(utf8Head(text, keep)), bytes: Buffer.byteLength(text, "utf8") },
     report,
   };
 }
