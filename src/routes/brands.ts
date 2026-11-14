@@ -12,12 +12,21 @@ import express, { Router, type Request, type Response, type NextFunction } from 
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { sql, eq, and, isNull } from "drizzle-orm";
-import { createReadStream } from "fs";
-import { mkdir, stat, writeFile } from "fs/promises";
-import { join, isAbsolute, dirname } from "path";
+import { mkdir, writeFile } from "fs/promises";
+import { dirname } from "path";
 import { createHash } from "crypto";
+import {
+  resolveInside,
+  resolveStoredFile,
+  sendStoredFile,
+  setStoredAssetGuards,
+  setStoredImageHeaders,
+  storedImageEtag,
+} from "../http/files.js";
+import { ifNoneMatchSatisfied } from "../http/etag.js";
 import multer from "multer";
 import { db } from "../db/client.js";
+import { liveTransactions } from "../db/live.js";
 import { brands, brandAssets } from "../schema/index.js";
 import { merchants } from "../schema/merchants.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -29,6 +38,7 @@ import {
   UploadBrandAssetForm,
 } from "../schemas/v1/brand.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
+import { unconvertedLegSql } from "../fx/unconverted.js";
 import {
   HttpProblem,
   NotFoundProblem,
@@ -298,7 +308,19 @@ brandsRouter.post(
       const sha = createHash("sha256").update(bytes).digest("hex");
       const ext = extensionForMime(mime);
       const relPath = `${brandId}/user-upload/${sha}.${ext}`;
-      const absPath = join(BRAND_ASSETS_ROOT, relPath);
+      // `brandId` is a free-text slug (any string can be minted through
+      // POST /v1/products), and here it becomes a directory name. Refuse
+      // one that would put the file outside the assets root.
+      const absPath = resolveInside(BRAND_ASSETS_ROOT, relPath);
+      if (!absPath) {
+        throw new ValidationProblem([
+          {
+            path: "brandId",
+            code: "unsafe_path",
+            message: "This brand id cannot be used as a storage directory",
+          },
+        ]);
+      }
 
       // Dedup: if (brand_id, content_hash) already exists, surface that row.
       // Whether or not we just wrote the bytes (race-safe: writeFile is
@@ -414,21 +436,16 @@ brandsRouter.get(
           `asset_id=${assetId} is retired`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand asset",
-          `File missing on disk: ${absPath}`,
+          `asset_id=${assetId} has no file on disk`,
         );
       }
-      res.setHeader("Content-Type", asset.contentType);
+      setStoredImageHeaders(res, asset.contentType);
       res.setHeader("Cache-Control", "public, max-age=86400, immutable");
-      createReadStream(absPath).pipe(res);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }
@@ -486,33 +503,32 @@ brandsRouter.get(
           `preferred_asset_id=${preferredId} is retired for brand=${brandId}`,
         );
       }
-      const absPath = isAbsolute(asset.localPath)
-        ? asset.localPath
-        : join(BRAND_ASSETS_ROOT, asset.localPath);
-      try {
-        const st = await stat(absPath);
-        if (!st.isFile()) throw new Error("not a file");
-      } catch {
+      const absPath = await resolveStoredFile(BRAND_ASSETS_ROOT, asset.localPath);
+      if (!absPath) {
         throw new NotFoundProblem(
           "Brand icon",
-          `File missing on disk: ${absPath}`,
+          `preferred_asset_id=${preferredId} has no file on disk for brand=${brandId}`,
         );
       }
-      // Strong ETag is the asset's content_hash. The URL stays stable
-      // (`/brands/<id>/icon`) while the underlying bytes flip whenever
-      // a user re-picks `preferred_asset_id` — so `immutable` would be
-      // wrong here. `max-age=0, must-revalidate` makes every request a
-      // conditional GET; the 304 path is cheap (no read) and the user's
-      // Pick takes effect the next time anything renders the icon.
-      const etag = `"${asset.contentHash}"`;
+      // Strong ETag is the asset's content_hash plus the generation of
+      // the headers it is served under (`storedImageEtag`). The URL
+      // stays stable (`/brands/<id>/icon`) while the underlying bytes
+      // flip whenever a user re-picks `preferred_asset_id` — so
+      // `immutable` would be wrong here. `max-age=0, must-revalidate`
+      // makes every request a conditional GET; the 304 path is cheap
+      // (no read) and the user's Pick takes effect the next time
+      // anything renders the icon.
+      const etag = storedImageEtag(asset.contentHash);
       res.setHeader("ETag", etag);
       res.setHeader("Cache-Control", "public, max-age=0, must-revalidate");
-      if (req.headers["if-none-match"] === etag) {
+      // Before the 304, so the revalidated copy is sandboxed too.
+      setStoredAssetGuards(res);
+      if (ifNoneMatchSatisfied(req, etag)) {
         res.status(304).end();
         return;
       }
-      res.setHeader("Content-Type", asset.contentType);
-      createReadStream(absPath).pipe(res);
+      setStoredImageHeaders(res, asset.contentType);
+      await sendStoredFile(res, absPath);
     } catch (err) {
       next(err);
     }
@@ -569,8 +585,9 @@ brandsRouter.patch(
 // across every merchant under this brand, the locations list with
 // per-merchant stats, recent transactions across the brand, and any
 // sibling brands sharing the same `parent_id` (Costco group case).
-// Voided transactions excluded from money sums; location_count is the
-// raw merchant row count (independent of activity).
+// Only live transactions (posted or reconciled, not deleted) are summed
+// or listed; location_count is the raw merchant row count (independent
+// of activity).
 
 brandsRouter.get(
   "/:brandId/rollup",
@@ -605,28 +622,49 @@ brandsRouter.get(
       // see the same rule and its cost in `merchants.ts` / `reports.ts`
       // (#221). `total_minor` on the recent-transaction rows below is
       // likewise signed: negative means refund.
+      //
+      // Every sum here is over `amount_base_minor` and is labelled with
+      // the workspace base currency. The native column is in each
+      // receipt's own currency and unit, so summing it adds yuan to
+      // dollars to loyalty points; see the same note in `merchants.ts`.
+      //
+      // `unconverted` counts the transactions whose expense legs include
+      // a foreign posting the FX pass never converted: those are in the
+      // sums at their native amount (`src/fx/unconverted.ts`), and the
+      // rollup says so instead of presenting them as base currency.
       const perMerchantStats = new Map<
         string,
-        { txnCount: number; lifetime: number; currentMonth: number; lastDate: string | null }
+        {
+          txnCount: number;
+          lifetime: number;
+          currentMonth: number;
+          lastDate: string | null;
+          unconverted: number;
+        }
       >();
       let brandTxnCount = 0;
       let brandLifetime = 0;
       let brandCurrentMonth = 0;
       let brandLastDate: string | null = null;
+      let brandUnconverted = 0;
 
       if (merchantRows.length > 0) {
         const statsResult = await db.execute(sql`
           SELECT
             t.merchant_id::text AS merchant_id,
             COUNT(DISTINCT t.id)::bigint AS txn_count,
-            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_minor ELSE 0 END), 0)::bigint AS lifetime,
+            COALESCE(SUM(CASE WHEN a.type = 'expense' THEN p.amount_base_minor ELSE 0 END), 0)::bigint AS lifetime,
             COALESCE(SUM(CASE
               WHEN a.type = 'expense'
                AND t.occurred_on >= date_trunc('month', CURRENT_DATE)::date
                AND t.occurred_on <  (date_trunc('month', CURRENT_DATE) + interval '1 month')::date
-              THEN p.amount_minor ELSE 0
+              THEN p.amount_base_minor ELSE 0
             END), 0)::bigint AS current_month,
-            MAX(t.occurred_on)::text AS last_date
+            MAX(t.occurred_on)::text AS last_date,
+            COUNT(DISTINCT t.id) FILTER (
+              WHERE a.type = 'expense'
+                AND ${unconvertedLegSql("p", sql`${currency}`)}
+            )::bigint AS unconverted_txn_count
           FROM transactions t
           JOIN postings p ON p.transaction_id = t.id
           JOIN accounts a ON a.id = p.account_id
@@ -645,8 +683,10 @@ brandsRouter.get(
             lifetime: toInt(r.lifetime),
             currentMonth: toInt(r.current_month),
             lastDate: r.last_date,
+            unconverted: toInt(r.unconverted_txn_count),
           };
           perMerchantStats.set(r.merchant_id, s);
+          brandUnconverted += s.unconverted;
           brandTxnCount += s.txnCount;
           brandLifetime += s.lifetime;
           brandCurrentMonth += s.currentMonth;
@@ -657,6 +697,12 @@ brandsRouter.get(
       }
 
       // 5. Recent transactions across the brand (top 20)
+      //
+      // Live rows only, read through the view. This query used to read
+      // `transactions` with no status or deleted_at filter, so a receipt
+      // the user had deleted dropped out of the stats above and stayed in
+      // this list, with status `posted` and its total, and nothing on the
+      // row to say it was gone.
       let recentTxns: any[] = [];
       if (merchantRows.length > 0) {
         const recentResult = await db.execute(sql`
@@ -669,14 +715,18 @@ brandsRouter.get(
             m.canonical_name AS merchant_canonical_name,
             m.custom_name AS merchant_custom_name,
             (
-              SELECT COALESCE(SUM(p.amount_minor), 0)::bigint
+              SELECT COALESCE(SUM(p.amount_base_minor), 0)::bigint
               FROM postings p
               JOIN accounts a ON a.id = p.account_id
               WHERE p.transaction_id = t.id AND a.type = 'expense'
             ) AS total_minor,
-            (
-              SELECT p.currency FROM postings p WHERE p.transaction_id = t.id LIMIT 1
-            ) AS row_currency,
+            EXISTS (
+              SELECT 1
+              FROM postings p
+              JOIN accounts a ON a.id = p.account_id
+              WHERE p.transaction_id = t.id AND a.type = 'expense'
+                AND ${unconvertedLegSql("p", sql`${currency}`)}
+            ) AS unconverted,
             (
               SELECT dl.document_id
               FROM document_links dl
@@ -684,7 +734,7 @@ brandsRouter.get(
               ORDER BY dl.created_at ASC
               LIMIT 1
             ) AS document_id
-          FROM transactions t
+          FROM ${liveTransactions} t
           JOIN merchants m ON m.id = t.merchant_id
           WHERE t.workspace_id = ${workspaceId}::uuid
             AND m.brand_id = ${brandId}
@@ -698,7 +748,8 @@ brandsRouter.get(
           payee: r.payee,
           status: r.status,
           total_minor: toInt(r.total_minor),
-          currency: r.row_currency ?? currency,
+          currency,
+          unconverted: r.unconverted === true,
           document_id: r.document_id,
           merchant_id: r.merchant_id,
           merchant_canonical_name: r.merchant_canonical_name,
@@ -747,6 +798,7 @@ brandsRouter.get(
             current_month_spend_minor: s?.currentMonth ?? 0,
             last_transaction_date: s?.lastDate ?? null,
             currency,
+            unconverted_transaction_count: s?.unconverted ?? 0,
           },
         };
       });
@@ -765,6 +817,7 @@ brandsRouter.get(
           current_month_spend_minor: brandCurrentMonth,
           last_transaction_date: brandLastDate,
           currency,
+          unconverted_transaction_count: brandUnconverted,
         },
         locations,
         recent_transactions: recentTxns,
@@ -912,7 +965,8 @@ export function registerBrandsOpenApi(registry: OpenAPIRegistry): void {
     summary: "Brand-level rollup — locations, recent transactions, sibling brands",
     description:
       "Aggregates across every merchant row sharing this brand_id within the workspace. " +
-      "Powers the BrandPage UI (#XXX). Voided transactions excluded from money sums. " +
+      "Powers the BrandPage UI (#XXX). Only live transactions (posted or reconciled, not deleted) " +
+      "are counted in the stats or listed in recent_transactions. " +
       "Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
     tags: ["brands"],
     request: { params: z.object({ brandId: z.string() }) },

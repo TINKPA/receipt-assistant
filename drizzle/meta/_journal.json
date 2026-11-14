@@ -281,6 +281,20 @@
       "when": 1785489462800,
       "tag": "0039_points_seed",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1794601061953,
+      "tag": "0040_live_transactions_view",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1794601817000,
+      "tag": "0041_agent_roles",
+      "breakpoints": true
     }
   ]
 }

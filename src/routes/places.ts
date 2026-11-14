@@ -13,11 +13,16 @@
  * wins over `display_name_zh` in the UI fallback chain.
  */
 import { type Request, type Response, type NextFunction, Router } from "express";
-import { createReadStream } from "fs";
-import { stat } from "fs/promises";
+import * as path from "path";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 
 import { parseOrThrow } from "../http/validate.js";
+import {
+  resolveInside,
+  resolveStoredFile,
+  sendStoredFile,
+  setStoredImageHeaders,
+} from "../http/files.js";
 import { NotFoundProblem } from "../http/problem.js";
 import {
   loadPlaceById,
@@ -44,6 +49,7 @@ import {
 } from "../http/problem.js";
 import {
   Place,
+  PlaceRef,
   UpdatePlaceRequest,
   ReDerivePlaceResponse,
   RefreshPlaceResponse,
@@ -130,6 +136,16 @@ placesRouter.get(
     if (!place.lat || !place.lng) {
       throw new NotFoundProblem("Place", id);
     }
+    // `google_place_id` is a database value and becomes the name of the
+    // cache directory this request reads from and, on a miss, writes
+    // into. Google's ids are plain tokens; one that would resolve
+    // outside the place cache is not served.
+    if (!resolveInside(path.join(getUploadDir(), "places"), place.google_place_id)) {
+      console.warn(
+        `[files] refusing a static-map cache directory outside the place cache: place=${place.id}`,
+      );
+      throw new NotFoundProblem("Place", id);
+    }
 
     // Parse + clamp the optional knobs. Bad input → 400.
     const sizeRaw = typeof req.query.size === "string" ? req.query.size : undefined;
@@ -187,7 +203,7 @@ placesRouter.get(
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     res.setHeader("ETag", cached.etag);
     res.setHeader("X-Cache", cached.cacheHit ? "HIT" : "MISS");
-    createReadStream(cached.filePath).pipe(res);
+    await sendStoredFile(res, cached.filePath);
   }),
 );
 
@@ -202,19 +218,19 @@ placesRouter.get(
     const photo = await loadPlacePhotoForStream(id, rank);
     if (!photo) throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
 
-    // Sanity: ensure the file is still on disk. Hard delete moves files
-    // into .trash/ rather than unlinking (#73), but the place row may
-    // outlive a manual cleanup.
-    try {
-      const st = await stat(photo.file_path);
-      if (!st.isFile()) throw new Error("not a file");
-    } catch {
-      throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
-    }
+    // `file_path` is written by the extraction agent: serve it only if
+    // it is a file under the place-photo cache. That also covers the
+    // file having gone — hard delete moves files into .trash/ rather
+    // than unlinking (#73), but the row may outlive a manual cleanup.
+    const absPath = await resolveStoredFile(
+      path.join(getUploadDir(), "places"),
+      photo.file_path,
+    );
+    if (!absPath) throw new NotFoundProblem("PlacePhoto", `${id}/${rank}`);
 
-    res.setHeader("Content-Type", photo.mime_type ?? "image/jpeg");
+    setStoredImageHeaders(res, photo.mime_type ?? "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
-    createReadStream(photo.file_path).pipe(res);
+    await sendStoredFile(res, absPath);
   }),
 );
 
@@ -233,10 +249,11 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/places/{id}",
     summary: "Get a place by id (full multilingual record).",
     description:
+      "`{id}` is the place's UUID or its Google place id. " +
       "Returns the place row with all multilingual columns plus refs to any cached photos. " +
       "Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
     tags: ["places"],
-    request: { params: z.object({ id: Uuid }) },
+    request: { params: z.object({ id: PlaceRef }) },
     responses: {
       200: { description: "Place", content: { "application/json": { schema: Place } } },
       404: { description: "Not found", content: problemContent },
@@ -275,7 +292,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
       "`derivation_event_id` lets you correlate. Returns 422 when " +
       "`raw_response` is NULL.",
     tags: ["places"],
-    request: { params: z.object({ id: Uuid }) },
+    request: { params: z.object({ id: PlaceRef }) },
     responses: {
       200: {
         description: "Re-derive committed",
@@ -302,7 +319,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
       "deferred until a Yelp client lands (separate epic). Returns " +
       "503 when `GOOGLE_MAPS_API_KEY` is unset and 502 on upstream errors.",
     tags: ["places"],
-    request: { params: z.object({ id: Uuid }) },
+    request: { params: z.object({ id: PlaceRef }) },
     responses: {
       200: {
         description: "Refresh committed",
@@ -331,7 +348,7 @@ export function registerPlacesOpenApi(registry: OpenAPIRegistry): void {
       "the server has no GOOGLE_MAPS_API_KEY configured.",
     tags: ["places"],
     request: {
-      params: z.object({ id: Uuid }),
+      params: z.object({ id: PlaceRef }),
       query: z.object({
         size: z.string().regex(/^\d{2,4}x\d{2,4}$/).optional(),
         zoom: z.string().regex(/^\d+$/).optional(),

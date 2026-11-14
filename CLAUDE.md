@@ -10,7 +10,7 @@ This file is for whoever is **developing** this repo: a person, or an AI working
 |---|---|---|
 | Developer (you) | How the project is built, deployed and debugged | This file, `README.md`, `docs/` |
 | Extraction agent (`claude -p`, spawned per receipt inside the container) | What to extract and how to write it to the ledger | `src/ingest/prompt.ts` and the modules it stitches together (`prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts`, `items-sql.ts`, `brand-icon-prompt.ts`), `src/ingest/lessons.md`, and `src/ingest/reextract-prompt.ts` for re-extract |
-| Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger, read-only | `src/insights/ask.ts` |
+| Ask agent (`POST /v1/insights/ask`) | How to answer a question from the ledger. It has no tools: it writes SQL and the server runs it as a read-only role | `src/insights/ask.ts` |
 
 Keep them apart:
 
@@ -43,7 +43,11 @@ Receipts can be wrong (mis-shot, wrong merchant, duplicate). Soft and hard delet
 **`DELETE /v1/documents/:id`**
 - default: soft delete (sets `deleted_at`). `GET` and link-creation hide the row; `?include_deleted=true` surfaces it. Re-uploading the same bytes resurrects it via the sha256 dedup path.
 - `?hard=true`: removes the row and the image file. Refuses with 409 if links exist, unless `?cascade=true`.
-- `?cascade=true`: in one DB transaction, also handles linked transactions: `posted` → soft-deleted, `draft|error` → hard-deleted, already soft-deleted → left alone, `reconciled` → **aborts the whole operation with 409, no writes**. Combine with `?hard=true` for a full purge.
+- `?cascade=true`: in one DB transaction, also deletes each linked transaction for which this document is the **last live evidence**. Each linked transaction is sorted by whether it is already soft-deleted **before** anything else is asked about it: an already soft-deleted one is **skipped** (left alone, link kept), whatever other documents it has. Of the rest, a transaction that another non-deleted document is still linked to is **kept**: an invoice and a payment confirmation both support one purchase, and deleting either file must not delete the purchase. The ones that are neither go the usual way: `posted` → soft-deleted, `draft|error` → hard-deleted, `reconciled` → **aborts the whole operation with 409, no writes**. A reconciled transaction that is merely kept does not block. The document is soft-deleted and its link rows stay (as on any soft delete), so `restore` brings the association back.
+- `?cascade=true&hard=true`: a full purge of the document. Transactions no other live document supports are hard-deleted, soft-deleted ones included; the supported ones only lose the link and get a `document_unlinked` event, and are reported as kept, or as skipped if they were already soft-deleted.
+- A cascade answers **200 with a `CascadeDeleteReport`** (`transactions_kept`, `transactions_soft_deleted`, `transactions_hard_deleted`, `transactions_skipped`), not 204: "delete this receipt" can leave the receipt standing when a second document supports it, and `transactions_kept` is how a caller finds out. Every linked transaction is in exactly one list, and a soft-deleted one is never under `transactions_kept`. A delete without `cascade` is still 204.
+- Every `hard_deleted` event, from any path, carries in its payload what the delete is about to erase: `transaction_id` (the FK nulls the column when the row goes, so the payload copy is the only pointer back, #202), `prior_status`, and `prior_deleted_at` (since when the row had been soft-deleted, or null). `check-ledger` dates a hard delete from it.
+- A transaction's `version` does not move when its documents do. Its ETag does: see "ETags" under "HTTP error contract".
 
 **`POST /v1/documents/:id/restore`** clears `deleted_at`.
 
@@ -51,8 +55,38 @@ Receipts can be wrong (mis-shot, wrong merchant, duplicate). Soft and hard delet
 - default: soft delete. The row drops out of every money query; `POST /v1/transactions/:id/restore` brings it back.
 - `?hard=true`: physical delete (postings and document_links cascade via FK).
 - `reconciled` rejects both with 409.
+- `If-Match` sent as the whole ETag must match its documents part too: 412, nothing deleted, when a document was linked, unlinked, deleted or restored since the tag was issued. The bare `W/"<version>"` form is held to the version only. See "ETags" under "HTTP error contract".
 
 The `reconciled` guard exists because that state means the row has been matched to a bank line. Erasing it without unreconciling first leaves the bank side hanging.
+
+### What counts as a live transaction
+
+A transaction is **live** when `status IN ('posted','reconciled') AND deleted_at IS NULL`. A soft delete leaves `status = 'posted'`, so a status filter alone treats a deleted row as live; that is how a receipt re-uploaded after its transaction was deleted came to be closed as a duplicate of the deleted row.
+
+The definition lives in the database as the view `ledger_live_transactions` (migration 0040), exposed to code as `liveTransactions` in `src/db/live.ts`. It has the columns of `transactions`.
+
+- Read it wherever the question is "is this in the ledger". The dedup probes that live in code do: the byte-level probe in `src/routes/ingest.service.ts`, the pHash neighbour query and the `near_dup` guard in `src/ingest/worker.ts`, both passes in `src/reconcile/dedup.ts`, and the apply step in `src/reconcile/engine.ts`. Re-extract (`reExtractDocument`) uses it to pick the target when a document links to several transactions and only one is live.
+- Keep reading `transactions` where deleted rows are wanted on purpose: restore, `include_deleted`, hard delete, audit, and anything that must tell "missing" from "deleted".
+- Not yet moved: the hand-written predicate is still in `src/routes/reports.ts`, `accounts.ts`, `merchants.ts`, `brands.ts`, `src/insights/discover.ts`, and in the extraction prompt's own candidate query.
+- **One dedup layer still ignores liveness: the agent's Message-ID pre-check** (`src/ingest/prompt.ts`, result set (3) of Turn A). It matches any earlier document with the same Message-ID, whether or not that document still has a live transaction, and closes the ingest as `done` with no transaction and `error = 'duplicate Message-ID'`; the worker accepts that as the one legitimate zero-transaction `done`. So an email re-forwarded after its transaction was deleted is not extracted again. This is the email twin of the byte-level case fixed above. Fixing it is a prompt change (join the check to the view, and deal with the `(workspace_id, message_id)` unique index when the new copy is stamped), so it needs a `PROMPT_VERSION` bump and the `--with-claude` cases of `eval-dedup`.
+- The view is `SELECT t.*`, expanded at creation. A migration that **drops or retypes** a `transactions` column must `DROP VIEW` first and recreate it after; a migration that **adds** one must re-run the `CREATE OR REPLACE VIEW` for the column to show through. Postings and line items have no view: join them to this one.
+
+### Reconcile proposals: apply, undo, stale
+
+A dedup proposal names a `duplicate` (the newer row, unless that one alone is `reconciled`: a row matched to a bank line always survives) and a `duplicate_of` (the survivor). Status moves `proposed` → `auto_applied` | `user_applied` → `reverted`, or `proposed` → `rejected` | `stale`.
+
+- **Apply** (`src/reconcile/engine.ts::applyDedupProposal`, used by auto-apply and by `POST /v1/batches/:id/reconcile/apply`) is one DB transaction: move the duplicate's document links to the survivor, soft-delete the duplicate, write an event on both rows, and store which links moved in `payload.applied.links`. It refuses when either row is not live, when the duplicate is `reconciled`, or when the two rows moved money in different directions. Direction is the class of the row's profit-and-loss legs (expense, income, both, neither) plus the sign of their total, then `metadata.flow` / `refund_of`; `directionLateral` and `flowsDisagree` in `src/reconcile/dedup.ts` are the one definition, shared with detection.
+- **Undo** (`POST /v1/batches/:id/reconcile/undo`) restores the duplicate and moves those links back. For proposals applied before links were recorded it rebuilds the list from ingest history and link timestamps and reports `links_source: "inferred"`; it refuses rather than restore a row with no documents. **It does not restore a row with no live document either**: when every document the apply moved has since been deleted (a cascade delete of the moved document keeps the survivor and tombstones or removes the file), the proposal is skipped with `no_live_document: …`, the duplicate stays deleted and the proposal stays applied. Restore the document and undo again; if the file is gone for good, the row can still be brought back deliberately with a plain transaction restore. A duplicate that had no document when it was folded is restored as it was. **The same holds from the survivor's side**: when the survivor's own documents have all been deleted since the apply (a cascade of its own receipt keeps it, because the moved document still supports it), taking the moved documents back would leave it live with no live document, so the proposal is skipped with `survivor_no_live_document: …`. Restore one of the survivor's own documents, or delete the survivor, then undo again. A survivor that never had a document of its own (a manual entry) goes back to having none, as it started. Applies that built on each other (C folded into B, then B into A) are undone newest first: undo of the inner one is refused with `survivor_folded: undo proposal <id> … first`. A plain `POST /v1/transactions/:id/restore` on a row dedup removed still brings it back without its documents and leaves the proposal applied; run undo for that proposal afterwards (it moves the links and reports `restored: false`). `check-ledger` reports that state as `applied-duplicate-gone`.
+- **Stale**: an open proposal naming a row that is no longer live is closed as `stale` by the next reconcile in the workspace. No ledger row changes.
+- A pair is proposed once per workspace, whatever batch sees it; `stale` is the only status that lets it be proposed again.
+
+What the detector will and will not propose is documented at the top of `src/reconcile/dedup.ts`. Two of its rules are heuristics, not proofs: the ±3-day window, and "two or more other same-total rows at the same merchant in that window means a recurring charge". The second threshold was chosen from the proposals on file in November 2026, and it has a known cost: three or more copies of one receipt that carry no printed identifier look like a recurring charge and get no proposal. A match on any of the five identifier keys can auto-apply (score 1.0), not only `order_number` and `payment_id` as before; an order, invoice or booking paid in two equal charges within three days at one merchant on one card would therefore be folded. It is recorded and undoable.
+
+The byte-level probe is check-then-insert, so `createBatchFromFiles` runs one request at a time per workspace (an in-process chain, like reconcile's): the same bytes arriving in several requests at once are extracted once.
+
+`scripts/check-ledger.ts <postgres-url> [--verbose] [--allow=<check>,…]` is a SELECT-only sweep (the session is opened read-only) that exits non-zero when a dedup or `near_dup` ingest points at a transaction that was not live when the ingest closed, an open proposal names a non-live row, an applied proposal's survivor was not live when it was applied or its duplicate is live again, a live document is linked only to non-live transactions, a live transaction that has (or had) a document has no live one left, a row sits deleted as the duplicate of a row whose money moved the other way, or un-retired items hang under a deleted transaction. A row deleted after the ingest or proposal pointed at it is a later decision and is not reported: a soft delete is dated by `deleted_at`, a hard delete by its `hard_deleted` event (`payload.transaction_id`, `prior_status`, `prior_deleted_at`). A missing row with no such event, or one that was already soft-deleted when the pointer was written and purged later, is still reported. It does not use the view, so it also runs against a database migration 0040 has not reached.
+
+Three of its checks stay red under ordinary use and are what `--allow` is for: `document-has-live-txn` (a transaction was deleted and its document kept), `txn-has-live-document` (its mirror image: a document was deleted on its own with a plain `DELETE /v1/documents/:id`, or a transaction was restored after a cascade took it and its document; manual entries, which never had a document, are not looked at) and `items-under-live-txn` (nothing retires a deleted transaction's line items, and the item and product reads do not look at the parent's `deleted_at`). `--allow` only takes them out of the exit code; they are still counted and printed. `txn-has-live-document` is there for the same state reached without anyone choosing it. The cascade delete removes a transaction with its last live document, and undo refuses from both sides (`no_live_document` for the duplicate it would restore, `survivor_no_live_document` for the survivor it would strip), so neither creates it. A plain document delete that runs while a cascade of the transaction's other document is deciding still can, but only as the same end state as running the two one after the other. A gate built on `--allow` (after a deploy, say) names all three, plus any check the existing data already fails.
 
 ## The three-layer data model (#80)
 
@@ -123,7 +157,7 @@ It is synchronous and bypasses `MAX_CLAUDE_CONCURRENCY`, so run calls strictly o
 
 `src/projection/layer3.ts` lists the columns re-extract must not overwrite.
 
-- **Hard**: `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. Extraction never writes these, so the re-extract UPDATE simply does not name them. `version` is the exception: always `version + 1`.
+- **Hard**: `status`, `deleted_at`, `trip_id`, `narration`, `id`, `workspace_id`, `source_ingest_id`, `created_by`, `created_at`, `version`. Extraction never writes these, so the re-extract UPDATE simply does not name them. `version` is the exception: always `version + 1`. Since migration 0041 the agent's database role also has no UPDATE privilege on any of them except `version` (see "Agent sandbox"), so nothing that goes through the agent's own `$DATABASE_URL` can write them, whatever the prompt says.
 - **Soft**: `payee`, `occurred_on`, `occurred_at`. Extraction writes them and the user may override them. `updateTransaction` sets `metadata.user_edited.<field> = true` whenever a PATCH names one, and the re-extract SQL wraps each in a CASE that keeps the current value when the flag is set:
 
 ```sql
@@ -134,6 +168,42 @@ END
 ```
 
 Once flagged, a field is read-only to re-extract. The flag is a boolean, not a timestamp: when the edit happened is in `transaction_events`.
+
+### Editing a transaction through the API
+
+Three rules keep an ordinary API call from destroying ledger data. All three are checked by `scripts/smoke-ledger-api-safety.ts` (below).
+
+**`PATCH /v1/transactions/:id` merges `metadata`, it never replaces it** (RFC 7396, `src/projection/metadata-patch.ts`). Objects merge recursively, `null` removes a key, and `metadata: {}` changes nothing. One refinement of the RFC: a value sent back exactly as stored is left as stored, nested nulls included, so GET → change a key → PATCH the whole object back is safe (strict RFC 7396 would strip every null inside the echoed values, and most rows carry nulls inside `items` and `ocr_audit`). Only the top-level keys that moved are written, as a jsonb expression, so untouched keys never round-trip through JavaScript. This matters because the deployed web client sends `metadata: {}` on every save: the OpenAPI schema used to give the field `default: {}`, and openapi-typescript renders a defaulted property as required. PATCH request schemas use `MetadataPatch` (no default) for that reason; do not put `Metadata` on a PATCH body. The other three PATCH routes that take `metadata` (accounts, owned items, wish items) follow the same rule through `metadataPatchSet`; none of them has server-owned keys.
+
+**Some metadata keys belong to the server.** `SERVER_OWNED_TX_METADATA_KEYS` lists the provenance and bookkeeping keys (`extraction`, `extraction_history`, `re_extracted_at`, `source`, `source_ingest_id`, `classification`, `ocr_audit`, `allocation_audit`, `enrichment_skipped`, `photo_ocr`, `receipt_ocr_zh`, `items`, `merge_audit`, `near_dup_check`, `fx`, `points`, `user_edited`), each cited to the code that writes it. A PATCH that would change or remove one is a 422 (`server_owned`); echoing the current value back is a no-op. Receipt facts and projections (`order_number`, `merchant`, `category_hint`, `flow`, …) stay client-writable. **When you add a server-side writer of `transactions.metadata`, add its key to that list in the same PR.** The `updated` event stores old and new values of the head fields and of only the metadata keys that moved.
+
+**Posting mutations** (`POST|PATCH|DELETE …/postings`) are refused with 409 on a `reconciled` (`transaction-reconciled`) or soft-deleted (`transaction-deleted`) transaction, and `resolvePostingMoney` in `src/routes/transactions.service.ts` decides the base-currency side for create, add and update alike:
+
+| Posting currency | `fx_rate` / `amount_base_minor` |
+|---|---|
+| workspace base | server sets `amount_base_minor = amount_minor`, `fx_rate = NULL`; a different client value is a 422 |
+| foreign cash | both required together; a patch that changes `amount_minor` or `currency` must restate them |
+| points (`*_PT`) | both, or neither (the server applies the programme valuation) |
+
+The pair is not checked against `amount_minor × fx_rate`: the FX pass settles rounding residue onto one leg, so the product is only approximate. `fx_rate` itself must fit the column (`numeric(20,10)`): below 10^10, and for cash not so small that it is stored as zero.
+
+Every If-Match-guarded mutation takes the head row's lock (`lockTransactionRow`, `SELECT … FOR UPDATE`) before checking the version, so two requests with the same If-Match cannot both win, and a background pass that writes `metadata.fx` / `metadata.points` cannot be overwritten by a concurrent PATCH.
+
+**Lock order: postings (in id order), then transaction head rows (in id order), then the document row.** One rule for every path that locks more than one of them. Keep new code on it.
+
+- *Postings before the head row.* The FX and points passes update a transaction's postings and then its `metadata` in one DB transaction, so anything that writes or deletes existing postings takes their locks first: `lockPostingRow` in posting PATCH/DELETE, `lockPostingRowsOf` in the two hard-delete paths (`deleteTransaction`, the document cascade), whose FK cascade would otherwise reach the postings after the head row. A writer that goes head-first deadlocks with a pass: Postgres aborts one of them after a second, and when the pass is the victim a foreign leg is left unconverted.
+- *Head rows before the document row.* Dedup apply and undo (`src/reconcile/engine.ts`) lock the proposal, then both transaction rows, and only then touch a document: inserting a `document_links` row makes the foreign key take `FOR KEY SHARE` on it, and undo reads the liveness of the moved documents and of the survivor's own under `FOR SHARE`, which also makes a plain document delete or restore wait instead of changing the answer before the undo commits. `DELETE /v1/transactions/:id` with a whole ETag reads the transaction's documents the same way, after its head row. Re-extract's SQL updates the transaction and then the document in one `BEGIN … COMMIT`. `cascadeDeleteDocument` (`src/routes/documents.service.ts`) used to lock the document first and the transactions after, and deadlocked with an apply or undo fired at the same pair (86 of 160 staged pairs on 7940db6; 0 of 240 since) and with re-extract's order (3 of 3). It only knows its transactions through the document's links, so it now reads the links without a lock, locks postings and head rows, locks the document `FOR UPDATE` last, and reads the links again. `FOR UPDATE` blocks the foreign key's `KEY SHARE`, so from then on no link to that document can be added; if the second read names a transaction the first did not (an apply or undo moved the document while the cascade waited), the attempt rolls back and starts over on the new link set (logged as `[documents] cascade delete of … starting over`), four times at most, then 409 `concurrent-update`.
+- *Why not a weaker lock on the document, taken first.* `FOR NO KEY UPDATE` does not conflict with `KEY SHARE`, so it would also stop the apply/undo deadlock. It would not stop the one with re-extract, which holds the transaction row and then updates the document, and it would let a link be added to a document that is being deleted, so the cascade could act on a link set that is no longer true.
+- *Linking.* A bare `INSERT INTO document_links` takes its foreign keys' `KEY SHARE` locks document first (the FK triggers fire in name order), against the rule. `linkDocumentToTransaction` therefore takes both itself, transaction then document, in one DB transaction, and checks that the document is not deleted under that lock. The extraction agent's attach branch (`src/ingest/prompt.ts`, "ATTACH") still inserts the link and then updates the transaction, so it is outside the rule; it links a document uploaded moments earlier, and moving it onto the rule is a prompt change (bump `PROMPT_VERSION`).
+- A plain document soft delete, restore or unlink writes one row and holds nothing else, so it cannot be part of a cycle (it may wait on a `FOR SHARE` above, never the other way round). Do not add a second lock to one of them without placing it in the order above; this is one reason the transaction ETag is derived from the documents instead of being bumped by them.
+
+A deadlock or serialization failure that happens anyway (SQLSTATE `40P01`, `40001`) is a 409 `errors/concurrent-update` with `Retry-After: 1`, never a 500: the whole DB transaction rolled back, nothing was written, and the same request can be sent again. Apply and undo report it per proposal as `apply_failed (sqlstate 40P01); nothing was changed`.
+
+```bash
+# Sandbox or throwaway DB only: it writes fixtures (and refuses port 3000).
+npx tsx scripts/smoke-ledger-api-safety.ts --base=http://<host>:<port> \
+  --pg=postgresql://postgres:postgres@<host>:<pgport>/receipts
+```
 
 ### Audit queries
 
@@ -152,6 +222,153 @@ SELECT place_id, source, fetched_at, fetched_by_sha
 ```
 
 A `derivation_events` row is written before the UPDATE, in the same transaction, even when `changed_keys = []`, so a no-op run is still a known-good checkpoint. To roll back a bad run, write the row's `before` jsonb back and insert a new event recording the rollback. The ingest prompt inserts a `place_snapshots` row in the same statement as the `places` upsert, on every visit, cached or not; `fetched_by_sha` is NULL on rows the original migration backfilled.
+
+## Money: minor units, exponents and base amounts
+
+Three columns on `postings` carry every amount, and `src/ledger/money.ts` is the only place that relates them.
+
+| Column | Unit |
+|---|---|
+| `amount_minor` | The posting's own currency, in that currency's own minor unit: cents for USD, fen for CNY, whole yen for JPY, fils (1/1000) for KWD, whole points for `HYATT_PT`. |
+| `fx_rate` | The multiplier from that to base-currency minor units. NULL on a base-currency posting. |
+| `amount_base_minor` | Workspace base currency, minor units. This is what every total sums. |
+
+One equation holds for every converted posting, cash or points: `amount_base_minor = round(amount_minor × fx_rate)` (the leg that absorbs a transaction's rounding residual may be off by a unit or two).
+
+- **`fx_rate` is not the published exchange rate when the two currencies have different decimals.** A rate source quotes whole units (1 JPY = 0.0065 USD); the posting needs cents per yen, 0.65. `postingFxRate(currency, base, publishedRate)` shifts it by the exponent difference, using the ISO 4217 table behind `currencyExponent()` (0 for JPY, KRW, VND and a dozen others, 3 for KWD and BHD, 2 for anything unlisted, 0 for a points code). The rate as published stays in `fx_rates.rate` and in `transactions.metadata.fx.rates[].rate`; that is the number to show a person.
+- **`toBaseMinor(amountMinor, fxRate)` is the only native-to-base conversion.** The FX pass, the points pass, and `createTransaction` / `addPosting` all call it. It works in integers and rounds half away from zero, so opposite legs convert to opposite amounts. Do not write `amount * rate` anywhere else: multiplying a minor amount by a published rate is the bug that booked a yen receipt at a hundredth of its value (¥5,000 at 0.0065 came out as 33 cents instead of $32.50).
+- **Sum `amount_base_minor`, label with the workspace base currency.** Reports, merchant and brand KPIs, account balances and dedup all do. `amount_minor` may only be summed within one currency (the points disclosure groups by programme). A new endpoint that sums it across rows adds yuan to dollars to points.
+- **No endpoint takes a `currency` parameter to relabel a sum.** The four reports and `/v1/accounts/:id/balance` each had one, and it wrote the requested code next to the same base-currency total. The response's `currency` is always the base currency.
+- **A client-supplied `fx_rate` is stored as sent.** `POST /v1/transactions` and the posting endpoints require `fx_rate` + `amount_base_minor` on a foreign cash posting and check neither against a published rate. The OpenAPI descriptions say the field is the minor-unit multiplier; a client that sends the quoted rate for a JPY posting books it at a hundredth of its value, and nothing refuses it. The boot check below notices only a rate sent that equals a published rate on record: the `fx_rates` row cached for the posting's date and currency, or a rate for that currency in the transaction's own `metadata.fx.rates[]`, matched on currency alone, not on date. Anything else goes unnoticed, such as a rounded rate, or the quoted rate on a date no rate was cached for in a transaction whose metadata does not carry it (a client of `POST /v1/transactions` rarely sends `metadata.fx`).
+
+Who converts: the extraction agent writes the receipt's own numbers with `amount_base_minor = amount_minor` as a placeholder, and the worker then runs `valuePointsSafely` and `normalizeFxSafely` (`src/ingest/worker.ts`). Neither can fail the ingest. When the FX pass cannot resolve a rate the posting stays **unconverted**: `fx_rate` NULL, base amount still the native number. `src/fx/unconverted.ts` is the one SQL definition of that state, and everything that sums base amounts for a person discloses it: every report in its `fx` block (`unconverted_transaction_count`, per-currency amounts), the same way `points` counts unvalued programmes; the merchant and brand KPIs in `unconverted_transaction_count`, and their transaction rows in `unconverted`. Zero is what makes a total trustworthy.
+
+Three different failures leave a posting unconverted, and `src/fx/rates.ts` tells them apart:
+
+| Failure | Meaning | Handling |
+|---|---|---|
+| timeout, 5xx, network | The rate exists, the source is having a bad day | 3 attempts, then a cached rate within 10 days, else unconverted. Retry later. |
+| HTTP 404, and the source still answers its probe (`FxRateNotPublishedError`) | The source has no rate for that currency (TWD, VND, KWD, AED …) or date (before 1999, far future) | One request, no retry, no stale fallback. Needs a rate supplied by hand, or the date corrected. |
+| HTTP 404, and the probe (EUR→USD on a settled date) is a 404 too | That endpoint is not the rate source: the API moved, or `FX_API_BASE` is wrong | Same as the first row. The 404 says nothing about the currency. |
+
+`scripts/backfill-fx.ts` is the only thing that revisits a posting after ingest. In particular, editing a transaction's date does not re-run FX: after correcting the date of an unconverted receipt, run `--unconverted`.
+
+```bash
+# Inside the app container (it has DATABASE_URL). Always --dry-run first.
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --dry-run            # every foreign posting, forced
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --exponent-mismatch  # only JPY/KRW/KWD…: rows booked at the wrong magnitude before exponents were respected
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --unconverted        # retry failed conversions, touch nothing that converted
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --unconverted --currency TWD --rate 0.0312   # supply a rate the source does not publish
+docker exec -i receipt-assistant npx tsx scripts/backfill-fx.ts --currency TWD --date 2026-10-01 --rate 0.0312   # correct a rate supplied earlier
+```
+
+`tsx` is not in the runtime image; `npx` fetches it on first use, so the container needs to reach the npm registry for these.
+
+`--rate` is used only for a date the source answered 404 for, and is recorded in `fx_rates` with source `manual`. It is not applied to a future date, and never replaces a published rate. To replace a manual rate (a typo), name the date with `--date` and leave `--unconverted` out, so the rate on record and every posting converted at it change together; without `--date` the recorded rate is kept and the output says so. The posting PATCH endpoint cannot set a rate by hand: it changes one leg per request, and a base amount changed on one leg fails the balance trigger.
+
+A run that computes what the postings already hold writes nothing, so re-running is free of version bumps. A run that overwrites a rate or base amount a posting already carried inserts a `derivation_events` row first, in the same DB transaction: `entity_type = 'transaction'`, `entity_id` the transaction id, `before` / `after` holding `postings` (per posting id: `fx_rate`, `amount_base_minor`) and `metadata_fx`. A first conversion at ingest is not an overwrite and is recorded by `metadata.fx` alone.
+
+**After deploying the exponent fix, run `--exponent-mismatch` once.** There is no migration for it: rows converted before the fix keep the published rate as their multiplier and stay at the wrong power of ten until the script repairs them. The server checks for exactly that state at boot (`src/fx/magnitude-check.ts`: a posting whose `fx_rate` equals the published rate for its date although its currency and the base differ in decimals) and logs `⚠️  [fx] … booked at the wrong power of ten` with the command. The script ends every run with the same check.
+
+Regression checks, each against a throwaway Postgres (usage in the file header): `scripts/smoke-fx.ts` (the JPY and KWD magnitude cases, both kinds of 404, the targeted re-derive, the no-op and audit-event behaviour, the boot check, and `--rate` supplied, mistyped and corrected) and `scripts/smoke-points.ts`.
+
+Not done:
+
+- The frontend (separate repo) formats every amount as hundredths, so a JPY receipt's own amount renders as ¥50.00 for ¥5,000, and its detail page shows `postings.fx_rate` as "the rate" where `metadata.fx.rates[].rate` is the published one.
+- `products.total_spent_minor` is still a sum of native line amounts (`transaction_items.effective_total_minor`), shown as dollars. It is written in three places that must agree: `recomputeProductStats` and the merge handler in `src/routes/products.ts`, and the ingest-time SQL in `src/ingest/items-sql.ts`, which is prompt text.
+- A points leg whose valuation pass never ran (`fx_rate` NULL, as opposed to valued at 0) sits in the totals at its points count and is in neither disclosure block.
+
+## Agent sandbox: what the two agents can reach
+
+Both agents are `claude -p` children of the server, and both read text a stranger wrote. The extraction agent has a forwarded email pasted into its prompt. The Ask agent takes a question from whoever can reach the API, then reads `ocr_text`. So what they can do is decided by what they are handed, not by what a prompt asks of them.
+
+`src/claude.ts` is the only place a child is spawned, and every spawn names a profile:
+
+| | `extraction` (ingest, re-extract) | `ask` | `text` (backfill scripts) |
+|---|---|---|---|
+| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | none | none |
+| Permissions | bypassed: Bash is unrestricted here anyway | `dontAsk`, with nothing to approve | none needed |
+| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: the server runs its SQL, as `receipts_ro` | unset |
+| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | none | none |
+
+Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`.
+
+The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` (below) with every bump.
+
+### Database roles
+
+Migration 0041 creates two roles. `src/db/agent-roles.ts` says what each may do, and the server re-applies that file at every boot (`syncAgentRoles`), along with the role passwords from `RECEIPTS_AGENT_DB_PASSWORD` and `RECEIPTS_RO_DB_PASSWORD`. The server's own pool keeps using `DATABASE_URL`, which is not in either child's environment.
+
+- **`receipts_agent`** holds exactly `AGENT_GRANTS`: SELECT on the 17 tables the prompt templates touch, INSERT where they insert, and UPDATE **per column**. No DELETE, no TRUNCATE, no DDL, no temp tables, no large objects, and no access at all to the remaining tables (`users`, `workspaces`, `idempotency_keys` and the rest). The column lists are what makes Layer 3 a server-side rule: `transactions.status` / `deleted_at` / `narration`, `places.custom_name`, `brands.user_chose_at`, `products.custom_name` and `documents.file_path` are not in them. Postings are insert-only.
+- **`receipts_ro`** holds SELECT on every table and view in `public`, and nothing else.
+
+To let the extraction agent do something new, edit `AGENT_GRANTS` in the same change as the prompt. No migration is needed, because boot applies the file.
+
+**Tables added later.** `receipts_ro` can read a new table as soon as it exists (a default privilege, re-asserted at boot) and can never write to it. `receipts_agent` cannot see a new table or view until `AGENT_GRANTS` lists it. Three things keep that from failing quietly:
+
+1. `npm run build` runs `scripts/check-agent-grants.ts`. It reads the SQL out of the rendered prompts (in any letter case, schema-qualified or not, views included) and fails when a statement is not covered by `AGENT_GRANTS`, or when a grant is no longer used by any template.
+2. Boot logs the tables the role cannot touch, and logs an error for every difference between the live privileges and the file.
+3. `check-agent-sandbox` fails on the same differences.
+
+A table neither agent may read, such as a credential store, goes in `RO_DENY_TABLES` and stays out of `AGENT_GRANTS`.
+
+**What boot does, and what its log lines mean.** After migrations, `syncAgentDbRoles` in `src/server.ts` applies the file and then logs in as each role with the URL an agent would be handed. None of it can stop the server from starting:
+
+- `🔐 Agent DB roles synced` is the normal line. `⚠️ … built-in development password` means a password variable is unset.
+- `❌ Agent DB role sync was blocked by another session` means a session held a lock the sync needs for more than ten seconds. Any role may take an advisory lock, and Postgres keeps a backend alive while it sleeps even after its client was killed, so an agent can leave such a session behind. Boot ends the sessions logged in as the two agent roles (no agent of this server exists yet) and tries once more.
+- `❌ Agent DB role drift` is a privilege that differs from the file after the sync; `❌ Agent DB login check` means an agent started now could not log in. Either one is a reason not to trust extraction until it is understood.
+
+Postgres lets any role change its own password and its own session defaults; no privilege controls that. The extraction agent can therefore lock `receipts_agent` out (`ALTER ROLE receipts_agent PASSWORD …`), and extraction then fails at its first psql call until the next restart puts the password back. The Ask path cannot do this (see below).
+
+Roles belong to the cluster, not to a database dump. After restoring a dump into a fresh Postgres the restore prints "role does not exist" for the GRANT lines; that is harmless, and the first boot recreates both roles with their grants. `scripts/tx-restore.sh` needs `session_replication_role` and keeps using the owner connection. Migration 0041 needs a connection that may create roles (the compose files connect as the `postgres` superuser).
+
+### How Ask reaches the database
+
+The Ask model has no tools. `askLedger` (`src/insights/ask.ts`) calls `claude -p` with the question; the model replies with SQL in fenced blocks; the server runs each one with `runLedgerQuery` (`src/insights/ledger-query.ts`) and calls the model again with the rows, until it replies `ANSWER:` or five model calls are spent. `session_id` in the response names the last call, whose prompt carries every query and result.
+
+`runLedgerQuery` logs in as `receipts_ro`, opens a read-only transaction, and sends the model's text as a single prepared statement, wrapped as the body of a cursor over `SELECT … FROM (<text>) q`. Only one query can parse there. It fetches at most 200 rows, each cut to 4000 characters by Postgres, under a 30 s statement timeout, and closes the connection afterwards. The read-only transaction is what stops the two things privileges do not: a role altering itself, and creating large objects.
+
+Ask used to have Bash with an allowlist of one command under `--permission-mode dontAsk`. On CLI 2.1.251 that mode still runs the CLI's built-in "read-only" commands (`id`, `cat`, `tac`, `du`, `stat` and others) without consulting any allow rule, so it was never one command. If a later change gives Ask a tool again, that is the fact to re-check first.
+
+### Checking it — `scripts/check-agent-sandbox.ts`
+
+Sandbox only; it refuses the production container. Run it after changing a profile, `AGENT_GRANTS`, the pinned CLI version, the SQL in a prompt or the Ask schema digest, and before that change is deployed:
+
+```bash
+# sandbox up first: docker compose -f docker-compose.test.yml up -d --build
+npx tsx scripts/check-agent-sandbox.ts             # runs inside receipt-assistant-test
+npx tsx scripts/check-agent-sandbox.ts --db-only   # database half only, no model calls
+```
+
+It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Every database statement is inside a transaction that is rolled back.
+
+A check that could not be carried out (usually because `claude` cannot authenticate in the sandbox) is reported as INCONCLUSIVE and fails the run. A green run means every claim was exercised.
+
+### What this does not bound
+
+Know these before treating the sandbox as a wall. Ask is confined by construction: it has nothing to run. **The extraction agent is not confined.** Its limits stop a mistake and an injection that works through what the agent was handed. They do not stop a hostile receipt that tells it to go around them, because it has an unrestricted shell running as the server's own Unix user:
+
+- **It can log in to Postgres as the owner.** The owner is a superuser, and until `RECEIPTS_DB_OWNER_PASSWORD` is set its password is the `postgres` printed in `docker-compose.yml` in a public repository, on the host named in the agent's own `$DATABASE_URL`. `psql postgresql://postgres:postgres@receipts-postgres/receipts` skips every grant above. Rotating the password (see below) removes the version of this that needs no looking; it does not remove the next one.
+- **It can read the server's environment.** A process can read `/proc/<pid>/environ` of another process of its own user, which holds the owner `DATABASE_URL`, the API keys and the OAuth token whatever they are set to.
+- **It can rewrite the server.** `/app`, `dist` included, is owned by the user the agent runs as. A change there lasts until the container is recreated.
+- **It can start another `claude`** with every tool, because `CLAUDE_CODE_OAUTH_TOKEN` is in its environment (the CLI needs it there).
+- **It can call the HTTP API**, which has no credential and will hard-delete on request, and it has outbound network because the prompts need `curl`. Whatever it can read (the receipt files, the tables in its grant list, the transcripts under `~/.claude`) it can send out.
+- **Within its grants it is not scoped to one receipt.** It may UPDATE the granted columns (`payee`, `metadata`, …) on every transaction and add postings to any of them, as long as the result balances.
+
+Closing the first four means running the agent as a different Unix user, or in a different container, from the server; the fifth is the API token and loopback ports of the next wave. None of that is in place.
+
+**Rotating the owner password.** `POSTGRES_PASSWORD` only applies when the data directory is first created, so change the role first, then the variable:
+
+```bash
+PW=$(openssl rand -hex 24)   # hex: it is pasted into a URL
+docker exec receipts-postgres psql -U postgres -qc "ALTER ROLE postgres PASSWORD '$PW'"
+echo "RECEIPTS_DB_OWNER_PASSWORD=$PW" >> .env
+docker compose up -d receipt-assistant
+```
+
+`docker exec receipts-postgres psql -U postgres` keeps working without it (local socket), so backups and `tx-restore.sh` are unaffected.
+
+For Ask, what remains: the model reads the whole ledger, including `ocr_text` written by strangers, and what it reads can steer what it answers; and every question costs up to five model calls from whoever can reach the API.
 
 ## Known Pitfalls
 
@@ -179,9 +396,9 @@ A `derivation_events` row is written before the UPDATE, in the same transaction,
    Guard rails now in place, do not remove them:
    - `src/claude.ts::assertArgvSafe()` runs before every spawn and
      throws a message naming the offending argument and its byte size.
-   - Both `src/claude.ts::runClaude` and
-     `src/ingest/extractor.ts::runClaude` take `prompt` as a separate
-     parameter and write it to stdin. `stdio[0]` must be `"pipe"`, and
+   - `src/claude.ts::runClaude` is the only spawn site (the extractor's
+     `runExtractorClaude` calls it). It takes `prompt` as a separate
+     parameter and writes it to stdin. `stdio[0]` must be `"pipe"`, and
      the `child.stdin.on("error", …)` handler must stay — the child can
      exit before draining stdin (auth failure, bad flag) and the
      resulting `EPIPE` would otherwise crash the worker instead of
@@ -213,8 +430,8 @@ A `derivation_events` row is written before the UPDATE, in the same transaction,
    whole v1 ledger transaction to Postgres via `psql` tool calls —
    **no JSON-schema coercion anywhere in the flow**. The pre-v1
    `src/claude.ts::processReceipt` that used to own this was deleted
-   in #164; `src/claude.ts` now only exports `runClaude` /
-   `detectPsqlCommand` for `src/insights/ask.ts`.
+   in #164; `src/claude.ts` now owns only how a child is spawned:
+   `runClaude` and the agent profiles (see "Agent sandbox").
 
    An earlier two-phase variant (Phase 1: image → plain-text OCR;
    Phase 2: separate `claude -p` call structuring the text into JSON
@@ -267,6 +484,49 @@ When you change a schema or add a new endpoint:
 
 Pinned to `@asteasolutions/zod-to-openapi` v7 because the repo uses zod v3. v8 requires zod v4 — bump both together in a dedicated PR if/when needed.
 
+## HTTP error contract
+
+Every error leaves through `src/http/problem.ts::problemHandler` as `application/problem+json` carrying a `trace_id`. Clients branch on `type`.
+
+**Throw, never format.** A handler throws an `HttpProblem` (or lets a zod error escape) and stops. Do not build an error body by hand and do not put `err.message` in one: for a failed query that message is Drizzle's `Failed query: <sql> params: <values>`. That holds for an error reported *inside* a 200 as well. A handler that lists per-item failures uses `renderProblem(err, req)` for a per-item problem document (`POST /v1/transactions/bulk`) or `publicErrorMessage(err)` for a one-line message (`POST /v1/admin/re-derive`), and logs the full error itself. `renderProblem` is the one mapping from "anything thrown" to a response:
+
+| Thrown | Response |
+|---|---|
+| `HttpProblem`, `ZodError` | as thrown (a body that fails its schema is 422 `errors/validation`) |
+| body-parser / multer / Express rejecting the request | 400 `malformed-body`, `malformed-upload`, `bad-request`; 413 `payload-too-large` |
+| Postgres `22P02` and the other "that value cannot be that type" codes (a NUL byte in text, `\u0000` in jsonb, an impossible date, …) | 400 `invalid-parameter` |
+| Postgres `23505` unique, `23P01` exclusion | 409 `conflict` |
+| Postgres `23503` foreign key | 422 `invalid-reference` when the request names a row that does not exist, 409 `still-referenced` when it removes one something points at |
+| Postgres `23514` check, `23502` not-null | 422 `constraint-violation` (a ledger trigger's own sentence is passed through as `detail`) |
+| Postgres `40P01` deadlock, `40001` serialization failure | 409 `concurrent-update` with `Retry-After: 1` and `retry_after_seconds` in the body: nothing was written, retry |
+| anything else | 500 `internal`: a fixed sentence and the `trace_id`, nothing from the error |
+
+The SQLSTATE table is `src/http/pg-error.ts`. A mapped Postgres error logs one `[http] trace_id=… sqlstate=…` line; a 500 logs the full error, stack and cause chain under the same id, so `docker logs receipt-assistant 2>&1 | grep trace_id=<id>` is how you get from a user's error to its cause. For a deadlock that line says `sqlstate=40P01 pg="deadlock detected"`; which two statements met is in the Postgres log (`docker logs receipts-postgres`), and the fix is the lock order under "Editing a transaction through the API", not a retry loop. A problem that needs a response header carries it in `HttpProblem.headers` (`ConcurrentUpdateProblem` sets `Retry-After`), and `problemHandler` sends it.
+
+**Malformed ids are a 400 `errors/invalid-id`, decided in one place.** `src/app.ts::UUID_PATH_PARAMS` lists, per router, the path parameters that are UUIDs; `src/http/params.ts::UUID_QUERY_PARAMS` lists the query-string ones. A request with a malformed one never reaches its handler. When you add a route with a new UUID parameter name, or a UUID filter to a `*Query` schema, add the name there. `:brandId` (a slug), `/v1/merchants/:id` (slug or UUID), `/v1/places/:id` (UUID or Google place id) and `:rank` are deliberately absent. The places one matters: `merchants.place_id` holds Google's `ChIJ…` id and the merchant page fetches `GET /v1/places/<that>`, so listing `placesRouter` turns every linked place into a 400. Before adding a parameter to either list, read the service and confirm it only ever takes a UUID. The `parseOrThrow(IdParam, req.params)` calls still in the route files are now redundant for this check.
+
+**Boolean query flags use `QueryBoolean`** (`src/schemas/v1/common.ts`), never `z.coerce.boolean()`, which reads the string `"false"` as true. `true` / `1` / `false` / `0` are accepted; anything else is a 422.
+
+**An unknown URL or method** is a 404 `errors/route-not-found`, distinct from `errors/not-found` (the record does not exist).
+
+**Cursors.** `decodeCursor(cursor, requiredKeys)` throws 400 `errors/invalid-cursor` for anything this API could not have issued; pass `requiredKeys`, or a cursor from another endpoint reaches the SQL with fields missing. Where a service decodes the cursor, its route calls `assertCursorShape` first. `/v1/merchants/:id/transactions` has its own `<date>|<id>` cursor and rejects anything else the same way.
+
+**ETags.** A resource with a `version` column uses `setEtag` / `requireIfMatch`. One without (documents) uses `sendWithRepresentationEtag`, a digest of the body. Never a constant: a tag that cannot move answers every revalidation with 304.
+
+A transaction is the case in between: it has a `version`, and its body also lists its `documents`, which change without the transaction row being written (a document soft delete or restore, a link or unlink, a cascade that keeps the transaction, a dedup apply or undo moving links onto the survivor, an upload resurrecting a soft-deleted document, the agent attaching a file to an existing transaction). Its tag is `transactionEtag(version, documents)` in `src/http/etag.ts`: `W/"<version>-<digest of each linked document's id and deleted_at>"`, computed when the response is built. It is derived, not maintained by bumping `version` from those paths, because a bump has to be remembered by every writer (one of them is prompt SQL), would make document operations take the transaction's row lock (see the lock order), and would refuse a concurrent edit for a change the edit does not touch. `If-Match` on a transaction reads the **version part only** (`parseTransactionEtag`): a client that loaded the receipt before a document was deleted and then saves an edit has the edit applied, and the response carries the current documents and tag. The bare `W/"<version>"` form is still accepted there, for a client that builds the header from the body's `version`; it never matches `If-None-Match`, so every copy cached before this format revalidates once. **`DELETE /v1/transactions/:id` is the exception**: a delete is the one write that undoes a document change (a hard delete takes the links with it, and either kind removes the purchase a receipt was just attached to), so a delete sent with the whole tag must match it whole, documents part included, or it is a 412 with nothing deleted (`assertDocumentsMatchEtag` in `transactions.service.ts`, under the head-row lock). A delete sent with the bare form named no documents and is held to the version only. Not covered yet: the body's `items` (`POST …/items` adds lines without a version bump) and its `merchant` / `place` blocks (a rename writes another table). A revalidation after one of those is still a 304. The fix is to add them to `transactionEtag`, not to bump `version`. The same reasoning covers response *headers*: `/v1/brands/:id/icon` and `/v1/products/:id/image` revalidate, a 304 leaves the browser with the headers it stored, so their ETag is `storedImageEtag(contentHash)`, the content hash plus `STORED_IMAGE_HEADERS_VERSION` in `src/http/files.ts`. Bump that constant when the security headers on stored images change, as `RENDER_VERSION` is bumped for `/rendered`.
+
+**`Idempotency-Key`** (`src/http/idempotency.ts`, mounted on `POST /v1/transactions`). The first request claims the key in `idempotency_keys` before the handler runs, so a concurrent duplicate gets 409 `errors/idempotency-in-progress` instead of running too. A row with `response_status = 0` is such a claim, held for a 2-minute lease; a completed request rewrites it with the real response and a 24 h expiry, a failed one deletes it. Expired rows are replaced on reuse and swept hourly. A key longer than 255 characters is a 400 `errors/invalid-idempotency-key` (the unique index cannot hold much more).
+
+**Files whose path is a database value.** `brand_assets.local_path`, `product_assets.local_path` and `place_photos.file_path` are written by the extraction agent, and `documents.file_path` can be rewritten by anything with `psql`. Serve them only through `src/http/files.ts`:
+
+- `resolveStoredFile(root, stored)` returns a path only for a regular file inside `root` (symlinks followed). Never `isAbsolute(p) ? p : join(root, p)`. `resolveInside` is the lexical half, for a path about to be written (brand uploads, the static-map cache directory named after `places.google_place_id`).
+- `setStoredImageHeaders` sends `nosniff` plus a `sandbox` CSP and downgrades any non-image type to a download: an SVG opened at its own URL is a document on the app's origin. A route that answers 304 calls `setStoredAssetGuards` first so the 304 carries them too.
+- `sendStoredFile(res, absPath)` streams the bytes. Never `createReadStream(p).pipe(res)`: it has no error listener, so a file that exists but cannot be opened ends the process. `sendStoredFile` opens the file before anything is sent, which makes that a 404 or 500 problem document, and `problemHandler` drops the `Cache-Control` / `ETag` the handler had staged so the error is not cached as the image.
+
+`GET /v1/documents/:id/content`, `/rendered` and the re-extract preflight are contained this way. `resolveUploadPath` itself is not: the ingest worker, ingest retry and hard delete (which moves the file into `.trash/`) still follow whatever `file_path` says.
+
+**Check:** `npx tsx scripts/check-http-errors.ts --disposable --db=<url of a throwaway Postgres>` boots the app in-process and asserts all of the above over real HTTP. It writes test rows and leaves them; never give it the ledger's URL. Run it after touching `src/http/`, `src/app.ts`, or how a route fails.
+
 ## Agent transcripts (session JSONL)
 
 There is no observability stack. Langfuse was removed; it only ever re-read the file below and truncated each field to 2–5K characters. Claude Code writes the full transcript of every `claude -p` run itself — prompt, thinking, every tool call and result, per-turn `usage` — to:
@@ -281,6 +541,8 @@ host:      ~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.
 **Retention is pinned in the image, not by default.** The CLI deletes transcripts older than `cleanupPeriodDays` (default 30). The Dockerfile writes `/etc/claude-code/managed-settings.json` with `cleanupPeriodDays: 36500` — intended as permanent; the CLI has no "never" value. Managed settings outrank every other scope. Do not drop that line, and do not "fix" it to `0` (fails validation) or to an astronomical number (the sweep's `now − N days` cutoff leaves the JS Date range past ~1e8 days). Runs made on the host (e.g. `scripts/smoke-v1-ingest.ts`) land in the host's own `~/.claude/projects/` under the host's retention, not here.
 
 Pre-removal history: every Langfuse trace (May–Oct 2026, 1300 traces / 21,826 observations, fields truncated) is exported to `~/Developer/receipt-assistant-data/langfuse-export/{traces,observations}.jsonl`. It is the only copy of runs older than the 30-day window that had already been swept.
+
+Sandbox runs (`docker-compose.test.yml`) are kept apart, in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`; everything below works the same with `test-claude` in the path and `receipt-assistant-test` as the container. Until that directory existed the sandbox mounted production's, so the production directory also holds older sandbox sessions. They can be told apart by the ingest id in the prompt: nothing deletes `ingests` rows, so an id production's table does not have came from the sandbox.
 
 ### Finding a run
 
@@ -343,9 +605,11 @@ for line in sys.stdin:
 
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
-The dedup system (#134/#135) has a dedicated sandbox-only regression
-harness. Run it after ANY change to `src/ingest/prompt.ts` Phase 4a.0,
-the worker guards, `src/reconcile/dedup.ts`, or the pHash code:
+The dedup system (#134/#135) has a dedicated regression harness that
+must never be pointed at production. Run it after ANY change to
+`src/ingest/prompt.ts` Phase 4a.0, the worker guards, `src/reconcile/*`,
+the dedup probes, the pHash code, or the document cascade delete (it
+meets apply and undo in cases `cd` and `cs`):
 
 ```bash
 # sandbox up + reset first:
@@ -355,11 +619,32 @@ npx tsx scripts/eval-dedup.ts --base=http://<mini>:3001 \
   --pg=postgresql://postgres:postgres@<mini>:5433/receipts --with-claude
 ```
 
-Stub cases (`g1-g3` worker guards, `r1-r3` reconcile edges) are
-deterministic seconds; `--with-claude` adds the agent decision-tree
-branches (`b2` attach, `b3` distinct-despite-pHash, `b4` flag+review
-round-trip) and the same-batch `race` case (~15 min total). The stub
-extractor it relies on is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
+Stub cases are deterministic and take about a minute: `g1-g4` worker
+guards, and the reconcile engine's rules — `r1-r3` (identifier match,
+card conflict, idempotent re-run), `rf` (refund vs purchase), `sd`
+(soft-deleted survivor, re-upload after delete), `l1` (the same bytes
+in four requests at once), `rc` (recurring equal-price charges), `ib`
+(in-batch identifier rules), `nd` (agent verdict respected), `pp` (one
+proposal per pair), `cl` (survivor must be live at apply), `un`
+(undo), `rd` (a reconciled row survives), `ch` (chained applies are
+undone newest first), `cd` (apply, cascade-delete the moved document,
+undo: refused with `no_live_document`), `cs` (apply, cascade-delete the
+survivor's own document, undo: refused with `survivor_no_live_document`).
+Every seed carries a per-run nonce in
+its payee and its amount, so they need no reset and can be pointed at
+any throwaway server started with `EXTRACTOR_STUB_ALLOWED=1`, not only
+the sandbox. "Removed" in this harness means soft-deleted: `deleted_at`
+set, status still `posted`.
+
+`--with-claude` adds the agent decision-tree branches (`b2` attach,
+`b3` distinct-despite-pHash, `b4` flag+review round-trip) and the
+same-batch `race` case (~15 min total); those do need a reset sandbox.
+The in-batch pass no longer removes a row on date + payee + amount
+alone, so `race` only converges on its second path when both
+extractions wrote the same identifier. That path has not been re-run
+since the change.
+
+The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable
 that env on the production compose. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and
@@ -413,6 +698,57 @@ curl -sS --max-time 1000 -X POST "$BASE/v1/documents/$DOC/re-extract" | jq .
 - **CI-ready**: verification scripts can hit the API directly
 - **No context switching**: stay in terminal, no browser navigation
 
+## Sandbox stack (`docker-compose.test.yml`)
+
+A second copy of the app and its database, for evals, the dedup matrix and frontend test runs. API on 3001, Postgres on 5433.
+
+```bash
+docker compose -f docker-compose.test.yml up -d --build   # builds receipt-assistant:sandbox from this checkout
+./scripts/sandbox-reset.sh                                # empty ledger, about a second, no restart
+```
+
+It shares no state with production. Everything the sandbox can write is its own:
+
+| | Production | Sandbox |
+|---|---|---|
+| Compose project | `receipt-assistant` | `receipts-test` |
+| Image | `receipt-assistant:local` | `receipt-assistant:sandbox` |
+| Containers | `receipt-assistant`, `receipts-postgres` | `receipt-assistant-test`, `receipts-test-postgres` |
+| Postgres data | `receipt-assistant-data/postgres/` | `receipt-assistant-data/test-postgres/` |
+| `/data` | four mounts: uploads (iCloud), `brand-assets/`, `product-assets/`, `prompt-lessons/` | one directory, `receipt-assistant-data/test-uploads/`, holding all four |
+| `/home/node/.claude` | `receipt-assistant-data/claude/` | `receipt-assistant-data/test-claude/` |
+
+Three rules keep it that way; the compose file's header explains each.
+
+- **`name:` is pinned.** Both files declare the same service names, so without it Compose treats the running production containers as stale instances of the sandbox's and removes them (#193).
+- **The image tag is the sandbox's own.** A tag is a pointer. While both files said `receipt-assistant:local`, building the sandbox from a branch moved the tag production runs, and the next `docker compose up -d receipt-assistant` on production would have started that branch build and run its migrations against the real ledger.
+- **No production path is mounted, not even read-only.** Every bind source in the sandbox file is a `test-*` directory. The sandbox used to mount production's Claude directory and `brand-assets/` read-write.
+
+What the two stacks do share is the account behind the keys: `.env` gives both the same `CLAUDE_CODE_OAUTH_TOKEN`, Google Maps key and logo.dev keys, so sandbox agent runs spend the same subscription quota. Compose reads `.env` from the directory the compose file is in. A git worktree has none, so there the token renders empty and every real extraction fails on auth (stub uploads still work); pass `--env-file ~/Developer/receipt-assistant/.env`. After rotating the token, run `docker compose -f docker-compose.test.yml up -d` so the sandbox picks up the new value.
+
+A build from a git worktree is stamped `unknown`: the `Dockerfile` copies `.git` to read the commit, and in a worktree `.git` is a one-line pointer to a host path the builder cannot follow. `/version` and every `metadata.extraction.prompt_git_sha` that image writes then say `unknown`, so an eval run cannot be tied to its commit. When that matters, check the branch out in the main checkout and build there.
+
+### What `scripts/sandbox-reset.sh` does
+
+It clears every table in the `public` schema except boot scaffolding, in one transaction, and moves everything under `test-uploads/` to the Trash. The table list comes from the catalog at run time, so a table added by a later migration is cleared without editing the script.
+
+Scaffolding is what a boot leaves in an empty database. The app creates it only at boot, so clearing it would break the running stack:
+
+| Kept | Written by |
+|---|---|
+| `users`, `workspaces`, `workspace_members`, `accounts`, `points_valuations` | `src/db/seed.ts`, which does nothing once the seed workspace exists |
+| `points_programmes` | `drizzle/0039_points_seed.sql`; a migration never runs twice |
+
+Rows of any other workspace or user are deleted from those tables too. **A migration that seeds reference rows into a new table must add that table to `keep` in the script**, or the reset will empty it and nothing will put the rows back. `./scripts/check-sandbox-reset.sh` catches a list that has fallen behind: it boots an empty throwaway Postgres (migrations, then seed), runs the reset, and fails if the reset changed anything or kept a table the boot left empty. Run it after adding a migration. It starts and removes its own container; neither stack has to be up.
+
+Three limits.
+
+- **Scaffolding is kept, not restored.** Seeded rows carry no marker, so the reset cannot tell them from later ones. In the seed workspace, accounts and valuations that a test or an agent added survive, and so does any edit to a seeded row (the extraction agent adds a points account the first time it sees a programme; a frontend test may rename or delete `Credit Card`, which the extraction prompt looks up by name). `points_programmes` has no workspace column, so every row in it survives; `scripts/smoke-points.ts` adds two. The summary line prints the counts. The script's header has the rebuild recipe for a factory-fresh database.
+- **It does not wait for extractions in flight.** It warns when it sees queued or processing ingests, and an agent still running will write rows after the reset.
+- **It is meant for a quiet stack.** On a busy one it is still all-or-nothing: two resets started together run one after the other, and a reset that cannot get every table within 30 s exits 3 with nothing cleared. A request that is mid-flight when its rows vanish fails (a 404, a foreign-key error, sometimes a deadlock error).
+
+It refuses to run against production three ways: the container name `receipts-postgres`, the compose project `receipt-assistant`, and any container or data directory that is a production path, whatever it is spelled like (compared by inode, so letter case and symlinks do not get past it). The data directory must also be named `test-*`; everything in it goes to the Trash.
+
 ## Persistent data — three locations by category
 
 App state is split across three host locations by data type. Each location is chosen to defeat a specific failure mode; do not collapse them back into one.
@@ -424,6 +760,8 @@ App state is split across three host locations by data type. Each location is ch
 | `/home/node/.claude` | `~/Developer/receipt-assistant-data/claude/` | Runtime state (OAuth credentials — now an inert escape-hatch; live auth is the `CLAUDE_CODE_OAUTH_TOKEN` setup-token, see below) + every agent session transcript (`projects/-app/*.jsonl`, the only trace store) | Same reason: `.credentials.json` is sensitive and transcripts carry receipt PII; keep both far from `git add -f` and never on iCloud. |
 
 `docker-compose.yml` uses absolute `${HOME}/...` paths so they resolve identically for any local user. Originals of all uploaded receipts also live in `~/Desktop/RECEIPT/`, which remains the human-curated source of truth.
+
+The sandbox stack mounts none of these. It has its own `test-postgres/`, `test-uploads/` and `test-claude/` beside them in `~/Developer/receipt-assistant-data/`; see "Sandbox stack".
 
 ### Why three locations (the four failure modes)
 
@@ -439,7 +777,7 @@ Bind mounts move the failure boundary: a container or volume reset no longer tou
 
 ### Claude Code OAuth — long-lived setup-token (Era 6, 2026-10-08 onward)
 
-Auth is a **long-lived `claude setup-token`** supplied via the `CLAUDE_CODE_OAUTH_TOKEN` env var (read from `.env`), **not** an interactive `/login` session and **not** an API key (`src/claude.ts` deletes `ANTHROPIC_API_KEY` to force subscription auth; it passes `CLAUDE_CODE_OAUTH_TOKEN` through). The token is the SSOT-stored `anthropic/oauth-token` in personal-vault — a setup-token on the Max-subscription quota, ~365-day TTL, fp `632c964f037d` — **the same token OpenClaw (agents `main` + `autotrader`) already runs on**. One line in `.env`:
+Auth is a **long-lived `claude setup-token`** supplied via the `CLAUDE_CODE_OAUTH_TOKEN` env var (read from `.env`), **not** an interactive `/login` session and **not** an API key (the child's environment is an allowlist built in `src/claude.ts::buildClaudeEnv`: `CLAUDE_CODE_OAUTH_TOKEN` is on it and `ANTHROPIC_API_KEY` is not, which is what forces subscription auth). The token is the SSOT-stored `anthropic/oauth-token` in personal-vault — a setup-token on the Max-subscription quota, ~365-day TTL, fp `632c964f037d` — **the same token OpenClaw (agents `main` + `autotrader`) already runs on**. One line in `.env`:
 
 ```
 CLAUDE_CODE_OAUTH_TOKEN=<setup-token from personal-vault anthropic/oauth-token>
@@ -449,7 +787,7 @@ Why this replaced the per-container `/login` session (Era 5): that session self-
 
 **Precedence — verified 2026-10-08:** when `CLAUDE_CODE_OAUTH_TOKEN` is set it is the **sole** auth gate. Proof: a garbage value `401`s (`OAuth access token is invalid`) even though the mounted `~/Developer/receipt-assistant-data/claude/.credentials.json` is still valid. So the bind mount is now only an **inert escape-hatch** — it is *not* a live fallback. The deliberate trade: self-refresh is off, so the token must be **rotated before its ~2027-07-31 expiry** or extraction hard-`401`s.
 
-**Rotation (do all four, or consumers drift):** on the mini run `claude setup-token`, then (1) update `.env` here and `docker compose up -d receipt-assistant`, (2) `openclaw models auth paste-token --provider anthropic --agent main`, (3) the same for `--agent autotrader`, (4) update the personal-vault `anthropic/oauth-token` record. Keep the value out of git — it lives only in `.env` (gitignored) and the vault.
+**Rotation (do all five, or consumers drift):** on the mini run `claude setup-token`, then (1) update `.env` here and `docker compose up -d receipt-assistant`, (2) if the sandbox stack is up, `docker compose -f docker-compose.test.yml up -d`, because it reads the same `.env` and keeps the old token until its container is recreated, (3) `openclaw models auth paste-token --provider anthropic --agent main`, (4) the same for `--agent autotrader`, (5) update the personal-vault `anthropic/oauth-token` record. Keep the value out of git — it lives only in `.env` (gitignored) and the vault.
 
 **Operate this via the `setup` skill** — first-time bootstrap, 401 diagnosis, recovery procedures all live there.
 

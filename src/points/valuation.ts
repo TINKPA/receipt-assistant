@@ -53,6 +53,7 @@
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { isPointsCurrency } from "./codes.js";
+import { toBaseMinor } from "../ledger/money.js";
 
 interface PostingRow {
   id: string;
@@ -188,7 +189,6 @@ export async function valueTransactionPoints(
   // legs get the new value. The residual is measured across everything so
   // the deferred balance trigger sees a clean sum-to-zero.
   const priced = postings.map((p) => {
-    const minor = BigInt(p.amount_minor);
     if (!isPointsCurrency(p.currency)) {
       return {
         id: p.id,
@@ -197,11 +197,15 @@ export async function valueTransactionPoints(
         isPoints: false,
       };
     }
+    // `minor_per_point` is already quoted per minor unit on both sides
+    // (one point, base-currency minor units), so it is the posting's
+    // `fx_rate` as it stands: no exponent shift, unlike a published FX
+    // rate. The multiply itself is the ledger's one conversion.
     const v = valuations.get(p.currency) ?? null;
     const rate = v?.minorPerPoint ?? 0;
     return {
       id: p.id,
-      baseMinor: BigInt(Math.round(Number(minor) * rate)),
+      baseMinor: toBaseMinor(p.amount_minor, rate),
       rate,
       isPoints: true,
     };

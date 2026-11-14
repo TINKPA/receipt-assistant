@@ -58,9 +58,11 @@ import {
   CashflowReport,
   PointsDisclosure,
   PointsProgrammeTotal,
+  FxDisclosure,
 } from "../schemas/v1/report.js";
 import { ProblemDetails } from "../schemas/v1/common.js";
 import { POINTS_CURRENCY_SQL_RE } from "../points/codes.js";
+import { unconvertedLegSql } from "../fx/unconverted.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -268,6 +270,110 @@ async function getAccountPointsDisclosure(args: {
   );
 }
 
+// ── Unconverted foreign currency ───────────────────────────────────────
+//
+// Every total in this file sums `amount_base_minor`, on the premise that
+// it is a base-currency amount. For one kind of posting it is not: a
+// foreign cash leg the FX pass could not convert (`src/fx/normalize.ts`:
+// the rate source was unreachable with nothing cached nearby, or it does
+// not publish that currency or date). The pass leaves such a leg with
+// `fx_rate` NULL and the base amount the extraction agent wrote, which is
+// the native amount, so 5,000 yen sits in the totals as 5,000 cents.
+//
+// Nothing here can convert it, and dropping it would move the error
+// without removing it. What a report can do is say so, the way the points
+// block says "this many transactions were not valued": each report counts
+// the unconverted legs inside its own scope and returns them per
+// currency, next to what they are currently counted as.
+//
+// What counts as unconverted is defined once, in `src/fx/unconverted.ts`
+// (zero-amount legs are not: they convert to zero at any rate). The
+// merchant and brand KPIs count the same legs.
+
+const FX_POLICY =
+  "Foreign-currency postings are converted to the base currency at the " +
+  "rate published for the receipt's date. A currency listed under " +
+  "`unconverted` has postings in scope with no rate (the rate source was " +
+  "unreachable, or does not publish that currency or date). They ARE in " +
+  "the totals above, at face value: `counted_base_minor` is their " +
+  "native amount read as base-currency minor units, which is wrong by " +
+  "the exchange rate. An empty list means every amount above is a true " +
+  "base-currency amount.";
+
+/**
+ * Unconverted foreign cash legs inside one report's scope: the same
+ * workspace, money-counting transactions and account types the report
+ * itself sums, and the same date bounds.
+ */
+async function getFxDisclosure(args: {
+  workspaceId: string;
+  baseCurrency: string;
+  accountTypes: ReadonlyArray<
+    "asset" | "liability" | "equity" | "income" | "expense"
+  >;
+  from?: string;
+  to?: string;
+  /** Net worth leaves closed accounts out of its balances. */
+  openAccountsOnly?: boolean;
+}): Promise<z.infer<typeof FxDisclosure>> {
+  const fromFilter = args.from
+    ? sql`AND t.occurred_on >= ${args.from}::date`
+    : sql``;
+  const toFilter = args.to ? sql`AND t.occurred_on <= ${args.to}::date` : sql``;
+  const openFilter = args.openAccountsOnly
+    ? sql`AND a.closed_at IS NULL`
+    : sql``;
+  const types = sql.join(
+    args.accountTypes.map((t) => sql`${t}`),
+    sql`, `,
+  );
+
+  const res = await db.execute(sql`
+    WITH legs AS (
+      SELECT p.currency,
+             p.amount_minor,
+             COALESCE(p.amount_base_minor, 0) AS base_minor,
+             t.id AS tx_id
+        FROM postings p
+        JOIN transactions t ON t.id = p.transaction_id
+        JOIN accounts a ON a.id = p.account_id
+       WHERE p.workspace_id = ${args.workspaceId}::uuid
+         AND t.status IN ('posted', 'reconciled') AND t.deleted_at IS NULL
+         AND a.type::text IN (${types})
+         AND ${unconvertedLegSql("p", sql`${args.baseCurrency}`)}
+         ${openFilter}
+         ${fromFilter}
+         ${toFilter}
+    )
+    SELECT l.currency,
+           SUM(l.amount_minor)::bigint  AS amount_minor,
+           SUM(l.base_minor)::bigint    AS counted_base_minor,
+           COUNT(DISTINCT l.tx_id)::int AS transaction_count,
+           (SELECT COUNT(DISTINCT tx_id)::int FROM legs) AS total_transactions
+      FROM legs l
+     GROUP BY l.currency
+     ORDER BY l.currency ASC
+  `);
+
+  const rows = res.rows as Array<{
+    currency: string;
+    amount_minor: string | number | bigint;
+    counted_base_minor: string | number | bigint;
+    transaction_count: number;
+    total_transactions: number;
+  }>;
+  return {
+    policy: FX_POLICY,
+    unconverted_transaction_count: toInt(rows[0]?.total_transactions),
+    unconverted: rows.map((r) => ({
+      currency: r.currency,
+      amount_minor: toInt(r.amount_minor),
+      counted_base_minor: toInt(r.counted_base_minor),
+      transaction_count: toInt(r.transaction_count),
+    })),
+  };
+}
+
 // ── Service: summary ───────────────────────────────────────────────────
 
 export interface SummaryArgs {
@@ -275,7 +381,6 @@ export interface SummaryArgs {
   from?: string;
   to?: string;
   groupBy?: "category" | "account" | "payee";
-  currency?: string;
 }
 
 /**
@@ -297,8 +402,7 @@ export interface SummaryArgs {
 export async function getSummaryReport(
   args: SummaryArgs,
 ): Promise<z.infer<typeof SummaryReport>> {
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
   const groupBy = args.groupBy ?? "category";
 
   const fromFilter = args.from
@@ -376,6 +480,13 @@ export async function getSummaryReport(
       from: args.from,
       to: args.to,
     }),
+    fx: await getFxDisclosure({
+      workspaceId: args.workspaceId,
+      baseCurrency: currency,
+      accountTypes: ["expense"],
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 
@@ -387,14 +498,12 @@ export interface TrendsArgs {
   from?: string;
   to?: string;
   groupBy?: "category" | "total";
-  currency?: string;
 }
 
 export async function getTrendsReport(
   args: TrendsArgs,
 ): Promise<z.infer<typeof TrendsReport>> {
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
   const period = args.period ?? "month";
   const groupBy = args.groupBy ?? "total";
 
@@ -484,6 +593,13 @@ export async function getTrendsReport(
       from: args.from,
       to: args.to,
     }),
+    fx: await getFxDisclosure({
+      workspaceId: args.workspaceId,
+      baseCurrency: currency,
+      accountTypes: ["expense"],
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 
@@ -492,7 +608,6 @@ export async function getTrendsReport(
 export interface NetWorthArgs {
   workspaceId: string;
   asOf?: string;
-  currency?: string;
 }
 
 /**
@@ -510,8 +625,7 @@ export interface NetWorthArgs {
 export async function getNetWorthReport(
   args: NetWorthArgs,
 ): Promise<z.infer<typeof NetWorthReport>> {
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
   const asOf = args.asOf ?? new Date().toISOString().slice(0, 10);
 
   const result = await db.execute(sql`
@@ -574,6 +688,13 @@ export async function getNetWorthReport(
       workspaceId: args.workspaceId,
       asOf,
     }),
+    fx: await getFxDisclosure({
+      workspaceId: args.workspaceId,
+      baseCurrency: currency,
+      accountTypes: ["asset", "liability", "equity"],
+      to: asOf,
+      openAccountsOnly: true,
+    }),
   };
 }
 
@@ -583,7 +704,6 @@ export interface CashflowArgs {
   workspaceId: string;
   from?: string;
   to?: string;
-  currency?: string;
 }
 
 /**
@@ -598,8 +718,7 @@ export interface CashflowArgs {
 export async function getCashflowReport(
   args: CashflowArgs,
 ): Promise<z.infer<typeof CashflowReport>> {
-  const currency =
-    args.currency ?? (await fetchWorkspaceBaseCurrency(args.workspaceId));
+  const currency = await fetchWorkspaceBaseCurrency(args.workspaceId);
 
   const fromFilter = args.from
     ? sql`AND t.occurred_on >= ${args.from}::date`
@@ -665,6 +784,13 @@ export async function getCashflowReport(
       from: args.from,
       to: args.to,
     }),
+    fx: await getFxDisclosure({
+      workspaceId: args.workspaceId,
+      baseCurrency: currency,
+      accountTypes: ["income", "expense"],
+      from: args.from,
+      to: args.to,
+    }),
   };
 }
 
@@ -681,7 +807,6 @@ reportsRouter.get(
       from: q.from,
       to: q.to,
       groupBy: q.group_by,
-      currency: q.currency,
     });
     res.json(out);
   }),
@@ -697,7 +822,6 @@ reportsRouter.get(
       from: q.from,
       to: q.to,
       groupBy: q.group_by,
-      currency: q.currency,
     });
     res.json(out);
   }),
@@ -710,7 +834,6 @@ reportsRouter.get(
     const out = await getNetWorthReport({
       workspaceId: req.ctx.workspaceId,
       asOf: q.as_of,
-      currency: q.currency,
     });
     res.json(out);
   }),
@@ -724,7 +847,6 @@ reportsRouter.get(
       workspaceId: req.ctx.workspaceId,
       from: q.from,
       to: q.to,
-      currency: q.currency,
     });
     res.json(out);
   }),
@@ -736,6 +858,12 @@ const problemResponse = {
   content: { "application/problem+json": { schema: ProblemDetails } },
 };
 
+const BASE_CURRENCY_NOTE =
+  "Every amount is in the workspace base currency, named by `currency` " +
+  "in the response; there is no parameter to convert the report into " +
+  "another one. The `points` and `fx` blocks say how loyalty points and " +
+  "any unconverted foreign-currency postings affect the totals.";
+
 export function registerReportsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("SummaryReport", SummaryReport);
   registry.register("TrendsReport", TrendsReport);
@@ -746,6 +874,7 @@ export function registerReportsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/reports/summary",
     summary: "Spend aggregated by category / account / payee",
+    description: BASE_CURRENCY_NOTE,
     tags: ["reports"],
     request: { query: SummaryQuery },
     responses: {
@@ -761,6 +890,7 @@ export function registerReportsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/reports/trends",
     summary: "Time-series trend (MoM / YoY) of expense spend",
+    description: BASE_CURRENCY_NOTE,
     tags: ["reports"],
     request: { query: TrendsQuery },
     responses: {
@@ -776,6 +906,7 @@ export function registerReportsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/reports/net_worth",
     summary: "Assets - liabilities at a point in time",
+    description: BASE_CURRENCY_NOTE,
     tags: ["reports"],
     request: { query: NetWorthQuery },
     responses: {
@@ -791,6 +922,7 @@ export function registerReportsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/reports/cashflow",
     summary: "Inflows vs outflows over a range, bucketed by month",
+    description: BASE_CURRENCY_NOTE,
     tags: ["reports"],
     request: { query: CashflowQuery },
     responses: {

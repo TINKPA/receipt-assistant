@@ -4,7 +4,13 @@
  * recomputed from the live `transaction_items` set, never incremented.
  */
 import { z } from "zod";
-import { IsoDate, IsoDateTime, Metadata, Uuid } from "./common.js";
+import {
+  IsoDate,
+  IsoDateTime,
+  Metadata,
+  QueryBoolean,
+  Uuid,
+} from "./common.js";
 
 export const ProductItemClass = z.enum([
   "durable",
@@ -180,7 +186,7 @@ export const ListProductsQuery = z.object({
   brand_id: z.string().optional(),
   merchant_id: Uuid.optional(),
   q: z.string().optional(),
-  include_retired: z.coerce.boolean().optional(),
+  include_retired: QueryBoolean.optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });

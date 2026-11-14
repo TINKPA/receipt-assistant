@@ -13,6 +13,7 @@ import { z } from "zod";
 import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishItems, products } from "../schema/index.js";
+import { metadataPatchSet } from "../projection/metadata-patch.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   WishItem,
@@ -91,7 +92,10 @@ wishItemsRouter.get(
     try {
       const query = parseOrThrow(ListWishItemsQuery, req.query);
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
-      const cursor = decodeCursor<WishItemsCursor>(query.cursor ?? undefined);
+      const cursor = decodeCursor<WishItemsCursor>(query.cursor ?? undefined, [
+        "updated_at",
+        "id",
+      ]);
 
       const conditions: ReturnType<typeof sql>[] = [];
       conditions.push(sql`w.workspace_id = ${req.ctx.workspaceId}::uuid`);
@@ -217,8 +221,7 @@ wishItemsRouter.patch(
       if (body.status !== undefined) updates["status"] = body.status;
       if (body.converted_transaction_id !== undefined)
         updates["convertedTransactionId"] = body.converted_transaction_id;
-      if (body.metadata !== undefined) updates["metadata"] = body.metadata;
-      if (Object.keys(updates).length === 0) {
+      if (Object.keys(updates).length === 0 && body.metadata === undefined) {
         throw new HttpProblem(
           400,
           "no-fields",
@@ -226,16 +229,34 @@ wishItemsRouter.patch(
           "PATCH /v1/wish-items/:id needs at least one field to update.",
         );
       }
-      updates["updatedAt"] = new Date();
-      const updated = await db
-        .update(wishItems)
-        .set(updates)
-        .where(
-          and(eq(wishItems.id, id), eq(wishItems.workspaceId, req.ctx.workspaceId)),
-        )
-        .returning();
-      if (updated.length === 0) throw new NotFoundProblem("WishItem", id);
-      res.json(rowToDto(updated[0]!));
+      const where = and(
+        eq(wishItems.id, id),
+        eq(wishItems.workspaceId, req.ctx.workspaceId),
+      );
+      const row = await db.transaction(async (tx) => {
+        const current = await tx.select().from(wishItems).where(where).for("update");
+        if (current.length === 0) throw new NotFoundProblem("WishItem", id);
+        // `metadata` is a JSON Merge Patch over the stored object, never a
+        // replacement for it (src/projection/metadata-patch.ts): `{}`
+        // changes nothing, `null` removes a key.
+        if (body.metadata !== undefined) {
+          const set = metadataPatchSet(
+            wishItems.metadata,
+            current[0]!.metadata,
+            body.metadata,
+          );
+          if (set !== undefined) updates["metadata"] = set;
+        }
+        if (Object.keys(updates).length === 0) return current[0]!;
+        updates["updatedAt"] = new Date();
+        const updated = await tx
+          .update(wishItems)
+          .set(updates)
+          .where(where)
+          .returning();
+        return updated[0]!;
+      });
+      res.json(rowToDto(row));
     } catch (err) {
       next(err);
     }
@@ -318,6 +339,9 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/wish-items/{id}",
     summary: "Patch a wish (fields, urgency, snooze, convert / decline)",
+    description:
+      "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
+      "replacing it (`null` removes a key, `{}` changes nothing).",
     tags: ["wish-items"],
     request: {
       params: z.object({ id: Uuid }),

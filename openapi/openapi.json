@@ -3,7 +3,7 @@
   "info": {
     "title": "Receipt Assistant API",
     "version": "2.0.0-alpha",
-    "description": "Double-entry ledger backend. The v1 resources (transactions, postings, accounts, documents) are under active construction — see issues #33 (schema), #35 (transactions API), #36 (accounts API)."
+    "description": "Double-entry ledger backend. The v1 resources (transactions, postings, accounts, documents) are under active construction — see issues #33 (schema), #35 (transactions API), #36 (accounts API).\n\nEvery error is an RFC 7807 `application/problem+json` document with a `trace_id`; branch on `type`, not on `title` or `detail`. A URL or method no route claims is a 404 `errors/route-not-found`. Database constraint failures surface as 409 (`errors/conflict`, `errors/still-referenced`) or 422 (`errors/invalid-reference`, `errors/constraint-violation`). An unexpected failure is a 500 `errors/internal` whose body is a fixed sentence plus the `trace_id`; the cause is only in the server log, under that id."
   },
   "servers": [
     {
@@ -16,6 +16,18 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer"
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request: an id in the path or query string is not a UUID (`errors/invalid-id`), the body is not valid JSON (`errors/malformed-body`), the cursor is not one this endpoint issued (`errors/invalid-cursor`), a value cannot be read as its type (`errors/invalid-parameter`), or the `Idempotency-Key` is too long (`errors/invalid-idempotency-key`).",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -403,8 +415,7 @@
           "metadata": {
             "type": "object",
             "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
           }
         },
         "additionalProperties": false
@@ -430,7 +441,8 @@
           },
           "currency": {
             "type": "string",
-            "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
+            "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. `balance_minor` is a sum of base amounts, whatever currency the account itself is denominated in (a CNY or points account still reports its balance in this one).",
             "example": "USD"
           },
           "posting_count": {
@@ -635,7 +647,9 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": [
@@ -2964,10 +2978,12 @@
             "minimum": 0
           },
           "lifetime_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "current_month_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "last_transaction_date": {
             "type": [
@@ -2976,7 +2992,13 @@
             ]
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -2985,7 +3007,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "Merchant": {
@@ -3110,10 +3133,12 @@
             "minimum": 0
           },
           "lifetime_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "current_month_spend_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "last_transaction_date": {
             "type": [
@@ -3122,7 +3147,13 @@
             ]
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Transactions counted above whose expense legs include a foreign-currency posting that was never converted (the rate source was unreachable, or does not publish that currency or date). Their native amount is in the spend figures at face value, so the figures are true base-currency amounts only when this is 0. The `fx` block of `/v1/reports/summary` lists the same postings per currency."
           }
         },
         "required": [
@@ -3130,7 +3161,8 @@
           "lifetime_spend_minor",
           "current_month_spend_minor",
           "last_transaction_date",
-          "currency"
+          "currency",
+          "unconverted_transaction_count"
         ]
       },
       "BrandRollupLocation": {
@@ -3175,10 +3207,16 @@
             ]
           },
           "total_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Signed expense total (negative for a refund). In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
           },
           "document_id": {
             "type": [
@@ -3210,6 +3248,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id",
           "merchant_id",
           "merchant_canonical_name",
@@ -3269,7 +3308,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BrandRollupRecentRow"
-            }
+            },
+            "description": "The 20 most recent live transactions across the brand's merchants (posted or reconciled, not deleted), drawn from the set the stats count."
           },
           "sibling_brands": {
             "type": "array",
@@ -3823,18 +3863,8 @@
             }
           },
           "auto_reconcile": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "string",
-                "enum": [
-                  "true",
-                  "false"
-                ]
-              }
-            ]
+            "type": "boolean",
+            "description": "Whether to run reconcile for the batch once every file has been extracted. Sent as text: `true` / `1` / `false` / `0`, in any case. On when the field is absent or empty; any other value is a 422."
           }
         }
       },
@@ -4010,7 +4040,9 @@
           "proposed",
           "auto_applied",
           "user_applied",
-          "rejected"
+          "rejected",
+          "reverted",
+          "stale"
         ]
       },
       "ReconcileProposal": {
@@ -4207,6 +4239,114 @@
           "skipped"
         ]
       },
+      "UndoRequest": {
+        "type": "object",
+        "properties": {
+          "proposal_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "proposal_ids"
+        ]
+      },
+      "UndoneProposal": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "transaction_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "canonical_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "restored": {
+            "type": "boolean"
+          },
+          "documents_relinked": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "documents_removed_from_canonical": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            }
+          },
+          "links_source": {
+            "type": "string",
+            "enum": [
+              "recorded",
+              "inferred"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "transaction_id",
+          "canonical_id",
+          "restored",
+          "documents_relinked",
+          "documents_removed_from_canonical",
+          "links_source"
+        ]
+      },
+      "UndoResult": {
+        "type": "object",
+        "properties": {
+          "reverted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UndoneProposal"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+                },
+                "reason": {
+                  "type": "string",
+                  "description": "Why nothing was changed for this proposal. Starts with one of: `not_found`, `already_reverted`, `not_applied`, `malformed_payload`, `duplicate_missing`, `not_deleted_by_this_proposal`, `no_link_record`, `no_live_document` (every document the apply moved has since been deleted, so restoring the transaction would leave it without evidence), `survivor_no_live_document` (the surviving transaction's own documents have all been deleted since, so taking the moved ones back would leave it in the ledger with no live document; restore one of its own, or delete it, then undo again), `survivor_folded`, or `undo_failed`."
+                }
+              },
+              "required": [
+                "id",
+                "reason"
+              ]
+            }
+          }
+        },
+        "required": [
+          "reverted",
+          "skipped"
+        ]
+      },
       "SummaryItem": {
         "type": "object",
         "properties": {
@@ -4304,6 +4444,58 @@
           "programmes"
         ]
       },
+      "FxUnconvertedCurrency": {
+        "type": "object",
+        "properties": {
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$",
+            "example": "TWD"
+          },
+          "amount_minor": {
+            "type": "integer",
+            "description": "The unconverted legs, summed in that currency's own minor units (yen, fen, fils).",
+            "example": 14723
+          },
+          "counted_base_minor": {
+            "type": "integer",
+            "description": "What the report's totals contain for those legs today: their native amount read as base-currency minor units. The totals are wrong by the difference between this and the real converted value.",
+            "example": 14723
+          },
+          "transaction_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "currency",
+          "amount_minor",
+          "counted_base_minor",
+          "transaction_count"
+        ]
+      },
+      "FxDisclosure": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "type": "string"
+          },
+          "unconverted_transaction_count": {
+            "type": "integer",
+            "description": "Transactions in the report's scope with at least one foreign-currency posting that was never converted. 0 means every amount in the report is a true base-currency amount."
+          },
+          "unconverted": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FxUnconvertedCurrency"
+            }
+          }
+        },
+        "required": [
+          "policy",
+          "unconverted_transaction_count",
+          "unconverted"
+        ]
+      },
       "SummaryReport": {
         "type": "object",
         "properties": {
@@ -4336,6 +4528,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "items": {
@@ -4351,6 +4544,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4360,7 +4556,8 @@
           "currency",
           "items",
           "grand_total_minor",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "TrendsItem": {
@@ -4446,6 +4643,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "buckets": {
@@ -4456,6 +4654,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4465,7 +4666,8 @@
           "group_by",
           "currency",
           "buckets",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "NetWorthAccount": {
@@ -4514,6 +4716,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "assets_minor": {
@@ -4544,6 +4747,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4554,7 +4760,8 @@
           "equity_minor",
           "net_worth_minor",
           "by_account",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "CashflowBucket": {
@@ -4610,6 +4817,7 @@
           "currency": {
             "type": "string",
             "pattern": "^[A-Z]{3}$",
+            "description": "The workspace base currency. Every amount in the report is in it; there is no parameter to ask for another.",
             "example": "USD"
           },
           "income_minor": {
@@ -4635,6 +4843,9 @@
           },
           "points": {
             "$ref": "#/components/schemas/PointsDisclosure"
+          },
+          "fx": {
+            "$ref": "#/components/schemas/FxDisclosure"
           }
         },
         "required": [
@@ -4645,7 +4856,8 @@
           "expense_minor",
           "net_minor",
           "buckets",
-          "points"
+          "points",
+          "fx"
         ]
       },
       "MerchantDetail": {
@@ -4690,10 +4902,16 @@
             ]
           },
           "total_minor": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Signed expense total (negative for a refund). In the workspace base currency (`currency`), summed from the postings' base amounts. A receipt in another currency counts at the rate it was converted at, and a loyalty-points leg at its programme valuation, exactly as in `/v1/reports/summary`."
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "description": "The workspace base currency. Always an ISO 4217 code, never a points-programme code."
+          },
+          "unconverted": {
+            "type": "boolean",
+            "description": "True when `total_minor` includes a foreign-currency posting that was never converted: that part is the receipt's native amount, not a base-currency amount."
           },
           "document_id": {
             "type": [
@@ -4711,6 +4929,7 @@
           "status",
           "total_minor",
           "currency",
+          "unconverted",
           "document_id"
         ]
       },
@@ -4767,11 +4986,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Required, together with `amount_base_minor`, on a foreign-currency cash posting: the pair is stored as sent and is not checked against a published rate, so send the minor-unit multiplier, not the quoted rate. Omit both on a points posting to have the server apply the programme valuation.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -4883,8 +5104,7 @@
           "metadata": {
             "type": "object",
             "additionalProperties": {},
-            "default": {},
-            "description": "User-defined JSON object; not schema-validated."
+            "description": "JSON Merge Patch (RFC 7396) applied to the stored metadata object: objects merge recursively, a `null` value removes that key, any other value replaces it, and keys the patch does not name are kept. `{}` changes nothing. A value sent back exactly as stored is left untouched (including nulls nested inside it), so GET → change one key → PATCH the whole object back is safe."
           }
         },
         "additionalProperties": false
@@ -5021,11 +5241,13 @@
             "example": "USD"
           },
           "fx_rate": {
-            "type": "string"
+            "type": "string",
+            "description": "Decimal string: the multiplier from this posting's minor units to base-currency minor units, so that `amount_base_minor = round(amount_minor × fx_rate)`. Null on a base-currency posting. It equals the published exchange rate only when both currencies have the same number of decimals (CNY→USD 0.14658). Against a two-decimal base, a zero-decimal currency stores the published rate × 100 (JPY→USD published at 0.0065 is `0.65`, cents per yen) and a three-decimal one the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points posting it is the programme's value per point in base minor units. The rate as published is in the transaction's `metadata.fx.rates[].rate`. Stored as sent and not checked against a published rate, so send the minor-unit multiplier, not the quoted rate.",
+            "example": "0.65"
           },
           "amount_base_minor": {
             "type": "integer",
-            "description": "Signed integer in the currency's minor unit (cents for USD, 1 for JPY, satoshi for BTC). Never store money as float.",
+            "description": "This posting in the workspace base currency, in that currency's minor unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on a base-currency posting.",
             "example": 14723
           },
           "memo": {
@@ -5036,6 +5258,64 @@
           }
         },
         "additionalProperties": false
+      },
+      "CascadeDeleteReport": {
+        "type": "object",
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "hard": {
+            "type": "boolean",
+            "description": "true: the document row was removed (`?hard=true`). false: it was soft-deleted."
+          },
+          "transactions_kept": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Linked transactions left in the ledger because another non-deleted document still supports them. Non-empty means the receipt is NOT gone: delete the remaining document(s) with cascade, or the transaction itself, to remove it. Never a transaction that was already soft-deleted; those are under `transactions_skipped`."
+          },
+          "transactions_soft_deleted": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Posted transactions this call soft-deleted (restorable)."
+          },
+          "transactions_hard_deleted": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Transactions this call removed for good: every non-kept one under `?hard=true`, and draft/error ones in soft mode."
+          },
+          "transactions_skipped": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Transactions that were already soft-deleted before this call and stay that way, whatever other documents they have. In soft mode that is every such transaction. Under `?hard=true` it is the ones another non-deleted document still supports (they lose only the link to this document); the rest are in `transactions_hard_deleted`."
+          }
+        },
+        "required": [
+          "document_id",
+          "hard",
+          "transactions_kept",
+          "transactions_soft_deleted",
+          "transactions_hard_deleted",
+          "transactions_skipped"
+        ]
       },
       "ReExtractDocumentResponse": {
         "type": "object",
@@ -5265,10 +5545,7 @@
         "parameters": [
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "flat",
@@ -5276,10 +5553,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_closed",
@@ -5299,6 +5573,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -5338,6 +5615,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Parent account not found",
@@ -5401,6 +5681,9 @@
           "304": {
             "description": "Not Modified (If-None-Match matched)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Account not found",
             "content": {
@@ -5415,6 +5698,7 @@
       },
       "patch": {
         "summary": "Patch account (rename / re-parent / close)",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing). `parent_id` may not be the account itself or any of its descendants.",
         "tags": [
           "accounts"
         ],
@@ -5456,6 +5740,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Account not found",
@@ -5520,6 +5807,9 @@
           "204": {
             "description": "Deleted"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Account not found",
             "content": {
@@ -5566,6 +5856,7 @@
     "/v1/accounts/{id}/balance": {
       "get": {
         "summary": "Account balance as of a date",
+        "description": "The balance is the sum of the account's postings in the workspace base currency, named by `currency` in the response. There is no parameter to ask for another currency.",
         "tags": [
           "accounts"
         ],
@@ -5593,20 +5884,7 @@
           },
           {
             "schema": {
-              "type": "string",
-              "pattern": "^([A-Z]{3}|[A-Z][A-Z0-9]{1,12}_PT)$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
-          },
-          {
-            "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_children",
@@ -5624,8 +5902,21 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Account not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`currency` is not the workspace base currency",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5640,6 +5931,7 @@
     "/v1/accounts/{id}/register": {
       "get": {
         "summary": "Register (checkbook view) with running balance",
+        "description": "`running_balance_after_minor` is the account's balance after that posting, counted from the account's first posting. `from` limits which rows are returned, not what the balance includes.",
         "tags": [
           "accounts"
         ],
@@ -5678,10 +5970,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -5723,6 +6012,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Account not found",
@@ -5772,6 +6064,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Idempotency conflict",
@@ -5907,10 +6202,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "has_document",
@@ -5918,10 +6210,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_deleted",
@@ -6020,6 +6309,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6027,6 +6319,7 @@
     "/v1/transactions/{id}": {
       "get": {
         "summary": "Get a transaction",
+        "description": "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted or restored — which `version` alone does not record. Treat it as opaque and send it back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made after a document change is applied rather than refused, and the bare `W/\"<version>\"` form (built from the body's `version`) is accepted as well. The exception is DELETE, which compares the whole tag when it is sent whole (see that operation).",
         "tags": [
           "transactions"
         ],
@@ -6045,6 +6338,13 @@
         "responses": {
           "200": {
             "description": "OK",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -6054,7 +6354,10 @@
             }
           },
           "304": {
-            "description": "Not Modified"
+            "description": "Not Modified (`If-None-Match` named the current ETag)"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -6070,6 +6373,7 @@
       },
       "patch": {
         "summary": "Patch transaction head fields",
+        "description": "JSON Merge Patch (RFC 7396). A field the body does not name is left alone.\n\n**`metadata` merges, it does not replace.** Objects merge recursively, a `null` value removes that key, any other value replaces it, and `metadata: {}` changes nothing. Send only the keys you mean to change.\n\n**Server-owned metadata keys cannot be changed here.** These are provenance and bookkeeping the server maintains: `user_edited`, `extraction`, `extraction_history`, `re_extracted_at`, `source`, `source_ingest_id`, `classification`, `ocr_audit`, `allocation_audit`, `enrichment_skipped`, `photo_ocr`, `receipt_ocr_zh`, `items`, `merge_audit`, `near_dup_check`, `fx`, `points`. A patch that would change or remove one is refused with 422 (violation code `server_owned`); echoing a key back with its current value is a no-op and is accepted, so a client may GET the object, change its own keys and PATCH the whole object back.\n\nPatching `payee`, `occurred_on` or `occurred_at` sets `metadata.user_edited.<field>`, which keeps re-extract from overwriting the value.\n\nA patch that changes nothing returns 200 without bumping `version`.",
         "tags": [
           "transactions"
         ],
@@ -6113,8 +6417,21 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "412": {
             "description": "Version mismatch",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed, or the patch would change a server-owned metadata key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6137,7 +6454,7 @@
       },
       "delete": {
         "summary": "Delete a transaction",
-        "description": "Default: reversible soft delete (sets deleted_at; the row drops out of every money query but is restorable via POST /:id/restore). ?hard=true forces a physical delete (postings + document_links cascade; irreversible). Reconciled transactions reject either way — unreconcile first.",
+        "description": "Default: reversible soft delete (sets deleted_at; the row drops out of every money query but is restorable via POST /:id/restore). ?hard=true forces a physical delete (postings + document_links cascade; irreversible). Reconciled transactions reject either way — unreconcile first.\n\nUnlike the other writes, a delete sent with the whole ETag (`W/\"<version>-<documents tag>\"`) must match it whole: if a document was linked, unlinked, deleted or restored since the tag was issued, the answer is 412 and nothing is deleted, so a delete cannot silently undo a receipt attached in the meantime. The bare `W/\"<version>\"` form is held to the version only.",
         "tags": [
           "transactions"
         ],
@@ -6180,8 +6497,51 @@
           "204": {
             "description": "Deleted"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "description": "Not found (or, for a soft delete, already deleted)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Transaction is reconciled — unreconcile first.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`If-Match` is stale: the version moved, or (whole tag only) the transaction's documents changed since it was issued. Re-fetch and retry.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`hard` is not one of `true`, `1`, `false`, `0`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "If-Match required",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6230,6 +6590,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found / not deleted",
@@ -6282,6 +6645,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found or not flagged",
             "content": {
@@ -6331,6 +6697,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6381,6 +6750,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "409": {
             "description": "Transaction is not in reconciled state",
@@ -6440,6 +6812,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -6447,6 +6822,7 @@
     "/v1/transactions/{id}/postings": {
       "post": {
         "summary": "Add a posting to a transaction",
+        "description": "Refused with 409 while the transaction is `reconciled` (`errors/transaction-reconciled` — unreconcile first) or soft-deleted (`errors/transaction-deleted` — restore first).\n\n`amount_minor` and `amount_base_minor` are kept consistent:\n- **Base-currency posting** — the server sets `amount_base_minor = amount_minor` and `fx_rate = null`. Omit both; a different `amount_base_minor` is a 422.\n- **Foreign-cash posting** — `fx_rate` and `amount_base_minor` are required together.\n- **Points posting** — supply both, or neither to apply the programme valuation.\n\n`amount_base_minor` must not have the opposite sign to `amount_minor`.",
         "tags": [
           "transactions"
         ],
@@ -6490,8 +6866,21 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Transaction is reconciled or soft-deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "422": {
-            "description": "Imbalance",
+            "description": "Imbalance, unknown account, or inconsistent amounts",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6542,6 +6931,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Transaction not found",
             "content": {
@@ -6578,6 +6970,7 @@
     "/v1/transactions/{tid}/postings/{pid}": {
       "patch": {
         "summary": "Update a posting",
+        "description": "Refused with 409 while the transaction is `reconciled` (`errors/transaction-reconciled` — unreconcile first) or soft-deleted (`errors/transaction-deleted` — restore first).\n\n`amount_minor` and `amount_base_minor` are kept consistent:\n- **Base-currency posting** — the server sets `amount_base_minor = amount_minor` and `fx_rate = null`. Omit both; a different `amount_base_minor` is a 422.\n- **Foreign-cash posting** — `fx_rate` and `amount_base_minor` are required together.\n- **Points posting** — supply both, or neither to apply the programme valuation.\n\n`amount_base_minor` must not have the opposite sign to `amount_minor`.\n\nA patch that names any of `amount_minor`, `currency`, `fx_rate` or `amount_base_minor` restates the whole pair under the rules above, so the native amount cannot change while the base amount stays behind. A patch of only `memo` and/or `account_id` leaves the amounts alone; `account_id` must be an account in this workspace. A patch that changes nothing returns 200 without bumping `version`.",
         "tags": [
           "transactions"
         ],
@@ -6630,6 +7023,29 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Transaction is reconciled or soft-deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Imbalance, unknown account, or inconsistent amounts",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         }
       },
@@ -6671,6 +7087,19 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Transaction is reconciled or soft-deleted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           },
           "422": {
             "description": "Would leave <2 postings",
@@ -6853,10 +7282,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -6909,6 +7335,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -6948,6 +7377,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed (bad item_class, unknown merchant_id)",
@@ -6990,6 +7422,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7045,6 +7480,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7080,6 +7518,9 @@
         "responses": {
           "200": {
             "description": "Image bytes"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Product or image unavailable",
@@ -7140,6 +7581,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7202,6 +7646,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Product not found",
             "content": {
@@ -7257,6 +7704,9 @@
         "responses": {
           "200": {
             "description": "Asset bytes"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7413,6 +7863,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7454,10 +7907,7 @@
           },
           {
             "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
+              "type": "boolean"
             },
             "required": false,
             "name": "include_retired",
@@ -7521,6 +7971,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -7548,6 +8001,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -7591,6 +8047,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7605,6 +8064,7 @@
       },
       "patch": {
         "summary": "Patch serial / location / warranty / condition / notes",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
         "tags": [
           "owned-items"
         ],
@@ -7645,6 +8105,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7677,6 +8140,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7771,6 +8237,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       },
@@ -7798,6 +8267,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -7841,6 +8313,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7855,6 +8330,7 @@
       },
       "patch": {
         "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
         "tags": [
           "wish-items"
         ],
@@ -7895,6 +8371,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -7927,6 +8406,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -7968,6 +8450,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -7988,6 +8473,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8020,6 +8508,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8060,6 +8551,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -8113,6 +8607,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8143,6 +8640,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8181,6 +8681,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8211,6 +8714,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8263,6 +8769,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8321,6 +8830,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8381,6 +8893,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Brand not found",
             "content": {
@@ -8433,6 +8948,9 @@
           "200": {
             "description": "Asset bytes"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not Found",
             "content": {
@@ -8467,6 +8985,9 @@
           "200": {
             "description": "Icon bytes"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Brand or icon unavailable",
             "content": {
@@ -8483,7 +9004,7 @@
     "/v1/brands/{brandId}/rollup": {
       "get": {
         "summary": "Brand-level rollup — locations, recent transactions, sibling brands",
-        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Voided transactions excluded from money sums. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
+        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Only live transactions (posted or reconciled, not deleted) are counted in the stats or listed in recent_transactions. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
         "tags": [
           "brands"
         ],
@@ -8507,6 +9028,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Brand not found",
@@ -8617,6 +9141,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -8649,6 +9176,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not Found",
@@ -8711,6 +9241,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Validation failed",
@@ -8779,6 +9312,9 @@
           "304": {
             "description": "Not modified (If-None-Match matched)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -8793,7 +9329,7 @@
       },
       "delete": {
         "summary": "Delete a document. Soft-deletes by default; ?hard=true removes the row and quarantines the file under .trash/; ?cascade=true also handles linked transactions.",
-        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: linked posted transactions are soft-deleted, draft/error transactions are hard-deleted, already-deleted transactions are left intact, reconciled transactions abort the operation with 409. ?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). Reconciled transactions always block hard cascades — unreconcile first.",
+        "description": "Default: soft delete (sets deleted_at). ?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. ?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. A transaction that is already soft-deleted is left as it is and reported under `transactions_skipped`, whatever other documents it has; it is never reported as kept. Of the remaining transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, and a reconciled one aborts the whole operation with 409 (unreconcile first). The document itself is soft-deleted and its link rows stay, so restoring it restores the association. ?cascade=true&hard=true: the transactions no other non-deleted document supports are hard-deleted (postings cascade), soft-deleted ones included; kept transactions, and soft-deleted ones another document supports, are only unlinked from this document (a `document_unlinked` event records it). The document row is removed and the image file is moved to .trash/ (never unlinked). A cascade answers 200 with a report of what happened to each linked transaction; check `transactions_kept` before telling a user the receipt is gone.",
         "tags": [
           "documents"
         ],
@@ -8832,7 +9368,7 @@
                 "1",
                 "0"
               ],
-              "description": "Also process transactions linked to this document. Combine with hard=true for full purge."
+              "description": "Also delete the linked transactions this document is the last live evidence of; transactions another live document supports are kept. Combine with hard=true for full purge."
             },
             "required": false,
             "name": "cascade",
@@ -8840,8 +9376,21 @@
           }
         ],
         "responses": {
+          "200": {
+            "description": "Cascade (`?cascade=true`) done. The body says which linked transactions were deleted and which were kept.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CascadeDeleteReport"
+                }
+              }
+            }
+          },
           "204": {
-            "description": "Deleted"
+            "description": "Deleted (no cascade requested)"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found",
@@ -8854,7 +9403,17 @@
             }
           },
           "409": {
-            "description": "Hard delete refused because document has links (use cascade), or cascade refused because a linked transaction is reconciled.",
+            "description": "`document-has-links`: hard delete refused because the document has links (use cascade). `cascade-blocked-reconciled`: cascade refused because a transaction it would delete is reconciled. `concurrent-update`: the cascade collided with another request changing the same records; nothing was changed, retry after `Retry-After`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`hard` or `cascade` is not one of `true`, `1`, `false`, `0`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8895,6 +9454,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found",
@@ -8937,6 +9499,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found / no file / empty render",
@@ -8993,6 +9558,9 @@
           "204": {
             "description": "Linked (or already linked — idempotent)"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Document or transaction not found",
             "content": {
@@ -9048,6 +9616,9 @@
           "204": {
             "description": "Unlinked"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Link not found",
             "content": {
@@ -9089,6 +9660,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Document not found or not deleted",
@@ -9143,6 +9717,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Document not found or soft-deleted",
@@ -9201,8 +9778,11 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "422": {
-            "description": "No files / validation failed",
+            "description": "No files, or `auto_reconcile` is not one of true / 1 / false / 0",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9276,6 +9856,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -9308,6 +9891,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -9351,6 +9937,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -9439,6 +10028,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         }
       }
@@ -9508,6 +10100,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "422": {
             "description": "Unknown status token in filter",
             "content": {
@@ -9549,6 +10144,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Ingest not found",
@@ -9598,6 +10196,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Ingest not found",
@@ -9681,6 +10282,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Batch not found",
             "content": {
@@ -9731,6 +10335,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Batch not found",
             "content": {
@@ -9746,7 +10353,7 @@
     },
     "/v1/batches/{id}/reconcile/apply": {
       "post": {
-        "summary": "Apply one or more reconcile proposals. For dedup proposals this voids the duplicate via the ledger service.",
+        "summary": "Apply one or more reconcile proposals. For a dedup proposal this moves the duplicate's document links to the surviving transaction and soft-deletes the duplicate, in one database transaction, and records which links moved so the apply can be undone. Refused (listed under `skipped`) when either transaction is no longer live, when the duplicate is reconciled, or when the two moved money in opposite directions.",
         "tags": [
           "reconcile"
         ],
@@ -9781,6 +10388,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Batch not found",
@@ -9843,6 +10453,73 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "description": "Batch not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/batches/{id}/reconcile/undo": {
+      "post": {
+        "summary": "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, when every document the apply moved has since been deleted (`no_live_document`: a transaction is not restored without live evidence; restore a document first), when the surviving transaction's own documents have all been deleted since, so that taking the moved ones back would leave it in the ledger with no live document (`survivor_no_live_document`: restore one of its own documents, or delete it, first), or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
+        "tags": [
+          "reconcile"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UndoRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-id undo/skip outcomes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UndoResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Batch not found",
             "content": {
@@ -9869,6 +10546,7 @@
     "/v1/reports/summary": {
       "get": {
         "summary": "Spend aggregated by category / account / payee",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -9907,16 +10585,6 @@
             "required": false,
             "name": "group_by",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -9929,6 +10597,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -9946,6 +10617,7 @@
     "/v1/reports/trends": {
       "get": {
         "summary": "Time-series trend (MoM / YoY) of expense spend",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -9995,16 +10667,6 @@
             "required": false,
             "name": "group_by",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -10017,6 +10679,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -10034,6 +10699,7 @@
     "/v1/reports/net_worth": {
       "get": {
         "summary": "Assets - liabilities at a point in time",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10048,16 +10714,6 @@
             "required": false,
             "name": "as_of",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -10070,6 +10726,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -10087,6 +10746,7 @@
     "/v1/reports/cashflow": {
       "get": {
         "summary": "Inflows vs outflows over a range, bucketed by month",
+        "description": "Every amount is in the workspace base currency, named by `currency` in the response; there is no parameter to convert the report into another one. The `points` and `fx` blocks say how loyalty points and any unconverted foreign-currency postings affect the totals.",
         "tags": [
           "reports"
         ],
@@ -10112,16 +10772,6 @@
             "required": false,
             "name": "to",
             "in": "query"
-          },
-          {
-            "schema": {
-              "type": "string",
-              "pattern": "^[A-Z]{3}$",
-              "example": "USD"
-            },
-            "required": false,
-            "name": "currency",
-            "in": "query"
           }
         ],
         "responses": {
@@ -10134,6 +10784,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Workspace not found",
@@ -10176,6 +10829,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Merchant not found",
@@ -10284,6 +10940,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Merchant or photo not found",
             "content": {
@@ -10343,6 +11002,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Merchant not found",
             "content": {
@@ -10359,7 +11021,7 @@
     "/v1/places/{id}": {
       "get": {
         "summary": "Get a place by id (full multilingual record).",
-        "description": "Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
+        "description": "`{id}` is the place's UUID or its Google place id. Returns the place row with all multilingual columns plus refs to any cached photos. Photo bytes are streamed separately via /v1/places/{id}/photos/{rank}/content.",
         "tags": [
           "places"
         ],
@@ -10367,8 +11029,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10392,6 +11055,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Not found",
@@ -10450,6 +11116,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -10474,8 +11143,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10492,6 +11162,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Place not found",
@@ -10527,8 +11200,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10545,6 +11219,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "404": {
             "description": "Place not found",
@@ -10590,8 +11267,9 @@
           {
             "schema": {
               "type": "string",
-              "format": "uuid",
-              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+              "minLength": 1,
+              "description": "The place's `id` (UUID), or its `google_place_id` (the value `merchants.place_id` holds).",
+              "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
             },
             "required": true,
             "name": "id",
@@ -10722,6 +11400,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -10766,6 +11447,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "422": {
             "description": "Invalid scope",

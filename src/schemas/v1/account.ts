@@ -4,12 +4,15 @@
 import { z } from "zod";
 import {
   AmountMinor,
+  CurrencyCode,
   LedgerCurrencyCode,
   IsoDate,
   IsoDateTime,
   Metadata,
+  MetadataPatch,
   Uuid,
 } from "./common.js";
+import { QueryBoolean } from "./common.js";
 
 export const AccountType = z.enum([
   "asset",
@@ -72,7 +75,8 @@ export const UpdateAccountRequest = z
     last4: z.string().nullable().optional(),
     parent_id: Uuid.nullable().optional(),
     closed_at: IsoDateTime.nullable().optional(),
-    metadata: Metadata.optional(),
+    /** Merge patch, not a replacement — see `MetadataPatch`. */
+    metadata: MetadataPatch.optional(),
   })
   .strict()
   .openapi("UpdateAccountRequest");
@@ -82,7 +86,12 @@ export const AccountBalance = z
     account_id: Uuid,
     as_of: IsoDate,
     balance_minor: AmountMinor,
-    currency: LedgerCurrencyCode,
+    currency: CurrencyCode.openapi({
+      description:
+        "The workspace base currency. `balance_minor` is a sum of base " +
+        "amounts, whatever currency the account itself is denominated in " +
+        "(a CNY or points account still reports its balance in this one).",
+    }),
     posting_count: z.number().int(),
     includes_children: z.boolean(),
   })
@@ -128,20 +137,21 @@ export const AccountRegister = z
   .openapi("AccountRegister");
 
 export const ListAccountsQuery = z.object({
-  flat: z.coerce.boolean().optional(),
-  include_closed: z.coerce.boolean().optional(),
+  flat: QueryBoolean.optional(),
+  include_closed: QueryBoolean.optional(),
 });
 
+// No `currency` parameter: the balance is a base-currency sum and is
+// labelled as one. See `getBalanceService`.
 export const BalanceQuery = z.object({
   as_of: IsoDate.optional(),
-  currency: LedgerCurrencyCode.optional(),
-  include_children: z.coerce.boolean().optional(),
+  include_children: QueryBoolean.optional(),
 });
 
 export const RegisterQuery = z.object({
   from: IsoDate.optional(),
   to: IsoDate.optional(),
-  include_deleted: z.coerce.boolean().optional(),
+  include_deleted: QueryBoolean.optional(),
   cursor: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });

@@ -60,9 +60,49 @@ export const Metadata = z
   .default({})
   .openapi({ description: "User-defined JSON object; not schema-validated." });
 
+/**
+ * `metadata` on a PATCH body: a JSON Merge Patch (RFC 7396) applied to
+ * the stored object, never a replacement for it.
+ *
+ * Deliberately has NO `.default({})`. `Metadata` above carries one, and
+ * openapi-typescript renders a defaulted property as REQUIRED — which is
+ * how the web client came to send `metadata: {}` on every save. A patch
+ * field that a generated client is forced to send must never mean
+ * "replace".
+ */
+export const MetadataPatch = z.record(z.string(), z.unknown()).openapi({
+  description:
+    "JSON Merge Patch (RFC 7396) applied to the stored metadata object: " +
+    "objects merge recursively, a `null` value removes that key, any other " +
+    "value replaces it, and keys the patch does not name are kept. `{}` " +
+    "changes nothing. A value sent back exactly as stored is left untouched " +
+    "(including nulls nested inside it), so GET → change one key → PATCH the " +
+    "whole object back is safe.",
+});
+
 // ── Path + query primitives ────────────────────────────────────────────
 
 export const IdParam = z.object({ id: Uuid }).openapi({ title: "IdParam" });
+
+/**
+ * A boolean in the query string. Use this, never `z.coerce.boolean()`:
+ * that is `Boolean(value)`, and every non-empty string is truthy —
+ * `"false"` and `"0"` included — so `?include_retired=false` returned
+ * exactly the rows it asked to leave out.
+ *
+ * Accepts `true` / `1` and `false` / `0` in any case; an empty value is
+ * false, as it always was. Anything else is a 422 instead of a silent
+ * `true`.
+ */
+export const QueryBoolean = z
+  .preprocess((value) => {
+    if (typeof value !== "string") return value;
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "1") return true;
+    if (v === "false" || v === "0" || v === "") return false;
+    return value;
+  }, z.boolean())
+  .openapi({ type: "boolean" });
 
 // ── Error envelope (RFC 7807) ──────────────────────────────────────────
 

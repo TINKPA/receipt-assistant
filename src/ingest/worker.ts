@@ -21,6 +21,7 @@
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
+import { liveTransactions } from "../db/live.js";
 import {
   batches,
   ingests,
@@ -34,6 +35,7 @@ import {
   type ExtractorResult,
 } from "./extractor.js";
 import { emit as busEmit, type BatchCountsPayload } from "../events/bus.js";
+import { publicErrorMessage } from "../http/problem.js";
 import {
   decodeSourceForAgent,
   resolveUploadPath,
@@ -153,12 +155,25 @@ async function markProcessing(ingestId: string, workspaceId: string): Promise<vo
     .where(and(eq(ingests.id, ingestId), eq(ingests.workspaceId, workspaceId)));
 }
 
+/**
+ * The text of a failure as it may be stored on the ingest row and sent
+ * on the SSE stream. A failed query's message is the statement plus its
+ * bound values, so that one is replaced by the caller-safe sentence; the
+ * full error is already in the server log. Everything else (timeouts,
+ * auth failures, guard messages) is kept, because `category` and
+ * `retryable` are derived from it at read time.
+ */
+function ingestErrorText(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("Failed query:") ? publicErrorMessage(err) : message;
+}
+
 async function markError(
   ingestId: string,
   workspaceId: string,
   err: unknown,
 ): Promise<void> {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = ingestErrorText(err);
   await db
     .update(ingests)
     .set({
@@ -226,8 +241,10 @@ async function readIngestTerminal(
 /**
  * #134 L2: find existing documents perceptually near (pHash hamming
  * distance <= 2) the just-uploaded one, restricted to documents already
- * linked to a live transaction (the only useful attach targets).
- * Returns at most 5, nearest first. Full scan over hashed rows — sub-ms
+ * linked to a live transaction (the only useful attach targets). "Live"
+ * is the view's definition: a soft-deleted transaction keeps status
+ * `posted`, so a status filter alone offered deleted rows as attach
+ * targets. Returns at most 5, nearest first. Full scan over hashed rows — sub-ms
  * at the current corpus scale; revisit if documents grows past ~10k.
  */
 async function findPhashNeighbors(
@@ -243,12 +260,11 @@ async function findPhashNeighbors(
     sql`SELECT DISTINCT d.id AS document_id, d.phash, dl.transaction_id
           FROM documents d
           JOIN document_links dl ON dl.document_id = d.id
-          JOIN transactions t ON t.id = dl.transaction_id
+          JOIN ${liveTransactions} t ON t.id = dl.transaction_id
          WHERE d.workspace_id = ${workspaceId}::uuid
            AND d.id <> ${documentId}::uuid
            AND d.phash IS NOT NULL
-           AND d.deleted_at IS NULL
-           AND t.status IN ('posted','reconciled')`,
+           AND d.deleted_at IS NULL`,
   );
   const out: { documentId: string; transactionId: string; distance: number }[] =
     [];
@@ -378,7 +394,7 @@ async function runOne(item: QueueItem): Promise<void> {
     busEmit("job.error", {
       batchId,
       ingestId,
-      error: err instanceof Error ? err.message : String(err),
+      error: ingestErrorText(err),
     });
     await onBatchChildTerminated(batchId, workspaceId);
     return;
@@ -407,17 +423,19 @@ async function runOne(item: QueueItem): Promise<void> {
   // attach contract requires a committed document_links row pointing
   // this document at a live transaction. An unverified near_dup would
   // silently drop a receipt under the cover of "already in the ledger"
-  // — the same failure class #125 guards `done` against.
+  // — the same failure class #125 guards `done` against. "Live" is the
+  // view's definition, so an attach to a soft-deleted transaction is
+  // rejected here too: that document's purchase would otherwise exist
+  // nowhere in the ledger.
   if (terminal.status === "near_dup") {
     const target = terminal.produced.transaction_ids[0];
     const linked = target
       ? await db.execute(
           sql`SELECT 1 FROM document_links dl
-                JOIN transactions t ON t.id = dl.transaction_id
+                JOIN ${liveTransactions} t ON t.id = dl.transaction_id
                WHERE dl.document_id = ${documentId}::uuid
                  AND dl.transaction_id = ${target}::uuid
-                 AND t.workspace_id = ${workspaceId}::uuid
-                 AND t.status IN ('posted','reconciled')`,
+                 AND t.workspace_id = ${workspaceId}::uuid`,
         )
       : { rows: [] };
     if (!target || linked.rows.length === 0) {
@@ -620,8 +638,8 @@ async function triggerAutoReconcile(
   batchId: string,
   workspaceId: string,
 ): Promise<void> {
-  // Dynamic import avoids a circular import (engine → transactions.service
-  // → documents/service chains), plus delays work until genuinely needed.
+  // Dynamic import: reconcile is only needed once a batch finishes, so
+  // the engine is loaded then rather than at worker start.
   const { runReconcile } = await import("../reconcile/engine.js");
 
   const wsRows = await db

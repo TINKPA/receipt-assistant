@@ -16,6 +16,7 @@ import { z } from "zod";
 import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { ownedItems, products } from "../schema/index.js";
+import { metadataPatchSet } from "../projection/metadata-patch.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   OwnedItem,
@@ -124,6 +125,7 @@ ownedItemsRouter.get(
       const limit = clampLimit(query.limit ?? DEFAULT_PAGE_LIMIT);
       const cursor = decodeCursor<OwnedItemsCursor>(
         query.cursor ?? undefined,
+        ["updated_at", "id"],
       );
 
       const conditions: ReturnType<typeof sql>[] = [];
@@ -305,12 +307,11 @@ ownedItemsRouter.patch(
       if (body.warranty_until !== undefined) updates["warrantyUntil"] = body.warranty_until;
       if (body.condition !== undefined) updates["condition"] = body.condition;
       if (body.notes !== undefined) updates["notes"] = body.notes;
-      if (body.metadata !== undefined) updates["metadata"] = body.metadata;
       if (body.retired_at !== undefined) {
         updates["retiredAt"] = body.retired_at ? new Date(body.retired_at) : null;
       }
       if (body.target_days !== undefined) updates["targetDays"] = body.target_days;
-      if (Object.keys(updates).length === 0) {
+      if (Object.keys(updates).length === 0 && body.metadata === undefined) {
         throw new HttpProblem(
           400,
           "no-fields",
@@ -318,19 +319,34 @@ ownedItemsRouter.patch(
           "PATCH /v1/owned-items/:id needs at least one field to update.",
         );
       }
-      updates["updatedAt"] = new Date();
-      const updated = await db
-        .update(ownedItems)
-        .set(updates)
-        .where(
-          and(
-            eq(ownedItems.id, id),
-            eq(ownedItems.workspaceId, req.ctx.workspaceId),
-          ),
-        )
-        .returning();
-      if (updated.length === 0) throw new NotFoundProblem("OwnedItem", id);
-      res.json(rowToDto(updated[0]!));
+      const where = and(
+        eq(ownedItems.id, id),
+        eq(ownedItems.workspaceId, req.ctx.workspaceId),
+      );
+      const row = await db.transaction(async (tx) => {
+        const current = await tx.select().from(ownedItems).where(where).for("update");
+        if (current.length === 0) throw new NotFoundProblem("OwnedItem", id);
+        // `metadata` is a JSON Merge Patch over the stored object, never a
+        // replacement for it (src/projection/metadata-patch.ts): `{}`
+        // changes nothing, `null` removes a key.
+        if (body.metadata !== undefined) {
+          const set = metadataPatchSet(
+            ownedItems.metadata,
+            current[0]!.metadata,
+            body.metadata,
+          );
+          if (set !== undefined) updates["metadata"] = set;
+        }
+        if (Object.keys(updates).length === 0) return current[0]!;
+        updates["updatedAt"] = new Date();
+        const updated = await tx
+          .update(ownedItems)
+          .set(updates)
+          .where(where)
+          .returning();
+        return updated[0]!;
+      });
+      res.json(rowToDto(row));
     } catch (err) {
       next(err);
     }
@@ -432,6 +448,9 @@ export function registerOwnedItemsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/owned-items/{id}",
     summary: "Patch serial / location / warranty / condition / notes",
+    description:
+      "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
+      "replacing it (`null` removes a key, `{}` changes nothing).",
     tags: ["owned-items"],
     request: {
       params: z.object({ id: Uuid }),

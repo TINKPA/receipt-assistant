@@ -8,10 +8,12 @@ import {
   IsoDate,
   IsoDateTime,
   Metadata,
+  MetadataPatch,
   Uuid,
 } from "./common.js";
 import { Place } from "./place.js";
 import { MerchantBrandId } from "./merchant.js";
+import { QueryBoolean } from "./common.js";
 
 /**
  * Compact merchant reference embedded in transaction responses so the
@@ -28,6 +30,44 @@ export const TransactionMerchantRef = z
     custom_name: z.string().nullable(),
   })
   .openapi("TransactionMerchantRef");
+
+/**
+ * What `fx_rate` on a posting means. Spelled out in the contract because
+ * it is NOT the number a rate feed prints whenever the two currencies
+ * have different decimals, and the service stores a client-supplied pair
+ * as sent. `src/ledger/money.ts` is the definition.
+ */
+const FX_RATE_DESCRIPTION =
+  "Decimal string: the multiplier from this posting's minor units to " +
+  "base-currency minor units, so that `amount_base_minor = " +
+  "round(amount_minor × fx_rate)`. Null on a base-currency posting. It " +
+  "equals the published exchange rate only when both currencies have the " +
+  "same number of decimals (CNY→USD 0.14658). Against a two-decimal base, " +
+  "a zero-decimal currency stores the published rate × 100 (JPY→USD " +
+  "published at 0.0065 is `0.65`, cents per yen) and a three-decimal one " +
+  "the published rate ÷ 10 (KWD→USD 3.25 is `0.325`). On a points " +
+  "posting it is the programme's value per point in base minor units. " +
+  "The rate as published is in the transaction's " +
+  "`metadata.fx.rates[].rate`.";
+
+const FX_RATE_INPUT_DESCRIPTION =
+  FX_RATE_DESCRIPTION +
+  " Required, together with `amount_base_minor`, on a foreign-currency " +
+  "cash posting: the pair is stored as sent and is not checked against a " +
+  "published rate, so send the minor-unit multiplier, not the quoted " +
+  "rate. Omit both on a points posting to have the server apply the " +
+  "programme valuation.";
+
+const FX_RATE_PATCH_DESCRIPTION =
+  FX_RATE_DESCRIPTION +
+  " Stored as sent and not checked against a published rate, so send " +
+  "the minor-unit multiplier, not the quoted rate.";
+
+const AMOUNT_BASE_INPUT_DESCRIPTION =
+  "This posting in the workspace base currency, in that currency's minor " +
+  "unit: `round(amount_minor × fx_rate)`. ¥5,000 at a published 0.0065 " +
+  "USD per yen is 3250 (US cents), not 33. Defaults to `amount_minor` on " +
+  "a base-currency posting.";
 
 export const TxnStatus = z.enum([
   "draft",
@@ -56,7 +96,11 @@ export const Posting = z
       }),
     amount_minor: AmountMinor,
     currency: LedgerCurrencyCode,
-    fx_rate: z.string().nullable(), // numeric returned as string from pg
+    // numeric returned as string from pg
+    fx_rate: z
+      .string()
+      .nullable()
+      .openapi({ description: FX_RATE_DESCRIPTION, example: "0.65" }),
     amount_base_minor: AmountMinor.nullable(),
     memo: z.string().nullable(),
     created_at: IsoDateTime,
@@ -68,8 +112,13 @@ export const NewPosting = z
     account_id: Uuid,
     amount_minor: AmountMinor,
     currency: LedgerCurrencyCode.optional(),
-    fx_rate: z.string().optional(),
-    amount_base_minor: AmountMinor.optional(),
+    fx_rate: z
+      .string()
+      .optional()
+      .openapi({ description: FX_RATE_INPUT_DESCRIPTION, example: "0.65" }),
+    amount_base_minor: AmountMinor.optional().openapi({
+      description: AMOUNT_BASE_INPUT_DESCRIPTION,
+    }),
     memo: z.string().optional(),
   })
   .openapi("NewPosting");
@@ -323,7 +372,10 @@ export const UpdateTransactionRequest = z
     payee: z.string().nullable().optional(),
     narration: z.string().nullable().optional(),
     trip_id: Uuid.nullable().optional(),
-    metadata: Metadata.optional(),
+    /** Merge patch, not a replacement — see `MetadataPatch`. Keys the
+     *  server owns (`SERVER_OWNED_TX_METADATA_KEYS` in
+     *  src/projection/metadata-patch.ts) cannot be changed here. */
+    metadata: MetadataPatch.optional(),
   })
   .strict()
   .openapi("UpdateTransactionRequest");
@@ -339,8 +391,13 @@ export const UpdatePostingRequest = z
     account_id: Uuid.optional(),
     amount_minor: AmountMinor.optional(),
     currency: LedgerCurrencyCode.optional(),
-    fx_rate: z.string().optional(),
-    amount_base_minor: AmountMinor.optional(),
+    fx_rate: z
+      .string()
+      .optional()
+      .openapi({ description: FX_RATE_PATCH_DESCRIPTION, example: "0.65" }),
+    amount_base_minor: AmountMinor.optional().openapi({
+      description: AMOUNT_BASE_INPUT_DESCRIPTION,
+    }),
     memo: z.string().nullable().optional(),
   })
   .strict()
@@ -357,9 +414,9 @@ export const ListTransactionsQuery = z.object({
   q: z.string().optional(),
   status: TxnStatus.optional(),
   trip_id: Uuid.optional(),
-  has_document: z.coerce.boolean().optional(),
+  has_document: QueryBoolean.optional(),
   /** Include soft-deleted (e.g. deduped) rows. Default false. #171 */
-  include_deleted: z.coerce.boolean().optional(),
+  include_deleted: QueryBoolean.optional(),
   source_ingest_id: Uuid.optional(),
   /** flagged=near_dup → only transactions whose extraction recorded
    *  metadata.near_dup_check.flagged_for_review=true (#134 branch 4:

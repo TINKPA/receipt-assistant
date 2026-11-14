@@ -19,7 +19,7 @@ import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 
 import { parseOrThrow } from "../http/validate.js";
 import { ValidationProblem } from "../http/problem.js";
-import { emitNextLink } from "../http/pagination.js";
+import { assertCursorShape, emitNextLink } from "../http/pagination.js";
 import { IdParam, ProblemDetails, Uuid, paginated } from "../schemas/v1/common.js";
 import {
   Batch,
@@ -60,16 +60,6 @@ function asyncHandler(
   };
 }
 
-function parseAutoReconcile(raw: unknown): boolean {
-  if (typeof raw === "boolean") return raw;
-  if (typeof raw === "string") {
-    const v = raw.toLowerCase();
-    if (v === "false" || v === "0") return false;
-    if (v === "true" || v === "1") return true;
-  }
-  return true;
-}
-
 // ── /v1/ingest ────────────────────────────────────────────────────────
 
 export const ingestRouter: Router = Router();
@@ -95,9 +85,11 @@ ingestRouter.post(
       );
     }
 
-    const autoReconcile = parseAutoReconcile(
-      (req.body as Record<string, unknown>)?.auto_reconcile,
-    );
+    // The text fields, checked before anything is written. A flag this
+    // route cannot read is a 422, never a guess; on is only the default
+    // for a flag that was not sent.
+    const fields = parseOrThrow(CreateBatchForm, req.body ?? {});
+    const autoReconcile = fields.auto_reconcile ?? true;
 
     const { batch, items } = await createBatchFromFiles({
       workspaceId: req.ctx.workspaceId,
@@ -127,6 +119,7 @@ batchesRouter.get(
   "/",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(ListBatchesQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listBatches({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,
@@ -266,6 +259,7 @@ ingestsRouter.get(
   "/",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(ListIngestsQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listIngests({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,
@@ -287,6 +281,7 @@ ingestsRouter.get(
   "/problems",
   asyncHandler(async (req, res) => {
     const q = parseOrThrow(IngestProblemsQuery, req.query);
+    assertCursorShape(q.cursor, ["created_at", "id"]);
     const out = await listIngests({
       workspaceId: req.ctx.workspaceId,
       cursor: q.cursor,
@@ -355,7 +350,10 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
           "application/json": { schema: CreateBatchResponse },
         },
       },
-      422: { description: "No files / validation failed", content: problemContent },
+      422: {
+        description: "No files, or `auto_reconcile` is not one of true / 1 / false / 0",
+        content: problemContent,
+      },
     },
   });
 

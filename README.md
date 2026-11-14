@@ -25,6 +25,8 @@ An open-source, AI-native receipt parsing backend that extracts structured data 
 
 `--json-schema` mode constrains Claude's output format and **degrades OCR accuracy** (4/10 dates wrong vs 0/10 with plain text), because it skips chain-of-thought reasoning. The current flow (`src/ingest/prompt.ts::buildExtractorPrompt`, spawned by `src/ingest/extractor.ts`) is a **single `claude -p` invocation** that reads the image, reasons about ambiguous characters in plain text, and writes the whole balanced transaction directly to Postgres via `psql` tool calls — no JSON-schema coercion anywhere. Node never parses fields; it seeds the `ingests` row and waits for the agent to close it. Full A/B rationale and the prior two-phase variant (kept around for anyone benchmarking a return) live in [`CLAUDE.md`](CLAUDE.md#known-pitfalls).
 
+The agent is handed only what its job needs: five tools (Bash, Read, Write, Edit, WebSearch), no MCP servers, an allowlisted environment, and a `DATABASE_URL` that logs in as a Postgres role (`receipts_agent`) which can read, insert into and update only the tables and columns the prompt writes, with no DELETE and no DDL. That stops mistakes and simple injections. It is not a wall: the agent has an unrestricted shell running as the server's own user, and a hostile receipt that tells it to go around the role can. The natural-language Ask agent is confined properly: it has no tools at all, and the server runs the SQL it writes as a SELECT-only role (`receipts_ro`) in a read-only transaction. The details, and the list of what is still open, are in [`CLAUDE.md`](CLAUDE.md#agent-sandbox-what-the-two-agents-can-reach).
+
 The rules the agent is given are **not** duplicated per prompt: `src/ingest/prompt-contract.ts`, `document-read-prompt.ts`, `line-item-prompt.ts` and `items-sql.ts` hold the single copy that both the ingest prompt and `reextract-prompt.ts` interpolate (#164).
 
 ### Quality & Business Flags
@@ -91,7 +93,9 @@ claude setup-token          # prints a token valid for about a year
 cp .env.example .env        # then set CLAUDE_CODE_OAUTH_TOKEN=<that token>
 ```
 
-When the variable is set it is the only credential the container uses, and it does not refresh itself: when it expires or is revoked, extraction returns 401 until you mint a new one. Rotation, 401 diagnosis and the reasons behind this design are in [`CLAUDE.md`](CLAUDE.md#claude-code-oauth--long-lived-setup-token-era-6-2026-10-08-onward).
+While you are in `.env`, set `RECEIPTS_AGENT_DB_PASSWORD` and `RECEIPTS_RO_DB_PASSWORD` (`openssl rand -hex 24` each). They are the passwords of the two restricted database roles: the extraction agent logs in as one, and the server runs the Ask model's queries as the other. The server sets them on the roles at every boot. Left unset, a built-in development password is used and boot prints a warning. On a new install also set `RECEIPTS_DB_OWNER_PASSWORD` (hex) before the first `up`, so the database owner does not keep the default password; on an existing database follow "Rotating the owner password" in `CLAUDE.md` instead. The server must connect as a role that may create roles (the compose files use the `postgres` superuser): migration 0041 creates the two restricted ones.
+
+When the token variable is set it is the only credential the container uses, and it does not refresh itself: when it expires or is revoked, extraction returns 401 until you mint a new one. Rotation, 401 diagnosis and the reasons behind this design are in [`CLAUDE.md`](CLAUDE.md#claude-code-oauth--long-lived-setup-token-era-6-2026-10-08-onward).
 
 ### 3. After changing source code
 
@@ -127,7 +131,7 @@ The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1)
 | Ingest | `POST /v1/ingest/batch` | Upload receipt files (images, PDFs, `.eml`); returns a `batchId` for async extraction |
 | | `GET /v1/batches`, `GET /v1/batches/:id`, `GET /v1/batches/:id/stream` | Batch status, per-file results, SSE progress |
 | | `GET /v1/ingests`, `GET /v1/ingests/problems`, `POST /v1/ingests/:id/retry` | Per-file ingest rows; list and retry failures |
-| Reconcile | `/v1/batches/:id/reconcile` (+ `/apply`, `/reject`) | Review and apply a batch's reconcile proposals |
+| Reconcile | `/v1/batches/:id/reconcile` (+ `/apply`, `/reject`, `/undo`) | Review, apply and take back a batch's reconcile proposals |
 | Ledger | `/v1/transactions` (+ `/bulk`, `/:id/restore`, `/:id/reconcile`, `/:id/unreconcile`, `/:id/items`, `/:id/postings`) | Double-entry transactions with their postings and line items |
 | | `/v1/accounts` (+ `/:id/balance`, `/:id/register`), `GET /v1/postings`, `GET /v1/items` | Chart of accounts; posting and line-item search |
 | Documents | `/v1/documents` (+ `/:id/content`, `/:id/rendered`, `/:id/links`, `/:id/restore`, `/:id/re-extract`) | Stored receipt files and their links to transactions |
@@ -135,6 +139,24 @@ The machine-readable contract is `openapi/openapi.json` (committed; OpenAPI 3.1)
 | Reports | `GET /v1/reports/summary`, `/cashflow`, `/net_worth`, `/trends` | Spending and balance aggregates |
 | Insights | `GET /v1/insights`, `POST /v1/insights/ask` | Generated insights; natural-language questions about spending |
 | Meta | `GET /health`, `GET /version`, `POST /v1/admin/re-derive` | Health check, build info, batch re-projection |
+
+### Errors
+
+Every error is an RFC 7807 `application/problem+json` document. Branch on `type`; `trace_id` is the handle for finding the cause in the server log (`docker logs receipt-assistant 2>&1 | grep trace_id=<id>`).
+
+| Status | `type` (after `https://receipts.dev/errors/`) | When |
+|--------|-----------------------------------------------|------|
+| 400 | `invalid-id` | An id in the path or query string is not a UUID (`/v1/places/{id}` also takes a Google place id, `/v1/merchants/{id}` a brand slug) |
+| 400 | `malformed-body`, `malformed-upload`, `invalid-cursor`, `invalid-parameter`, `invalid-idempotency-key` | Body is not JSON / not parseable multipart; cursor was not issued by this API; a value cannot be read as its type; `Idempotency-Key` is over 255 characters |
+| 404 | `not-found` · `route-not-found` | The record does not exist · no such URL or method |
+| 409 | `conflict`, `still-referenced`, `idempotency-conflict`, `idempotency-in-progress`, … | The request collides with current state |
+| 409 | `concurrent-update` | Another request was changing the same records at the same moment (a database deadlock or serialization failure). Nothing was written; send the same request again after `Retry-After` seconds |
+| 412 / 428 | `version-mismatch` / `precondition-required` | `If-Match` is stale / missing |
+| 413 | `payload-too-large` | Body or upload over the endpoint's limit |
+| 422 | `validation`, `invalid-reference`, `constraint-violation`, … | The body is well-formed but not acceptable |
+| 500 | `internal` | Unexpected. The body is a fixed sentence plus `trace_id`; nothing from the error itself is returned |
+
+`scripts/check-http-errors.ts` asserts this contract over real HTTP against a throwaway database (usage in its header). See [`CLAUDE.md` → HTTP error contract](CLAUDE.md#http-error-contract) for how the server side is put together.
 
 ### OpenAPI contract (for client codegen)
 
@@ -164,6 +186,8 @@ grep -l "<ingest-id>" ~/Developer/receipt-assistant-data/claude/projects/-app/*.
 
 See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-jsonl) for live tailing.
 
+The sandbox stack keeps its own transcripts in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`.
+
 ## Scripts
 
 Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, for `.sh`). The ones with an npm alias:
@@ -173,11 +197,15 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
 | `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
+| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
+| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
 | `npm run measure:turns` | Turns and billed tokens per extraction, from session JSONL |
 | `npm run eval:dates` | Date-accuracy eval against the fixture set (`scripts/eval-dates.md`) |
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
 
 The rest are sandbox regression harnesses (`eval-dedup.ts`, `smoke-*.ts`), one-off data backfills (`backfill-*.ts`) and ledger snapshot/restore (`tx-snapshot.sh`, `tx-restore.sh`); each documents its own usage in its header.
+
+The sandbox is a second stack (`docker-compose.test.yml`: API on 3001, its own image tag, database and data directories) that shares no state with production. `scripts/sandbox-reset.sh` returns it to an empty ledger without a restart, and `scripts/check-sandbox-reset.sh` checks that the reset still keeps exactly what a boot writes (run it after adding a migration). See [`CLAUDE.md` → Sandbox stack](CLAUDE.md#sandbox-stack-docker-composetestyml).
 
 ## Tech Stack
 

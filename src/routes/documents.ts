@@ -25,8 +25,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import multer from "multer";
 import * as path from "path";
-import { createReadStream } from "fs";
-import { stat } from "fs/promises";
 import { z } from "zod";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import {
@@ -35,10 +33,16 @@ import {
   CreateDocumentLinkRequest,
   UploadDocumentForm,
   ReExtractDocumentResponse,
+  CascadeDeleteReport,
 } from "../schemas/v1/document.js";
 import { ProblemDetails, Uuid } from "../schemas/v1/common.js";
 import { NotFoundProblem, ValidationProblem } from "../http/problem.js";
-import { setEtag, handleIfNoneMatch } from "../http/etag.js";
+import {
+  setEtag,
+  representationEtag,
+  sendWithRepresentationEtag,
+} from "../http/etag.js";
+import { resolveStoredFile, sendStoredFile } from "../http/files.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
   getDocumentById,
@@ -52,7 +56,7 @@ import {
   reExtractDocument,
   renderDocumentHtml,
   extForMime,
-  resolveUploadPath,
+  getUploadDir,
   type DocumentKindValue,
 } from "./documents.service.js";
 
@@ -66,21 +70,25 @@ const upload = multer({
 });
 
 /**
- * Documents don't carry a `version` column in the schema, so ETag is
- * derived from a synthetic value: `1` for "freshly-materialized
- * immutable metadata". This matches the pattern in issue #28 — the
- * caller just wants a stable token for If-None-Match caching.
+ * Documents carry no `version` column, and three different things are
+ * served under `/v1/documents/:id*`, each with the tag that fits it:
+ *
+ *   - the metadata JSON changes — soft delete and restore move
+ *     `deleted_at`, re-extract rewrites `ocr_text` — so its ETag is a
+ *     digest of the body (`representationEtag`). It used to be the
+ *     constant `W/"1"`, which answered every revalidation with a 304 and
+ *     left a client holding the pre-delete, pre-re-extract row for good;
+ *   - `/content` is the stored bytes, which never change for a given
+ *     document: its ETag is their sha256;
+ *   - `/rendered` is `RENDER_VERSION`, below.
  */
-const DOC_VERSION = 1;
 
 /**
- * ETag for `/rendered` ONLY — deliberately not `DOC_VERSION`.
+ * ETag for `/rendered`.
  *
- * `DOC_VERSION` rests on "freshly-materialized immutable metadata",
- * which is true of a document's bytes and false of its rendering: what
- * this route returns is a FUNCTION of those bytes and the sanitizer
- * profile plus CSP that present them, and that function changes when we
- * change it.
+ * What that route returns is a FUNCTION of the document's bytes and the
+ * sanitizer profile plus CSP that present them. The bytes are fixed; the
+ * function changes when we change it.
  *
  * The route answers If-None-Match with a 304, so a tag that never moves
  * means every browser that has already opened a fold keeps its stale
@@ -136,7 +144,7 @@ documentsRouter.post(
       kind,
     });
 
-    setEtag(res, DOC_VERSION);
+    res.setHeader("ETag", representationEtag(doc));
     if (created) {
       res.setHeader("Location", `/v1/documents/${doc.id}`);
       res.status(201).json(doc);
@@ -177,9 +185,7 @@ documentsRouter.get(
     const doc = await getDocumentById(req.ctx.workspaceId, id, { includeDeleted });
     if (!doc) throw new NotFoundProblem("Document", id);
 
-    if (handleIfNoneMatch(req, res, DOC_VERSION)) return;
-    setEtag(res, DOC_VERSION);
-    res.json(doc);
+    sendWithRepresentationEtag(req, res, doc);
   }),
 );
 
@@ -193,12 +199,10 @@ documentsRouter.get(
     if (!doc) throw new NotFoundProblem("Document", id);
     if (!doc.file_path) throw new NotFoundProblem("Document content", id);
 
-    const absPath = resolveUploadPath(doc.file_path);
-    try {
-      await stat(absPath);
-    } catch {
-      throw new NotFoundProblem("Document content", id);
-    }
+    // Only a regular file under the uploads dir is ever streamed, even
+    // if the row's `file_path` says otherwise (see http/files.ts).
+    const absPath = await resolveStoredFile(getUploadDir(), doc.file_path);
+    if (!absPath) throw new NotFoundProblem("Document content", id);
 
     const ext = extForMime(doc.mime_type) ?? path.extname(doc.file_path).replace(/^\./, "");
     const filename = ext ? `${doc.id}.${ext}` : doc.id;
@@ -226,8 +230,8 @@ documentsRouter.get(
       res.setHeader("Content-Type", doc.mime_type ?? "application/octet-stream");
       res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
     }
-    setEtag(res, DOC_VERSION);
-    createReadStream(absPath).pipe(res);
+    res.setHeader("ETag", `"${doc.sha256}"`);
+    await sendStoredFile(res, absPath);
   }),
 );
 
@@ -310,8 +314,13 @@ documentsRouter.delete(
 //
 // Default: soft delete. Optional flags:
 //   ?hard=true               — actually remove row + image file
-//   ?cascade=true            — also handle linked transactions
-//   ?cascade=true&hard=true  — full purge (txns + links + doc + file)
+//   ?cascade=true            — also delete the linked transactions this
+//                              document is the LAST live evidence of;
+//                              ones another live document supports stay
+//   ?cascade=true&hard=true  — full purge (those txns + links + doc + file)
+//
+// Without cascade the answer is 204. With it, 200 and a
+// `CascadeDeleteReport` naming what happened to each linked transaction.
 
 const DeleteQuery = z.object({
   hard: BoolFlag.optional(),
@@ -331,13 +340,24 @@ documentsRouter.delete(
     const cascade = flagTrue(q.cascade);
 
     if (cascade) {
-      await cascadeDeleteDocument({
+      const report = await cascadeDeleteDocument({
         workspaceId: req.ctx.workspaceId,
         userId: req.ctx.userId,
         documentId: id,
         hard,
       });
-      res.status(204).end();
+      // 200 with a report, not 204: a cascade keeps any transaction that
+      // another live document still supports, and the caller has to be
+      // able to see that "delete this receipt" left the receipt standing.
+      const body: z.infer<typeof CascadeDeleteReport> = {
+        document_id: id,
+        hard,
+        transactions_kept: report.txns_kept,
+        transactions_soft_deleted: report.txns_soft_deleted,
+        transactions_hard_deleted: report.txns_hard_deleted,
+        transactions_skipped: report.txns_skipped,
+      };
+      res.status(200).json(body);
       return;
     }
 
@@ -371,7 +391,7 @@ documentsRouter.post(
       documentId: id,
     });
     if (!doc) throw new NotFoundProblem("Document", id);
-    setEtag(res, DOC_VERSION);
+    res.setHeader("ETag", representationEtag(doc));
     res.json(doc);
   }),
 );
@@ -563,9 +583,14 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Default: soft delete (sets deleted_at). " +
       "?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. " +
-      "?cascade=true: linked posted transactions are soft-deleted, draft/error transactions are hard-deleted, already-deleted transactions are left intact, reconciled transactions abort the operation with 409. " +
-      "?cascade=true&hard=true: every linked transaction is hard-deleted (postings cascade), the document row is removed, and the image file is moved to .trash/ (never unlinked). " +
-      "Reconciled transactions always block hard cascades — unreconcile first.",
+      "?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. " +
+      "A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. " +
+      "A transaction that is already soft-deleted is left as it is and reported under `transactions_skipped`, whatever other documents it has; it is never reported as kept. " +
+      "Of the remaining transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, and a reconciled one aborts the whole operation with 409 (unreconcile first). " +
+      "The document itself is soft-deleted and its link rows stay, so restoring it restores the association. " +
+      "?cascade=true&hard=true: the transactions no other non-deleted document supports are hard-deleted (postings cascade), soft-deleted ones included; kept transactions, and soft-deleted ones another document supports, are only unlinked from this document (a `document_unlinked` event records it). " +
+      "The document row is removed and the image file is moved to .trash/ (never unlinked). " +
+      "A cascade answers 200 with a report of what happened to each linked transaction; check `transactions_kept` before telling a user the receipt is gone.",
     tags: ["documents"],
     request: {
       params: z.object({ id: Uuid }),
@@ -577,16 +602,29 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
         }),
         cascade: z.enum(["true", "false", "1", "0"]).optional().openapi({
           description:
-            "Also process transactions linked to this document. Combine with hard=true for full purge.",
+            "Also delete the linked transactions this document is the last live evidence of; " +
+            "transactions another live document supports are kept. Combine with hard=true for full purge.",
         }),
       }),
     },
     responses: {
-      204: { description: "Deleted" },
+      200: {
+        description:
+          "Cascade (`?cascade=true`) done. The body says which linked transactions were deleted and which were kept.",
+        content: { "application/json": { schema: CascadeDeleteReport } },
+      },
+      204: { description: "Deleted (no cascade requested)" },
       404: { description: "Not found", content: problemContent },
       409: {
         description:
-          "Hard delete refused because document has links (use cascade), or cascade refused because a linked transaction is reconciled.",
+          "`document-has-links`: hard delete refused because the document has links (use cascade). " +
+          "`cascade-blocked-reconciled`: cascade refused because a transaction it would delete is reconciled. " +
+          "`concurrent-update`: the cascade collided with another request changing the same records; nothing was changed, retry after `Retry-After`.",
+        content: problemContent,
+      },
+      422: {
+        description:
+          "`hard` or `cascade` is not one of `true`, `1`, `false`, `0`.",
         content: problemContent,
       },
     },

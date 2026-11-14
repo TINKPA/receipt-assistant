@@ -10,7 +10,7 @@ import { Router, type Request, type Response, type NextFunction } from "express"
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import { parseOrThrow } from "../http/validate.js";
-import { emitNextLink } from "../http/pagination.js";
+import { assertCursorShape, emitNextLink } from "../http/pagination.js";
 import {
   ListPostingsQuery,
   Posting as PostingSchema,
@@ -25,6 +25,7 @@ postingsRouter.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const query = parseOrThrow(ListPostingsQuery, req.query);
+      assertCursorShape(query.cursor, ["created_at", "id"]);
       const result = await listPostings(req.ctx.workspaceId, query);
       emitNextLink(req, res, result.next_cursor);
       res.json(result);

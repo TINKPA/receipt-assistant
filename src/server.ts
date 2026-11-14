@@ -10,12 +10,26 @@
 import "dotenv/config";
 import { buildApp } from "./app.js";
 import { runMigrations } from "./db/migrate.js";
+import { pool } from "./db/client.js";
+import {
+  AGENT_GRANTS,
+  AGENT_ROLE,
+  AgentRoleSyncBlockedError,
+  RO_ROLE,
+  auditAgentRoles,
+  endAgentRoleSessions,
+  rolePasswordEnvName,
+  syncAgentRoles,
+  verifyAgentLogins,
+  type AgentRoleSyncReport,
+} from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
 import { start as startIngestWorker } from "./ingest/worker.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 import { buildExtractorPrompt } from "./ingest/prompt.js";
 import { iconPipelineFileExists } from "./ingest/brand-icon-prompt.js";
+import { warnAboutMisScaledPostings } from "./fx/magnitude-check.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
@@ -53,10 +67,81 @@ function logPromptSize(): void {
   }
 }
 
+/**
+ * Bring the two agent database roles in line with `src/db/agent-roles.ts`:
+ * passwords from the environment, privileges from `AGENT_GRANTS`.
+ *
+ * Non-fatal, and bounded: the sync gives up on a lock after ten seconds
+ * instead of waiting in front of `app.listen`, and gets one retry after
+ * the leftover agent-role sessions are ended. If it fails, the HTTP API
+ * and everything that does not spawn an agent still work, the roles keep
+ * what the previous boot gave them, and if that was nothing the next
+ * extraction fails on its first psql call with a login or permission
+ * error that names the role — which is a better outage than a server that
+ * will not boot. The error lines below are what to look for.
+ *
+ * The login check runs whether or not the sync succeeded: it answers the
+ * question that matters, "can an agent started now reach the database".
+ */
+async function syncAgentDbRoles(): Promise<void> {
+  try {
+    let report: AgentRoleSyncReport;
+    try {
+      report = await syncAgentRoles(pool);
+    } catch (err) {
+      if (!(err instanceof AgentRoleSyncBlockedError)) throw err;
+      // Something holds a lock the sync needs. This server has started no
+      // agent yet, so a session under an agent role is an orphan of an
+      // earlier process (or was left behind on purpose). End them, try
+      // once more, and say what was ended.
+      const ended = await endAgentRoleSessions(pool);
+      console.error(
+        `❌ Agent DB role sync was blocked by another session. Ended ${ended.length} leftover ` +
+          `agent-role session(s)${ended.length ? `: ${ended.join("; ")}` : ""}. Retrying once.`,
+      );
+      report = await syncAgentRoles(pool);
+    }
+    console.log(
+      `🔐 Agent DB roles synced: ${AGENT_ROLE} on ${Object.keys(AGENT_GRANTS).length} tables, ` +
+        `${RO_ROLE} read-only on all`,
+    );
+    for (const role of report.defaultPasswords) {
+      console.warn(
+        `⚠️  ${role} is using the built-in development password — set ${rolePasswordEnvName(role)} in .env.`,
+      );
+    }
+    for (const what of report.skipped) {
+      console.error(
+        `❌ AGENT_GRANTS names ${what}, which the schema does not have — the grant was skipped. ` +
+          `Fix src/db/agent-roles.ts.`,
+      );
+    }
+    // Printed so a table added later is never invisible to the extraction
+    // agent without anyone having been told.
+    console.log(`🔐 ${AGENT_ROLE} has no access to: ${report.agentCannotSee.join(", ") || "(none)"}`);
+    const drift = await auditAgentRoles(pool);
+    for (const line of drift) console.error(`❌ Agent DB role drift: ${line}`);
+  } catch (err) {
+    console.error(
+      "❌ Agent DB role sync FAILED — extraction and Ask may not be able to reach the database:",
+      (err as Error).message,
+    );
+  }
+  try {
+    for (const line of await verifyAgentLogins()) {
+      console.error(`❌ Agent DB login check: ${line}`);
+    }
+  } catch (err) {
+    console.error("❌ Agent DB login check could not run:", (err as Error).message);
+  }
+}
+
 async function main(): Promise<void> {
   console.log("🗄️  Running Drizzle migrations…");
   await runMigrations();
   console.log("✅ Migrations complete");
+
+  await syncAgentDbRoles();
 
   logPromptSize();
 
@@ -68,6 +153,12 @@ async function main(): Promise<void> {
         : `🌱 Workspace ${r.workspaceId} already present`,
     );
   }
+
+  // Postings converted before FX respected currency exponents stay at
+  // the wrong power of ten until `scripts/backfill-fx.ts
+  // --exponent-mismatch` is run; there is no migration for it. Read-only
+  // and non-fatal: it only says so in the boot log.
+  await warnAboutMisScaledPostings();
 
   if (!process.env.GOOGLE_MAPS_API_KEY) {
     console.warn(

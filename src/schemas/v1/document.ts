@@ -81,6 +81,47 @@ export const ReExtractDocumentResponse = z
   })
   .openapi("ReExtractDocumentResponse");
 
+/**
+ * Response from `DELETE /v1/documents/:id?cascade=true`: what the call
+ * did to each transaction the document was linked to. Every linked
+ * transaction appears in exactly one of the four lists.
+ *
+ * It exists because a cascade may delete less than its name suggests: a
+ * transaction another live document still supports is kept, and without
+ * this body a client could not tell "deleted" from "kept".
+ */
+export const CascadeDeleteReport = z
+  .object({
+    document_id: Uuid,
+    hard: z.boolean().openapi({
+      description:
+        "true: the document row was removed (`?hard=true`). false: it was soft-deleted.",
+    }),
+    transactions_kept: z.array(Uuid).openapi({
+      description:
+        "Linked transactions left in the ledger because another non-deleted " +
+        "document still supports them. Non-empty means the receipt is NOT gone: " +
+        "delete the remaining document(s) with cascade, or the transaction itself, to remove it. " +
+        "Never a transaction that was already soft-deleted; those are under `transactions_skipped`.",
+    }),
+    transactions_soft_deleted: z.array(Uuid).openapi({
+      description: "Posted transactions this call soft-deleted (restorable).",
+    }),
+    transactions_hard_deleted: z.array(Uuid).openapi({
+      description:
+        "Transactions this call removed for good: every non-kept one under `?hard=true`, " +
+        "and draft/error ones in soft mode.",
+    }),
+    transactions_skipped: z.array(Uuid).openapi({
+      description:
+        "Transactions that were already soft-deleted before this call and stay that way, " +
+        "whatever other documents they have. In soft mode that is every such transaction. " +
+        "Under `?hard=true` it is the ones another non-deleted document still supports " +
+        "(they lose only the link to this document); the rest are in `transactions_hard_deleted`.",
+    }),
+  })
+  .openapi("CascadeDeleteReport");
+
 // Multipart form is described inline in the route registration;
 // Zod can't fully model multipart, but we register the field shape
 // so the OpenAPI docs reflect the expected client contract.

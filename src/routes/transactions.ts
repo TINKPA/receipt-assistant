@@ -35,19 +35,21 @@ import {
 } from "../schemas/v1/transaction.js";
 import { parseOrThrow } from "../http/validate.js";
 import {
-  setEtag,
   requireIfMatch,
-  handleIfNoneMatch,
-  parseEtag,
+  ifNoneMatchSatisfied,
+  transactionEtag,
+  parseTransactionEtag,
+  fullTransactionEtag,
 } from "../http/etag.js";
 import {
   PreconditionRequiredProblem,
   NotFoundProblem,
   HttpProblem,
   VersionMismatchProblem,
+  renderProblem,
 } from "../http/problem.js";
 import { idempotencyMiddleware } from "../http/idempotency.js";
-import { emitNextLink } from "../http/pagination.js";
+import { assertCursorShape, emitNextLink } from "../http/pagination.js";
 import {
   createTransaction,
   getTransaction,
@@ -65,6 +67,7 @@ import {
   deletePosting,
 } from "./transactions.service.js";
 import { ProblemDetails, paginated, IdParam, Uuid } from "../schemas/v1/common.js";
+import { SERVER_OWNED_TX_METADATA_KEYS } from "../projection/metadata-patch.js";
 
 export const transactionsRouter: Router = Router();
 
@@ -76,6 +79,28 @@ export const transactionsRouter: Router = Router();
 transactionsRouter.use(
   express.json({ type: "application/merge-patch+json", limit: "25mb" }),
 );
+
+/**
+ * A transaction's ETag is its version plus the state of its linked
+ * documents (`transactionEtag` in http/etag.ts says why). Every response
+ * that returns the full row sets it from that row.
+ */
+function setTransactionEtag(
+  res: Response,
+  row: {
+    version: number;
+    documents: ReadonlyArray<{ id: string; deleted_at: string | null }>;
+  },
+): string {
+  const etag = transactionEtag(row.version, row.documents);
+  res.setHeader("ETag", etag);
+  return etag;
+}
+
+/** If-Match on a transaction: the version part of the tag is what counts. */
+function requireTransactionIfMatch(req: Request, currentVersion: number): void {
+  requireIfMatch(req, currentVersion, parseTransactionEtag);
+}
 
 // Helper: load current version (for If-Match check) before mutation.
 async function loadVersion(
@@ -109,7 +134,7 @@ transactionsRouter.post(
         body,
       );
       res.setHeader("Location", `/v1/transactions/${result.id}`);
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -133,6 +158,9 @@ transactionsRouter.get(
         else if (lower === "true" || lower === "1") raw.has_document = true;
       }
       const query = parseOrThrow(ListTransactionsQuery, raw);
+      // Current cursors are { sort, value, at?, id }; ones issued before
+      // sort was recorded are { occurred_on, id }.
+      assertCursorShape(query.cursor, ["sort", "value", "id"], ["occurred_on", "id"]);
       const result = await listTransactions(req.ctx.workspaceId, query);
       emitNextLink(req, res, result.next_cursor);
       res.json(result);
@@ -162,7 +190,7 @@ transactionsRouter.post(
       for (let i = 0; i < body.operations.length; i++) {
         const op = body.operations[i]!;
         try {
-          const expected = parseEtag(op.if_match);
+          const expected = parseTransactionEtag(op.if_match);
           if (expected === null) {
             throw new VersionMismatchProblem(await loadVersion(req.ctx.workspaceId, op.id), undefined);
           }
@@ -185,24 +213,11 @@ transactionsRouter.post(
             results.push({ index: i, status: 200, body: out });
           }
         } catch (err) {
-          if (err instanceof HttpProblem) {
-            results.push({
-              index: i,
-              status: err.status,
-              body: err.toBody(),
-            });
-          } else {
-            results.push({
-              index: i,
-              status: 500,
-              body: {
-                type: "https://receipts.dev/errors/internal",
-                title: "Internal Server Error",
-                status: 500,
-                detail: err instanceof Error ? err.message : String(err),
-              },
-            });
-          }
+          // Same mapping (and the same logging) as a top-level failure:
+          // a per-item error must not carry SQL out inside a 200 either.
+          // (Status and body only: a per-item entry has no headers.)
+          const { status, body } = renderProblem(err, req);
+          results.push({ index: i, status, body });
         }
       }
 
@@ -221,8 +236,13 @@ transactionsRouter.get(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const result = await getTransaction(req.ctx.workspaceId, id);
-      if (handleIfNoneMatch(req, res, result.version)) return;
-      setEtag(res, result.version);
+      // The tag covers the documents too: a revalidation after one of
+      // them was deleted, restored, linked or unlinked must not be a 304.
+      const etag = setTransactionEtag(res, result);
+      if (ifNoneMatchSatisfied(req, etag)) {
+        res.status(304).end();
+        return;
+      }
       res.json(result);
     } catch (err) {
       next(err);
@@ -249,7 +269,7 @@ transactionsRouter.patch(
       }
 
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
 
       const patch = parseOrThrow(UpdateTransactionRequest, req.body);
       const result = await updateTransaction(
@@ -259,7 +279,7 @@ transactionsRouter.patch(
         currentVersion,
         patch,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -286,16 +306,23 @@ transactionsRouter.delete(
       const q = parseOrThrow(TxnDeleteQuery, req.query);
       const hard = q.hard === "true" || q.hard === "1";
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
+      // Unlike the other writes, a delete sent with the whole tag must
+      // match its documents part too (checked under the row lock): a
+      // delete is the one write that undoes a document linked since the
+      // client read the row. See `transactionEtag` in http/etag.ts.
+      const expectedEtag = fullTransactionEtag(req.header("If-Match")) ?? undefined;
       // Default: reversible soft delete (deleted_at). ?hard=true: physical
       // delete. Reconciled transactions reject either way (unreconcile first).
       if (hard) {
         await deleteTransaction(req.ctx.workspaceId, id, currentVersion, {
           userId: req.ctx.userId,
+          expectedEtag,
         });
       } else {
         await softDeleteTransaction(req.ctx.workspaceId, id, currentVersion, {
           userId: req.ctx.userId,
+          expectedEtag,
         });
       }
       res.status(204).end();
@@ -313,14 +340,14 @@ transactionsRouter.post(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await restoreTransaction(
         req.ctx.workspaceId,
         id,
         currentVersion,
         { userId: req.ctx.userId },
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.status(200).json(result);
     } catch (err) {
       next(err);
@@ -336,14 +363,14 @@ transactionsRouter.post(
     try {
       const { id } = parseOrThrow(IdParam, req.params);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await reconcileTransaction(
         req.ctx.workspaceId,
         req.ctx.userId,
         id,
         currentVersion,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -360,7 +387,7 @@ transactionsRouter.post(
       const { id } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(UnreconcileTransactionRequest, req.body ?? {});
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await unreconcileTransaction(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -368,7 +395,7 @@ transactionsRouter.post(
         currentVersion,
         body.reason,
       );
-      setEtag(res, result.version);
+      setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
       next(err);
@@ -385,7 +412,7 @@ transactionsRouter.post(
       const { id } = parseOrThrow(IdParam, req.params);
       const body = parseOrThrow(NewPosting, req.body);
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await addPosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -440,7 +467,7 @@ transactionsRouter.patch(
       );
       const patch = parseOrThrow(UpdatePostingRequest, req.body);
       const currentVersion = await loadVersion(req.ctx.workspaceId, params.tid);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       const result = await updatePosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -467,7 +494,7 @@ transactionsRouter.delete(
         req.params,
       );
       const currentVersion = await loadVersion(req.ctx.workspaceId, params.tid);
-      requireIfMatch(req, currentVersion);
+      requireTransactionIfMatch(req, currentVersion);
       await deletePosting(
         req.ctx.workspaceId,
         req.ctx.userId,
@@ -507,6 +534,19 @@ transactionsRouter.post(
 );
 
 // ── OpenAPI registration ───────────────────────────────────────────────
+
+/** Shared prose for the posting add / update endpoints. The rules are
+ *  enforced in `resolvePostingMoney` and `assertPostingsMutable`
+ *  (transactions.service.ts). */
+const POSTING_MUTATION_RULES =
+  "Refused with 409 while the transaction is `reconciled` (`errors/transaction-reconciled` — " +
+  "unreconcile first) or soft-deleted (`errors/transaction-deleted` — restore first).\n\n" +
+  "`amount_minor` and `amount_base_minor` are kept consistent:\n" +
+  "- **Base-currency posting** — the server sets `amount_base_minor = amount_minor` and " +
+  "`fx_rate = null`. Omit both; a different `amount_base_minor` is a 422.\n" +
+  "- **Foreign-cash posting** — `fx_rate` and `amount_base_minor` are required together.\n" +
+  "- **Points posting** — supply both, or neither to apply the programme valuation.\n\n" +
+  "`amount_base_minor` must not have the opposite sign to `amount_minor`.";
 
 export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Transaction", TransactionSchema);
@@ -563,14 +603,23 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "get",
     path: "/v1/transactions/{id}",
     summary: "Get a transaction",
+    description:
+      "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does " +
+      "and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted " +
+      "or restored — which `version` alone does not record. Treat it as opaque and send it " +
+      "back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made " +
+      "after a document change is applied rather than refused, and the bare `W/\"<version>\"` " +
+      "form (built from the body's `version`) is accepted as well. The exception is DELETE, " +
+      "which compares the whole tag when it is sent whole (see that operation).",
     tags: ["transactions"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
       200: {
         description: "OK",
+        headers: { ETag: { schema: { type: "string" } } },
         content: { "application/json": { schema: TransactionSchema } },
       },
-      304: { description: "Not Modified" },
+      304: { description: "Not Modified (`If-None-Match` named the current ETag)" },
       404: { description: "Not Found", content: problemContent },
     },
   });
@@ -579,6 +628,20 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/transactions/{id}",
     summary: "Patch transaction head fields",
+    description:
+      "JSON Merge Patch (RFC 7396). A field the body does not name is left alone.\n\n" +
+      "**`metadata` merges, it does not replace.** Objects merge recursively, a `null` value " +
+      "removes that key, any other value replaces it, and `metadata: {}` changes nothing. " +
+      "Send only the keys you mean to change.\n\n" +
+      "**Server-owned metadata keys cannot be changed here.** These are provenance and " +
+      "bookkeeping the server maintains: " +
+      SERVER_OWNED_TX_METADATA_KEYS.map((k) => `\`${k}\``).join(", ") +
+      ". A patch that would change or remove one is refused with 422 (violation code " +
+      "`server_owned`); echoing a key back with its current value is a no-op and is accepted, " +
+      "so a client may GET the object, change its own keys and PATCH the whole object back.\n\n" +
+      "Patching `payee`, `occurred_on` or `occurred_at` sets `metadata.user_edited.<field>`, " +
+      "which keeps re-extract from overwriting the value.\n\n" +
+      "A patch that changes nothing returns 200 without bumping `version`.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -595,6 +658,11 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         content: { "application/json": { schema: TransactionSchema } },
       },
       412: { description: "Version mismatch", content: problemContent },
+      422: {
+        description:
+          "Validation failed, or the patch would change a server-owned metadata key",
+        content: problemContent,
+      },
       428: { description: "If-Match required", content: problemContent },
     },
   });
@@ -607,7 +675,11 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       "Default: reversible soft delete (sets deleted_at; the row drops out of every " +
       "money query but is restorable via POST /:id/restore). ?hard=true forces a physical " +
       "delete (postings + document_links cascade; irreversible). Reconciled transactions " +
-      "reject either way — unreconcile first.",
+      "reject either way — unreconcile first.\n\n" +
+      "Unlike the other writes, a delete sent with the whole ETag (`W/\"<version>-<documents tag>\"`) " +
+      "must match it whole: if a document was linked, unlinked, deleted or restored since the tag " +
+      "was issued, the answer is 412 and nothing is deleted, so a delete cannot silently undo a " +
+      "receipt attached in the meantime. The bare `W/\"<version>\"` form is held to the version only.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -621,10 +693,18 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     },
     responses: {
       204: { description: "Deleted" },
+      404: { description: "Not found (or, for a soft delete, already deleted)", content: problemContent },
       409: {
         description: "Transaction is reconciled — unreconcile first.",
         content: problemContent,
       },
+      412: {
+        description:
+          "`If-Match` is stale: the version moved, or (whole tag only) the transaction's documents changed since it was issued. Re-fetch and retry.",
+        content: problemContent,
+      },
+      422: { description: "`hard` is not one of `true`, `1`, `false`, `0`.", content: problemContent },
+      428: { description: "If-Match required", content: problemContent },
     },
   });
 
@@ -732,6 +812,7 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/transactions/{id}/postings",
     summary: "Add a posting to a transaction",
+    description: POSTING_MUTATION_RULES,
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -743,7 +824,14 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
         description: "Posting added",
         content: { "application/json": { schema: PostingSchema } },
       },
-      422: { description: "Imbalance", content: problemContent },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description: "Imbalance, unknown account, or inconsistent amounts",
+        content: problemContent,
+      },
     },
   });
 
@@ -804,6 +892,13 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     method: "patch",
     path: "/v1/transactions/{tid}/postings/{pid}",
     summary: "Update a posting",
+    description:
+      POSTING_MUTATION_RULES +
+      "\n\nA patch that names any of `amount_minor`, `currency`, `fx_rate` or " +
+      "`amount_base_minor` restates the whole pair under the rules above, so the native " +
+      "amount cannot change while the base amount stays behind. A patch of only `memo` " +
+      "and/or `account_id` leaves the amounts alone; `account_id` must be an account in " +
+      "this workspace. A patch that changes nothing returns 200 without bumping `version`.",
     tags: ["transactions"],
     request: {
       params: z.object({ tid: Uuid, pid: Uuid }),
@@ -816,6 +911,14 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       200: {
         description: "Updated",
         content: { "application/json": { schema: PostingSchema } },
+      },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
+      422: {
+        description: "Imbalance, unknown account, or inconsistent amounts",
+        content: problemContent,
       },
     },
   });
@@ -831,6 +934,10 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     },
     responses: {
       204: { description: "Deleted" },
+      409: {
+        description: "Transaction is reconciled or soft-deleted",
+        content: problemContent,
+      },
       422: { description: "Would leave <2 postings", content: problemContent },
     },
   });
