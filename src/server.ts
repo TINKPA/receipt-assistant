@@ -4,7 +4,8 @@
  * Boot sequence:
  *   1. Run pending Drizzle migrations. Fail fast on any migration error.
  *   2. Idempotent seed (default workspace + chart of accounts).
- *   3. Start the in-process ingest worker.
+ *   3. Start the in-process ingest worker (its boot recovery errors
+ *      orphaned ingests and abandons their runs).
  *   4. Start Express HTTP server built from `buildApp()`.
  */
 import "dotenv/config";
@@ -24,7 +25,8 @@ import {
   type AgentRoleSyncReport,
 } from "./db/agent-roles.js";
 import { seed } from "./db/seed.js";
-import { start as startIngestWorker } from "./ingest/worker.js";
+import { getConcurrency, start as startIngestWorker } from "./ingest/worker.js";
+import { claudeCliVersion } from "./claude.js";
 import { startMerchantEnrichmentLoop } from "./enrichment/merchants.js";
 import { buildInfo } from "./generated/build-info.js";
 import { buildExtractorPrompt } from "./ingest/prompt.js";
@@ -178,7 +180,13 @@ async function main(): Promise<void> {
   // then sits idle until /v1/ingest/batch enqueues files. Same process
   // as HTTP so the DB pool + v1 services are shared.
   await startIngestWorker();
-  console.log(`⚙️  Ingest worker ready (concurrency ${process.env.MAX_CLAUDE_CONCURRENCY ?? 3})`);
+  console.log(`⚙️  Ingest worker ready (concurrency ${getConcurrency()})`);
+
+  // Read once and kept: every run record carries it as `cli_version`.
+  // Not awaited, so a slow or missing CLI never holds up the boot.
+  void claudeCliVersion().then((v) =>
+    console.log(v ? `🤖 claude CLI ${v}` : "⚠️  claude --version did not answer; runs record cli_version NULL"),
+  );
 
   // Background poller that fills place_id / address / lat / lng on
   // newly-canonicalized merchant rows. No-ops when GOOGLE_MAPS_API_KEY

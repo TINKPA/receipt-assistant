@@ -21,7 +21,11 @@
  * usage, 0 content blocks repeated within an id. Langfuse (since removed)
  * independently reported 10 generations for the same session.
  *
- * This script groups by `message.id`, which is correct by construction.
+ * The parser lives in `src/session-transcript.ts::summarizeSession`, which
+ * the server also runs after every extraction to fill `agent_runs` (turns,
+ * tokens, the observed model). One parser, so the run records and this
+ * report cannot drift apart. It groups by `message.id`, which is correct
+ * by construction.
  *
  * The second trap, inherited from #227: `billed input` is
  * `input_tokens + cache_read + cache_creation`. Cache WRITES are billed,
@@ -30,10 +34,11 @@
  *
  * ── What it reports ────────────────────────────────────────────────────
  *
- * Per session: real turns, tool calls, turns that made no tool call,
- * billed input split three ways, output, the prompt's token cost, and
- * the share of the whole bill that prompt represents (turns × prompt,
- * because the prompt is re-read from cache on every single turn).
+ * Per session: the model that answered, real turns, tool calls, turns
+ * that made no tool call, billed input split three ways, output, the
+ * prompt's token cost, and the share of the whole bill that prompt
+ * represents (turns × prompt, because the prompt is re-read from cache on
+ * every single turn).
  *
  * CLI — `--key=value` only, same convention as eval-dates.ts. A bare
  * `--key` binds to `true`, so the space form fails silently.
@@ -41,156 +46,31 @@
  *   --dir=<path>          Where to look for `<id>.jsonl`. Default: the
  *                         Claude Code projects dir for this cwd.
  *   --last=<n>            Instead of --session, take the N most recently
- *                         modified JSONLs in --dir.
+ *                         modified JSONLs in --dir (of --kind, when given).
+ *   --kind=<k>            Only sessions of this kind: `ingest` or
+ *                         `re_extract`, read from the prompt's first words.
+ *                         Ask and ad-hoc sessions in the same directory are
+ *                         `other`.
  *   --turns               Print the per-turn table (tokens + tool command head).
  *   --json                Emit JSON instead of the text report.
  *
- * Run: `npm run measure:turns -- --last=6 --turns`
+ * Run: `npm run measure:turns -- --last=6 --kind=ingest --turns`
  *
- * Production JSONLs live on the mini, not here:
- *   scp mini:Developer/receipt-assistant-data/claude/projects/-app/<id>.jsonl /tmp/j/
- *   npm run measure:turns -- --dir=/tmp/j --last=6
+ * Production transcripts are on the host that runs production, under
+ * ~/Developer/receipt-assistant-data/claude/projects/-app (CLAUDE.md,
+ * "Agent transcripts"). Point --dir there, or at a copy of them:
+ *   npm run measure:turns -- --dir=$HOME/Developer/receipt-assistant-data/claude/projects/-app --last=6
+ * The same numbers are on each run's `agent_runs` row.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 
-import { getSessionJsonlPath } from "../src/session-transcript.js";
-
-// ── Types ──────────────────────────────────────────────────────────────
-
-interface Usage {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_input_tokens?: number;
-  cache_creation_input_tokens?: number;
-}
-
-interface Turn {
-  id: string;
-  usage: Usage;
-  tools: { name: string; head: string }[];
-  text: string;
-  thinkingChars: number;
-  stopReason?: string;
-}
-
-interface SessionReport {
-  session: string;
-  rawAssistantRecords: number;
-  turns: number;
-  toolCalls: number;
-  turnsWithoutToolCall: number;
-  promptChars: number;
-  promptTokens: number;
-  billedInput: number;
-  freshInput: number;
-  cacheRead: number;
-  cacheCreation: number;
-  output: number;
-  promptShare: number;
-  detail: Turn[];
-}
-
-// ── Parsing ────────────────────────────────────────────────────────────
-
-/** All three buckets are billed. See the header note. */
-function billedInput(u: Usage): number {
-  return (
-    (u.input_tokens ?? 0) +
-    (u.cache_read_input_tokens ?? 0) +
-    (u.cache_creation_input_tokens ?? 0)
-  );
-}
-
-/** The most identifying string in a tool call, for the per-turn table. */
-function toolHead(input: unknown): string {
-  const i = (input ?? {}) as Record<string, unknown>;
-  const v = i.command ?? i.file_path ?? i.pattern ?? i.url ?? i.query ?? "";
-  return String(v).replace(/\s+/g, " ").trim();
-}
-
-function analyze(jsonlPath: string): SessionReport {
-  const lines = readFileSync(jsonlPath, "utf8").split("\n");
-
-  const byId = new Map<string, Turn>();
-  let rawAssistantRecords = 0;
-  let promptChars = 0;
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let rec: any;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue; // a torn last line on a still-running session is not an error
-    }
-
-    // The first user message IS the extractor prompt.
-    if (promptChars === 0 && rec.type === "user") {
-      const c = rec.message?.content;
-      promptChars = typeof c === "string" ? c.length : JSON.stringify(c ?? "").length;
-    }
-
-    if (rec.type !== "assistant") continue;
-    rawAssistantRecords++;
-
-    const msg = rec.message ?? {};
-    // One API turn = one message.id. Records without one are synthetic.
-    const id: string = msg.id ?? `_noid_${rawAssistantRecords}`;
-
-    let turn = byId.get(id);
-    if (!turn) {
-      // Take usage from the FIRST record of this id only — the copies that
-      // follow are the same object, and adding them is exactly the bug.
-      turn = {
-        id,
-        usage: msg.usage ?? {},
-        tools: [],
-        text: "",
-        thinkingChars: 0,
-        stopReason: msg.stop_reason,
-      };
-      byId.set(id, turn);
-    }
-    if (msg.stop_reason) turn.stopReason = msg.stop_reason;
-
-    const content = Array.isArray(msg.content) ? msg.content : [];
-    for (const b of content) {
-      if (b.type === "tool_use") {
-        turn.tools.push({ name: b.name ?? "?", head: toolHead(b.input) });
-      } else if (b.type === "text" && b.text) {
-        turn.text += (turn.text ? " " : "") + b.text.replace(/\s+/g, " ");
-      } else if (b.type === "thinking") {
-        turn.thinkingChars += (b.thinking ?? "").length;
-      }
-    }
-  }
-
-  const detail = [...byId.values()];
-  const sum = (f: (u: Usage) => number) => detail.reduce((a, t) => a + f(t.usage), 0);
-
-  const billed = sum(billedInput);
-  // The prompt is written to cache on turn 1, so turn 1's cache_creation is
-  // its token cost. It is then re-read on every subsequent turn.
-  const promptTokens = detail[0]?.usage.cache_creation_input_tokens ?? 0;
-
-  return {
-    session: path.basename(jsonlPath, ".jsonl"),
-    rawAssistantRecords,
-    turns: detail.length,
-    toolCalls: detail.reduce((a, t) => a + t.tools.length, 0),
-    turnsWithoutToolCall: detail.filter((t) => t.tools.length === 0).length,
-    promptChars,
-    promptTokens,
-    billedInput: billed,
-    freshInput: sum((u) => u.input_tokens ?? 0),
-    cacheRead: sum((u) => u.cache_read_input_tokens ?? 0),
-    cacheCreation: sum((u) => u.cache_creation_input_tokens ?? 0),
-    output: sum((u) => u.output_tokens ?? 0),
-    promptShare: billed > 0 ? (detail.length * promptTokens) / billed : 0,
-    detail,
-  };
-}
+import {
+  getSessionJsonlPath,
+  summarizeSession,
+  type SessionKind,
+  type SessionSummary,
+} from "../src/session-transcript.js";
 
 // ── CLI ────────────────────────────────────────────────────────────────
 
@@ -201,19 +81,33 @@ const argv = Object.fromEntries(
   }),
 ) as Record<string, string>;
 
-function resolveSessions(): string[] {
+const KINDS: readonly SessionKind[] = ["ingest", "re_extract", "other"];
+const kind = argv.kind as SessionKind | undefined;
+if (kind !== undefined && !KINDS.includes(kind)) {
+  throw new Error(`--kind must be one of ${KINDS.join(", ")}, got ${JSON.stringify(argv.kind)}`);
+}
+
+function resolveSessions(): SessionSummary[] {
   const dir = argv.dir ?? path.dirname(getSessionJsonlPath("x"));
+  const ofKind = (s: SessionSummary) => kind === undefined || s.kind === kind;
 
   if (argv.last) {
     const n = Number(argv.last);
     if (!Number.isFinite(n) || n < 1) {
       throw new Error(`--last must be a positive number, got ${JSON.stringify(argv.last)}`);
     }
-    return readdirSync(dir)
+    const newestFirst = readdirSync(dir)
       .filter((f) => f.endsWith(".jsonl"))
       .map((f) => path.join(dir, f))
-      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
-      .slice(0, n);
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    // Kind is read from the file, so read newest first until N match.
+    const out: SessionSummary[] = [];
+    for (const f of newestFirst) {
+      if (out.length >= n) break;
+      const s = summarizeSession(f);
+      if (ofKind(s)) out.push(s);
+    }
+    return out;
   }
 
   if (!argv.session) {
@@ -223,13 +117,15 @@ function resolveSessions(): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((s) => (s.includes("/") || s.endsWith(".jsonl") ? s : path.join(dir, `${s}.jsonl`)));
+    .map((s) => (s.includes("/") || s.endsWith(".jsonl") ? s : path.join(dir, `${s}.jsonl`)))
+    .map((f) => summarizeSession(f))
+    .filter(ofKind);
 }
 
 const n = (x: number) => x.toLocaleString("en-US");
 const pct = (x: number) => `${Math.round(x * 100)}%`;
 
-const reports = resolveSessions().map(analyze);
+const reports = resolveSessions();
 
 if (argv.json === "true") {
   // Drop `detail` unless asked — it is large and rarely diffed.
@@ -244,6 +140,7 @@ if (argv.json === "true") {
   console.log(
     "\n" +
       w("session", 10) +
+      w("model", 18) +
       r("raw recs", 9) +
       r("turns", 7) +
       r("calls", 7) +
@@ -256,6 +153,7 @@ if (argv.json === "true") {
   for (const s of reports) {
     console.log(
       w(s.session.slice(0, 8), 10) +
+        w(s.model ?? "-", 18) +
         r(n(s.rawAssistantRecords), 9) +
         r(n(s.turns), 7) +
         r(n(s.toolCalls), 7) +
@@ -278,7 +176,7 @@ if (argv.json === "true") {
   for (const s of reports) {
     const ratio = s.turns ? (s.rawAssistantRecords / s.turns).toFixed(1) : "n/a";
     console.log(
-      `\n${s.session}\n` +
+      `\n${s.session}  (${s.kind}, ${s.model ?? "no model answered"})\n` +
         `  ${n(s.rawAssistantRecords)} JSONL records → ${n(s.turns)} real turns (${ratio}× — see header note)\n` +
         `  billed input ${n(s.billedInput)} = fresh ${n(s.freshInput)} + cache_read ${n(s.cacheRead)} + cache_create ${n(s.cacheCreation)}\n` +
         `  prompt ${n(s.promptChars)} chars ≈ ${n(s.promptTokens)} tokens ` +

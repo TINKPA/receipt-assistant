@@ -1,5 +1,6 @@
-import { spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { readdirSync, readFileSync } from "fs";
 import { AGENT_ROLE, roleDatabaseUrl } from "./db/agent-roles.js";
 
 /**
@@ -215,10 +216,10 @@ export interface RunClaudeOptions {
    *  and `--session-id` are supplied by this function. */
   args?: string[];
   timeoutMs: number;
-  /** Pre-allocated session id. The ingest path mints its own before
-   *  spawning so the session JSONL path is known while the agent is
-   *  still running (root CLAUDE.md invariant); other callers omit it and
-   *  get a fresh one back. */
+  /** Pre-allocated session id. The ingest worker and re-extract mint their
+   *  own before spawning, so the run record and the session JSONL path
+   *  exist while the agent is still running and survive its failure;
+   *  other callers omit it and get a fresh one back. */
   sessionId?: string;
 }
 
@@ -261,6 +262,307 @@ export function assertCallerArgs(args: readonly string[], profile: string): void
   }
 }
 
+/** How long a child gets after SIGTERM before its process group is
+ *  SIGKILLed, and again after SIGKILL (or after it exited on its own)
+ *  before its pipes are abandoned. */
+export const KILL_GRACE_MS = 15_000;
+
+/**
+ * Every process on the machine as `[pid, ppid, pgid]`, from `/proc` on
+ * Linux (the container) and `ps` elsewhere. Empty when neither can be
+ * read: the caller then signals only the child's own group, as it would
+ * have anyway.
+ */
+function processTable(): Array<[number, number, number]> {
+  try {
+    if (process.platform === "linux") {
+      const rows: Array<[number, number, number]> = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        let stat: string;
+        try {
+          stat = readFileSync(`/proc/${name}/stat`, "utf8");
+        } catch {
+          continue; // exited while we looked
+        }
+        // "pid (comm) state ppid pgrp …"; comm may hold spaces and ")".
+        const f = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        rows.push([Number(name), Number(f[1]), Number(f[2])]);
+      }
+      return rows;
+    }
+    const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,pgid="], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    return out
+      .split("\n")
+      .map((l) => l.trim().split(/\s+/).map(Number))
+      .filter((r): r is [number, number, number] => r.length === 3 && r.every(Number.isInteger));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The process groups of `rootPid`'s live descendants, other than its own
+ * group. The CLI (2.1.251) starts every Bash tool command `detached`, in
+ * a session of its own, so a `psql` waiting on a lock or a command left
+ * running with `&` is not in the group `kill(-pid)` reaches. They are the
+ * CLI's descendants only while it lives (an orphan is re-parented), so
+ * this is read before the first signal. Never returns this server's own
+ * group, or group 0 or 1.
+ */
+function descendantGroups(rootPid: number): number[] {
+  const table = processTable();
+  const children = new Map<number, number[]>();
+  const groupOf = new Map<number, number>();
+  for (const [pid, ppid, pgid] of table) {
+    groupOf.set(pid, pgid);
+    const list = children.get(ppid);
+    if (list) list.push(pid);
+    else children.set(ppid, [pid]);
+  }
+  const own = groupOf.get(process.pid);
+  const groups = new Set<number>();
+  const seen = new Set<number>();
+  const stack = [...(children.get(rootPid) ?? [])];
+  while (stack.length > 0) {
+    const p = stack.pop()!;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    const g = groupOf.get(p);
+    if (g !== undefined && g > 1 && g !== rootPid && g !== own) groups.add(g);
+    stack.push(...(children.get(p) ?? []));
+  }
+  return [...groups];
+}
+
+/** Why a supervised child did not succeed. */
+export type ChildFailureKind = "spawn" | "timeout" | "exit";
+
+/**
+ * A `claude -p` run that did not exit 0. The message is the same text the
+ * callers have always stored (`ingests.error` is categorised from it), and
+ * the fields say what happened without parsing it.
+ */
+export class ClaudeRunError extends Error {
+  constructor(
+    message: string,
+    readonly kind: ChildFailureKind,
+    readonly exitCode: number | null,
+    readonly signal: string | null,
+    readonly sessionId: string | null,
+  ) {
+    super(message);
+    this.name = "ClaudeRunError";
+  }
+}
+
+export interface SupervisedExit {
+  stdout: string;
+  stderr: string;
+  /** NULL when the child was ended by a signal. */
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  /** The timeout fired and the process group was killed. */
+  timedOut: boolean;
+}
+
+export interface SuperviseOptions {
+  env: NodeJS.ProcessEnv;
+  /** Written to the child's stdin, which is then closed. */
+  input: string;
+  timeoutMs: number;
+  killGraceMs?: number;
+  /** For the log lines a kill writes. */
+  label: string;
+}
+
+/**
+ * Spawn a child in a process group of its own and settle only once it is
+ * gone.
+ *
+ * The child is the leader of a new process group (`detached: true`, which
+ * is `setsid` on Linux and macOS), so every process it starts in that
+ * group — a `curl`, a `python3`, a `sleep` left in the background — can
+ * be signalled at once with `kill(-pgid)`. The CLI's Bash tool is the
+ * exception: CLI 2.1.251 runs each tool command in a session of its own,
+ * outside that group (see `descendantGroups`).
+ *
+ *   - Timeout: the groups of the child's descendants that left its group
+ *     are read first, while they are still its descendants. Then SIGTERM
+ *     to the child's group and to those, and SIGKILL to all of them after
+ *     `killGraceMs`. When the pipes close, any of those groups still alive
+ *     is SIGKILLed before the promise settles. A child that has not closed
+ *     its pipes another `killGraceMs` after the SIGKILL (something held
+ *     them from outside every group we know) has its pipes destroyed so
+ *     the caller is not held forever; the log says so.
+ *   - Exit before the timeout: whatever is left in the child's group is
+ *     SIGKILLed as soon as the leader exits, and the timeout is cancelled,
+ *     so a late close is never reported as a timeout. If the pipes are
+ *     still open `killGraceMs` after the exit (held by a process in a
+ *     session of its own), they are destroyed and the exit stands. Such a
+ *     process, and a tool command left running in its own session, is
+ *     not reached after a normal exit: by then it is no longer the
+ *     child's descendant and cannot be told from anyone else's process.
+ *   - The promise settles on 'close' — after the child has exited AND its
+ *     stdout/stderr have closed (or been destroyed as above) — never on
+ *     the timer. The worker releases its slot when this settles, so the
+ *     next job cannot start while a timed-out child's processes are still
+ *     alive (before wave 1 the timeout rejected at once and only
+ *     SIGTERMed the leader).
+ *
+ * Resolves with how the child ended, timeouts included. Rejects only when
+ * the child could not be spawned at all.
+ */
+export function runSupervised(
+  command: string,
+  args: string[],
+  { env, input, timeoutMs, killGraceMs = KILL_GRACE_MS, label }: SuperviseOptions,
+): Promise<SupervisedExit> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    const pid = child.pid;
+
+    let settled = false;
+    let timedOut = false;
+    let exited = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    const timers: NodeJS.Timeout[] = [];
+    const clearTimers = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      timeoutTimer = null;
+      timers.splice(0).forEach(clearTimeout);
+    };
+    /** Groups the child's descendants moved to, collected on timeout. */
+    const strayGroups = new Set<number>();
+
+    const killGroup = (signal: NodeJS.Signals): void => {
+      if (pid === undefined) return;
+      try {
+        process.kill(-pid, signal);
+      } catch (err) {
+        // ESRCH: the group is already empty. Anything else (EPERM) means
+        // the group cannot be signalled; fall back to the leader alone.
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+          try {
+            child.kill(signal);
+          } catch {
+            /* already gone */
+          }
+        }
+      }
+    };
+    const killStrays = (signal: NodeJS.Signals): void => {
+      for (const g of strayGroups) {
+        try {
+          process.kill(-g, signal);
+        } catch {
+          /* ESRCH: that group is gone */
+        }
+      }
+    };
+    const collectStrays = (): void => {
+      if (pid === undefined || exited) return;
+      for (const g of descendantGroups(pid)) strayGroups.add(g);
+    };
+    const abandonPipes = (why: string): void => {
+      console.error(
+        `[${label}] pipes of process ${pid} still open ${why} (held by a process outside its group); abandoning them`,
+      );
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
+
+    // The child may exit before draining stdin (bad flag, auth failure).
+    // Without this the EPIPE surfaces as an unhandled 'error' on the
+    // stream and crashes the process instead of rejecting the promise.
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+
+    timeoutTimer = setTimeout(() => {
+      timeoutTimer = null;
+      timedOut = true;
+      // Before any signal: once the leader dies its tool shells are
+      // re-parented and can no longer be found.
+      collectStrays();
+      console.warn(
+        `[${label}] timed out after ${timeoutMs}ms; SIGTERM to process group ${pid}` +
+          (strayGroups.size > 0
+            ? ` and to ${strayGroups.size} group(s) its descendants started (${[...strayGroups].join(", ")})`
+            : ""),
+      );
+      killGroup("SIGTERM");
+      killStrays("SIGTERM");
+      timers.push(
+        setTimeout(() => {
+          collectStrays(); // anything started since, if the leader still lives
+          console.warn(`[${label}] process group ${pid} still open after ${killGraceMs}ms; SIGKILL`);
+          killGroup("SIGKILL");
+          killStrays("SIGKILL");
+          timers.push(setTimeout(() => abandonPipes(`${killGraceMs}ms after SIGKILL`), killGraceMs));
+        }, killGraceMs),
+      );
+    }, timeoutMs);
+
+    child.on("exit", (code, signal) => {
+      exited = true;
+      exitCode = code;
+      exitSignal = signal;
+      // The leader is gone; nothing it started in its group may outlive it.
+      killGroup("SIGKILL");
+      if (timeoutTimer) {
+        // It ended before the timeout: waiting for its pipes is not a
+        // timeout, but it is bounded.
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+        timers.push(setTimeout(() => abandonPipes(`${killGraceMs}ms after it exited`), killGraceMs));
+      }
+    });
+
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      // A timed-out run's stragglers die before the caller (and the next
+      // job) goes on. SIGTERM went out at the timeout; whatever ignored it
+      // or has not finished yet gets no more time.
+      if (timedOut) killStrays("SIGKILL");
+      resolve({
+        stdout,
+        stderr,
+        exitCode: code ?? exitCode,
+        signal: signal ?? exitSignal,
+        timedOut,
+      });
+    });
+
+    child.on("error", (err) => {
+      // 'error' with no pid is a failed spawn (ENOENT, E2BIG): nothing is
+      // running and 'close' may never come. Any other 'error' (a failed
+      // kill) leaves the child running, and 'close' still settles it.
+      if (pid !== undefined || settled) return;
+      settled = true;
+      clearTimers();
+      reject(err);
+    });
+  });
+}
+
 /**
  * Run `claude -p` and return its stdout plus the session id used.
  *
@@ -276,48 +578,96 @@ export function assertCallerArgs(args: readonly string[], profile: string): void
  * die with an opaque `spawn E2BIG` (incident 2026-07-28, #194 —
  * production ingestion was down until this moved to stdin). stdin has no
  * such limit.
+ *
+ * The child runs under `runSupervised`: its own process group, killed as
+ * a group on timeout, and the promise settles only after it has closed.
+ * A failure rejects with a `ClaudeRunError` whose message is the text
+ * this function has always produced.
  */
-export function runClaude(
+export async function runClaude(
   prompt: string,
   { profile, args = [], timeoutMs, sessionId = randomUUID() }: RunClaudeOptions,
 ): Promise<{ stdout: string; sessionId: string }> {
   assertCallerArgs(args, profile);
   const fullArgs = ["-p", ...buildClaudeArgs(profile), ...args, "--session-id", sessionId];
   assertArgvSafe(fullArgs);
-  return new Promise((resolve, reject) => {
-    const child = spawn("claude", fullArgs, {
-      env: buildClaudeEnv(profile),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    // The child may exit before draining stdin (bad flag, auth failure).
-    // Without this the EPIPE surfaces as an unhandled 'error' on the
-    // stream and crashes the process instead of rejecting the promise.
-    child.stdin.on("error", () => {});
-    child.stdin.end(prompt);
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`claude -p timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(stderr || stdout || `claude -p exited with code ${code}`));
-      } else {
-        resolve({ stdout, sessionId });
-      }
-    });
-
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
+  const stdout = await runAgentChild("claude", fullArgs, {
+    env: buildClaudeEnv(profile),
+    input: prompt,
+    timeoutMs,
+    sessionId,
   });
+  return { stdout, sessionId };
+}
+
+/**
+ * Run an agent-shaped child under `runSupervised` and turn how it ended
+ * into `runClaude`'s contract: stdout on exit 0, otherwise a
+ * `ClaudeRunError` carrying the text callers have always stored.
+ *
+ * Exported for the sandbox stub extractor's `child` mode, which runs a
+ * fake agent through this exact path so a timeout or a stray grandchild
+ * can be tested without spending a real run.
+ */
+export async function runAgentChild(
+  command: string,
+  args: string[],
+  opts: { env: NodeJS.ProcessEnv; input: string; timeoutMs: number; sessionId: string; killGraceMs?: number },
+): Promise<string> {
+  const { sessionId, timeoutMs } = opts;
+  let exit: SupervisedExit;
+  try {
+    exit = await runSupervised(command, args, {
+      env: opts.env,
+      input: opts.input,
+      timeoutMs,
+      killGraceMs: opts.killGraceMs,
+      label: `claude ${sessionId.slice(0, 8)}`,
+    });
+  } catch (err) {
+    throw new ClaudeRunError((err as Error).message, "spawn", null, null, sessionId);
+  }
+  if (exit.timedOut) {
+    throw new ClaudeRunError(
+      `claude -p timed out after ${timeoutMs}ms`,
+      "timeout",
+      exit.exitCode,
+      exit.signal,
+      sessionId,
+    );
+  }
+  if (exit.exitCode !== 0) {
+    throw new ClaudeRunError(
+      exit.stderr || exit.stdout || `claude -p exited with code ${exit.exitCode}`,
+      "exit",
+      exit.exitCode,
+      exit.signal,
+      sessionId,
+    );
+  }
+  return exit.stdout;
+}
+
+let cliVersionPromise: Promise<string | null> | null = null;
+
+/**
+ * The CLI's version (`claude --version`), read once per process and kept.
+ * NULL when the CLI cannot be run. The server starts the read at boot so
+ * the first run record does not wait for it.
+ */
+export function claudeCliVersion(): Promise<string | null> {
+  cliVersionPromise ??= runSupervised("claude", ["--version"], {
+    env: buildClaudeEnv("text"),
+    input: "",
+    timeoutMs: 10_000,
+    killGraceMs: 2_000,
+    label: "claude --version",
+  })
+    .then((exit) => {
+      if (exit.timedOut || exit.exitCode !== 0) return null;
+      const line = exit.stdout.trim().split("\n")[0] ?? "";
+      return line.match(/^\d+\.\d+\.\d+\S*/)?.[0] ?? (line.slice(0, 100) || null);
+    })
+    .catch(() => null);
+  return cliVersionPromise;
 }
