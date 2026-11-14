@@ -572,6 +572,7 @@ Found by the P3 sandbox smoke and left for later by the owner. The A/B treats th
 | `scripts/check-projection-replay.ts --records` | the same; gate G3 | stored records re-project to the transactions they produced (fingerprints), and a record that booked nothing does so for a known reason |
 | `scripts/check-ledger.ts` | after every deploy and trial | `apply-row-has-record` (a server-written transaction still has its record), `run-without-terminal-ingest`, `postings-native-balance` |
 | `scripts/eval-dedup.ts --writer=server_apply` | after a dedup or worker change | the worker guards' record variants (g1, g3, g4) and the applier cases a1 to a9 with record stubs; with `--with-claude`, the agent cases |
+| `scripts/ab-campaign.ts`, `scripts/diff-arms.ts` | P4, the A/B | the runs every gate below is computed from, and the gates and the adjudication worksheet themselves |
 | `scripts/check-agent-sandbox.ts` | after a profile, CLI or grant change | the record profile has no database URL, no logo key and no web search, and a resumed session offers exactly its tools |
 | `scripts/probe-cli.ts` | with every CLI bump | the `--resume` behaviour the repair round relies on |
 
@@ -613,7 +614,7 @@ The corpus: the public fixtures of `scripts/eval-dates.fixtures.json`; a private
 
 The instruments: `eval-dates` scores date, total, payee, classification, flow and currency per document, with the run, model, turns and tokens; the fingerprint (`src/ingest/apply/fingerprint.ts`) is what compares what the two arms booked for one document field by field; `npm run measure:turns` gives the cost. Disagreements are settled by reading the document, in private notes.
 
-Not built yet: the cross-arm comparison itself. Today the fingerprint is used only by `check-projection-replay --records`, `check-apply-decide` and `check-apply-extraction`, each within one writer. A script that pairs arm A's and arm B's transactions for each fixture, fingerprints both and prints the field-by-field table G4 adjudicates is a P4 prerequisite.
+Two scripts carry the comparison out (`scripts/ab-campaign.md` has the night-run recipe). `scripts/ab-campaign.ts` runs it unattended on the sandbox: one unit per trial and arm, the arm order alternating, the container recreated with the arm's writer from one image (never rebuilt) and the ledger reset before each, `eval-dates` with a row dump that includes each transaction's fingerprint, `check-ledger` and (arm B) `--records` after each, and the `eval-dedup`, `check-apply-extraction` and re-extract steps. It keeps its state in the campaign directory, resumes where it stopped, and voids a trial pair and stops the moment a run fails on quota, overload or auth or the app log shows a rate limit. `scripts/diff-arms.ts` reads that directory and writes the gate table and the adjudication worksheet: per fixture and field the majority value of each arm side by side, the differences listed above marked as expected, and a file for the verdicts a person gives after reading the document.
 
 ### Gates
 

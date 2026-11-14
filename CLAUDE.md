@@ -763,6 +763,8 @@ npm run eval:dates -- --dry-run            # resolve and copy only; no upload
 npm run eval:dates -- --reset --limit=6    # the six-fixture sanity set
 ```
 
+The wave-1 A/B is run with `scripts/ab-campaign.ts` (unattended, sandbox only, resumable: one unit per trial and arm with the container recreated for the arm's writer, `eval-dates --dump`, `check-ledger` and `--records` per unit, plus the `eval-dedup`, `check-apply-extraction` and re-extract steps; it stops and voids the trial pair on a quota, overload, auth or rate-limit failure) and judged with `scripts/diff-arms.ts` (the gates G1-G9 and a private adjudication worksheet). Recipe, outputs and the no-model rehearsal: `scripts/ab-campaign.md`.
+
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
 The dedup system (#134/#135) has a dedicated regression harness that

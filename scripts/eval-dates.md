@@ -196,10 +196,12 @@ No auth headers (the seed-workspace middleware), no `--json-schema`.
 | `--dry-run` | off | Resolve and copy every fixture, check the copies, upload nothing |
 | `--rescore=<batch id>[,<id>]` | off | Score batches that already ran, with the current manifest and code: no reset, upload or model calls. Items are matched to fixtures by upload filename. Use it after correcting ground truth, or to dump a run after the fact (before the next reset) |
 
-Two arms are two runs. Recreate the sandbox for each with the conditions
-that differ from the compose defaults named on the command line (the
-sandbox's concurrency default is 6, and a value in `.env` would move
-production too):
+For the wave-1 A/B use `scripts/ab-campaign.ts` (`scripts/ab-campaign.md`),
+which does all of the below per unit and keeps the units in order across
+nights. By hand, two arms are two runs. Recreate the sandbox for each with
+the conditions that differ from the compose defaults named on the command
+line (the sandbox's concurrency default is 6, and a value in `.env` would
+move production too):
 
 ```bash
 # arm A
