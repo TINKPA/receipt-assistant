@@ -56,14 +56,26 @@
  *   items-under-live-txn    no un-retired line item hangs under a deleted
  *                           transaction (it would still count in product
  *                           statistics).
- *   postings-native-balance every transaction's postings sum to zero in
- *                           each currency they use, in `amount_minor`.
+ *   postings-native-balance the postings an extraction wrote sum to zero
+ *                           in each currency they use, in `amount_minor`.
  *                           The deferred trigger only checks the base-
  *                           currency sum, so a points stay booked as
  *                           points on one side and dollars on the other,
  *                           or a foreign leg paired with a base leg, passes
- *                           it. Every transaction is checked, deleted ones
- *                           included: a delete does not touch postings.
+ *                           it. Checked: transactions an ingest wrote
+ *                           (`source_ingest_id`, or `metadata.source =
+ *                           'ingest'` on rows older than that column),
+ *                           posted or reconciled (deleted ones included: a
+ *                           delete does not touch postings), whose postings
+ *                           no person has changed since (no
+ *                           `posting_added` / `posting_updated` /
+ *                           `posting_removed` event). Not checked, because
+ *                           the ledger allows them on purpose and the base
+ *                           sum is their only contract: drafts and `error`
+ *                           rows (the trigger exempts them), entries made
+ *                           through `POST /v1/transactions` (their postings
+ *                           may be in different currencies, balanced in
+ *                           base), and postings edited by hand.
  *   run-without-terminal-ingest
  *                           an ingest run that has ended (`finished`, or
  *                           `abandoned` at boot) belongs to an ingest that
@@ -111,8 +123,10 @@
  *
  * The two newest checks are expected to be clean and fail by default:
  * postings-native-balance held for every transaction in production when
- * it was added (2026-11-13), and run-without-terminal-ingest describes a
- * state no code path produces.
+ * it was added (2026-11-13; none was multi-currency, a draft or an
+ * `error` row, so its scope only keeps out the states a person can
+ * create), and run-without-terminal-ingest describes a state no code
+ * path produces.
  */
 import pg from "pg";
 
@@ -361,7 +375,7 @@ const CHECKS: Check[] = [
   },
   {
     name: "postings-native-balance",
-    what: "transactions whose postings do not sum to zero in one of their currencies",
+    what: "extracted transactions whose postings do not sum to zero in one of their currencies",
     sql: `
       SELECT t.id::text AS id,
              string_agg(g.currency || ' off by ' || g.total, ', ' ORDER BY g.currency) AS detail
@@ -370,6 +384,11 @@ const CHECKS: Check[] = [
                GROUP BY p.transaction_id, p.currency
               HAVING sum(p.amount_minor) <> 0) g
         JOIN transactions t ON t.id = g.transaction_id
+       WHERE t.status NOT IN ('draft', 'error')
+         AND (t.source_ingest_id IS NOT NULL OR t.metadata->>'source' = 'ingest')
+         AND NOT EXISTS (SELECT 1 FROM transaction_events e
+                          WHERE e.transaction_id = t.id
+                            AND e.event_type IN ('posting_added', 'posting_updated', 'posting_removed'))
        GROUP BY t.id, t.created_at
        ORDER BY t.created_at`,
   },
