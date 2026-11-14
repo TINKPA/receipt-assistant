@@ -3308,7 +3308,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/BrandRollupRecentRow"
-            }
+            },
+            "description": "The 20 most recent live transactions across the brand's merchants (posted or reconciled, not deleted), drawn from the set the stats count."
           },
           "sibling_brands": {
             "type": "array",
@@ -3862,18 +3863,8 @@
             }
           },
           "auto_reconcile": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "string",
-                "enum": [
-                  "true",
-                  "false"
-                ]
-              }
-            ]
+            "type": "boolean",
+            "description": "Whether to run reconcile for the batch once every file has been extracted. Sent as text: `true` / `1` / `false` / `0`, in any case. On when the field is absent or empty; any other value is a 422."
           }
         }
       },
@@ -8964,7 +8955,7 @@
     "/v1/brands/{brandId}/rollup": {
       "get": {
         "summary": "Brand-level rollup — locations, recent transactions, sibling brands",
-        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Voided transactions excluded from money sums. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
+        "description": "Aggregates across every merchant row sharing this brand_id within the workspace. Powers the BrandPage UI (#XXX). Only live transactions (posted or reconciled, not deleted) are counted in the stats or listed in recent_transactions. Sibling brands (same parent_id) included for the Costco-style grouped-brand callout.",
         "tags": [
           "brands"
         ],
@@ -9732,7 +9723,7 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "No files / validation failed",
+            "description": "No files, or `auto_reconcile` is not one of true / 1 / false / 0",
             "content": {
               "application/problem+json": {
                 "schema": {

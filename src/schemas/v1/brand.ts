@@ -175,7 +175,11 @@ export const BrandRollup = z
     brand: Brand,
     stats: BrandRollupStats,
     locations: z.array(BrandRollupLocation),
-    recent_transactions: z.array(BrandRollupRecentRow),
+    recent_transactions: z.array(BrandRollupRecentRow).openapi({
+      description:
+        "The 20 most recent live transactions across the brand's merchants " +
+        "(posted or reconciled, not deleted), drawn from the set the stats count.",
+    }),
     sibling_brands: z.array(BrandRollupSibling),
   })
   .openapi("BrandRollup");

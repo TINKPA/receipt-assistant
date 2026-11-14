@@ -26,7 +26,8 @@
  *      `NOT_IN_A_TEMPLATE` below with the reason it exists. A grant nobody
  *      can explain is a grant that should go.
  *   4. Every table and column AGENT_GRANTS names exists in `src/schema`.
- *   5. Every table and column in the Ask prompt's schema digest exists.
+ *   5. Every table and column in the Ask prompt's schema digest exists in
+ *      `src/schema`, and every view it names is created by a migration.
  *
  * It is a reader of prose, not a SQL parser. It errs toward seeing a
  * statement where there is only a mention; if it ever trips on a sentence,
@@ -331,8 +332,33 @@ for (const [table, grant] of Object.entries(AGENT_GRANTS)) {
 }
 
 // ── 5. the Ask digest names real things ────────────────────────────────
+//
+// The Ask model has no tools: a name that is wrong here is a query that
+// fails, and a turn spent, on every question that touches it.
 
+const digestTables = new Set(ASK_SCHEMA_DIGEST.filter((t) => t.viewOf === undefined).map((t) => t.table));
 for (const entry of ASK_SCHEMA_DIGEST) {
+  if (entry.viewOf !== undefined) {
+    // A view has no drizzle definition to read columns from. What can be
+    // checked without a database: a migration creates it, and the table
+    // whose columns the digest says it has is itself in the digest.
+    // `check-agent-sandbox` selects those columns through the view on a
+    // real database.
+    if (!VIEWS.has(entry.table)) {
+      violations.push(`Ask schema digest lists the view ${entry.table}, which no migration in drizzle/ creates`);
+    }
+    if (!digestTables.has(entry.viewOf)) {
+      violations.push(
+        `Ask schema digest says ${entry.table} has the columns of ${entry.viewOf}, which the digest does not list`,
+      );
+    }
+    if (entry.columns.length > 0) {
+      violations.push(
+        `Ask schema digest gives the view ${entry.table} columns of its own; it is printed with the columns of ${entry.viewOf}`,
+      );
+    }
+    continue;
+  }
   const cols = TABLES.get(entry.table);
   if (!cols) {
     violations.push(`Ask schema digest lists ${entry.table}, which is not a table in src/schema`);
@@ -369,5 +395,5 @@ if (violations.length > 0) {
 }
 console.log(
   `check-agent-grants: OK — ${used.size} tables used by the templates, all covered by AGENT_GRANTS; ` +
-    `Ask digest columns exist.`,
+    `the Ask digest's ${ASK_SCHEMA_DIGEST.length} relations and their columns exist.`,
 );

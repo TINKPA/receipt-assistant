@@ -6,7 +6,7 @@
  * no schema here covers proposal payloads yet; keep this file minimal.
  */
 import { z } from "zod";
-import { IsoDateTime, Uuid } from "./common.js";
+import { IsoDateTime, QueryBoolean, Uuid } from "./common.js";
 
 // ── Enums (serialized as bare lowercase strings) ──────────────────────
 
@@ -176,15 +176,45 @@ export const BatchSummary = z
 
 // ── Request shapes ────────────────────────────────────────────────────
 
+/**
+ * `auto_reconcile` as a multipart text field. It takes the spellings
+ * `QueryBoolean` takes (`true` / `1` / `false` / `0`, any case) and
+ * anything else is a 422. The hand-rolled parser this replaces returned
+ * `true` for whatever it did not recognise, so `auto_reconcile=no` and
+ * `=off` switched reconcile ON.
+ *
+ * Absent parses to `undefined`, and the route applies the default (on).
+ * So does an empty value, which is the one place this differs from
+ * `QueryBoolean`. There an empty value is false, which is also what
+ * every flag that uses it defaults to. This flag defaults to true, and a
+ * form field left blank has always meant "not given" here, so it keeps
+ * meaning that instead of quietly switching reconcile off.
+ *
+ * No `default` in the OpenAPI metadata: openapi-typescript renders a
+ * defaulted request property as required (see `MetadataPatch`).
+ */
+export const AutoReconcileField = z
+  .preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    QueryBoolean.optional(),
+  )
+  .openapi({
+    type: "boolean",
+    description:
+      "Whether to run reconcile for the batch once every file has been extracted. " +
+      "Sent as text: `true` / `1` / `false` / `0`, in any case. On when the field is " +
+      "absent or empty; any other value is a 422.",
+  });
+
 // Multipart form: one or more `files` fields + optional `auto_reconcile`.
 // zod-to-openapi can't fully model multipart; we register the shape so
-// the spec documents the expected fields.
+// the spec documents the expected fields. The route parses the text
+// fields of the body with this same schema (multer puts the files
+// themselves on `req.files`, so `files` is absent there).
 export const CreateBatchForm = z
   .object({
     files: z.any().openapi({ type: "array", items: { type: "string", format: "binary" } }),
-    auto_reconcile: z
-      .union([z.boolean(), z.enum(["true", "false"])])
-      .optional(),
+    auto_reconcile: AutoReconcileField,
   })
   .openapi("CreateBatchForm");
 
