@@ -26,7 +26,10 @@
  *   purchase (two-level lines, a product_key twice) · refund with
  *   refund_of · refund whose refund_of is ambiguous · income retiring a
  *   sold item · income refused by the two-instance guard · owned items,
- *   quantity 2 · points + cash (points account under Assets) · JPY and EUR
+ *   quantity 2 · points + cash (points account under Assets) · tenders:
+ *   a debit card purchase and its refund (Checking), a gift card or app
+ *   balance (Cash), a mixed tender (Credit Card, warned and flagged),
+ *   points + cash on a debit card · JPY and EUR
  *   (the post-commit FX pass, rates from a seeded cache) · attach by
  *   identifier · attach by the hard tuple · attach refused: not a
  *   candidate · attach refused: target deleted while the apply waited on
@@ -111,6 +114,7 @@ const { parseArtefact } = await import("../src/ingest/contract/artefact.js");
 const { APPLIER_METADATA_KEYS, EXTRACTION_STAMP_KEYS } = await import("../src/ingest/apply/metadata.js");
 const { readLedgerFingerprint, diffFingerprints } = await import("../src/ingest/apply/fingerprint.js");
 const { RECORD_PROMPT_VERSION } = await import("../src/ingest/prompt-contract.js");
+const { verdictAbout } = await import("../src/reconcile/dedup.js");
 const { GooglePlacesApiKeyMissing } = await import("../src/google/places-fetch.js");
 type ApplyResult = Awaited<ReturnType<typeof A.applyExtraction>>;
 type RecordResult = Awaited<ReturnType<typeof A.recordExtraction>>;
@@ -680,6 +684,92 @@ await fixture("points + cash: points account created under Assets", async () => 
   check("the report says the account was created", r.res.report?.accounts?.points_account_created === true);
   await expect({ transactions: 1, postings: 4, document_links: 1, transaction_items: 2, transaction_parties: 1, transaction_events: 1,
     merchants: 1, brands: 1, accounts: 1, document_extractions: 1 });
+});
+
+// The owner's tender decisions (November 2026): a debit card draws on
+// Checking, a gift card or app balance on Cash, a mixed tender is booked
+// whole to Credit Card with a warning on the record and a review flag on
+// the transaction.
+await fixture("tenders: a debit card purchase and its refund go through Checking", async () => {
+  const brand = "tender-debit";
+  const order = `T-${N}-1`;
+  const debit = { method: "debit_card", card_last4: "0000", as_printed: "US DEBIT ****0000" };
+  const p = receipt({ brand, total: 3810, ids: { order_number: order } });
+  p.payment = debit;
+  const pr = await ingest(W, p);
+  const purchase = await checkWritten(pr, "debit purchase");
+  check("debit purchase: Checking pays", json((await postingsOf(purchase)).map((x) => [x.account, x.amount_minor])) === json([["Shopping", "3810"], ["Checking", "-3810"]]));
+  const pm = (await one(`SELECT metadata FROM transactions WHERE id = $1`, [purchase])).metadata;
+  check("debit purchase: mirror_account Checking, the card in the Payment cell", pm.mirror_account === "Checking" && pm.payment_method === "****0000" &&
+    pm.card_last4 === "0000" && !("near_dup_check" in pm), json([pm.mirror_account, pm.payment_method, pm.near_dup_check]));
+  check("debit purchase: the report names Checking", pr.res.report?.accounts?.mirror === "Checking" && !("flagged_for_review" in (pr.res.report?.accounts ?? {})));
+
+  const expect = await watch(W);
+  const r = receipt({ brand, total: -3810, flow: "refund", ids: { order_number: order },
+    items: [{ line_no: 1, raw_name: "RETURN ITEM", line_total_minor: -3810, item_class: "consumable", confidence: "high", product_key: `${slug(brand)}-item` }] });
+  r.payment = debit;
+  const rr = await ingest(W, r);
+  const refund = await checkWritten(rr, "debit refund");
+  check("debit refund: the money returns to Checking", json((await postingsOf(refund)).map((x) => [x.account, x.amount_minor])) === json([["Checking", "3810"], ["Shopping", "-3810"]]));
+  const rm = (await one(`SELECT metadata FROM transactions WHERE id = $1`, [refund])).metadata;
+  check("debit refund: refund_of names the purchase", rm.refund_of === purchase && rm.mirror_account === "Checking", json([rm.refund_of, rm.mirror_account]));
+  await expect({ transactions: 1, postings: 2, document_links: 1, transaction_items: 1, transaction_parties: 1, transaction_events: 1, document_extractions: 1 });
+});
+
+await fixture("tenders: a gift card or app balance goes through Cash", async () => {
+  const raw = receipt({ brand: "tender-gift", total: 3820 });
+  raw.payment = { method: "gift_card", as_printed: "STORE APP BALANCE" };
+  const r = await ingest(W, raw);
+  const txId = await checkWritten(r);
+  check("Cash pays", json((await postingsOf(txId)).map((x) => [x.account, x.amount_minor])) === json([["Shopping", "3820"], ["Cash", "-3820"]]));
+  const m = (await one(`SELECT metadata FROM transactions WHERE id = $1`, [txId])).metadata;
+  check("mirror_account Cash, the tender as printed, no flag", m.mirror_account === "Cash" && m.payment_method === "STORE APP BALANCE" && !("near_dup_check" in m),
+    json([m.mirror_account, m.payment_method, m.near_dup_check]));
+  check("no mixed_tender warning", !r.outcome.report.warnings.some((w) => w.rule === "mixed_tender"));
+});
+
+await fixture("tenders: a mixed tender is booked whole to Credit Card, warned and flagged for review", async () => {
+  const expect = await watch(W);
+  const raw = receipt({ brand: "tender-mixed", total: 3830 });
+  raw.payment = { method: "mixed", as_printed: "CASH 10.00 / VISA 28.30" };
+  const r = await ingest(W, raw);
+  const txId = await checkWritten(r);
+  check("Credit Card pays the whole total", json((await postingsOf(txId)).map((x) => [x.account, x.amount_minor])) === json([["Shopping", "3830"], ["Credit Card", "-3830"]]));
+  const stored = await one(`SELECT validation FROM document_extractions WHERE id = $1`, [r.rec.extractionId]);
+  check("the record carries mixed_tender, as money", stored.validation.warnings.some((w: any) => w.rule === "mixed_tender" && w.path === "payment.method" && w.money === true),
+    json(stored.validation.warnings));
+  const t = await one(`SELECT metadata FROM transactions WHERE id = $1`, [txId]);
+  const nd = t.metadata.near_dup_check;
+  check("flagged for review, naming no candidate, saying the split was not booked", nd?.flagged_for_review === true && nd?.verdict === "uncertain" &&
+    json(nd?.candidate_transaction_ids) === "[]" && !("candidate_transaction_id" in nd) && /split not booked/.test(nd?.reason ?? "") && nd?.decided_by === "applier", json(nd));
+  const queue = await q(`SELECT id FROM transactions WHERE id = $1 AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`, [txId]);
+  check("the review queue's predicate lists it", queue.length === 1);
+  check("reconcile reads no verdict about any pair from it", verdictAbout({ near_dup_check: nd } as any, randomUUID()) === null);
+  check("the run's report says why", /split not booked/.test(r.res.report?.accounts?.flagged_for_review ?? ""), json(r.res.report?.accounts));
+  check("the dedup decision itself found nothing", r.res.report?.decision?.verdict === "none" && r.res.report?.decision?.flagged_for_review === false);
+  await expect({ transactions: 1, postings: 2, document_links: 1, transaction_items: 1, products: 1, transaction_parties: 1,
+    transaction_events: 1, merchants: 1, brands: 1, document_extractions: 1 });
+});
+
+await fixture("tenders: points plus cash on a debit card, the cash part through Checking", async () => {
+  const cur = `CHK${N.toUpperCase()}_PT`;
+  const raw = receipt({ brand: "resort-debit", total: 21000, currency: cur, category: "Travel", items: [
+    { line_no: 1, raw_name: "AWARD NIGHT", line_total_minor: 21000, currency: cur, item_class: "service", confidence: "high" },
+    { line_no: 2, raw_name: "PARKING", line_total_minor: 2500, currency: "USD", item_class: "service", confidence: "high", line_type: "service_fee" },
+  ] });
+  raw.payment = { method: "debit_card", card_last4: "0000" };
+  raw.points = { programme_name: "Example Stay Rewards" };
+  raw.cash_component = { amount_minor: 2500, currency: "USD" };
+  const r = await ingest(W, raw);
+  const txId = await checkWritten(r);
+  const ps = await postingsOf(txId);
+  check(
+    "a points pair on the programme's account and a cash pair on Checking",
+    json(ps.map((p) => [p.account, p.amount_minor, p.currency])) ===
+      json([["Travel", "21000", cur], ["Example Stay Rewards points", "-21000", cur], ["Travel", "2500", "USD"], ["Checking", "-2500", "USD"]]),
+    json(ps),
+  );
+  check("no account overridden", !(r.res.report?.warnings ?? []).some((w) => w.rule === "account_overridden"));
 });
 
 async function fxFixture(currency: string, total: number, rate: string, expectedBase: string, expectedFx: string) {

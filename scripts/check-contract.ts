@@ -373,6 +373,8 @@ expectErrors("fractional total", variant((r) => (r.facts.total_minor = 10.8)), [
 expectErrors("bad enum", variant((r) => (r.merchant.category = "Coffee")), [["schema", "merchant.category"]]);
 expectErrors("bad slug", variant((r) => (r.merchant.brand_id = "Example Cafe")), [["schema", "merchant.brand_id"]]);
 expectErrors("bad card last4", variant((r) => (r.payment.card_last4 = "12345")), [["schema", "payment.card_last4"]]);
+// The method is the enum, never the tender word: `debit` is `debit_card`.
+expectErrors("debit is not a method", variant((r) => (r.payment.method = "debit")), [["schema", "payment.method"]]);
 expectErrors("date in the wrong format", variant((r) => (r.facts.occurred_on = "06/10/2026")), [["schema", "facts.occurred_on"]]);
 expectErrors("required item field missing", variant((r) => delete r.items[1].confidence), [["schema", "items[1].confidence"]]);
 
@@ -608,6 +610,37 @@ expectValid("review flags", variant((r) => (r.audit.review_flags = ["needs_revie
 expectValid("the other review flags", variant((r) => (r.audit.review_flags = ["date_unresolved", "total_unresolved", "partial_document"])), {
   warnings: ["review_flag_date_unresolved", "review_flag_total_unresolved", "review_flag_partial_document"],
 });
+// Tenders (the owner's decisions of November 2026): a debit card and a
+// gift card or balance are their own methods; a mixed tender warns, as
+// money, because one method cannot book the split.
+{
+  const debit = expectValid("debit card", variant((r) => (r.payment = { method: "debit_card", card_last4: "0000", as_printed: "US DEBIT ****0000" })), {
+    noWarnings: ["mixed_tender"],
+  });
+  if (debit.status === "valid") check("debit card: kept as debit_card", debit.record.payment.method === "debit_card");
+  expectValid("gift card", variant((r) => (r.payment = { method: "gift_card", as_printed: "GIFT CARD" })), { noWarnings: ["mixed_tender"] });
+  const mixed = expectValid("mixed tender", variant((r) => (r.payment = { method: "mixed", as_printed: "CASH 5.00 / VISA 5.80" })), {
+    warnings: ["mixed_tender"],
+  });
+  const w = mixed.report.warnings.find((x) => x.rule === "mixed_tender");
+  check("mixed tender: a money warning at payment.method", w?.path === "payment.method" && w?.money === true, JSON.stringify(w));
+  expectValid("mixed tender on a refund", variant((r) => {
+    r.facts.flow = "refund";
+    r.facts.total_minor = -1080;
+    r.facts.total_printed = "-$10.80";
+    for (const it of r.items) {
+      it.line_total_minor = -it.line_total_minor;
+      if (it.tax_minor) it.tax_minor = -it.tax_minor;
+    }
+    r.payment = { method: "mixed" };
+  }), { warnings: ["mixed_tender"] });
+  // Income lands where `income` says; its method books nothing.
+  expectValid("mixed tender on income is quiet", variant((r) => {
+    r.facts.flow = "income";
+    r.income = { deposit_account: "Checking", income_account: "Other" };
+    r.payment = { method: "mixed" };
+  }), { noWarnings: ["mixed_tender"] });
+}
 
 // Printed amounts, directly.
 for (const [text, exp, want] of [

@@ -51,12 +51,18 @@
  *       record books nothing (X10);
  *     - several legs in one currency (a split tender): the contract has
  *       one pair per currency;
- *     - the payment text names cash, a check or a bank transfer and the
- *       row was booked to Credit Card: the legacy prompt's default mirror
- *       (hole 9), which §3.3 replaces with the stated method;
- *     - the other way round, a tender §3.3 sends to Credit Card (a debit
- *       card, a gift-card or wallet balance, a mixed tender) that the
- *       legacy agent booked to Cash or Checking: the table is the plan's;
+ *     - the payment text names a tender §3.3 books away from Credit Card
+ *       (cash, a check, a bank transfer, a debit card, a gift card or a
+ *       balance) and the row was booked to Credit Card: the legacy
+ *       prompt's default mirror (hole 9), which §3.3 replaces with the
+ *       stated method;
+ *     - the other way round, a tender §3.3 sends to Credit Card (a card
+ *       of no stated kind, a mixed tender, another tender) that the
+ *       legacy agent booked to Cash or Checking: the table is the plan's.
+ *       A debit card booked to Checking and a gift card or balance booked
+ *       to Cash match since the owner's tender decisions, and a debit card
+ *       or gift card booked anywhere but its own account or Credit Card
+ *       is not explained;
  *     - the expense account differs from the `metadata.merchant.category`
  *       the same agent wrote: the record carries one category, and it
  *       picks the account.
@@ -173,23 +179,34 @@ function texts(v: unknown, out: string[] = []): string[] {
 
 const PAYMENT_TEXT_KEYS = ["payment_method", "tender", "payment", "tender_type", "payment_type", "card_type", "refund_method", "payout_method"];
 
+/** Gift cards, store credit and balances held in an app or account: the
+ *  contract's `gift_card`. A store-branded CARD ("… store card ending
+ *  1234") is a credit card, so "store card" is not here. */
+const GIFT_TEXT = /gift[ _-]?card|shop[ _-]?card|stored[ _-]?value|store[ _-]?credit|购物卡|储值|\b(?:account|app|wallet|venmo|paypal|cash app) balance\b/;
+/** A bank card's own words: debit, or a debit-only network. */
+const DEBIT_TEXT = /debit|interac|maestro|interlink|eftpos|girocard|\bcheck ?card\b/;
+const BANK_CARD_TEXT = /visa|master ?card|amex|american express|discover|credit|apple (pay|card)|google pay|contactless|\bchip\b|\bcard\b/;
+
 /** The payment method a row's own payment text names, by keyword: one
  *  tender kind gives that method, two or more give `mixed`, none gives
- *  null. */
+ *  null. A bank card is `debit_card` when the text says debit or names a
+ *  debit-only network, else `card`, as the contract defines them;
+ *  "credit/debit" says neither, so it is `card`. */
 export function methodFromText(md: Record<string, any>): ExtractionV1["payment"]["method"] | null {
-  const t = PAYMENT_TEXT_KEYS.flatMap((k) => texts(md[k])).join(" ").toLowerCase();
-  if (t.trim() === "") return null;
+  const raw = PAYMENT_TEXT_KEYS.flatMap((k) => texts(md[k])).join(" ").toLowerCase();
+  if (raw.trim() === "") return null;
+  // "credit/debit", "credit_debit", "debit or credit": either one, so a card of no stated kind.
+  const t = raw.replace(/credit\s*(?:\/|_|-|or)\s*debit|debit\s*(?:\/|_|-|or)\s*credit/g, "card");
   const kinds = new Set<ExtractionV1["payment"]["method"]>();
   if (/\bpoints?\b|\bmiles\b|award/.test(t)) kinds.add("points");
   if (/\bcash\b(?!\s*(back|app))|现金|現金/.test(t)) kinds.add("cash");
-  if (/\bcheck\b|\bcheque\b/.test(t)) kinds.add("check");
+  if (/\bcheck\b(?!\s*card)|\bcheque\b/.test(t)) kinds.add("check");
   if (/\bach\b|bank transfer|direct deposit|\bwire\b|\beft\b|zelle/.test(t)) kinds.add("bank_transfer");
-  if (/gift[ _-]?card|store[ _-]?card|shop[ _-]?card|stored[ _-]?value|购物卡/.test(t)) kinds.add("gift_card");
-  if (/visa|master ?card|amex|american express|discover|credit|debit|apple (pay|card)|google pay|contactless|\bchip\b|\bcard\b/.test(t)) {
-    // "gift card" and "store card" alone are not a bank card.
-    if (/visa|master ?card|amex|american express|discover|credit|debit|apple (pay|card)|google pay|contactless|\bchip\b/.test(t) ||
-        t.replace(/(gift|store|shop)[ _-]?card/g, "").match(/\bcard\b/)) kinds.add("card");
-  }
+  if (GIFT_TEXT.test(t)) kinds.add("gift_card");
+  // A bank card, once the gift-card and store-credit wording is taken out.
+  const rest = t.replace(/(gift|shop)[ _-]?card|store[ _-]?credit/g, "");
+  if (DEBIT_TEXT.test(rest)) kinds.add("debit_card");
+  else if (BANK_CARD_TEXT.test(rest)) kinds.add("card");
   if (kinds.size === 0 && /paypal|alipay|wechat|支付宝|微信|venmo|cash app|klarna|affirm/.test(t)) kinds.add("other");
   if (kinds.size === 0) return null;
   return kinds.size > 1 ? "mixed" : [...kinds][0]!;
@@ -407,19 +424,22 @@ export function explain(row: LedgerRow, syn: Synthesis, diff: MoneyDiff): string
   }
   // §3.3 derives the mirror from the method the record states. The legacy
   // prompt said "Mirror side is Credit Card (default)", so an agent that read
-  // a cash, check or bank tender and still booked the card is the rule
-  // change of hole 9, not a projector fault.
-  const projectedMirror = MIRROR_BY_METHOD[syn.raw.payment?.method as keyof typeof MIRROR_BY_METHOD];
+  // a tender §3.3 books elsewhere (cash, a check or bank transfer, and since
+  // the owner's tender decisions a debit card, a gift card or a balance)
+  // and still booked the card is the rule change of hole 9, not a projector
+  // fault. Each method is its own class, so the printout shows which.
+  const method = syn.raw.payment?.method as keyof typeof MIRROR_BY_METHOD;
+  const projectedMirror = MIRROR_BY_METHOD[method];
   if (kinds.size === 1 && kinds.has("mirror_account") && syn.sources.method === "text") {
-    if (mainMirror?.account_name === "Credit Card") {
-      return "hole 9: the payment text names a cash, check or bank tender; the legacy prompt's default mirror was Credit Card";
+    if (mainMirror?.account_name === "Credit Card" && projectedMirror !== "Credit Card") {
+      return `hole 9: the payment text names a ${method} tender, which §3.3 books to ${projectedMirror}; the legacy prompt's default mirror was Credit Card`;
     }
-    // The other way round: the legacy agent left its default for a tender
-    // §3.3 sends to Credit Card (a debit card, a gift-card or wallet
-    // balance). The table is the plan's; these rows are where it and the
-    // legacy agent's own choice part.
+    // The other way round: the legacy agent booked a tender §3.3 sends to
+    // Credit Card (a card of no stated kind, a mixed tender, another
+    // tender) to Cash or Checking. A debit card booked to Checking and a
+    // gift card or balance booked to Cash are no longer here: they match.
     if (projectedMirror === "Credit Card") {
-      return `§3.3 sends this tender (${syn.raw.payment.method}) to Credit Card; the legacy agent chose ${mainMirror?.account_name}`;
+      return `§3.3 sends this tender (${method}) to Credit Card; the legacy agent chose ${mainMirror?.account_name}`;
     }
   }
   if (kinds.size === 1 && kinds.has("expense_account") && syn.sources.category === "metadata") {

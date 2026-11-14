@@ -204,15 +204,28 @@ duplicate the server cannot see.
 `;
 
 /** Record rendering: how the total was paid, which decides the paying
- *  account (plan §3.3), and the printed totals. Legacy has no counterpart:
- *  its template always credited Credit Card. */
-const RECORD_PAYMENT = `**payment** — how the total was paid, read off the tender line. The
-server picks the paying account from \`payment.method\`: \`cash\` → Cash;
-\`check\` and \`bank_transfer\` → Checking; \`points\` → the programme's
-points account; anything else (\`card\`, \`gift_card\`, \`mixed\`,
-\`other\`, \`unknown\`) → Credit Card. \`unknown\` when the document does
-not say. Copy card_last4 (exactly four digits), card_network and the
-tender line itself (as_printed) when they are printed.
+ *  account (plan §3.3 and the owner's tender decisions, `project.ts`), and
+ *  the printed totals. Legacy has no counterpart: its template always
+ *  credited Credit Card. */
+const RECORD_PAYMENT = `**payment** — how total_minor was paid, read off the tender line. The
+server picks the paying account from \`payment.method\` (the contract
+below says which method books where), so the method is a reading of the
+document, never a guess:
+  - A card is \`card\` unless the document itself says debit: the tender
+    line reads DEBIT or names a debit-only network (Interac, Maestro, a
+    "US DEBIT" chip label). Then it is \`debit_card\`. A phone wallet
+    (Apple Pay, Google Pay) pays with a card and follows the same rule.
+  - \`gift_card\` is a gift card, store credit, or a balance held in an
+    app or account (a store app's balance, a PayPal or Venmo balance). A
+    card linked through PayPal or an app is that card, not a balance.
+  - A gift card or balance that covered only part of the order is not a
+    second tender: total_minor is the residual (Phase 2), and the method
+    is what paid the residual. \`mixed\` is two or more tenders that
+    together paid total_minor (cash and a card, two cards); the server
+    books it whole to Credit Card and flags the transaction for a person.
+\`unknown\` when the document does not say. Copy card_last4 (exactly four
+digits), card_network and the tender line itself (as_printed) when they
+are printed.
 
 **printed_totals** — the document's printed subtotal, tax, tip, discount
 and fees (service, delivery and surcharges added together), in minor

@@ -76,7 +76,9 @@ export const PROMPT_VERSION = "3.4";
  * WebSearch. Bump it on any semantic change to the record rendering, and
  * always together with `EXTRACTION_CONTRACT_VERSION` when the record's
  * shape changes. When the legacy writer is retired the two constants
- * collapse into one `PROMPT_VERSION = "4.0"`.
+ * collapse into one `PROMPT_VERSION = "4.0"`. The tender text of November
+ * 2026 (`debit_card`, how to choose a method) went in under "4.0" because
+ * no record had been written outside throwaway and sandbox databases.
  */
 export const RECORD_PROMPT_VERSION = "4.0";
 

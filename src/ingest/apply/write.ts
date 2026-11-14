@@ -760,6 +760,7 @@ async function insert(
         mirror_account_id: mirrorPosting ? accountId(mirrorPosting.account) : null,
         expense_or_income: draft.flow === "income" ? "income" : draft.merchant.category,
         ...(points ? { points_account_id: points.id, points_account_created: points.created } : {}),
+        ...(draft.reviewFlag ? { flagged_for_review: draft.reviewFlag } : {}),
       },
       brand: { brand_id: draft.merchantBrand.brandId, created: brand.created, name_kept: brand.nameKept },
       merchant: { id: merchant.id, created: merchant.created },

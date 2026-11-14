@@ -41,7 +41,11 @@
  *
  * VERSIONING. Any change to this shape bumps
  * `EXTRACTION_CONTRACT_VERSION`, always together with
- * `RECORD_PROMPT_VERSION` (`prompt-contract.ts`).
+ * `RECORD_PROMPT_VERSION` (`prompt-contract.ts`). One exception was
+ * taken: `debit_card` joined `PAYMENT_METHODS` inside version 1 (November
+ * 2026), because no record had been written outside throwaway and sandbox
+ * databases yet, so no stored version-1 record lacks it. Once production
+ * holds records, there are no more exceptions.
  */
 import { z } from "zod";
 import type { IdentifierKey } from "../../reconcile/dedup.js";
@@ -94,6 +98,7 @@ export const PAYEE_SOURCES = ["printed", "google_check_c", "email_sender"] as co
 
 export const PAYMENT_METHODS = [
   "card",
+  "debit_card",
   "cash",
   "check",
   "bank_transfer",
@@ -369,8 +374,12 @@ const Payment = z
     method: z
       .enum(PAYMENT_METHODS)
       .describe(
-        "How the total was paid. cash pays from Cash, check and bank_transfer from Checking, points from the points account, " +
-          "anything else from Credit Card. unknown when the document does not say.",
+        "How total_minor was paid. card: a credit card, or a card whose kind the document does not say (a phone wallet " +
+          "such as Apple Pay pays with a card). debit_card: a debit, ATM or bank card; the tender line says DEBIT or names " +
+          "a debit-only network. gift_card: a gift card, store credit, or a balance held in an app or account, never a card " +
+          "linked through one. mixed: two or more tenders. other: any other tender. unknown when the document does not say. " +
+          "Books to: cash and gift_card → Cash; debit_card, check and bank_transfer → Checking; points → the points account; " +
+          "anything else → Credit Card, and a mixed tender is flagged for review.",
       ),
     card_last4: z
       .string()

@@ -117,9 +117,11 @@ export interface CandidateVerdict {
   strong: boolean;
 }
 
-/** `metadata.near_dup_check` as the applier writes it (§6.4). */
+/** `metadata.near_dup_check` as the applier writes it (§6.4). Without a
+ *  candidate (`flagForReview` on a row nothing resembles) the list is
+ *  empty and `candidate_transaction_id` absent. */
 export interface NearDupCheck {
-  candidate_transaction_id: string;
+  candidate_transaction_id?: string;
   candidate_transaction_ids: string[];
   verdict: "distinct" | "uncertain";
   flagged_for_review: boolean;
@@ -152,6 +154,28 @@ export type ApplyDecision =
       /** What goes in `metadata.near_dup_check`, or null. */
       nearDupCheck: NearDupCheck | null;
     });
+
+/**
+ * The duplicate check with a review flag added for a reason that is not
+ * about duplicates (a mixed tender, `project.ts`). `flagged_for_review` is
+ * what the review queue lists (`GET /v1/transactions?flagged=near_dup`)
+ * and what its dismiss clears, so a row a person must look at for any
+ * reason carries it there. A check that already exists keeps its verdict
+ * and candidates (reconcile reads those, and a flag says nothing about
+ * them) and gains the reason after its own; with no check, the flag names
+ * no candidate, so reconcile finds no verdict about any pair in it.
+ */
+export function flagForReview(check: NearDupCheck | null, reason: string): NearDupCheck {
+  if (check) return { ...check, flagged_for_review: true, reason: `${check.reason}; ${reason}` };
+  return {
+    candidate_transaction_ids: [],
+    verdict: "uncertain",
+    flagged_for_review: true,
+    reason,
+    decided_by: "applier",
+    applier_version: APPLIER_VERSION,
+  };
+}
 
 /** Identifier values shorter than this match only under the same key. */
 export const CROSS_KEY_MIN_LENGTH = 6;

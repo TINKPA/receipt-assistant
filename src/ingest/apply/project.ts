@@ -24,10 +24,20 @@
  *
  * The expense account is the record's `merchant.category` (one of the
  * seven), as it was the legacy prompt's. The MIRROR account is derived
- * from `payment.method` (§3.3), not chosen by the model:
+ * from `payment.method` (§3.3, with the owner's tender decisions of
+ * November 2026), not chosen by the model:
  *
- *   cash → Cash · check, bank_transfer → Checking · points → the points
- *   account · card, gift_card, mixed, other, unknown → Credit Card
+ *   cash, gift_card → Cash · debit_card, check, bank_transfer → Checking
+ *   · points → the points account · card, mixed, other, unknown → Credit
+ *   Card
+ *
+ * A gift card, store credit or app balance books to Cash: no gift-card
+ * account exists, Cash is where the legacy writer put them, and a prepaid
+ * balance is not a charge on the credit card that statements reconcile
+ * against. A mixed tender cannot be split (the record states one method),
+ * so it books whole to Credit Card and the draft carries `reviewFlag`,
+ * which the writer turns into a review flag on the transaction
+ * (`metadata.ts`); the record itself carries the warning `mixed_tender`.
  *
  * Two cases the plan's table leaves open, decided here and warned about
  * as `account_overridden`: `points` on a cash currency names no
@@ -168,6 +178,9 @@ export interface ApplyDraft {
   } | null;
   /** Apply-time warnings the projection can decide. */
   warnings: ValidationWarning[];
+  /** Why the inserted transaction must be flagged for a person, decided
+   *  from the record alone (a mixed tender booked whole), or null. */
+  reviewFlag: string | null;
 }
 
 export class ProjectionError extends Error {
@@ -185,15 +198,21 @@ export class ProjectionError extends Error {
  *  programme's account; the others name a seeded account. */
 export const MIRROR_BY_METHOD: Readonly<Record<PaymentMethod, "Cash" | "Checking" | "Credit Card" | "points">> = {
   cash: "Cash",
+  gift_card: "Cash",
+  debit_card: "Checking",
   check: "Checking",
   bank_transfer: "Checking",
   points: "points",
   card: "Credit Card",
-  gift_card: "Credit Card",
   mixed: "Credit Card",
   other: "Credit Card",
   unknown: "Credit Card",
 };
+
+/** `reviewFlag` for a mixed tender: where its money went, and that the
+ *  split was not booked. Reason first, so a short display keeps it. */
+export const MIXED_TENDER_REVIEW =
+  "mixed tender, split not booked: what more than one tender paid was booked to Credit Card";
 
 const MIRROR_TYPE = { Cash: "asset", Checking: "asset", "Credit Card": "liability" } as const;
 
@@ -297,9 +316,12 @@ export function project(
     }
   }
 
+  // Set when a mixed tender picks a paying account below.
+  let reviewFlag: string | null = null;
   /** The paying account of a cash currency for this method. */
   const cashMirror = (path: string): AccountRef | null => {
     let name = MIRROR_BY_METHOD[method];
+    if (method === "mixed") reviewFlag = MIXED_TENDER_REVIEW;
     if (name === "points") {
       if (!points) {
         warnings.push({
@@ -469,6 +491,7 @@ export function project(
     parties,
     place,
     warnings,
+    reviewFlag,
   };
 }
 

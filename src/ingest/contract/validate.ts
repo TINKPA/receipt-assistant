@@ -77,6 +77,7 @@ export const RECORD_WARNING_RULES = [
   "no_items",
   "income_defaults_applied",
   "party_line_dropped",
+  "mixed_tender",
   ...REVIEW_FLAGS.map((f) => `review_flag_${f}` as const),
   "repair_changed_unnamed",
 ] as const;
@@ -850,6 +851,12 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
     }
     if (rec.classification === "receipt_email" && facts.occurred_at == null) {
       warn("email_without_time", "facts.occurred_at", "an email with no transaction time");
+    }
+    // A record names one tender, so the applier books a mixed one whole to
+    // Credit Card and flags the transaction for review (`project.ts`).
+    // Income is deposited where `income` says; its method books nothing.
+    if (facts.flow !== "income" && rec.payment.method === "mixed") {
+      warn("mixed_tender", "payment.method", "paid with two or more tenders; the split between them is not booked", true);
     }
   }
 

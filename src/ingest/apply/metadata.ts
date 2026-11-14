@@ -18,7 +18,7 @@
  *   tax_minor?, tip_minor?, printed_totals?                     the UI's Tax and Tip cells
  *   ocr_audit { …audit, payee_as_printed, payee_source }
  *   allocation_audit?                                          only when the lines miss the total
- *   near_dup_check?                                            from `decide()`
+ *   near_dup_check?                                            from `decide()`, flagged for a mixed tender
  *   receipt_facts?
  *   owned_items_note?                                          income: why no sold item was retired
  *
@@ -45,7 +45,7 @@
 import { identifiersOf, itemsResidual, type ItemsResidual } from "../contract/validate.js";
 import { EXTRACTION_CONTRACT_VERSION, type ExtractionV1, type PaymentMethod } from "../contract/v1.js";
 import { RECORD_PROMPT_VERSION } from "../prompt-contract.js";
-import type { NearDupCheck } from "./decide.js";
+import { flagForReview, type NearDupCheck } from "./decide.js";
 import type { ApplyDraft } from "./project.js";
 import { APPLIER_VERSION } from "./version.js";
 
@@ -123,6 +123,7 @@ export function paymentString(p: ExtractionV1["payment"]): string | null {
 /** The Payment cell's text for a method when nothing was printed. */
 const METHOD_LABELS: Readonly<Record<PaymentMethod, string | null>> = {
   card: "Card",
+  debit_card: "Debit card",
   cash: "Cash",
   check: "Check",
   bank_transfer: "Bank transfer",
@@ -227,7 +228,8 @@ export function buildTransactionMetadata(
   }
   const allocation = allocationAudit(record);
   if (allocation) m.allocation_audit = allocation;
-  if (dedup.nearDupCheck) m.near_dup_check = dedup.nearDupCheck;
+  const nearDupCheck = draft.reviewFlag ? flagForReview(dedup.nearDupCheck, draft.reviewFlag) : dedup.nearDupCheck;
+  if (nearDupCheck) m.near_dup_check = nearDupCheck;
   if (record.receipt_facts && Object.keys(record.receipt_facts).length > 0) m.receipt_facts = record.receipt_facts;
   if (dedup.ownedItemsNote) m.owned_items_note = dedup.ownedItemsNote;
   return m;
