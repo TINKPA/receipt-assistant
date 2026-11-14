@@ -56,6 +56,25 @@
  *   items-under-live-txn    no un-retired line item hangs under a deleted
  *                           transaction (it would still count in product
  *                           statistics).
+ *   postings-native-balance every transaction's postings sum to zero in
+ *                           each currency they use, in `amount_minor`.
+ *                           The deferred trigger only checks the base-
+ *                           currency sum, so a points stay booked as
+ *                           points on one side and dollars on the other,
+ *                           or a foreign leg paired with a base leg, passes
+ *                           it. Every transaction is checked, deleted ones
+ *                           included: a delete does not touch postings.
+ *   run-without-terminal-ingest
+ *                           an ingest run that has ended (`finished`, or
+ *                           `abandoned` at boot) belongs to an ingest that
+ *                           has ended too, unless a newer run of that
+ *                           ingest is still going. The worker closes the
+ *                           ingest before it finishes the run, and boot
+ *                           recovery does both in one transaction, so a
+ *                           hit is an ingest stuck in `queued` /
+ *                           `processing` with nobody working on it.
+ *                           Skipped on a database without `agent_runs`
+ *                           (before migration 0042).
  *
  * What is NOT a violation: a transaction deleted AFTER an ingest or an
  * applied proposal pointed at it. That is somebody's later decision (or
@@ -89,6 +108,11 @@
  *     has line items: neither a person's delete nor a dedup apply
  *     retires them, and the item and product reads do not look at the
  *     parent's `deleted_at`.
+ *
+ * The two newest checks are expected to be clean and fail by default:
+ * postings-native-balance held for every transaction in production when
+ * it was added (2026-11-13), and run-without-terminal-ingest describes a
+ * state no code path produces.
  */
 import pg from "pg";
 
@@ -169,6 +193,9 @@ interface Check {
   what: string;
   /** Returns one row per violation; `id` identifies it, `detail` explains. */
   sql: string;
+  /** Tables the check reads that older databases lack; it is skipped,
+   *  and says so, when one is missing. */
+  requires?: string[];
 }
 
 const CHECKS: Check[] = [
@@ -332,6 +359,39 @@ const CHECKS: Check[] = [
        GROUP BY t.id
        ORDER BY t.id`,
   },
+  {
+    name: "postings-native-balance",
+    what: "transactions whose postings do not sum to zero in one of their currencies",
+    sql: `
+      SELECT t.id::text AS id,
+             string_agg(g.currency || ' off by ' || g.total, ', ' ORDER BY g.currency) AS detail
+        FROM (SELECT p.transaction_id, p.currency, sum(p.amount_minor) AS total
+                FROM postings p
+               GROUP BY p.transaction_id, p.currency
+              HAVING sum(p.amount_minor) <> 0) g
+        JOIN transactions t ON t.id = g.transaction_id
+       GROUP BY t.id, t.created_at
+       ORDER BY t.created_at`,
+  },
+  {
+    name: "run-without-terminal-ingest",
+    what: "ended ingest runs whose ingest is still queued or processing",
+    requires: ["agent_runs"],
+    sql: `
+      SELECT r.id::text AS id,
+             r.status || ' run (' || COALESCE(r.outcome::text, 'no outcome') || '), ingest ' ||
+               i.id || ' still ' || i.status AS detail
+        FROM agent_runs r
+        JOIN ingests i ON i.id = r.ingest_id
+       WHERE r.kind = 'ingest'
+         AND r.status IN ('finished', 'abandoned')
+         AND i.status IN ('queued', 'processing')
+         AND NOT EXISTS (SELECT 1 FROM agent_runs cur
+                          WHERE cur.id = i.current_run_id
+                            AND cur.id <> r.id
+                            AND cur.status IN ('queued', 'running'))
+       ORDER BY r.started_at`,
+  },
 ];
 
 async function main(): Promise<void> {
@@ -355,15 +415,26 @@ async function main(): Promise<void> {
 
   let violated = 0;
   let allowed = 0;
+  let skipped = 0;
   console.log("# check-ledger (read-only)\n");
   for (const c of CHECKS) {
+    const missing: string[] = [];
+    for (const rel of c.requires ?? []) {
+      const r = await client.query("SELECT to_regclass($1) AS oid", [`public.${rel}`]);
+      if (r.rows[0]?.oid === null) missing.push(rel);
+    }
+    if (missing.length > 0) {
+      skipped++;
+      console.log(`skip  ${c.name.padEnd(28)}    -  no ${missing.join(", ")} table in this database`);
+      continue;
+    }
     const res = await client.query(c.sql);
     const n = res.rows.length;
     const waived = n > 0 && ALLOW.has(c.name);
     if (waived) allowed++;
     else if (n > 0) violated++;
     const mark = n === 0 ? "ok  " : waived ? "seen" : "FAIL";
-    console.log(`${mark}  ${c.name.padEnd(24)} ${String(n).padStart(4)}  ${c.what}`);
+    console.log(`${mark}  ${c.name.padEnd(28)} ${String(n).padStart(4)}  ${c.what}`);
     if (VERBOSE) {
       for (const r of res.rows as Array<{ id: string; detail: string | null }>) {
         console.log(`        ${r.id}  ${r.detail ?? ""}`);
@@ -372,10 +443,11 @@ async function main(): Promise<void> {
   }
   await client.end();
   const waivedNote =
-    allowed > 0 ? `; ${allowed} more violated but allowed by --allow` : "";
+    (allowed > 0 ? `; ${allowed} more violated but allowed by --allow` : "") +
+    (skipped > 0 ? `; ${skipped} skipped` : "");
   console.log(
     violated === 0
-      ? `\n${allowed > 0 ? "no unallowed violation" : "all invariants hold"}${waivedNote}`
+      ? `\n${allowed > 0 ? "no unallowed violation" : skipped > 0 ? "every check that ran holds" : "all invariants hold"}${waivedNote}`
       : `\n${violated} of ${CHECKS.length} invariants violated${waivedNote}${VERBOSE ? "" : " (re-run with --verbose for ids)"}`,
   );
   process.exit(violated === 0 ? 0 : 1);
