@@ -125,6 +125,8 @@ The receipt text does not travel inside the JSON. It has its own fenced block (s
 
 Rows written by the server writer stamp the record prompt's version on `metadata.extraction.prompt_version` and on `transaction_items.extraction_version`, and `metadata.extraction.writer = 'server_apply'` tells the two prompt lines apart. When the legacy writer is retired the prompt constants collapse into one.
 
+**The recorded exception, and when it ends.** Contract 1, record prompt 4.0 and applier 1.0 have absorbed changes that would each have bumped a constant: the tender decisions, the dates booked as printed, the misread-key attach and the record rendering's turn economy (November 2026). That was allowed because no extraction record existed outside throwaway and sandbox databases (production's `document_extractions` was empty), so no stored row could carry a version whose meaning had moved. The exception ends with the first P4 A/B trial. From then on the versions are frozen in the ordinary sense: any change to the record rendering bumps `RECORD_PROMPT_VERSION`, any change to a projection, dedup or catalog rule bumps `APPLIER_VERSION`, and any change to the record's shape bumps `EXTRACTION_CONTRACT_VERSION` (with the prompt version). A trial's rows are then always tied to the text and the rules that produced them, and a fix found by the A/B is measured as a new version against the old one.
+
 ## The hand-back
 
 The record prompt asks the agent to end its final message with, in this order and nothing after:
@@ -546,6 +548,13 @@ The tenders (debit card to Checking, gift card or balance to Cash, a mixed tende
 X13 already reaches the legacy side: since d224b7b, which production runs, reconcile's `cardLast4` reads a typed `card_last4` first on every row, legacy rows included. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one), and a recent change in what reconcile proposes may come from it rather than from the writer flip.
 
 Kept on purpose: category picks the expense account; a merchant is fixed at first sight; the model's tax, tip and discount allocation; the agent's `brand_id`; signed totals; Phase 3a and Check C.
+
+## Known gaps
+
+Found by the P3 sandbox smoke and left for later by the owner. The A/B treats them as known, not as regressions of the writer.
+
+- **One store, two brand slugs.** Two readings of one store can choose different `brand_id` slugs (a short name and one with the store format's suffix, say). The merchant row is keyed by the slug, so the second reading creates a second brand stub and a second merchant row for the same place, and merchant and brand totals split between them; the duplicate decision falls back to the payee for "the same merchant". The legacy agent also derives the slug from the document, so arm A has the same exposure, but it could look an existing slug up in the database and the record agent cannot: it has no database. Matching a reading to an existing catalog row (by name, domain or place) is wave 2 work.
+- **Purchases paid wholly from a balance.** The tender rule (see "Tenders") is that a purchase paid entirely from a gift card or a stored balance has total 0: the money event is the reload or the purchase of the balance, which was counted when it happened. The legacy writer sometimes ignored that and booked such a purchase at its order value, counting the money twice. The A/B adjudicates those legacy rows against the rule, so an arm-B total of 0 where arm A booked the order value is arm B being right, not a total miss.
 
 ## Checks
 

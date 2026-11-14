@@ -146,7 +146,7 @@ Wave 1 adds constants for the server writer, all shipped dark. Until the agent-S
 
 When the legacy writer is retired the prompt constants collapse into one `PROMPT_VERSION = "4.0"`.
 
-One exception was taken on purpose: the tender decisions of November 2026 (`debit_card`, gift cards to Cash, the mixed-tender flag) went in under contract 1, record prompt 4.0 and applier 1.0, because no record had yet been written outside throwaway and sandbox databases (production's `document_extractions` was empty). Once production holds records, every such change bumps its constant.
+One exception was taken on purpose: the tender decisions of November 2026 (`debit_card`, gift cards to Cash, the mixed-tender flag), and after the P3 smoke the dates booked as printed, the misread-key attach and the record rendering's turn economy, went in under contract 1, record prompt 4.0 and applier 1.0, because no record had yet been written outside throwaway and sandbox databases (production's `document_extractions` was empty; check it read-only before relying on this). **The exception ends with the first P4 A/B trial.** From then on any change to the record rendering bumps `RECORD_PROMPT_VERSION`, any change to a projection, dedup or catalog rule bumps `APPLIER_VERSION`, and any change to the record's shape bumps `EXTRACTION_CONTRACT_VERSION` (with the prompt version), so every trial's rows name the text and rules that produced them. The known gaps the A/B treats as known (one store read as two brand slugs; a purchase paid wholly from a balance has total 0, which some legacy rows ignore) are under "Known gaps" in the design doc.
 
 ### Extraction records (`document_extractions`, wave 1)
 
