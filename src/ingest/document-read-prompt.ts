@@ -169,6 +169,11 @@ export function phase0DocumentRead(opts: {
   filePath: string;
   /** Per-run scratch directory, e.g. `/tmp/<ingestId>`. */
   scratchDir: string;
+  /** The ingest prompt's rendering. The record rendering reads the text
+   *  layer in the same command that extracts it, a turn fewer per PDF;
+   *  without it (the legacy rendering, re-extract) the text is the
+   *  legacy one, byte for byte. */
+  writer?: PromptWriter;
 }): string {
   return `── Reading the document ───────────────────────────────────────────────
 
@@ -176,11 +181,20 @@ PDFs — TEXT FIRST. Always try the text layer before rasterizing.
 Rasterized pages cost ~1500x more context than the same page as text,
 and every later turn re-reads them from cache.
 
-  mkdir -p ${opts.scratchDir}
+${forWriter(
+  opts.writer,
+  `  mkdir -p ${opts.scratchDir}
   pdftotext -layout "${opts.filePath}" ${opts.scratchDir}/text.txt
   wc -c ${opts.scratchDir}/text.txt
 
-  Then Read ${opts.scratchDir}/text.txt.
+  Then Read ${opts.scratchDir}/text.txt.`,
+  `  One command extracts the text layer and prints it:
+
+    mkdir -p ${opts.scratchDir} && pdftotext -layout "${opts.filePath}" ${opts.scratchDir}/text.txt && wc -c ${opts.scratchDir}/text.txt && cat ${opts.scratchDir}/text.txt
+
+  That output is your read of the text; Read the file only when the
+  output was cut short. The same goes for an email's PDF attachment.`,
+)}
 
   If that file is >= 200 bytes AND contains a recognizable merchant
   name, a date, and a total, you are DONE reading. Do NOT rasterize.

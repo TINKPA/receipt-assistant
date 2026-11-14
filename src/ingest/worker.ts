@@ -80,6 +80,7 @@ import {
   type RecordStub,
 } from "./stub-extractor.js";
 import { appendLessonProposal } from "./prompt.js";
+import { childEnvHas } from "../claude.js";
 import {
   applyExtraction,
   applyMessageIdDuplicate,
@@ -949,6 +950,9 @@ async function extractRecordAndApply(
     attachments: decoded.attachments,
     sessionId: run.sessionId,
     uploadedAt: await ingestUploadedAt(ingestId),
+    // The prompt tells the agent whether its key is set, so it never spends
+    // a turn testing it or prints it.
+    googleKeySet: childEnvHas("extraction_record", "GOOGLE_MAPS_API_KEY"),
     ...(stub ? { spawn: recordStubSpawn(stub) } : {}),
   });
   // A stub renders the prompt but sends it nowhere: no prompt size, and

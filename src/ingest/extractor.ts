@@ -250,6 +250,9 @@ export interface RecordExtractorInput {
   /** When the document was uploaded. Dates are judged against it, never
    *  against the clock (`validate.ts`). */
   uploadedAt: Date;
+  /** Whether the agent's environment has the Google key; the prompt says
+   *  so (`ExtractorPromptContext.googleKeySet`). */
+  googleKeySet: boolean;
   /** Called with the rendered prompt's size just before the first spawn. */
   onPrompt?: (promptBytes: number) => void;
   /** Overrides, for the stub and the checks; production leaves them out. */
@@ -404,6 +407,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     userId: input.userId,
     sourceText: input.sourceText,
     attachments: input.attachments,
+    googleKeySet: input.googleKeySet,
   });
   const promptBytes = Buffer.byteLength(prompt, "utf8");
   input.onPrompt?.(promptBytes);

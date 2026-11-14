@@ -160,9 +160,13 @@ export function agentHygiene(opts: {
    *  budget names its own core and its own enrichment. Ignored for
    *  re-extract, which has one rendering. */
   writer?: PromptWriter;
+  /** The record rendering's: whether the Google key is set for the run
+   *  (default: set). */
+  googleKeySet?: boolean;
 }): string {
   const record = opts.path === "ingest" && opts.writer === "server_apply";
   const w = (legacy: string, rec: string) => (record ? rec : legacy);
+  const keySet = opts.googleKeySet !== false;
   const core = record
     ? `classify → read the fields → hand back ONE extraction record at the
   end of your final message ("Hand back your record", at the end). A run
@@ -188,9 +192,25 @@ export function agentHygiene(opts: {
     "",
     `Your tools are Bash, Read and Write; there is no database connection
 and no web search, and you need neither. Bash is for reading the
-document (pdftotext, pdftoppm, python3) and for the Google lookups of
-Phase 3a and Check C (curl with $GOOGLE_MAPS_API_KEY). Nothing you run
-writes to the ledger: your record is the only output.
+document (pdftotext, pdftoppm, python3)${
+      keySet
+        ? ` and for the Google lookups of
+Phase 3a and Check C (curl with $GOOGLE_MAPS_API_KEY). The server has
+set that key for this run: use it as $GOOGLE_MAPS_API_KEY in those
+commands, and never test whether it is set.`
+        : `. No Google key is set for
+this run, so skip Phase 3 and Check C.`
+    }
+Never print any part of any key or token. Nothing you run writes to
+the ledger: your record is the only output.
+
+Every tool call must read the document or fetch data the record needs.
+Each one is a turn that re-reads this whole prompt, so make no call
+only to check a variable, to print a message or a note to yourself, or
+to create, list or remove a scratch directory, and leave the scratch
+directory as it is at the end. Reasoning and arithmetic (adding up the
+lines, checking a total, a tax rate or a percentage) go in your reply,
+not in a command.
 
 `,
   )}Scratch files — PER-INGEST DIRECTORY ONLY. Several extractions run
@@ -200,9 +220,16 @@ and you will silently read someone else's receipt (#143 — this
 happened: an agent extracted the neighbor's Trader Joe's receipt under
 a Kelly's Coffee ingest and rationalized the mismatch as a stale EXIF
 preview). Rules:
-  - First command before any image work:
+${w(
+  `  - First command before any image work:
       mkdir -p ${opts.scratchDir}
-    and create EVERY scratch file inside that directory.
+    and create EVERY scratch file inside that directory.`,
+  `  - Create EVERY scratch file inside
+      ${opts.scratchDir}
+    and create that directory in the same command as the first file
+    you write there (mkdir -p … && pdftotext …). A photo you only Read
+    needs no scratch file at all.`,
+)}
   - If a crop/rotation ever shows a DIFFERENT merchant than your first
     read of the original upload, do NOT rationalize it (no "stale
     preview" theories). Re-read the ORIGINAL file at
@@ -219,9 +246,15 @@ extraction state (#126). One command, one result, then the next.
 
 This job has ONE required deliverable plus a best-effort tail. Keep them
 straight, or you will burn minutes on polish while the core sits unfinished.
-Trace evidence: routine receipts finish in ~7 tool calls, but some balloon
+${w(
+  `Trace evidence: routine receipts finish in ~7 tool calls, but some balloon
 to 40+ turns — and the extra 30 turns are almost always merchant enrichment
-(Google fetches, storefront photos, brand icons), NOT harder extraction.
+(Google fetches, storefront photos, brand icons), NOT harder extraction.`,
+  `A routine receipt needs two to four tool calls: reading the document
+(one, or three for a scanned PDF) and the place lookup (one, sometimes
+two). Runs that go far past that are almost always spending turns on
+enrichment or bookkeeping, NOT harder extraction.`,
+)}
 
 CORE — required. Do this ${w("and commit it ", "")}no matter what:
   ${core}
