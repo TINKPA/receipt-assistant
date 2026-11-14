@@ -668,7 +668,11 @@ since the change.
 
 The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable
-that env on the production compose. Don't run the claude cases while
+that env on the production compose. Its `child` mode runs a fake agent
+process through the same supervisor as `claude -p` (own process group,
+group kill on timeout, a grandchild that outlives it), for testing the
+timeout and slot-release path without a real run; see the header of
+`src/ingest/stub-extractor.ts`. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and
 the auth pool, and harness poll timeouts will fire while queued.
 
