@@ -83,6 +83,10 @@
  *   are counted, not compared. A record whose apply failed (its run
  *   finished `failed` / `apply`, the ingest `error`) is explained: the
  *   failure is the run's to report, and the record waits for a re-apply.
+ *   So is one whose ingest the Message-ID re-check under the apply lock
+ *   closed `dedup` (X9: the run finished `duplicate_skip`, and
+ *   `ingests.produced.transaction_ids` names a live transaction, the one
+ *   the same email was applied to while this run read).
  *   A record whose transaction was re-extracted since (a legacy re-extract
  *   moves the stamp into `metadata.extraction_history`) is explained and
  *   not compared: a later reading wrote the values. Any other receipt
@@ -755,7 +759,12 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
               ORDER BY t.created_at LIMIT 1) AS re_extracted_transaction_id,
             (SELECT r.outcome::text || '/' || COALESCE(r.error_class, '') FROM agent_runs r
               WHERE r.extraction_id = e.id
-              ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run
+              ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run,
+            -- How many of the transactions the ingest says it produced are live.
+            (SELECT count(*)::int FROM ledger_live_transactions lt
+              WHERE lt.id::text IN (SELECT jsonb_array_elements_text(
+                      CASE WHEN jsonb_typeof(i.produced->'transaction_ids') = 'array'
+                           THEN i.produced->'transaction_ids' ELSE '[]'::jsonb END))) AS produced_live
        FROM document_extractions e
        JOIN documents d ON d.id = e.document_id
        LEFT JOIN ingests i ON i.id = e.ingest_id
@@ -784,12 +793,20 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
     }
     if (!r.transaction_id) {
       const applyFailed = r.ingest_status === "error" && r.last_run === "failed/apply";
+      // X9 under the apply lock: a copy of the same email was applied while
+      // this run read, so the document was linked to that transaction and
+      // the ingest closed dedup. The record is valid and booked nothing.
+      const messageIdCopy = r.ingest_status === "dedup" && r.last_run === "duplicate_skip/";
       const why =
         r.ingest_status === "near_dup"
           ? "attached to an existing transaction"
           : applyFailed
             ? "the apply failed"
-            : `not applied (ingest ${r.ingest_status ?? "gone"})`;
+            : messageIdCopy
+              ? r.produced_live > 0
+                ? "a Message-ID copy, linked (ingest dedup)"
+                : "a Message-ID copy whose transaction is not live (ingest dedup)"
+              : `not applied (ingest ${r.ingest_status ?? "gone"})`;
       tally.add(
         `no transaction names the record: ${why}`,
         r.id,
@@ -798,7 +815,9 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
           ? "an attach books nothing"
           : applyFailed
             ? "the run records the failure (agent_runs.error); the record waits, valid, for a re-apply"
-            : null,
+            : messageIdCopy && r.produced_live > 0
+              ? "X9: the same email was applied while this run read; the ingest names the live transaction it was linked to"
+              : null,
       );
       continue;
     }
