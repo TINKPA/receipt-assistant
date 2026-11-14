@@ -2,11 +2,14 @@
  * Phase 2 extractor — spawns `claude -p` with a prompt that teaches
  * the agent to classify, extract, optionally geocode, AND write the
  * result directly into the v1 ledger via psql. The worker consumes
- * only `sessionId` from this module; everything else (classification,
+ * only `stdout` from this module; everything else (classification,
  * produced tx_ids) is read by polling the `ingests` row the agent
  * itself updates.
+ *
+ * The session id is the CALLER's: the worker and re-extract mint it,
+ * write it on the `agent_runs` row, and only then call in here, so a
+ * run that fails still names its transcript.
  */
-import { randomUUID } from "crypto";
 import { runClaude } from "../claude.js";
 import { getSessionJsonlPath } from "../session-transcript.js";
 import { buildExtractorPrompt, type ExtractorPromptContext } from "./prompt.js";
@@ -21,7 +24,16 @@ import {
 // curl downloads), and Phase 4c (Read tool per candidate + visual
 // scoring). First-time brand resolution legitimately needs the budget;
 // cached brands return in seconds via the Case A early-out.
-const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
+export const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
+
+/**
+ * The model an extraction asks for: `CLAUDE_MODEL` when set, else NULL
+ * (the CLI picks its own default). One reading for the spawn and for the
+ * run record's `model_requested`, so the two cannot disagree.
+ */
+export function requestedModel(): string | null {
+  return process.env.CLAUDE_MODEL || null;
+}
 
 export interface ExtractorInput {
   /** Absolute path on disk — sha256-named, written by the documents service. */
@@ -53,13 +65,20 @@ export interface ExtractorInput {
   sourceText?: string | null;
   /** PDF attachments of an `.eml`, already written to the scratch dir. */
   attachments?: DecodedAttachment[];
+  /** Session id minted by the worker and already on the run record. */
+  sessionId: string;
+  /** Called with the rendered prompt's size just before the spawn. */
+  onPrompt?: (promptBytes: number) => void;
 }
 
 export interface ExtractorResult {
-  /** Claude session id pre-allocated before spawn (names the JSONL). */
+  /** The session id the run used: the one the caller passed in. */
   sessionId: string;
   /** stdout captured from the claude subprocess (the DONE summary line). */
   stdout: string;
+  /** The child's exit code: 0 for a real run that returned; NULL when no
+   *  process ran (a stub without a `child`). */
+  exitCode: number | null;
 }
 
 export type Extractor = (input: ExtractorInput) => Promise<ExtractorResult>;
@@ -83,13 +102,15 @@ async function runExtractorClaude(
   timeoutMs: number,
 ): Promise<string> {
   const args = ["--output-format", "text"];
-  // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
-  // mini today) means the CLI picks its own default, and the prompt
-  // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
-  // Passing a hard-coded "sonnet" here would silently downgrade the
-  // model that has actually been running.
-  if (process.env.CLAUDE_MODEL) {
-    args.push("--model", process.env.CLAUDE_MODEL);
+  // Only pin the model when CLAUDE_MODEL is explicitly set. Unset means
+  // the CLI picks its own default, and the prompt stamps
+  // `EXTRACTION_MODEL = "cli-default"`; the run record then has
+  // `model_requested` NULL and the model that answered in
+  // `model_observed`. Passing a hard-coded "sonnet" here would silently
+  // change the model that has actually been running.
+  const model = requestedModel();
+  if (model) {
+    args.push("--model", model);
   }
   const { stdout } = await runClaude(prompt, {
     profile: "extraction",
@@ -101,12 +122,12 @@ async function runExtractorClaude(
 }
 
 /**
- * Production extractor: spawns `claude -p` with a pre-allocated session
- * id (invariant from root CLAUDE.md — finding the session JSONL relies
- * on the UUID being stable across the lifecycle of one extraction).
+ * Production extractor: spawns `claude -p` under the session id the
+ * worker minted (finding the session JSONL relies on the UUID being
+ * stable across the lifecycle of one extraction, failures included).
  */
 export const defaultClaudeExtractor: Extractor = async (input) => {
-  const sessionId = randomUUID();
+  const sessionId = input.sessionId;
   const ctx: ExtractorPromptContext = {
     filePath: input.filePath,
     ingestId: input.ingestId,
@@ -118,6 +139,7 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     attachments: input.attachments,
   };
   const prompt = buildExtractorPrompt(ctx);
+  input.onPrompt?.(Buffer.byteLength(prompt, "utf8"));
   // Log the live-transcript path BEFORE spawn so an operator can
   // `tail -f` it mid-run. The agent loop can take 30-900s and may hang,
   // and this line is the only link from an ingest to its transcript
@@ -126,7 +148,7 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
     `[claude] extract ingestId=${input.ingestId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
   );
   const stdout = await runExtractorClaude(prompt, sessionId, CLAUDE_TIMEOUT_MS);
-  return { sessionId, stdout };
+  return { sessionId, stdout, exitCode: 0 };
 };
 
 // ── Re-extract path (Phase 4c of #80 / #91) ────────────────────────────
@@ -148,6 +170,10 @@ export interface ReExtractorInput {
   ocrText?: string | null;
   /** PDF attachments of an `.eml`, already written to the scratch dir. */
   attachments?: DecodedAttachment[];
+  /** Session id minted by re-extract and already on the run record. */
+  sessionId: string;
+  /** Called with the rendered prompt's size just before the spawn. */
+  onPrompt?: (promptBytes: number) => void;
 }
 
 export interface ReExtractorResult {
@@ -164,7 +190,7 @@ export type ReExtractor = (input: ReExtractorInput) => Promise<ReExtractorResult
  * just spawns + waits.
  */
 export const defaultClaudeReExtractor: ReExtractor = async (input) => {
-  const sessionId = randomUUID();
+  const sessionId = input.sessionId;
   const ctx: ReExtractPromptContext = {
     filePath: input.filePath,
     workspaceId: input.workspaceId,
@@ -175,6 +201,7 @@ export const defaultClaudeReExtractor: ReExtractor = async (input) => {
     attachments: input.attachments,
   };
   const prompt = buildReExtractPrompt(ctx);
+  input.onPrompt?.(Buffer.byteLength(prompt, "utf8"));
   console.log(
     `[claude] re-extract txId=${input.transactionId} sessionId=${sessionId} jsonl=${getSessionJsonlPath(sessionId)}`,
   );

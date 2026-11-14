@@ -176,15 +176,22 @@ See [`CLAUDE.md` → Schema editing workflow](CLAUDE.md#schema-editing-workflow-
 
 Every `claude -p` call is recorded by Claude Code itself — prompt, reasoning, every tool call and result, per-turn token usage — at `~/Developer/receipt-assistant-data/claude/projects/-app/<session-id>.jsonl` (bind-mounted from the container). The image pins `cleanupPeriodDays` to 36500 (100 years, i.e. permanent) in managed settings; the CLI default would delete them after 30 days.
 
-```bash
-# Turns and billed tokens for the 20 most recent runs
-npm run measure:turns -- --last=20
+Every run also has a row in `agent_runs`, written by the server: the session id that names its transcript, the model that answered, turns, tokens, how it ended and why.
 
-# Find the run for an ingest
+```sql
+-- The run(s) for an ingest
+SELECT session_id, status, outcome, error_class, model_observed, turns FROM agent_runs WHERE ingest_id = '<ingest-id>';
+```
+
+```bash
+# Turns and billed tokens for the 20 most recent extraction runs
+npm run measure:turns -- --dir=$HOME/Developer/receipt-assistant-data/claude/projects/-app --last=20 --kind=ingest
+
+# A run from before agent_runs existed: the prompt carries the ingest id
 grep -l "<ingest-id>" ~/Developer/receipt-assistant-data/claude/projects/-app/*.jsonl
 ```
 
-See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-jsonl) for live tailing.
+See [`CLAUDE.md` → Agent transcripts](CLAUDE.md#agent-transcripts-session-jsonl) for run records and live tailing.
 
 The sandbox stack keeps its own transcripts in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`.
 
@@ -199,7 +206,7 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
 | `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
 | `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
-| `npm run measure:turns` | Turns and billed tokens per extraction, from session JSONL |
+| `npm run measure:turns` | Turns, billed tokens and model per extraction, from session JSONL (the parser that also fills `agent_runs`) |
 | `npm run eval:dates` | Date-accuracy eval against the fixture set (`scripts/eval-dates.md`) |
 | `npm run db:migrate:prod` | Apply migrations inside the runtime image |
 

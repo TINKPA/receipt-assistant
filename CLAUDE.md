@@ -32,7 +32,8 @@ Postgres, managed by Drizzle migrations in `drizzle/`. `src/schema/` is the sour
 | `merchants`, `brands`, `products`, `owned_items`, `wish_items` | Catalog. |
 | `transaction_events`, `derivation_events` | Append-only audit logs: user/agent edits, and re-derive / re-extract runs. |
 | `accounts`, `workspaces`, `users`, `workspace_members` | Multi-tenant scaffolding. |
-| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. |
+| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. `ingests.document_id` is the stored document; `ingests.current_run_id` is the run that owns a `processing` ingest. |
+| `agent_runs` | One row per `claude -p` run for a document (ingest or re-extract), written only by the server: writer, session id, model requested and observed, CLI version, turns, tokens, exit, outcome and error class. See "Run records" under "Agent transcripts". |
 
 A "receipt" surfaces to the user as the pair `(documents row, linked transaction row(s))`. The agent reads a document, then writes a balanced transaction with its postings and items, and a `document_links` row.
 
@@ -114,7 +115,7 @@ Every transaction the agent writes carries the prompt and model it ran under:
 }
 ```
 
-Rows whose `prompt_version` differs from the source tree's are the ones worth re-extracting. Rows ingested before this existed have `metadata.extraction = NULL`; treat that as "unknown version, eligible". `documents.ocr_model_version` records the model that produced `ocr_text` (NULL on old rows; no backfill is possible). `places.metadata.derivation` is the same idea for a place row.
+Rows whose `prompt_version` differs from the source tree's are the ones worth re-extracting. Rows ingested before this existed have `metadata.extraction = NULL`; treat that as "unknown version, eligible". `model` here is what was *requested*; the model that actually answered is on the run's `agent_runs.model_observed` (`metadata.extraction` carries no run id yet, so join on `agent_runs.ingest_id = transactions.source_ingest_id`). `documents.ocr_model_version` records the model that produced `ocr_text` (NULL on old rows; no backfill is possible). `places.metadata.derivation` is the same idea for a place row.
 
 ### When to bump `PROMPT_VERSION`
 
@@ -135,7 +136,7 @@ The version is a flat string (`"3.3"`, `"3.3.1"` for a small additive iteration,
 |---|---|---|---|
 | `POST /v1/places/:id/re-derive`, `POST /v1/admin/re-derive?scope=places` | Layer 2 of a place, from the stored `raw_response` | nothing | `places` projection columns, one `derivation_events` row |
 | `POST /v1/places/:id/refresh` | Layer 1 of a place, then re-derive | Google Places v1 (en + zh-CN) | a `place_snapshots` row, `places.raw_response`, then as re-derive |
-| `POST /v1/documents/:id/re-extract` | Layer 2 of a transaction, from the document file | `claude -p` | `payee` / `occurred_on` / `occurred_at` / items on the linked transaction, `documents.ocr_text`, one `derivation_events` row |
+| `POST /v1/documents/:id/re-extract` | Layer 2 of a transaction, from the document file | `claude -p` | `payee` / `occurred_on` / `occurred_at` / items on the linked transaction, `documents.ocr_text`, one `derivation_events` row, one `agent_runs` row |
 
 **Re-derive** is pure TypeScript: `src/projection/derive.ts::projectPlace(rawResponse)` encodes the place-naming rules (CJK extraction, branch-suffix stripping, the `is_native` heuristic with its `GLOBAL_ENGLISH_BRANDS` allowlist). The rules are stable enough to encode once, and an LLM call per place would cost 5–15 s each on the batch path for no gain. When you change them, bump `PROJECTION_VERSION` in the same PR and run the admin batch endpoint after deploy.
 
@@ -149,7 +150,7 @@ It does not cascade to `merchants`: `merchants.canonical_name` / `brand_id` / `c
 
 **Refresh** (`src/google/places-fetch.ts::fetchPlaceV1Dual`) inserts the snapshot and updates `raw_response` in one transaction, then calls `reDerivePlace`, which opens its own. A crash between the two leaves Layer 2 stale until the next refresh, and one duplicate snapshot; both are harmless. It returns 503 when `GOOGLE_MAPS_API_KEY` is unset and 502 with the upstream status when Google answers non-2xx, so a caller can tell a dead place id from a bad day at Google. There is no Yelp client; the `yelp_*` columns are placeholders.
 
-**Re-extract** (`src/routes/documents.service.ts::reExtractDocument`, prompt in `src/ingest/reextract-prompt.ts`) tells the agent to UPDATE the existing transaction, never INSERT. It needs exactly one linked transaction: zero is a 422, and more than one is a 422 unless the caller passes `?transaction_id=`. The service snapshots before and after, diffs, and writes the `derivation_events` row. The response carries `outcome` (`written` | `no_change`): key any tooling on that, never on a timestamp (#167). It does not touch postings (a re-run could change amounts and break sum-to-zero), `place_id`, `merchant_id` or `document_links`.
+**Re-extract** (`src/routes/documents.service.ts::reExtractDocument`, prompt in `src/ingest/reextract-prompt.ts`) tells the agent to UPDATE the existing transaction, never INSERT. It needs exactly one linked transaction: zero is a 422, and more than one is a 422 unless the caller passes `?transaction_id=`. The service snapshots before and after, diffs, and writes the `derivation_events` row. It also records the run in `agent_runs` (`kind='re_extract'`) before the spawn, with the before snapshot, and finishes it with the outcome, the after snapshot and the event id; a run that fails still leaves that row, which is then the only record of what the transaction looked like before the agent touched it. The response carries `outcome` (`written` | `no_change`): key any tooling on that, never on a timestamp (#167). It does not touch postings (a re-run could change amounts and break sum-to-zero), `place_id`, `merchant_id` or `document_links`.
 
 It is synchronous and bypasses `MAX_CLAUDE_CONCURRENCY`, so run calls strictly one at a time. Running it twice under the same prompt and model should leave the transaction unchanged apart from `metadata.extraction.ran_at`; `ocr_text` may differ slightly because vision OCR is not deterministic.
 
@@ -545,19 +546,38 @@ Pre-removal history: every Langfuse trace (May–Oct 2026, 1300 traces / 21,826 
 
 Sandbox runs (`docker-compose.test.yml`) are kept apart, in `~/Developer/receipt-assistant-data/test-claude/projects/-app/`; everything below works the same with `test-claude` in the path and `receipt-assistant-test` as the container. Until that directory existed the sandbox mounted production's, so the production directory also holds older sandbox sessions. They can be told apart by the ingest id in the prompt: nothing deletes `ingests` rows, so an id production's table does not have came from the sandbox.
 
+### Run records (`agent_runs`)
+
+Every ingest and re-extract run has a row in `agent_runs` (migration 0042, `src/ingest/runs.ts`), written by the server, never by the agent:
+
+- **Before the spawn** the worker inserts it `running`, in the same transaction that moves the ingest to `processing` and sets `ingests.current_run_id`, with a session id it minted. A run that dies at once (auth, spawn) still has its row and its transcript name.
+- **After the exit** it becomes `finished` with `outcome` (`written`, `attached`, `unsupported`, `duplicate_skip`, `no_change`, `agent_error`, `failed`), `error_class` (`auth`, `quota`, `overloaded`, `timeout`, `spawn`, `crash`, `agent_reported`, `guard`, `no_closeout`, `apply`), the exit code or signal, and what `src/session-transcript.ts::summarizeSession` reads from the transcript: turns, tool calls, the three input buckets, output, and `model_observed`. The run is finished before the ingest's SSE event goes out.
+- **At boot** every run still `running` becomes `abandoned` / `interrupted`, in the same transaction that errors the ingests of abandoned batches, and the boot log line `[ingest worker] boot recovery: …` gives the counts.
+- **Timeouts** kill the agent's whole process group (`src/claude.ts::runSupervised`: SIGTERM, then SIGKILL after 15 s), and the worker's slot is released only after the child has closed, so the next extraction never overlaps a dying one. A process the agent leaves running after a normal exit is killed with its group too. In the container node is PID 1, so stopping it ends every group; a server killed outside a container leaves its current agent group running.
+
+`writer` is `agent_sql` (the agent writes the ledger, today's only path) or `stub` (the sandbox stub extractor); `EXTRACTION_WRITER` is read per run, and any value other than `agent_sql` is logged and ignored until the server writer exists. `scripts/check-ledger.ts` checks that no ended run leaves its ingest open (`run-without-terminal-ingest`).
+
 ### Finding a run
+
+```sql
+-- Ingest → run(s), newest first; session_id names the transcript.
+SELECT id, status, outcome, error_class, session_id, model_observed, turns,
+       input_tokens + cache_read_tokens + cache_creation_tokens AS billed_input, output_tokens
+  FROM agent_runs WHERE ingest_id = $1 ORDER BY started_at DESC;
+```
 
 ```bash
 T=~/Developer/receipt-assistant-data/claude/projects/-app
 
-# Ingest / re-extract → session: the prompt carries the ingest id and the
-# document/transaction ids, so grep is the durable lookup (docker logs rotate).
+# Runs from before agent_runs (migration 0042) have no row: the prompt
+# carries the ingest id and the document/transaction ids, so grep finds
+# them (docker logs rotate).
 grep -l "$INGEST_ID" $T/*.jsonl
 
 # Turns, billed input (fresh + cache read + cache write) and output tokens,
-# deduplicated by message.id — the numbers Langfuse used to approximate.
+# deduplicated by message.id — the same parser that fills agent_runs.
 npm run measure:turns -- --session=<id|path>
-npm run measure:turns -- --last=20
+npm run measure:turns -- --dir=$T --last=20 --kind=ingest
 ```
 
 ### Live trace: tail the JSONL while the extractor is running

@@ -39,7 +39,6 @@
  * }
  */
 import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { newId } from "../http/uuid.js";
@@ -163,7 +162,8 @@ export const stubFileExtractor: Extractor = async (input) => {
        AND workspace_id = ${input.workspaceId}::uuid`);
 
   return {
-    sessionId: randomUUID(),
+    sessionId: input.sessionId,
     stdout: `STUB ingest=${input.ingestId} terminal=${t.status} tx=${seededTxId ?? "-"}`,
+    exitCode: null,
   };
 };

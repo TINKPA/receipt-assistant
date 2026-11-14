@@ -38,6 +38,13 @@ import {
 } from "../ingest/document-read-prompt.js";
 import { buildInfo } from "../generated/build-info.js";
 import { liveTransactions } from "../db/live.js";
+import {
+  agentFailure,
+  finishRun,
+  startReExtractRun,
+  stdoutTail,
+  type RunFinish,
+} from "../ingest/runs.js";
 
 export type DocumentKindValue =
   | "receipt_image"
@@ -1466,90 +1473,130 @@ export async function reExtractDocument(
     "re-extract",
   );
 
-  // 3) Spawn the agent. Errors here bubble to the route handler;
-  //    nothing has been written yet so the DB state is untouched.
-  const { sessionId, stdout } = await reExtractor({
-    // The agent needs a container-absolute path it can open (#128).
-    filePath: absPath,
+  // 3) Record the run, then spawn the agent. The run row is inserted
+  //    `running` with a session id minted here and the BEFORE snapshot,
+  //    so a run that dies part-way still names its transcript and keeps
+  //    what the transaction looked like before the agent touched it.
+  //    Every way out below finishes it. Errors from the spawn bubble to
+  //    the route handler as before.
+  const run = await startReExtractRun({
     workspaceId,
     documentId,
     transactionId,
-    userId,
-    ocrText: source.text,
-    attachments: source.attachments,
+    before: beforeSnapshot,
   });
+  let finished = false;
+  const finish = async (f: RunFinish): Promise<void> => {
+    if (finished) return;
+    finished = true;
+    await finishRun(run, f);
+  };
+  let promptBytes: number | null = null;
 
-  // 3c) The prompt's own contract: on an unreadable source the agent
-  //     writes NOTHING and prints `ERROR <reason>`. Honour it before
-  //     inserting a `derivation_events` row — that row asserts a
-  //     derivation ran, and writing one for a run that refused is a
-  //     false audit record.
-  const lastLine =
-    stdout
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
-      .pop() ?? "";
-  if (/^ERROR\b/.test(lastLine)) {
-    throw new HttpProblem(
-      422,
-      "re-extract-agent-error",
-      "The extraction agent could not read this document",
-      lastLine.replace(/^ERROR\s*/, "") || "Agent reported an error.",
-      {
-        document_id: documentId,
-        transaction_id: transactionId,
-        session_id: sessionId,
-      },
-    );
-  }
+  try {
+    let sessionId: string;
+    let stdout: string;
+    try {
+      ({ sessionId, stdout } = await reExtractor({
+        // The agent needs a container-absolute path it can open (#128).
+        filePath: absPath,
+        workspaceId,
+        documentId,
+        transactionId,
+        userId,
+        ocrText: source.text,
+        attachments: source.attachments,
+        sessionId: run.sessionId,
+        onPrompt: (bytes) => {
+          promptBytes = bytes;
+        },
+      }));
+    } catch (err) {
+      // The agent may have written before it died; the AFTER snapshot is
+      // the record of that, next to `before`.
+      await finish(
+        agentFailure(err, {
+          promptBytes,
+          result: { after: await snapshotReExtractFields(transactionId, doc.id).catch(() => null) },
+        }),
+      );
+      throw err;
+    }
 
-  // 4) Snapshot AFTER. Agent has now UPDATEd transactions + documents.
-  const afterSnapshot = await snapshotReExtractFields(transactionId, doc.id);
+    // 3c) The prompt's own contract: on an unreadable source the agent
+    //     writes NOTHING and prints `ERROR <reason>`. Honour it before
+    //     inserting a `derivation_events` row — that row asserts a
+    //     derivation ran, and writing one for a run that refused is a
+    //     false audit record.
+    const lastLine =
+      stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0)
+        .pop() ?? "";
+    if (/^ERROR\b/.test(lastLine)) {
+      const reason = lastLine.replace(/^ERROR\s*/, "") || "Agent reported an error.";
+      await finish({
+        outcome: "agent_error",
+        errorClass: "agent_reported",
+        error: reason,
+        exitCode: 0,
+        promptBytes,
+        agentReport: stdoutTail(stdout),
+      });
+      throw new HttpProblem(
+        422,
+        "re-extract-agent-error",
+        "The extraction agent could not read this document",
+        reason,
+        {
+          document_id: documentId,
+          transaction_id: transactionId,
+          session_id: sessionId,
+        },
+      );
+    }
 
-  // 5) Compute diff and write derivation_events. We do this in TS
-  //    (not the prompt) so the audit row reflects ground truth after
-  //    the agent's writes have committed, not the agent's intent.
-  const changedKeys: string[] = [];
-  const beforeAny = beforeSnapshot as unknown as Record<string, unknown>;
-  const afterAny = afterSnapshot as unknown as Record<string, unknown>;
-  for (const k of Object.keys(beforeAny)) {
-    if (!reExtractFieldEq(beforeAny[k], afterAny[k])) changedKeys.push(k);
-  }
+    // 4) Snapshot AFTER. Agent has now UPDATEd transactions + documents.
+    const afterSnapshot = await snapshotReExtractFields(transactionId, doc.id);
 
-  const [evt] = await db
-    .insert(derivationEvents)
-    .values({
-      workspaceId,
-      entityType: "document",
-      entityId: documentId,
-      promptVersion: PROMPT_VERSION,
-      promptGitSha: buildInfo.gitSha,
-      model: EXTRACTION_MODEL,
-      ranAt: new Date(),
-      before: beforeSnapshot as unknown as Record<string, unknown>,
-      after: afterSnapshot as unknown as Record<string, unknown>,
-      // (`as unknown as` so TS accepts the cast across the
-      // ReExtractSnapshot → Record<string, unknown> jump.)
-      changedKeys,
-    })
-    .returning({ id: derivationEvents.id });
+    // 5) Compute diff and write derivation_events. We do this in TS
+    //    (not the prompt) so the audit row reflects ground truth after
+    //    the agent's writes have committed, not the agent's intent.
+    const changedKeys: string[] = [];
+    const beforeAny = beforeSnapshot as unknown as Record<string, unknown>;
+    const afterAny = afterSnapshot as unknown as Record<string, unknown>;
+    for (const k of Object.keys(beforeAny)) {
+      if (!reExtractFieldEq(beforeAny[k], afterAny[k])) changedKeys.push(k);
+    }
 
-  // Surface stdout to console so operators can grep DONE/ERROR lines.
-  if (stdout && stdout.trim().length > 0) {
-    console.info(`[re-extract] doc=${documentId} tx=${transactionId} ${stdout.trim().split("\n").pop()}`);
-  }
+    const [evt] = await db
+      .insert(derivationEvents)
+      .values({
+        workspaceId,
+        entityType: "document",
+        entityId: documentId,
+        promptVersion: PROMPT_VERSION,
+        promptGitSha: buildInfo.gitSha,
+        model: EXTRACTION_MODEL,
+        ranAt: new Date(),
+        before: beforeSnapshot as unknown as Record<string, unknown>,
+        after: afterSnapshot as unknown as Record<string, unknown>,
+        // (`as unknown as` so TS accepts the cast across the
+        // ReExtractSnapshot → Record<string, unknown> jump.)
+        changedKeys,
+      })
+      .returning({ id: derivationEvents.id });
 
-  return {
-    document_id: documentId,
-    transaction_id: transactionId,
-    derivation_event_id: evt!.id,
-    changed_keys: changedKeys,
-    ocr_text_changed: !reExtractFieldEq(
+    // Surface stdout to console so operators can grep DONE/ERROR lines.
+    if (stdout && stdout.trim().length > 0) {
+      console.info(`[re-extract] doc=${documentId} tx=${transactionId} ${stdout.trim().split("\n").pop()}`);
+    }
+
+    const ocrTextChanged = !reExtractFieldEq(
       beforeSnapshot.ocr_text,
       afterSnapshot.ocr_text,
-    ),
-    session_id: sessionId,
+    );
     // The agent's metadata UPDATE always rewrites `extraction.ran_at`
     // with NOW(), so `metadata_extraction` is present whenever the psql
     // block ran at all. An EMPTY `changed_keys` therefore means the
@@ -1557,8 +1604,37 @@ export async function reExtractDocument(
     // was identical. Production corroborates: 118 of 122
     // `derivation_events` contain the key; the 4 empties are exactly the
     // #167 no-ops.
-    outcome: changedKeys.length > 0 ? "written" : "no_change",
-  };
+    const outcome: ReExtractOutcome = changedKeys.length > 0 ? "written" : "no_change";
+
+    await finish({
+      outcome,
+      exitCode: 0,
+      promptBytes,
+      agentReport: stdoutTail(stdout),
+      derivationEventId: evt!.id,
+      result: {
+        changed_keys: changedKeys,
+        ocr_text_changed: ocrTextChanged,
+        after: afterSnapshot,
+      },
+    });
+
+    return {
+      document_id: documentId,
+      transaction_id: transactionId,
+      derivation_event_id: evt!.id,
+      changed_keys: changedKeys,
+      ocr_text_changed: ocrTextChanged,
+      session_id: sessionId,
+      outcome,
+    };
+  } catch (err) {
+    // A failure of the server's own after the agent returned (the
+    // snapshot or the audit insert). The agent's failures and its ERROR
+    // line finished the run above, so this is a no-op for them.
+    await finish({ outcome: "failed", errorClass: "apply", error: err, exitCode: 0, promptBytes });
+    throw err;
+  }
 }
 
 interface ReExtractSnapshot {

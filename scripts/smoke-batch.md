@@ -73,9 +73,11 @@ curl -sS "http://localhost:3000/v1/transactions?source_ingest_id=$INGEST_ID" | j
 
 ## Step 5 — Session transcript (optional)
 
-Each `claude -p` invocation writes a Claude Code session JSONL keyed on the pre-allocated session-id. The prompt carries the ingest id, so grep finds it; `measure:turns` reports turns and billed tokens:
+Each `claude -p` invocation writes a Claude Code session JSONL named by the session id the worker minted, and its `agent_runs` row records that id with the turns, tokens and model read from it. `measure:turns` reads the same numbers from the file:
 
 ```bash
+docker exec receipts-postgres psql -U postgres -d receipts -c \
+  "SELECT session_id, outcome, model_observed, turns FROM agent_runs WHERE ingest_id = '$INGEST_ID'"
 JSONL=$(grep -l "$INGEST_ID" ~/Developer/receipt-assistant-data/claude/projects/-app/*.jsonl)
 npm run measure:turns -- --session="$JSONL"
 ```
@@ -94,7 +96,7 @@ npm run measure:turns -- --session="$JSONL"
 |---|---|---|
 | `counts.error > 0` with "401" in `ingests.error` | Claude CLI can't reach Anthropic | Run the `setup` skill — credential file drift |
 | `counts.unsupported` hit for a real receipt | Agent's final JSON fence was malformed | Inspect the session JSONL's final assistant message; the fallback coercer logs a reason |
-| Ingest stuck at `processing` for >5 min | Worker hang (rare) | Restart container; `recoverStaleBatches()` will mark it `failed` on boot |
+| Ingest stuck at `processing` for >5 min | Worker hang (rare) | Restart container; `recoverStaleBatches()` will mark it `failed` on boot and its run `abandoned` |
 | `statement_pdf` classification → marked `unsupported` with note "Phase 2" | Expected Phase 1 behavior | Statement pipeline deferred; file as `receipt_pdf` if it's actually a single-invoice doc |
 
 ## Automation hook (not implemented yet)

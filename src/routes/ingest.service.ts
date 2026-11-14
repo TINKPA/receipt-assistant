@@ -383,6 +383,9 @@ export function createBatchFromFiles(params: {
   workspaceId: string;
   files: IncomingFile[];
   autoReconcile: boolean;
+  /** Recorded on each extraction's run (`agent_runs.trigger`); default
+   *  `upload`. */
+  trigger?: "upload" | "retry";
 }): Promise<{
   batch: BatchSummaryRow;
   items: Array<{ ingestId: string; filename: string; mime_type: string | null }>;
@@ -411,6 +414,7 @@ async function seedBatchFromFiles(params: {
   workspaceId: string;
   files: IncomingFile[];
   autoReconcile: boolean;
+  trigger?: "upload" | "retry";
 }): Promise<{
   batch: BatchSummaryRow;
   items: Array<{ ingestId: string; filename: string; mime_type: string | null }>;
@@ -537,6 +541,7 @@ async function seedBatchFromFiles(params: {
               filename: s.filename,
               mimeType: s.mimeType,
               filePath: s.filePath,
+              documentId: s.documentId,
               status: "dedup" as const,
               // Point provenance at the pre-existing transaction so the
               // client can deep-link "already in your ledger → view it".
@@ -559,6 +564,7 @@ async function seedBatchFromFiles(params: {
               filename: s.filename,
               mimeType: s.mimeType,
               filePath: s.filePath,
+              documentId: s.documentId,
               status: "queued" as const,
             },
       ),
@@ -576,6 +582,7 @@ async function seedBatchFromFiles(params: {
       filePath: s.filePath,
       mimeType: s.mimeType,
       filename: s.filename,
+      trigger: params.trigger ?? "upload",
     });
   }
 
@@ -923,6 +930,7 @@ export async function retryIngest(
       },
     ],
     autoReconcile: true,
+    trigger: "retry",
   });
 
   const newIngestId = items[0]!.ingestId;
