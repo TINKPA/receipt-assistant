@@ -126,6 +126,14 @@ services:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY:-}
       MAX_CLAUDE_CONCURRENCY: ${MAX_CLAUDE_CONCURRENCY:-6}
+      # The same three as production (see docker-compose.yml for what each
+      # does). They read the same `.env`, so an override there moves both
+      # stacks; to flip only the sandbox, set the variable in the shell for
+      # the one `up -d`:
+      #   EXTRACTION_WRITER=server_apply docker compose -f docker-compose.test.yml up -d
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      EXTRACTION_WRITER: ${EXTRACTION_WRITER:-agent_sql}
+      EXTRACTION_REPAIR_ROUNDS: ${EXTRACTION_REPAIR_ROUNDS:-1}
       # Test-only: lets stub instruction files ("__stub__": true JSON)
       # bypass `claude -p` so guard negative paths + L3b seeding are
       # deterministic. NEVER set this on the production compose.

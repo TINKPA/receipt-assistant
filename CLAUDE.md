@@ -107,12 +107,14 @@ Every transaction the agent writes carries the prompt and model it ran under:
   "extraction": {
     "prompt_version": "<PROMPT_VERSION>",       // src/ingest/prompt-contract.ts
     "prompt_git_sha": "<build-info gitSha>",
-    "model":          "<EXTRACTION_MODEL>",     // CLAUDE_MODEL env, else "cli-default"
+    "model":          "<EXTRACTION_MODEL>",     // CLAUDE_MODEL env (both compose files pin it), else "cli-default"
     "source":         "ingest" | "re-extract",
     "ran_at":         "<wall-clock at COMMIT>"
   }
 }
 ```
+
+`CLAUDE_MODEL` is pinned to `claude-sonnet-5` in both compose files and is passed as `--model` to both agents. Before the pin it was unset, the CLI chose, and rows said `cli-default`; the surviving transcripts (from 2026-09-25) show that default ran `claude-opus-5` until the switch to the setup-token on 2026-10-08 and `claude-sonnet-5` since. An override in `.env` must be a full model id, never an alias such as `sonnet`, because the stamp is the literal string.
 
 Rows whose `prompt_version` differs from the source tree's are the ones worth re-extracting. Rows ingested before this existed have `metadata.extraction = NULL`; treat that as "unknown version, eligible". `documents.ocr_model_version` records the model that produced `ocr_text` (NULL on old rows; no backfill is possible). `places.metadata.derivation` is the same idea for a place row.
 

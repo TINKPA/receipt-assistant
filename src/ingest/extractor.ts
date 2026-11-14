@@ -83,11 +83,13 @@ async function runExtractorClaude(
   timeoutMs: number,
 ): Promise<string> {
   const args = ["--output-format", "text"];
-  // Only pin the model when CLAUDE_MODEL is explicitly set. Unset (the
-  // mini today) means the CLI picks its own default, and the prompt
-  // stamps `EXTRACTION_MODEL = "cli-default"` — which is the truth.
-  // Passing a hard-coded "sonnet" here would silently downgrade the
-  // model that has actually been running.
+  // Pass the model only when CLAUDE_MODEL is set. Both compose files pin
+  // it (claude-sonnet-5), so every container run names its model and the
+  // prompt stamps that id. Unset (a run outside the compose files) the
+  // CLI picks its own default and the prompt stamps
+  // `EXTRACTION_MODEL = "cli-default"`, which is the truth. A hard-coded
+  // fallback here would make the stamp lie whenever the CLI's default
+  // moves.
   if (process.env.CLAUDE_MODEL) {
     args.push("--model", process.env.CLAUDE_MODEL);
   }
