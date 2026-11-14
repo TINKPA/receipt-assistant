@@ -91,6 +91,13 @@ export const IngestProduced = z
     receipt_ids: z.array(Uuid).default([]),
     transaction_ids: z.array(Uuid).default([]),
     document_ids: z.array(Uuid).default([]),
+    // Wave 1: the server writer (`src/ingest/apply/`) names the record it
+    // stored and applied. The agent's own close-out never writes it.
+    extraction_ids: z.array(Uuid).optional().openapi({
+      description:
+        "The extraction records (`document_extractions`) the server writer stored for this ingest. " +
+        "Absent on an ingest the extraction agent closed itself.",
+    }),
   })
   .openapi("IngestProduced");
 
