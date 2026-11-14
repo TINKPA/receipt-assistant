@@ -746,8 +746,10 @@ npm run eval:dates -- --reset --limit=6    # the six-fixture sanity set
 The dedup system (#134/#135) has a dedicated regression harness that
 must never be pointed at production. Run it after ANY change to
 `src/ingest/prompt.ts` Phase 4a.0, the worker guards, `src/reconcile/*`,
-the dedup probes, the pHash code, or the document cascade delete (it
-meets apply and undo in cases `cd` and `cs`):
+the dedup probes, the pHash code, the document cascade delete (it
+meets apply and undo in cases `cd` and `cs`), the server applier's
+dedup (`src/ingest/apply/candidates.ts`, `decide.ts`) or the worker's
+server-writer path:
 
 ```bash
 # sandbox up + reset first:
@@ -774,6 +776,27 @@ its payee and its amount, so they need no reset and can be pointed at
 any throwaway server started with `EXTRACTOR_STUB_ALLOWED=1`, not only
 the sandbox. "Removed" in this harness means soft-deleted: `deleted_at`
 set, status still `posted`.
+
+`--writer=agent_sql|server_apply` tells the harness the server's
+`EXTRACTION_WRITER` (it cannot read it over HTTP; default `agent_sql`).
+Stubs take their own path whatever the server says, so the reconcile
+cases (legacy seeds) and the applier cases below run under both. Under
+`server_apply` the worker guards are not on the agent's path, so `g1`,
+`g3` and `g4` run as record variants (a record that is repaired, and one
+still invalid after its round; no record at all; a record whose only
+match is a soft-deleted row) and `g2` is skipped, saying why: 19 of the
+20 stub cases then run. The Claude cases also check that their runs
+carry the writer the harness was told.
+
+The applier cases `a1-a8` (plan §12.2) upload record stubs: `a1`
+identifier attach, `a2` identifier conflict → `distinct`, `a3` no
+identifier → `uncertain` and flagged, `a4` refund with `refund_of`, `a5`
+attach by card + minute + line totals, `a6` pHash neighbour with other
+identifiers → `distinct`, `a7` Message-ID → `dedup` before any spawn,
+`a8` three copies in one batch → one transaction, three rounds. Run
+`a8` with `MAX_CLAUDE_CONCURRENCY=3` too: the copies are then in flight
+together (the case prints how many), and the workspace apply lock is
+what keeps it at one transaction; without the lock it fails 0/3.
 
 `--with-claude` adds the agent decision-tree branches (`b2` attach,
 `b3` distinct-despite-pHash, `b4` flag+review round-trip) and the

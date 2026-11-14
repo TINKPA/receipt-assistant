@@ -16,7 +16,7 @@
  * Usage (from the repo root):
  *   npx tsx scripts/eval-dedup.ts --base=http://<host>:<port> \
  *       --pg=postgresql://postgres:postgres@<host>:<port>/receipts \
- *       [--only=g1,rf] [--with-claude]
+ *       [--writer=agent_sql|server_apply] [--only=g1,rf] [--with-claude]
  *
  * Stub cases are deterministic and fast (about a minute in total): every
  * seed carries a per-run nonce, so they can run against a dirty database
@@ -24,6 +24,19 @@
  * extraction (~2-4 min), need macOS `sips`, and are gated behind
  * --with-claude. Run them after any eval-dates batch finishes to avoid
  * auth-pool contention.
+ *
+ * --writer names the server's `EXTRACTION_WRITER` (wave 1; default
+ * agent_sql). The harness cannot read it over HTTP, so it is told, and it
+ * checks what it can: every Claude-case run must carry that writer. A
+ * stub decides its own path whatever the server's setting: the `terminal`
+ * stubs that seed the reconcile cases always take the legacy one, and the
+ * record stubs of the a* cases always take the server writer's, so those
+ * cases run, and must pass, under both. What changes with --writer is the
+ * worker-guard block: under server_apply the agent has no database, so
+ * the #125 / #134 guards are not on its path, and g1, g3 and g4 run as
+ * record variants (below) while g2 is skipped (nothing to self-heal: the
+ * server writes the transaction and closes the ingest in one database
+ * transaction).
  *
  * "Removed" below always means SOFT-DELETED: `deleted_at` set, status
  * still `posted` (#171). Nothing writes `voided` any more, and a count of
@@ -74,6 +87,32 @@
  *        instead of leaving the survivor live with no live document; restoring its document
  *        (soft) or deleting the survivor (hard) lets the undo through
  *
+ * Worker guards, record variants (--writer=server_apply; record stubs):
+ *   g1   a record the server cannot use             → never booked: repaired in one round, it is
+ *                                                     booked and the round is on the run and the
+ *                                                     record; still invalid after it, the ingest
+ *                                                     errors ("extraction record rejected: …"), the
+ *                                                     record is kept as `invalid` evidence
+ *   g3   no record handed back at all               → ingest error ("extraction record missing"),
+ *                                                     run invalid_record / artefact_missing, nothing stored
+ *   g4   a record whose only match is SOFT-DELETED  → inserted as a new live transaction, never
+ *                                                     attached to the deleted row
+ *
+ * Server applier dedup (record stubs, both writers; plan §7, §12.2):
+ *   a1   identifier attach                          → near_dup onto the first row, document linked,
+ *                                                     merge_audit + document_linked event, the second
+ *                                                     reading stored too
+ *   a2   identifier conflict                        → inserted, near_dup_check verdict `distinct`
+ *   a3   no identifier, same merchant and total     → inserted, `uncertain`, flagged for review (and listed)
+ *   a4   refund sharing the purchase's order number → inserted with metadata.refund_of = the purchase
+ *   a5   card + time to the minute + item totals    → attached by the hard tuple
+ *   a6   pHash neighbour, different identifiers     → inserted, `distinct`, naming the neighbour's row
+ *   a7   the same Message-ID again                  → closed `dedup` before any spawn, document linked;
+ *                                                     once that row is deleted, a third copy extracts again
+ *   a8   three copies in ONE batch                  → one transaction holding three documents, three
+ *                                                     rounds in a row (run it with MAX_CLAUDE_CONCURRENCY=3
+ *                                                     to make the copies race; the apply lock is what holds)
+ *
  * Agent decision tree (--with-claude):
  *   b2   re-encoded copy of extracted receipt       → branch-2 attach (near_dup, no new txn)
  *   b3   same-app-template different purchase (d≈2) → branch-3 INSERT distinct (pHash never decides)
@@ -103,6 +142,12 @@ const PG_URL =
   argOf("pg") ?? "postgresql://postgres:postgres@localhost:5433/receipts";
 const ONLY = argOf("only")?.split(",") ?? null;
 const WITH_CLAUDE = process.argv.includes("--with-claude");
+const WRITER = argOf("writer") ?? "agent_sql";
+if (WRITER !== "agent_sql" && WRITER !== "server_apply") {
+  console.error(`--writer must be agent_sql or server_apply, got ${JSON.stringify(WRITER)}`);
+  process.exit(2);
+}
+const SERVER_APPLY = WRITER === "server_apply";
 const UPLOADS_DIR =
   argOf("uploads-dir") ??
   path.join(
@@ -229,6 +274,306 @@ function stubFile(ins: Record<string, unknown>): UploadFile {
     mime: "application/json",
   };
 }
+
+// ── record stubs (the server writer) ───────────────────────────────────
+
+/** One synthetic extraction record (contract v1), as an agent under
+ *  `server_apply` would hand it back. Nothing in it is real. */
+interface RecSpec {
+  /** Makes the brand slug and the payee; give every case its own. */
+  brand: string;
+  /** Signed minor units: a refund is negative. */
+  total: number;
+  date: string;
+  /** ISO-8601 with offset, or null (no time printed). */
+  at?: string | null;
+  flow?: "purchase" | "refund";
+  classification?: "receipt_image" | "receipt_email";
+  ids?: Record<string, string>;
+  /** Last four digits; null: no card printed. */
+  card?: string | null;
+  /** Line totals, one item each; default one line for the whole total. */
+  lines?: number[];
+}
+
+function recordOf(r: RecSpec): Record<string, unknown> {
+  const payee = `Example ${r.brand}`;
+  const slug = r.brand.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const lines = r.lines ?? [r.total];
+  const email = r.classification === "receipt_email";
+  return {
+    contract_version: 1,
+    classification: r.classification ?? "receipt_image",
+    source_used: email ? "email_body" : "image",
+    facts: {
+      flow: r.flow ?? "purchase",
+      occurred_on: r.date,
+      occurred_at: r.at ?? null,
+      payee,
+      payee_as_printed: payee.toUpperCase(),
+      payee_source: "printed",
+      total_minor: r.total,
+      currency: "USD",
+    },
+    payment:
+      r.card === null || r.card === undefined
+        ? { method: "unknown" }
+        : { method: "card", card_last4: r.card, card_network: "Visa" },
+    identifiers: r.ids ?? {},
+    merchant: { canonical_name: payee, brand_id: slug, category: "Shopping" },
+    items: lines.map((t, i) => ({
+      line_no: i + 1,
+      raw_name: `ITEM ${i + 1}`,
+      line_total_minor: t,
+      item_class: "consumable",
+      confidence: "high",
+    })),
+    audit: {
+      ocr_raw_payee: payee.toUpperCase(),
+      correction_applied: false,
+      date_candidates: [r.date],
+      chosen_date_reason: "printed in the header",
+      year_sanity_ok: true,
+    },
+  };
+}
+
+const isEmailRecord = (record: unknown): boolean =>
+  typeof record === "object" && record !== null && (record as { classification?: unknown }).classification === "receipt_email";
+
+/** A record stub upload (see RECORD MODE in src/ingest/stub-extractor.ts).
+ *  An image record comes with a receipt-text block, as the prompt asks. */
+function recordStub(record: unknown, extra: Record<string, unknown> = {}): UploadFile {
+  return stubFile({
+    record,
+    ...(isEmailRecord(record) ? {} : { receipt_text: "EXAMPLE RECEIPT\nTOTAL" }),
+    ...extra,
+  });
+}
+
+interface IngestState {
+  status: string;
+  error: string | null;
+  produced: any;
+  classification: string | null;
+}
+
+async function ingestState(ingestId: string): Promise<IngestState> {
+  const [row] = await q<IngestState>(
+    `SELECT status, error, produced, classification FROM ingests WHERE id = $1`,
+    [ingestId],
+  );
+  assert(row, `ingest ${ingestId} missing`);
+  return row;
+}
+
+interface RunState {
+  writer: string;
+  status: string;
+  outcome: string | null;
+  error_class: string | null;
+  repair_rounds: number;
+  extraction_id: string | null;
+  apply_report: any;
+  started_at: Date;
+  finished_at: Date | null;
+}
+
+/** The newest run of an ingest. */
+async function runOf(ingestId: string): Promise<RunState> {
+  const [row] = await q<RunState>(
+    `SELECT writer, status, outcome::text AS outcome, error_class, repair_rounds, extraction_id, apply_report,
+            started_at, finished_at
+       FROM agent_runs WHERE ingest_id = $1 ORDER BY started_at DESC LIMIT 1`,
+    [ingestId],
+  );
+  assert(row, `no run for ingest ${ingestId}`);
+  return row;
+}
+
+/** Upload one record stub in its own batch; wait for its reconcile. */
+async function uploadRecord(record: unknown, extra: Record<string, unknown> = {}): Promise<{
+  batchId: string;
+  ingestId: string;
+  docId: string;
+  ingest: IngestState;
+  run: RunState;
+}> {
+  const { batchId, ingestIds } = await postBatch([recordStub(record, extra)]);
+  await pollReconciled(batchId);
+  const ingestId = ingestIds[0]!;
+  return { batchId, ingestId, docId: await docOfIngest(ingestId), ingest: await ingestState(ingestId), run: await runOf(ingestId) };
+}
+
+/** An upload the server applier booked: done, one live transaction, a
+ *  `written` run with the server writer. Returns that transaction. */
+async function bookedBy(u: { ingestId: string; ingest: IngestState; run: RunState }, what: string): Promise<TxState> {
+  assert(u.ingest.status === "done", `${what}: expected done, got ${u.ingest.status} (${u.ingest.error})`);
+  assert(
+    u.run.writer === "server_apply" && u.run.outcome === "written",
+    `${what}: run ${u.run.writer}/${u.run.outcome}/${u.run.error_class}`,
+  );
+  const tx = await txBySourceIngest(u.ingestId);
+  assert(isLive(tx), `${what}: the booked transaction is not live`);
+  return tx;
+}
+
+async function metadataOf(txId: string): Promise<any> {
+  const [row] = await q<{ metadata: any }>(`SELECT metadata FROM transactions WHERE id = $1`, [txId]);
+  assert(row, `transaction ${txId} missing`);
+  return row.metadata;
+}
+
+/** The current valid record of a document, or null. */
+async function currentRecordOf(docId: string): Promise<{ id: string; status: string; validation: any } | null> {
+  const [row] = await q<{ id: string; status: string; validation: any }>(
+    `SELECT id, status::text AS status, validation FROM document_extractions
+      WHERE document_id = $1 AND status = 'valid' AND superseded_at IS NULL`,
+    [docId],
+  );
+  return row ?? null;
+}
+
+/** True when the review queue (`GET /v1/transactions?flagged=near_dup`)
+ *  lists the transaction, following the cursor through every page. */
+async function inReviewQueue(txId: string): Promise<boolean> {
+  let cursor: string | null = null;
+  for (let page = 0; page < 50; page++) {
+    const qs: string = `flagged=near_dup&limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+    const res = await api(`/v1/transactions?${qs}`);
+    assert(res.status === 200, `flagged list → ${res.status}`);
+    const items: any[] = res.json.items ?? res.json.transactions ?? [];
+    if (items.some((t) => t.id === txId)) return true;
+    cursor = res.json.next_cursor ?? null;
+    if (!cursor) return false;
+  }
+  return false;
+}
+
+/** The Claude cases must have run under the writer the harness was told. */
+async function assertRunWriter(ingestId: string): Promise<void> {
+  const run = await runOf(ingestId);
+  assert(
+    run.writer === WRITER,
+    `ingest ${ingestId} ran under writer ${run.writer}; the harness was told --writer=${WRITER}`,
+  );
+}
+
+/** How many of these runs were in flight at once, at most. */
+function maxOverlap(runs: RunState[]): number {
+  const edges = runs.flatMap((r) => [
+    { t: new Date(r.started_at).getTime(), d: 1 },
+    { t: new Date(r.finished_at ?? r.started_at).getTime(), d: -1 },
+  ]);
+  edges.sort((a, b) => a.t - b.t || a.d - b.d);
+  let now = 0;
+  let max = 0;
+  for (const e of edges) max = Math.max(max, (now += e.d));
+  return max;
+}
+
+// ── worker-guard record variants (--writer=server_apply) ──────────────
+
+/** g1 under the server writer: a record the server cannot use is never
+ *  booked, whether or not the repair round fixes it. */
+async function g1Record(notes: string[]): Promise<void> {
+  const good = recordOf({
+    brand: `G1 Repair ${NONCE}`,
+    total: amt(31),
+    date: "2026-10-20",
+    ids: { order_number: `G1-${NONCE}-R` },
+  });
+  // A date that does not exist: `calendar_date`, sent back for repair.
+  const bad = { ...good, facts: { ...(good.facts as Record<string, unknown>), occurred_on: "2026-02-30" } };
+
+  // (1) the round fixes it.
+  const fixed = await uploadRecord(bad, { repair_record: good });
+  const tx = await bookedBy(fixed, "repaired record");
+  assert(fixed.run.repair_rounds === 1, `repair_rounds ${fixed.run.repair_rounds}, expected 1`);
+  const rec = await currentRecordOf(fixed.docId);
+  assert(rec && rec.id === fixed.run.extraction_id, "the run does not point at the document's current record");
+  const repairs = rec.validation?.repairs ?? [];
+  assert(
+    repairs.length === 1 && repairs[0].round === 1 && repairs[0].errors?.[0]?.rule === "calendar_date",
+    `the round is not noted on the record: ${JSON.stringify(rec.validation)}`,
+  );
+  assert(
+    !(rec.validation?.warnings ?? []).some((w: any) => w.rule === "repair_changed_unnamed"),
+    "a repair that only fixed the named field was flagged repair_changed_unnamed",
+  );
+  notes.push(`invalid date, fixed by one --resume round → booked (${tx.id.slice(0, 8)}…), repair_rounds=1, the round noted on the record`);
+
+  // (2) it is still wrong after the round.
+  const never = await uploadRecord(bad, { repair_record: bad });
+  assert(never.ingest.status === "error", `still-invalid record: expected error, got ${never.ingest.status}`);
+  assert(
+    never.ingest.error === "extraction record rejected: facts.occurred_on: calendar_date",
+    `ingest error: ${never.ingest.error}`,
+  );
+  assert(
+    never.run.outcome === "invalid_record" && never.run.error_class === "artefact_invalid" && never.run.repair_rounds === 1,
+    `run: ${never.run.outcome}/${never.run.error_class}/${never.run.repair_rounds}`,
+  );
+  const [kept] = await q<{ status: string }>(
+    `SELECT status::text AS status FROM document_extractions WHERE id = $1`,
+    [never.run.extraction_id],
+  );
+  assert(kept?.status === "invalid", "the rejected record was not kept as invalid evidence");
+  assert(
+    JSON.stringify(never.ingest.produced?.extraction_ids) === JSON.stringify([never.run.extraction_id]),
+    `ingest produced: ${JSON.stringify(never.ingest.produced)}`,
+  );
+  const none = await q(`SELECT 1 FROM transactions WHERE source_ingest_id = $1`, [never.ingestId]);
+  assert(none.length === 0, "a rejected record was booked");
+  notes.push('still invalid after the round → error "extraction record rejected: facts.occurred_on: calendar_date", run invalid_record/artefact_invalid, record kept as invalid');
+}
+
+/** g3 under the server writer: no record at all is an error, never a
+ *  silent `done`. */
+async function g3Record(notes: string[]): Promise<void> {
+  const u = await uploadRecord(null);
+  assert(u.ingest.status === "error", `expected error, got ${u.ingest.status}`);
+  assert(String(u.ingest.error).startsWith("extraction record missing"), `ingest error: ${u.ingest.error}`);
+  assert(
+    u.run.outcome === "invalid_record" && u.run.error_class === "artefact_missing" && u.run.extraction_id === null,
+    `run: ${u.run.outcome}/${u.run.error_class}/${u.run.extraction_id}`,
+  );
+  const stored = await q(`SELECT 1 FROM document_extractions WHERE document_id = $1`, [u.docId]);
+  assert(stored.length === 0, "a missing record left a document_extractions row");
+  const booked = await q(`SELECT 1 FROM transactions WHERE source_ingest_id = $1`, [u.ingestId]);
+  assert(booked.length === 0, "a run with no record booked something");
+  const [report] = await q<{ agent_report: any }>(
+    `SELECT agent_report FROM agent_runs WHERE ingest_id = $1 ORDER BY started_at DESC LIMIT 1`,
+    [u.ingestId],
+  );
+  assert(typeof report?.agent_report?.stdout_tail === "string", "no stdout tail on the run");
+  notes.push(`no record handed back → error "${String(u.ingest.error).slice(0, 60)}…", run invalid_record/artefact_missing, nothing stored`);
+}
+
+/** g4 under the server writer: a soft-deleted transaction is no attach
+ *  target, even when the identifier matches. */
+async function g4Record(notes: string[]): Promise<void> {
+  const brand = `G4 Tombstone ${NONCE}`;
+  const target = await seedOne({
+    payee: `Example ${brand}`,
+    occurred_on: "2026-10-21",
+    total_minor: amt(33),
+    metadata: { order_number: `G4-${NONCE}` },
+  });
+  await softDeleteViaApi(target.tx.id);
+  const u = await uploadRecord(
+    recordOf({ brand, total: amt(33), date: "2026-10-21", ids: { order_number: `G4-${NONCE}` } }),
+  );
+  const tx = await bookedBy(u, "record matching a deleted row");
+  assert(tx.id !== target.tx.id, "booked onto the deleted row");
+  assert((await txState(target.tx.id)).deleted_at !== null, "the deleted row came back");
+  assert((await linksOf(target.tx.id)).join() === target.docId, "the deleted row gained a document");
+  notes.push("same order number as a soft-deleted row → a new live transaction; the deleted row untouched");
+}
+
+const G2_SKIP =
+  "server_apply: the server writes the transaction and closes the ingest in one database transaction, " +
+  "so a run cannot write a row and report none (#133); there is nothing to self-heal";
 
 // ── stub-seed helpers (reconcile matrix) ───────────────────────────────
 
@@ -453,10 +798,15 @@ async function runCase(
   name: string,
   needsClaude: boolean,
   fn: (notes: string[]) => Promise<void>,
+  skipReason: string | null = null,
 ): Promise<void> {
   if (ONLY && !ONLY.includes(name)) return;
   if (needsClaude && !WITH_CLAUDE) {
     console.log(`~ ${name}: skipped (needs --with-claude)`);
+    return;
+  }
+  if (skipReason) {
+    console.log(`~ ${name}: skipped (${skipReason})`);
     return;
   }
   const notes: string[] = [];
@@ -484,10 +834,10 @@ function assert(cond: unknown, msg: string): asserts cond {
 async function main(): Promise<void> {
   await db.connect();
   tmp = await mkdtemp(path.join(tmpdir(), "eval-dedup-"));
-  console.log(`# eval-dedup  base=${BASE}  claude-cases=${WITH_CLAUDE ? "ON" : "off"}\n`);
+  console.log(`# eval-dedup  base=${BASE}  writer=${WRITER}  claude-cases=${WITH_CLAUDE ? "ON" : "off"}\n`);
 
   // g1 — near_dup claimed, no link → forced error (#134 guard)
-  await runCase("g1", false, async (notes) => {
+  await runCase("g1", false, SERVER_APPLY ? g1Record : async (notes) => {
     const phantom = randomUUID();
     const { batchId, ingestIds } = await postBatch([
       stubFile({
@@ -528,10 +878,10 @@ async function main(): Promise<void> {
       `produced not repaired: ${JSON.stringify(repaired)} vs ${tx!.id}`,
     );
     notes.push(`produced self-healed to [${String(tx!.id).slice(0, 8)}…]`);
-  });
+  }, SERVER_APPLY ? G2_SKIP : null);
 
   // g3 — done + produced=[] + no txn → forced error (#125 guard)
-  await runCase("g3", false, async (notes) => {
+  await runCase("g3", false, SERVER_APPLY ? g3Record : async (notes) => {
     const { batchId, ingestIds } = await postBatch([
       stubFile({ terminal: { status: "done", transaction_ids: [] } }),
     ]);
@@ -546,7 +896,7 @@ async function main(): Promise<void> {
   // committed link → forced error. A deleted row keeps status `posted`,
   // so a guard that only reads status accepts the attach and the
   // document's purchase then exists nowhere in the ledger.
-  await runCase("g4", false, async (notes) => {
+  await runCase("g4", false, SERVER_APPLY ? g4Record : async (notes) => {
     const target = await seedOne({
       payee: `Tombstone Deli ${NONCE}`,
       occurred_on: "2026-06-01",
@@ -1448,6 +1798,240 @@ async function main(): Promise<void> {
     }
   });
 
+  // ── the server applier's dedup (record stubs) ──────────────────────
+  // Every record stub takes the server writer's path whatever the
+  // server's EXTRACTION_WRITER, so these run, and must pass, under both.
+
+  // a1 — the same reading again, another copy of the file → attached by
+  // identifier, and the second reading is stored too (hole 5).
+  await runCase("a1", false, async (notes) => {
+    const rec = recordOf({
+      brand: `A1 Order ${NONCE}`,
+      total: amt(41),
+      date: "2026-10-01",
+      ids: { order_number: `A1-${NONCE}` },
+      card: "0001",
+    });
+    const first = await uploadRecord(rec);
+    const t1 = await bookedBy(first, "first copy");
+    const [created] = await q<{ n: number }>(
+      `SELECT count(*)::int AS n FROM transaction_events WHERE transaction_id = $1 AND event_type = 'created'`,
+      [t1.id],
+    );
+    assert(created!.n === 1, `expected one created event, got ${created!.n}`);
+    const second = await uploadRecord(rec);
+    assert(second.ingest.status === "near_dup", `second copy: expected near_dup, got ${second.ingest.status} (${second.ingest.error})`);
+    assert(second.ingest.produced?.transaction_ids?.join() === t1.id, `pointer: ${JSON.stringify(second.ingest.produced)}`);
+    assert(second.run.writer === "server_apply" && second.run.outcome === "attached", `run: ${second.run.writer}/${second.run.outcome}`);
+    assert(
+      (await linksOf(t1.id)).join() === [first.docId, second.docId].sort().join(),
+      "the first row should hold both documents",
+    );
+    const audit = (await metadataOf(t1.id)).merge_audit ?? [];
+    assert(
+      audit.length === 1 &&
+        audit[0].attached_document_id === second.docId &&
+        audit[0].decided_by === "applier" &&
+        audit[0].tiebreaker === "identifier",
+      `merge_audit: ${JSON.stringify(audit)}`,
+    );
+    const ev = await q(
+      `SELECT 1 FROM transaction_events WHERE transaction_id = $1 AND event_type = 'document_linked' AND payload->>'document_id' = $2`,
+      [t1.id, second.docId],
+    );
+    assert(ev.length === 1, "no document_linked event");
+    const rec2 = await currentRecordOf(second.docId);
+    assert(rec2 && rec2.id === second.run.extraction_id, "the attached copy's reading was not stored as its current record");
+    assert((await q(`SELECT 1 FROM transactions WHERE source_ingest_id = $1`, [second.ingestId])).length === 0, "the attach also inserted");
+    notes.push("second copy, same order number → near_dup onto the first row; merge_audit (identifier) + document_linked; its reading stored");
+  });
+
+  // a2 — same merchant, total and day, different order numbers → two
+  // purchases, said so.
+  await runCase("a2", false, async (notes) => {
+    const base = { brand: `A2 Twin ${NONCE}`, total: amt(42), date: "2026-10-02" };
+    const t1 = await bookedBy(await uploadRecord(recordOf({ ...base, ids: { order_number: `A2-${NONCE}-1` } })), "first");
+    const t2 = await bookedBy(await uploadRecord(recordOf({ ...base, ids: { order_number: `A2-${NONCE}-2` } })), "second");
+    const ndc = (await metadataOf(t2.id)).near_dup_check;
+    assert(
+      ndc?.verdict === "distinct" &&
+        ndc.flagged_for_review === false &&
+        ndc.decided_by === "applier" &&
+        (ndc.candidate_transaction_ids ?? []).includes(t1.id),
+      `near_dup_check: ${JSON.stringify(ndc)}`,
+    );
+    assert(isLive(await txState(t1.id)), "the first row was removed");
+    assert((await proposalsBetween(t1.id, t2.id)).length === 0, "reconcile proposed a pair the applier judged distinct");
+    notes.push("different order numbers → inserted, near_dup_check distinct naming the first row, no proposal");
+  });
+
+  // a3 — nothing tells them apart and nothing proves them one: inserted,
+  // flagged for a person.
+  await runCase("a3", false, async (notes) => {
+    const base = { brand: `A3 Coffee ${NONCE}`, total: amt(43), date: "2026-10-03" };
+    const t1 = await bookedBy(await uploadRecord(recordOf(base)), "first");
+    const t2 = await bookedBy(await uploadRecord(recordOf(base)), "second");
+    const ndc = (await metadataOf(t2.id)).near_dup_check;
+    assert(
+      ndc?.verdict === "uncertain" && ndc.flagged_for_review === true && (ndc.candidate_transaction_ids ?? []).includes(t1.id),
+      `near_dup_check: ${JSON.stringify(ndc)}`,
+    );
+    assert(await inReviewQueue(t2.id), "the flagged row is not in the review queue");
+    notes.push("no identifier, no card: inserted, uncertain + flagged_for_review, listed by ?flagged=near_dup");
+  });
+
+  // a4 — a refund names the purchase it reverses, and is never folded
+  // into it.
+  await runCase("a4", false, async (notes) => {
+    const base = { brand: `A4 Returns ${NONCE}`, ids: { order_number: `A4-${NONCE}` }, card: "0004" };
+    const tp = await bookedBy(await uploadRecord(recordOf({ ...base, total: amt(44), date: "2026-10-04" })), "purchase");
+    const tr = await bookedBy(
+      await uploadRecord(recordOf({ ...base, total: -amt(44), date: "2026-10-06", flow: "refund" })),
+      "refund",
+    );
+    const meta = await metadataOf(tr.id);
+    assert(meta.flow === "refund" && meta.refund_of === tp.id, `refund metadata: flow=${meta.flow} refund_of=${meta.refund_of}`);
+    const [legs] = await q<{ expense: string }>(
+      `SELECT sum(p.amount_minor)::text AS expense FROM postings p JOIN accounts a ON a.id = p.account_id
+        WHERE p.transaction_id = $1 AND a.type = 'expense'`,
+      [tr.id],
+    );
+    assert(Number(legs!.expense) === -amt(44), `refund expense leg ${legs!.expense}`);
+    assert(isLive(await txState(tp.id)), "the purchase was removed");
+    assert((await proposalsBetween(tp.id, tr.id)).length === 0, "the refund was proposed as a duplicate of its purchase");
+    notes.push("refund with the purchase's order number → inserted, refund_of = the purchase, expense leg negative, no proposal");
+  });
+
+  // a5 — no identifier, but the same card, the same minute and the same
+  // line totals → attached by the hard tuple; an hour later is not.
+  await runCase("a5", false, async (notes) => {
+    const base = {
+      brand: `A5 Tuple ${NONCE}`,
+      total: amt(45),
+      date: "2026-10-05",
+      card: "0005",
+      lines: [amt(45) - 300, 300],
+    };
+    const first = await uploadRecord(recordOf({ ...base, at: "2026-10-05T12:34:00-07:00" }));
+    const t1 = await bookedBy(first, "first");
+    const second = await uploadRecord(recordOf({ ...base, at: "2026-10-05T12:34:40-07:00" }));
+    assert(second.ingest.status === "near_dup", `same tuple: expected near_dup, got ${second.ingest.status}`);
+    assert(second.ingest.produced?.transaction_ids?.join() === t1.id, "attached to the wrong row");
+    const audit = (await metadataOf(t1.id)).merge_audit ?? [];
+    assert(audit.length === 1 && audit[0].tiebreaker === "hard_tuple", `merge_audit: ${JSON.stringify(audit)}`);
+    const later = await uploadRecord(recordOf({ ...base, at: "2026-10-05T13:34:00-07:00" }));
+    const t3 = await bookedBy(later, "an hour later");
+    const ndc = (await metadataOf(t3.id)).near_dup_check;
+    assert(ndc?.verdict === "uncertain" && ndc.flagged_for_review === true, `an hour later: ${JSON.stringify(ndc)}`);
+    notes.push("same card, minute and line totals → attached (hard_tuple); the same an hour later → inserted, uncertain");
+  });
+
+  // a6 — a perceptual neighbour is a candidate, never a decision: other
+  // order numbers win.
+  await runCase("a6", false, async (notes) => {
+    const ph1 = `${NONCE}${NONCE}0000`;
+    const ph2 = ph1.slice(0, 15) + "1"; // Hamming distance 1
+    const brand = `A6 Template ${NONCE}`;
+    const t1 = await bookedBy(
+      await uploadRecord(recordOf({ brand, total: amt(46), date: "2026-10-07", ids: { order_number: `A6-${NONCE}-1` } }), { phash: ph1 }),
+      "first",
+    );
+    // Another total, two weeks later: only the pHash makes it a candidate.
+    const second = await uploadRecord(
+      recordOf({ brand, total: amt(47), date: "2026-10-21", ids: { order_number: `A6-${NONCE}-2` } }),
+      { phash: ph2 },
+    );
+    const t2 = await bookedBy(second, "pHash neighbour");
+    const cands: any[] = second.run.apply_report?.candidates ?? [];
+    assert(
+      cands.some((c) => c.id === t1.id && (c.matched_on ?? []).includes("phash")),
+      `the neighbour was not a pHash candidate: ${JSON.stringify(cands)}`,
+    );
+    const ndc = (await metadataOf(t2.id)).near_dup_check;
+    assert(
+      ndc?.verdict === "distinct" && (ndc.candidate_transaction_ids ?? []).includes(t1.id),
+      `near_dup_check: ${JSON.stringify(ndc)}`,
+    );
+    const [meta] = await q<{ input_meta: any }>(`SELECT input_meta FROM document_extractions WHERE id = $1`, [second.run.extraction_id]);
+    assert(
+      (meta?.input_meta?.phash_neighbors ?? []).some((n: any) => n.transaction_id === t1.id),
+      "the record does not say which neighbours the run was shown",
+    );
+    notes.push("pHash d=1, other order number → inserted, distinct naming the neighbour; neighbours on the record's input_meta");
+  });
+
+  // a7 — X9: an email whose Message-ID the ledger already holds is linked
+  // before anything is spawned; once that row is gone, it extracts again.
+  await runCase("a7", false, async (notes) => {
+    const meta = {
+      message_id: `<a7-${NONCE}@example.test>`,
+      from: "Example Store <receipts@example.test>",
+      subject: "Your receipt",
+      date: "2026-10-08T17:00:00.000Z",
+    };
+    const rec = recordOf({
+      brand: `A7 Mail ${NONCE}`,
+      total: amt(48),
+      date: "2026-10-08",
+      classification: "receipt_email",
+      ids: { order_number: `A7-${NONCE}` },
+    });
+    const first = await uploadRecord(rec, { email_meta: meta });
+    const t1 = await bookedBy(first, "first email");
+    const [doc] = await q<{ message_id: string | null; source_meta: any }>(
+      `SELECT message_id, source_meta FROM documents WHERE id = $1`,
+      [first.docId],
+    );
+    assert(doc!.message_id === `a7-${NONCE}@example.test`, `message_id stamped as ${doc!.message_id}`);
+    assert(doc!.source_meta?.message_id === `a7-${NONCE}@example.test`, "source_meta has no message_id");
+    // The copy's stub would hand back NO record: had it been spawned, the
+    // ingest would end artefact_missing.
+    const second = await uploadRecord(null, { email_meta: meta });
+    assert(second.ingest.status === "dedup", `same Message-ID: expected dedup, got ${second.ingest.status} (${second.ingest.error})`);
+    assert(second.ingest.produced?.transaction_ids?.join() === t1.id, `pointer: ${JSON.stringify(second.ingest.produced)}`);
+    assert(
+      second.run.outcome === "duplicate_skip" && second.run.apply_report?.branch === "message_id_duplicate",
+      `run: ${second.run.outcome}/${second.run.apply_report?.branch}`,
+    );
+    assert((await linksOf(t1.id)).includes(second.docId), "the copy was not linked to the row");
+    assert((await q(`SELECT 1 FROM document_extractions WHERE document_id = $1`, [second.docId])).length === 0, "the copy was read");
+    await softDeleteViaApi(t1.id);
+    const third = await uploadRecord(rec, { email_meta: meta });
+    const t3 = await bookedBy(third, "third copy, after the delete");
+    assert(t3.id !== t1.id, "booked onto the deleted row");
+    notes.push("same Message-ID → dedup before any spawn, linked, no record read; after a delete the next copy extracts again");
+  });
+
+  // a8 — three copies in one batch: the workspace apply lock makes the
+  // candidate check and the insert one step, so one row results however
+  // the runs overlap.
+  await runCase("a8", false, async (notes) => {
+    let converged = 0;
+    for (let round = 1; round <= 3; round++) {
+      const rec = recordOf({
+        brand: `A8 Race ${NONCE} R${round}`,
+        total: amt(50 + round),
+        date: "2026-10-09",
+        ids: { order_number: `A8-${NONCE}-${round}` },
+      });
+      // The child sleeps a second before handing back, so at concurrency
+      // 3 the three runs are in flight together.
+      const files = [1, 2, 3].map(() => recordStub(rec, { child: { sleep_s: 1 } }));
+      const { batchId, ingestIds } = await postBatch(files);
+      await pollReconciled(batchId);
+      const statuses = (await Promise.all(ingestIds.map(ingestState))).map((s) => s.status).sort();
+      const txs = await q<{ id: string }>(`SELECT id FROM transactions WHERE source_ingest_id = ANY($1)`, [ingestIds]);
+      const runs = await Promise.all(ingestIds.map(runOf));
+      const overlap = maxOverlap(runs);
+      notes.push(`round ${round}: [${statuses.join(", ")}], ${txs.length} transaction(s), ${overlap} run(s) in flight at once`);
+      if (statuses.join() === "done,near_dup,near_dup" && txs.length === 1 && (await linksOf(txs[0]!.id)).length === 3) {
+        converged++;
+      }
+    }
+    assert(converged === 3, `${converged}/3 rounds converged to one transaction`);
+    notes.push("3/3 rounds converged to one transaction holding three documents");
+  });
+
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach
   let starbucks1Tx: string | null = null;
   await runCase("b2", true, async (notes) => {
@@ -1455,6 +2039,7 @@ async function main(): Promise<void> {
       { name: "starbucks-1.jpg", bytes: await readFile(path.join(UPLOADS_DIR, STARBUCKS_1)), mime: "image/jpeg" },
     ]);
     await pollBatch(seed.batchId);
+    await assertRunWriter(seed.ingestIds[0]!);
     const [seedIng] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [seed.ingestIds[0]]);
     assert(seedIng!.status === "done", `seed extraction: ${seedIng!.status}`);
@@ -1465,6 +2050,7 @@ async function main(): Promise<void> {
       { name: "starbucks-1-copy.jpg", bytes: await reencode(STARBUCKS_1, 70), mime: "image/jpeg" },
     ]);
     await pollBatch(copy.batchId);
+    await assertRunWriter(copy.ingestIds[0]!);
     const [ing] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [copy.ingestIds[0]]);
     assert(ing!.status === "near_dup", `expected near_dup, got ${ing!.status}`);
@@ -1481,6 +2067,7 @@ async function main(): Promise<void> {
       { name: "starbucks-2.jpg", bytes: await readFile(path.join(UPLOADS_DIR, STARBUCKS_2)), mime: "image/jpeg" },
     ]);
     await pollBatch(up.batchId);
+    await assertRunWriter(up.ingestIds[0]!);
     const [ing] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [up.ingestIds[0]]);
     assert(ing!.status === "done", `expected done (distinct INSERT), got ${ing!.status} — a near_dup here means pHash overrode the differing receipt numbers (calibration regression!)`);
@@ -1503,12 +2090,14 @@ async function main(): Promise<void> {
     const e1 = makeEml({ merchant: `Corner Cafe ${NONCE.toUpperCase()}`, totalUsd: "4.50", dateLine: date, item: "Drip Coffee" });
     const u1 = await postBatch([e1]);
     await pollBatch(u1.batchId);
+    await assertRunWriter(u1.ingestIds[0]!);
     const [i1] = await q<{ status: string }>(`SELECT status FROM ingests WHERE id = $1`, [u1.ingestIds[0]]);
     assert(i1!.status === "done", `first email: ${i1!.status}`);
 
     const e2 = makeEml({ merchant: `Corner Cafe ${NONCE.toUpperCase()}`, totalUsd: "4.50", dateLine: date, item: "Drip Coffee" });
     const u2 = await postBatch([e2]);
     await pollBatch(u2.batchId);
+    await assertRunWriter(u2.ingestIds[0]!);
     const [i2] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [u2.ingestIds[0]]);
     assert(i2!.status === "done", `second email should INSERT (no strong tiebreaker), got ${i2!.status}`);
@@ -1555,6 +2144,7 @@ async function main(): Promise<void> {
     // two concurrent heavy extractions + icon pipeline legitimately exceed
     // 10 min; wait for reconcile too, since path B is repaired by it.
     await pollBatch(up.batchId, 1_200_000, RECONCILE_DONE);
+    for (const id of up.ingestIds) await assertRunWriter(id);
     const ings = await q<{ status: string }>(
       `SELECT status FROM ingests WHERE batch_id = $1`, [up.batchId]);
     const statuses = ings.map((i) => i.status).sort();
