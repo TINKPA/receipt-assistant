@@ -20,6 +20,7 @@
  *   allocation_audit?                                          only when the lines miss the total
  *   near_dup_check?                                            from `decide()`
  *   receipt_facts?
+ *   owned_items_note?                                          income: why no sold item was retired
  *
  * `metadata.items` is not written: `transaction_items` is canonical and
  * `itemsFromMetadataFallback` serves legacy rows only. The FX and points
@@ -74,6 +75,7 @@ export const APPLIER_METADATA_KEYS = [
   "allocation_audit",
   "near_dup_check",
   "receipt_facts",
+  "owned_items_note",
 ] as const;
 export type ApplierMetadataKey = (typeof APPLIER_METADATA_KEYS)[number];
 
@@ -151,12 +153,18 @@ export function allocationAudit(record: ExtractionV1): Record<string, unknown> |
 /**
  * The metadata object for the transaction a receipt record inserts. Keys
  * whose value would be absent are left out, never written as null.
+ * `dedup` is what `decide()` found; `ownedItemsNote` is the writer's
+ * account of a sold item it could not retire (§6.3 l), the key the legacy
+ * prompt used for it.
  */
 export function buildTransactionMetadata(
   record: ExtractionV1,
   draft: ApplyDraft,
   ctx: MetadataRunContext,
-  dedup: { refundOf: string | null; nearDupCheck: NearDupCheck | null } = { refundOf: null, nearDupCheck: null },
+  dedup: { refundOf: string | null; nearDupCheck: NearDupCheck | null; ownedItemsNote?: string | null } = {
+    refundOf: null,
+    nearDupCheck: null,
+  },
 ): Record<string, unknown> {
   const { facts, merchant, audit } = record;
   if (!facts || !merchant) throw new Error("buildTransactionMetadata: only a receipt record has transaction metadata");
@@ -216,5 +224,6 @@ export function buildTransactionMetadata(
   if (allocation) m.allocation_audit = allocation;
   if (dedup.nearDupCheck) m.near_dup_check = dedup.nearDupCheck;
   if (record.receipt_facts && Object.keys(record.receipt_facts).length > 0) m.receipt_facts = record.receipt_facts;
+  if (dedup.ownedItemsNote) m.owned_items_note = dedup.ownedItemsNote;
   return m;
 }

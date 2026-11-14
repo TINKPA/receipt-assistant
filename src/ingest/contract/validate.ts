@@ -84,7 +84,8 @@ export const RECORD_WARNING_RULES = [
 /** Warnings only the applier can decide; they go on `apply_report`.
  *  The last two are the projection's own (`src/ingest/apply/project.ts`):
  *  a record that names an account its currency cannot use, and an owned
- *  item the record asked for that cannot be tracked. */
+ *  item the record asked for that cannot be tracked (the writer,
+ *  `catalog.ts`, also raises it for a sold item it cannot retire). */
 export const APPLY_WARNING_RULES = [
   "refund_of_dropped",
   "category_differs_from_merchant",
