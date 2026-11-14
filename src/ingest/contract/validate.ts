@@ -81,12 +81,17 @@ export const RECORD_WARNING_RULES = [
   "repair_changed_unnamed",
 ] as const;
 
-/** Warnings only the applier can decide; they go on `apply_report`. */
+/** Warnings only the applier can decide; they go on `apply_report`.
+ *  The last two are the projection's own (`src/ingest/apply/project.ts`):
+ *  a record that names an account its currency cannot use, and an owned
+ *  item the record asked for that cannot be tracked. */
 export const APPLY_WARNING_RULES = [
   "refund_of_dropped",
   "category_differs_from_merchant",
   "place_fetch_failed",
   "place_not_projectable",
+  "account_overridden",
+  "owned_items_skipped",
 ] as const;
 
 export type WarningRule =
