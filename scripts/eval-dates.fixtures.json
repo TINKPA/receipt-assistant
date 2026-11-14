@@ -12,7 +12,7 @@
       "total_minor": 17871
     },
     "expected_status": "done",
-    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, date and total, so #181 lever A must take the text path and never invoke pdftoppm. Ground truth read off the document itself: 'Fri, Jul 24, 2026 - Sat, Jul 25, 2026 / 178.71 USD', confirmation 93934392. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all."
+    "notes": "TEXT-LAYER PDF (#189). pdftotext -layout yields 1,732 B containing merchant, date and total, so #181 lever A must take the text path and never invoke pdftoppm. Ground truth read off the document itself: 'Fri, Jul 24, 2026 - Sat, Jul 25, 2026 / 178.71 USD'. Added because all 23 original fixtures are JPEGs and therefore cannot exercise lever A at all."
   },
   {
     "sha256": "8975c08945295d059a74e37ecea21c32b6641e208a62b9d28c7b16b6302588fb",
@@ -88,7 +88,7 @@
       "total_minor": 18425
     },
     "expected_status": "done",
-    "notes": "TEXT-LAYER PDF (#189), 5,460 B. Deliberately a hard_total: the invoice prints FOUR competing subtotals in one column — Subtotal 176.55, Parts Subtotal 102.29, Labor Subtotal 74.26, Total 184.25 — so a text-layer read that linearizes the column badly picks the wrong one. This is the case that catches lever A degrading accuracy rather than merely skipping a render. Ground truth from the document: Invoice 129724, 07/10/2026, Total 184.25."
+    "notes": "TEXT-LAYER PDF (#189), 5,460 B. Deliberately a hard_total: the invoice prints FOUR competing subtotals in one column — Subtotal 176.55, Parts Subtotal 102.29, Labor Subtotal 74.26, Total 184.25 — so a text-layer read that linearizes the column badly picks the wrong one. This is the case that catches lever A degrading accuracy rather than merely skipping a render. Ground truth from the document: invoice date 07/10/2026, Total 184.25."
   },
   {
     "sha256": "8e4239477e236ffa798d742f51c45b7c3e46fc590810de647f735d4e0c288a04",
