@@ -74,7 +74,10 @@
  *   `updated` event records a person changing it since (payee, date,
  *   metadata), so the applier is no longer the field's author. Records
  *   that booked nothing (attached, unsupported, statement, not applied)
- *   are counted, not compared.
+ *   are counted, not compared. A record whose apply failed (its run
+ *   finished `failed` / `apply`, the ingest `error`) is explained: the
+ *   failure is the run's to report, and the record waits for a re-apply.
+ *   Any other receipt record that no transaction names is unexplained.
  *
  * Prints counts per class; `--verbose` adds the transaction ids of each
  * class (ids only, no amounts, names or text).
@@ -717,7 +720,10 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
             d.mime_type, i.status::text AS ingest_status,
             (SELECT t.id FROM transactions t
               WHERE t.metadata->'extraction'->>'extraction_id' = e.id::text
-              ORDER BY t.created_at LIMIT 1) AS transaction_id
+              ORDER BY t.created_at LIMIT 1) AS transaction_id,
+            (SELECT r.outcome::text || '/' || COALESCE(r.error_class, '') FROM agent_runs r
+              WHERE r.extraction_id = e.id
+              ORDER BY r.started_at DESC NULLS LAST LIMIT 1) AS last_run
        FROM document_extractions e
        JOIN documents d ON d.id = e.document_id
        LEFT JOIN ingests i ON i.id = e.ingest_id
@@ -734,8 +740,23 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
       continue;
     }
     if (!r.transaction_id) {
-      const why = r.ingest_status === "near_dup" ? "attached to an existing transaction" : `not applied (ingest ${r.ingest_status ?? "gone"})`;
-      tally.add(`no transaction names the record: ${why}`, r.id, true, r.ingest_status === "near_dup" ? "an attach books nothing" : null);
+      const applyFailed = r.ingest_status === "error" && r.last_run === "failed/apply";
+      const why =
+        r.ingest_status === "near_dup"
+          ? "attached to an existing transaction"
+          : applyFailed
+            ? "the apply failed"
+            : `not applied (ingest ${r.ingest_status ?? "gone"})`;
+      tally.add(
+        `no transaction names the record: ${why}`,
+        r.id,
+        true,
+        r.ingest_status === "near_dup"
+          ? "an attach books nothing"
+          : applyFailed
+            ? "the run records the failure (agent_runs.error); the record waits, valid, for a re-apply"
+            : null,
+      );
       continue;
     }
     // A valid record's `result` is the record as validated (normalised,
