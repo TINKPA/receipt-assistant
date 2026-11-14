@@ -178,7 +178,7 @@ The code that turns a stored record into ledger rows. The worker calls it under 
 | `accounts.ts` | the chart of accounts as `project` takes it |
 | `metadata.ts` | `transactions.metadata` as a fixed key set (`APPLIER_METADATA_KEYS`) |
 | `catalog.ts`, `places.ts` | the catalog and place writes; every value is a bound parameter |
-| `candidates.ts`, `decide.ts` | the duplicate candidates, read after `takeWorkspaceApplyLock`, and the pure attach-or-insert decision. It reuses `IDENTIFIER_KEYS`, `compareIdentifiers`, `flowsDisagree` and `cardLast4` from `src/reconcile/dedup.ts`; change those there. |
+| `candidates.ts`, `decide.ts` | the duplicate candidates, read after `takeWorkspaceApplyLock`, and the pure attach-or-insert decision. It reuses `IDENTIFIER_KEYS`, `compareIdentifiers`, `flowsDisagree` and `cardLast4` from `src/reconcile/dedup.ts`; change those there. An identifier alone never attaches, and a conflicting key blocks an attach, with one exception (rule 2 (ii), tiebreaker `hard_tuple_misread`): exactly one key conflicts and its two values are the same length and differ in one character, at least two other keys match under the same key, the hard tuple holds and the cards agree. That reads one checkout whose key was misread; the attach flags the target for review (`near_dup_check`, the reason naming the key, also in `merge_audit` and `apply_report`). The exception lives here only: `src/reconcile/` is shared with the legacy writer and unchanged. |
 | `fingerprint.ts` | the fields two writers must agree on for one document, canonicalised and hashed |
 | `review.ts` | the record's own review reasons, read off its stored validation report: a date after the upload booked as printed (`future_date_unresolved`), and a repair round that changed the date, the time or money |
 | `version.ts` | `APPLIER_VERSION` |
@@ -829,7 +829,11 @@ same-batch `race` case (~15 min total); those do need a reset sandbox.
 The in-batch pass no longer removes a row on date + payee + amount
 alone, so `race` only converges on its second path when both
 extractions wrote the same identifier. That path has not been re-run
-since the change.
+since the change. Under `server_apply` the applier decides the second
+copy under the apply lock; when its reading differs from the first in
+one character of one identifier and agrees on the hard tuple and two
+other keys, it attaches (`hard_tuple_misread`) and flags the target, so
+`race` still expects one live transaction.
 
 The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable

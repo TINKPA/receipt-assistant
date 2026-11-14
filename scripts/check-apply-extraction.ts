@@ -31,7 +31,8 @@
  *   balance (Cash), a mixed tender (Credit Card, warned and flagged),
  *   points + cash on a debit card · JPY and EUR
  *   (the post-commit FX pass, rates from a seeded cache) · attach by
- *   identifier · attach by the hard tuple · attach refused: not a
+ *   identifier · attach by the hard tuple · attach with one identifier
+ *   misread by one character (the target flagged) · attach refused: not a
  *   candidate · attach refused: target deleted while the apply waited on
  *   its lock · attach refused: other direction · distinct · uncertain ·
  *   unsupported (text stamped) · statement (recorded, not booked) ·
@@ -495,6 +496,10 @@ const postingsOf = async (txId: string) =>
     [txId],
   );
 
+/** Whether the review queue's predicate (`?flagged=near_dup`) lists a row. */
+const inQueue = async (txId: string) =>
+  (await q(`SELECT 1 FROM transactions WHERE id = $1 AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`, [txId])).length === 1;
+
 // ── The fixtures ───────────────────────────────────────────────────────
 
 const W = await makeWorkspace("check-apply-extraction");
@@ -847,6 +852,38 @@ await fixture("attach by the hard tuple (card, minute, total, line totals)", asy
   const r = await ingest(W, receipt({ brand: "tuple", total: 1500, card: "0042", at: "2026-06-10T09:15:40-07:00", items }));
   check("attached to the target", r.res.outcome === "attached" && r.res.transactionIds[0] === target, json(r.res));
   check("by the hard tuple", r.res.report?.decision?.tiebreaker === "hard_tuple");
+});
+
+await fixture("attach with one identifier misread by one character: the target flagged for review", async () => {
+  const items = [
+    { line_no: 1, raw_name: "A", line_total_minor: 3000, item_class: "consumable", confidence: "high", product_key: `${slug("misread")}-a` },
+    { line_no: 2, raw_name: "B", line_total_minor: 1300, item_class: "consumable", confidence: "high", product_key: `${slug("misread")}-b` },
+  ];
+  const ids = { order_number: `M${N}-4300`, invoice_number: `MI-${N}`, approval_code: `MA${N}` };
+  const target = await seed(receipt({ brand: "misread", total: 4300, card: "0077", at: "2026-06-10T10:05:12-07:00", items, ids }));
+  const before = await one(`SELECT version, metadata FROM transactions WHERE id = $1`, [target]);
+  const expect = await watch(W);
+  const r = await ingest(W, receipt({ brand: "misread", total: 4300, card: "0077", at: "2026-06-10T10:05:12-07:00", items,
+    ids: { ...ids, order_number: `M${N}-4308` } }));
+  check("attached to the target", r.res.outcome === "attached" && json(r.res.transactionIds) === json([target]), json(r.res));
+  check("by its own tiebreaker", r.res.report?.decision?.tiebreaker === "hard_tuple_misread", json(r.res.report?.decision));
+  const t = await one(`SELECT version, metadata FROM transactions WHERE id = $1`, [target]);
+  const nd = t.metadata.near_dup_check;
+  check("the target is flagged, naming the key, reason first", nd?.flagged_for_review === true &&
+    (nd?.reason ?? "").startsWith("a document was attached although order_number differs by one character") &&
+    json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists the target", await inQueue(target));
+  const audit = t.metadata.merge_audit;
+  check("merge_audit records the tiebreaker and the flag", Array.isArray(audit) && audit.length === 1 &&
+    audit[0].tiebreaker === "hard_tuple_misread" && audit[0].flagged_for_review === nd?.reason, json(audit));
+  check("apply_report records it", json(r.res.report?.review) === json({ flagged: [nd?.reason], noted: [] }) &&
+    r.res.report?.decision?.flagged_for_review === nd?.reason, json(r.res.report?.review));
+  const rest = { ...t.metadata };
+  delete rest.merge_audit;
+  delete rest.near_dup_check;
+  check("nothing else on the target changed, and version moved once", canon(rest) === canon(before.metadata) &&
+    Number(t.version) === Number(before.version) + 1, json({ v0: before.version, v1: t.version }));
+  await expect({ document_links: 1, transaction_events: 1, document_extractions: 1 });
 });
 
 await fixture("attach refused: not a candidate (another workspace, outside the window)", async () => {
@@ -1239,9 +1276,6 @@ async function applyRepaired(ws: Ws, outcome: ValidationOutcome): Promise<Ran> {
   const res = await A.applyExtraction({ ...st, extractionId: rec.extractionId!, stats: STATS, placeFetcher: refuseFetch });
   return { st, outcome, rec, res };
 }
-
-const inQueue = async (txId: string) =>
-  (await q(`SELECT 1 FROM transactions WHERE id = $1 AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`, [txId])).length === 1;
 
 await fixture("a repair round that moved the date: booked as repaired, flagged with the reason", async () => {
   // The P3 smoke: a date after the upload bounced, and the reply moved it

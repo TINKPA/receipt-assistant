@@ -125,7 +125,10 @@
  *   race two byte-different copies in ONE batch     → ledger converges to 1 live txn
  *        (L3a attach in-flight, or the in-batch pass repairs after — which needs the two
  *        extractions to agree on an identifier; without one it is a 0.9 proposal for a
- *        person, and this case then fails by design)
+ *        person, and this case then fails by design). Under server_apply the applier
+ *        also attaches a copy whose reading differs in one character of one identifier
+ *        when the hard tuple and two other keys agree (`hard_tuple_misread`), and flags
+ *        the target
  */
 import "dotenv/config";
 import { readFile, mkdtemp } from "node:fs/promises";

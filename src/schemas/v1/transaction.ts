@@ -423,8 +423,9 @@ export const ListTransactionsQuery = z.object({
    *  Usually #134 branch 4 (a same-amount/date candidate existed but
    *  neither side had a strong tiebreaker, so the writer inserted AND
    *  flagged); the server writer also flags a mixed tender, a date booked
-   *  as printed after the upload and a repair that moved the date or
-   *  money, none of which names a candidate
+   *  as printed after the upload, a repair that moved the date or money,
+   *  and the target of an attach whose one identifier differs by one
+   *  character, none of which names a candidate
    *  (src/ingest/apply/decide.ts::flagForReview, review.ts). */
   flagged: z
     .enum(["near_dup"])
@@ -436,8 +437,9 @@ export const ListTransactionsQuery = z.object({
         "(near_dup_check names it). The server writer also flags, with no candidate, a row paid with a mixed " +
         "tender (booked whole to Credit Card, the split between its tenders not booked), a row booked on a " +
         "printed date after the document's upload, and a row whose date, time or money a repair round of " +
-        "the extraction changed. metadata.near_dup_check.reason says which; those reasons come before the " +
-        "duplicate check's own.",
+        "the extraction changed; and a row a document was attached to although one identifier differs by " +
+        "one character. metadata.near_dup_check.reason says which; those reasons come before the duplicate " +
+        "check's own.",
     }),
   sort: z.enum(["occurred_on", "amount", "created_at"]).optional(),
   order: z.enum(["asc", "desc"]).optional(),

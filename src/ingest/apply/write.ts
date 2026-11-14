@@ -52,7 +52,7 @@ import { pgSafeText } from "../contract/artefact.js";
 import type { ValidationReport, ValidationWarning } from "../contract/validate.js";
 import { readAccountCatalog } from "./accounts.js";
 import { findCandidates, takeWorkspaceApplyLock } from "./candidates.js";
-import { decide, type ApplyCandidate, type ApplyDecision } from "./decide.js";
+import { decide, flagStoredForReview, type ApplyCandidate, type ApplyDecision } from "./decide.js";
 import { buildTransactionMetadata, transactionReviewReasons } from "./metadata.js";
 import { recordReviewReasons } from "./review.js";
 import { ProjectionError, project, unbalancedCurrencies, type ApplyDraft, type AccountRef } from "./project.js";
@@ -525,10 +525,19 @@ function decisionReport(d: ApplyDecision): Record<string, unknown> {
     same_total: v.sameTotal,
     card_conflict: v.cardConflict,
     hard_tuple: v.hardTuple,
+    ...(v.misreadKey ? { misread_key: v.misreadKey } : {}),
     strong: v.strong,
   }));
   return d.action === "attach"
-    ? { action: "attach", target: d.targetId, tiebreaker: d.tiebreaker, reason: d.reason, considered, dropped: d.dropped }
+    ? {
+        action: "attach",
+        target: d.targetId,
+        tiebreaker: d.tiebreaker,
+        reason: d.reason,
+        ...(d.reviewFlag ? { flagged_for_review: d.reviewFlag } : {}),
+        considered,
+        dropped: d.dropped,
+      }
     : {
         action: "insert",
         verdict: d.verdict,
@@ -611,13 +620,23 @@ async function attach(
     decision: "attach",
     tiebreaker: decision.tiebreaker,
     reason: decision.reason,
+    ...(decision.reviewFlag ? { flagged_for_review: decision.reviewFlag } : {}),
     decided_by: "applier",
     applier_version: APPLIER_VERSION,
     at: new Date().toISOString(),
   };
+  // Rule 2(ii) (a key one character off): the target, held FOR UPDATE,
+  // is flagged for review on its own check, reason first.
+  // One UPDATE either way, so `version` moves once.
+  let base = sql`metadata`;
+  if (decision.reviewFlag) {
+    const row = await tx.execute(sql`SELECT metadata->'near_dup_check' AS check FROM transactions WHERE id = ${target}::uuid`);
+    const check = flagStoredForReview((row.rows[0] as { check: unknown } | undefined)?.check ?? null, decision.reviewFlag);
+    base = sql`jsonb_set(metadata, '{near_dup_check}', ${JSON.stringify(check)}::jsonb)`;
+  }
   await tx.execute(sql`
     UPDATE transactions
-       SET metadata = jsonb_set(metadata, '{merge_audit}',
+       SET metadata = jsonb_set(${base}, '{merge_audit}',
                                 COALESCE(metadata->'merge_audit', '[]'::jsonb) || jsonb_build_array(${JSON.stringify(audit)}::jsonb))
      WHERE id = ${target}::uuid`);
   await event(tx, {
@@ -636,8 +655,9 @@ async function attach(
   const { stamp, kind } = textOf(c);
   const { messageIdStored } = await stampDocument(tx, ids, stamp, c.source?.email);
   // The record's own review reasons: the attach books nothing of this
-  // reading, so they are noted, not flagged.
+  // reading, so they are noted, not flagged. A misread key flags the target.
   const noted = recordReviewReasons(c.validation);
+  const flagged = decision.reviewFlag ? [decision.reviewFlag] : [];
   return {
     outcome: "attached",
     status: "near_dup",
@@ -651,7 +671,7 @@ async function attach(
       candidates: candidateReport(candidates),
       ocr_text: kind,
       ...(c.source?.email ? { message_id_stored: messageIdStored } : {}),
-      ...(noted.length > 0 ? { review: { flagged: [], noted } } : {}),
+      ...(flagged.length + noted.length > 0 ? { review: { flagged, noted } } : {}),
       warnings: [...draft.warnings, ...decision.warnings],
     },
   };

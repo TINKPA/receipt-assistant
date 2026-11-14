@@ -25,18 +25,28 @@
  *   1. NO CANDIDATE LEFT: insert. `near_dup_check` is still written when
  *      a perceptually similar document existed (verdict `distinct`: it was
  *      dropped by the direction gate).
- *   2. STRONG MATCH. `strong(c)` needs all three of
- *        - the same merchant: equal `brand_id` (through the merchant row),
- *          or equal normalised payee, or equal normalised
- *          `metadata.merchant.canonical_name`;
- *        - no identifier conflict: no shared key carries different values;
- *        - one tiebreaker: an identifier match (the same value under the
- *          same key, or the same value of 6 or more characters under two
- *          different keys) with the same total in the record's currency
- *          and no conflicting card last-4, or the hard tuple (both card
- *          last-4 present and equal, both times present and equal to the
- *          minute, equal total, equal multisets of line totals with items
- *          on both).
+ *   2. STRONG MATCH. `strong(c)` needs the same merchant (equal `brand_id`
+ *      through the merchant row, or equal normalised payee, or equal
+ *      normalised `metadata.merchant.canonical_name`) and one of:
+ *        (i) no identifier conflict (no shared key carries different
+ *            values) and a tiebreaker: an identifier match (the same value
+ *            under the same key, or the same value of 6 or more characters
+ *            under two different keys) with the same total in the record's
+ *            currency and no conflicting card last-4, or the hard tuple
+ *            (both card last-4 present and equal, both times present and
+ *            equal to the minute, equal total, equal multisets of line
+ *            totals with items on both);
+ *        (ii) ONE MISREAD KEY, tiebreaker `hard_tuple_misread`: exactly one
+ *            key conflicts, and its two values have the same length after
+ *            trimming and differ in exactly one character; at least two
+ *            OTHER keys match (the same value under the same key); the hard
+ *            tuple holds; no card conflict. Two readings of one photo once
+ *            agreed on the total, the time to the second, the card, every
+ *            line total, the invoice number and the approval code, and
+ *            differed in one digit of the order number: an OCR
+ *            slip, and the purchase was booked twice until review. The
+ *            attach flags the TARGET for review (`reviewFlag`), naming the
+ *            key, so a person picks the right reading.
  *      Exactly one strong candidate: attach to it. More than one: insert,
  *      `uncertain`, flagged ("several candidates match").
  *
@@ -51,7 +61,15 @@
  *      leaves the record to rule 3 or 4: inserted, and flagged when a
  *      person must look. This is reconcile's own line (`scorePair` in
  *      `src/reconcile/dedup.ts` folds only equal totals, and a conflicting
- *      key or card sends a pair to review).
+ *      key or card sends a pair to review). The one exception is (ii): a
+ *      key one character off, when the card, the minute, the total, every
+ *      line total and two other keys agree, is a misreading of one
+ *      checkout, not a second money event. A second real charge at the
+ *      same minute carries its own approval code or order number, so two
+ *      conflicting keys, a difference of two characters or of length, a
+ *      missing hard tuple, or fewer than two other matching keys still
+ *      block. `src/reconcile/` is not changed: it is shared with the
+ *      legacy writer production runs.
  *   3. EVERY REMAINING CANDIDATE HAS AN IDENTIFIER CONFLICT: insert,
  *      `distinct`, naming them.
  *   4. OTHERWISE: insert, `uncertain`, `flagged_for_review` (the legacy
@@ -115,6 +133,8 @@ export interface CandidateVerdict {
   /** Both sides carry a card last-4, and they differ. */
   cardConflict: boolean;
   hardTuple: boolean;
+  /** The one conflicting key rule 2(ii) reads as a misreading, or null. */
+  misreadKey: IdentifierKey | null;
   strong: boolean;
 }
 
@@ -145,7 +165,9 @@ export type ApplyDecision =
   | (DecisionBase & {
       action: "attach";
       targetId: string;
-      tiebreaker: "identifier" | "hard_tuple";
+      tiebreaker: "identifier" | "hard_tuple" | "hard_tuple_misread";
+      /** Why the TARGET must be flagged for review (rule 2(ii)), or null. */
+      reviewFlag: string | null;
     })
   | (DecisionBase & {
       action: "insert";
@@ -183,8 +205,35 @@ export function flagForReview(check: NearDupCheck | null, reason: string): NearD
   };
 }
 
+/**
+ * `flagForReview` on the check a transaction already carries: the attach
+ * target of rule 2(ii). The stored check may be this applier's, the legacy
+ * agent's (any shape) or none; its other keys are kept, and its reason,
+ * when it has one, follows the new one.
+ */
+export function flagStoredForReview(stored: unknown, reason: string): Record<string, unknown> {
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) return { ...flagForReview(null, reason) };
+  const s = stored as Record<string, unknown>;
+  const prior = typeof s.reason === "string" && s.reason !== "" ? `; ${s.reason}` : "";
+  return { ...s, flagged_for_review: true, reason: `${reason}${prior}` };
+}
+
 /** Identifier values shorter than this match only under the same key. */
 export const CROSS_KEY_MIN_LENGTH = 6;
+
+/** Rule 2(ii): same-key matches, besides the misread key, it needs. */
+export const MISREAD_OTHER_KEYS_MIN = 2;
+
+/** Whether two identifier values, trimmed as `compareIdentifiers` trims
+ *  them, have the same length in characters and differ in exactly one. */
+export function differsByOneCharacter(a: string | null | undefined, b: string | null | undefined): boolean {
+  const x = [...(a ?? "").trim()];
+  const y = [...(b ?? "").trim()];
+  if (x.length === 0 || x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) diff += 1;
+  return diff === 1;
+}
 
 /** Case, width and spacing folded: how payees and merchant names compare. */
 export function normaliseName(s: string | null | undefined): string | null {
@@ -282,6 +331,18 @@ function judge(record: ExtractionV1, rec: DedupSide, c: ApplyCandidate): Candida
     sameMultiset(recItems, c.item_totals);
   const identifierTiebreak = ids.matches.length > 0 && sameTotal && !cardConflict;
 
+  // Rule 2(ii): one key one character off, everything else agreeing.
+  const only = ids.conflicts.length === 1 ? ids.conflicts[0]! : null;
+  const otherKeysMatching = ids.matches.filter((m) => !m.includes("~")).length;
+  const misreadKey =
+    only !== null &&
+    hardTuple &&
+    !cardConflict &&
+    otherKeysMatching >= MISREAD_OTHER_KEYS_MIN &&
+    differsByOneCharacter(rec.identifiers[only], c.identifiers[only])
+      ? only
+      : null;
+
   return {
     id: c.id,
     sameMerchant,
@@ -290,7 +351,8 @@ function judge(record: ExtractionV1, rec: DedupSide, c: ApplyCandidate): Candida
     sameTotal,
     cardConflict,
     hardTuple,
-    strong: sameMerchant !== null && noConflict && (identifierTiebreak || hardTuple),
+    misreadKey,
+    strong: sameMerchant !== null && ((noConflict && (identifierTiebreak || hardTuple)) || misreadKey !== null),
   };
 }
 
@@ -391,16 +453,30 @@ export function decide(record: ExtractionV1, candidates: readonly ApplyCandidate
   // 2. Strong match.
   if (strong.length === 1) {
     const v = strong[0]!;
+    const tuple = "card last-4, time to the minute, total and line totals all equal";
+    if (v.misreadKey !== null) {
+      const others = v.identifierMatches.filter((m) => !m.includes("~"));
+      return {
+        ...base,
+        action: "attach",
+        targetId: v.id,
+        tiebreaker: "hard_tuple_misread",
+        reviewFlag:
+          `a document was attached although ${v.misreadKey} differs by one character: ${tuple}, and ` +
+          `${others.join(", ")} match; check which reading of ${v.misreadKey} is right`,
+        considered: verdicts,
+        dropped,
+        reason: `same merchant (${v.sameMerchant}), ${tuple}, ${others.join(", ")} match, and ${v.misreadKey} differs by one character`,
+      };
+    }
     const tiebreaker = v.identifierMatches.length > 0 && v.sameTotal && !v.cardConflict ? "identifier" : "hard_tuple";
-    const evidence =
-      tiebreaker === "identifier"
-        ? `identifier match (${v.identifierMatches.join(", ")})`
-        : "card last-4, time to the minute, total and line totals all equal";
+    const evidence = tiebreaker === "identifier" ? `identifier match (${v.identifierMatches.join(", ")})` : tuple;
     return {
       ...base,
       action: "attach",
       targetId: v.id,
       tiebreaker,
+      reviewFlag: null,
       considered: verdicts,
       dropped,
       reason: `same merchant (${v.sameMerchant}) and ${evidence}`,
