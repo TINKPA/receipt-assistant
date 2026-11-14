@@ -25,11 +25,13 @@
  *   etag  document metadata ETag moves when the document does, and a
  *         transaction's ETag moves when its documents do (soft delete,
  *         restore, unlink, link, a cascade that keeps the transaction)
- *         while If-Match still lets an edit through
+ *         while If-Match still lets an edit through; a delete sent with
+ *         a whole tag from before a link is a 412
  *   state a request the resource is in the wrong state for, where
  *         cascade delete and dedup apply / undo meet: undo of a proposal
  *         that was never applied, already reverted, or whose documents
- *         were deleted since; what the cascade report says for a kept,
+ *         were deleted since (the duplicate's, or the survivor's own);
+ *         what the cascade report says for a kept,
  *         a deleted and an already-deleted transaction; the 409s and the
  *         422 the delete route can answer
  *   file  asset and document endpoints refuse a stored path outside
@@ -1313,6 +1315,37 @@ if (wants("etag")) {
     status: 412,
     type: "version-mismatch",
   });
+
+  // A delete is the one write that undoes a document change: a hard
+  // delete takes the links with it. Sent with the whole tag, it must
+  // match the documents part too; sent with the bare form, the version.
+  for (const hard of [true, false]) {
+    const mode = hard ? "hard" : "soft";
+    const e1 = await uploadDoc(`etag-del-${mode}-1`);
+    const e2 = await uploadDoc(`etag-del-${mode}-2`);
+    const victim = await txnWithDocs(`etag-del-${mode}`, a, b, [e1]);
+    const vurl = `/v1/transactions/${victim.id}${hard ? "?hard=true" : ""}`;
+    await call("POST", `/v1/documents/${e2}/links`, { json: { transaction_id: victim.id } });
+    const stale = await call("DELETE", vurl, { headers: { "If-Match": victim.etag } });
+    const left = await q<{ deleted: boolean; links: number }>(
+      `SELECT t.deleted_at IS NOT NULL AS deleted,
+              (SELECT count(*)::int FROM document_links dl WHERE dl.transaction_id = t.id) AS links
+         FROM transactions t WHERE t.id = $1`,
+      [victim.id],
+    );
+    record(G, `DELETE${hard ? "?hard=true" : ""}  If-Match: <whole ETag read before a document was linked>`, stale, {
+      status: 412,
+      type: "version-mismatch",
+      also: () => (left[0] && !left[0].deleted && left[0].links === 2 ? null : "refused, but something was deleted"),
+    });
+    const fresh = (await call("GET", `/v1/transactions/${victim.id}`)).headers.get("etag") ?? "";
+    record(G, `DELETE${hard ? "?hard=true" : ""}  If-Match: <the current ETag>`, await call("DELETE", vurl, { headers: { "If-Match": fresh } }), { status: 204 });
+  }
+  const e3 = await uploadDoc("etag-del-bare-1");
+  const e4 = await uploadDoc("etag-del-bare-2");
+  const bareVictim = await txnWithDocs("etag-del-bare", a, b, [e3]);
+  await call("POST", `/v1/documents/${e4}/links`, { json: { transaction_id: bareVictim.id } });
+  record(G, 'DELETE  If-Match: W/"<version>" after a link  (bare form: the version only)', await call("DELETE", `/v1/transactions/${bareVictim.id}`, { headers: { "If-Match": `W/"${bareVictim.version}"` } }), { status: 204 });
 }
 
 // ── state: where cascade delete and dedup apply / undo meet ────────────
@@ -1453,6 +1486,86 @@ if (wants("state")) {
               : "the two transactions do not each hold their own document",
       });
     }
+  }
+
+  // — apply, then the SURVIVOR's own document is cascade-deleted, then undo —
+  // The cascade keeps the survivor: the moved document still supports it.
+  // Undo must not then take that document away and leave the survivor in
+  // the ledger with nothing live behind it.
+  for (const hard of [false, true]) {
+    const mode = hard ? "hard" : "soft";
+    const s = await pair(`surv-${mode}`);
+    await reconcile("apply", [s.pid]);
+    const cascade = await call("DELETE", `/v1/documents/${s.docA}?cascade=true${hard ? "&hard=true" : ""}`);
+    record(G, `apply, then ${mode} cascade delete of the survivor's own document`, cascade, {
+      status: 200,
+      also: (o) => reportIs(o, { kept: [s.A] }),
+    });
+    const refused = await reconcile("undo", [s.pid]);
+    const survivor = await stateOf(s.A);
+    const dup = await stateOf(s.B);
+    const status = await proposalStatus(s.pid);
+    record(G, `…then undo: it would strip the survivor of its last live document (${mode})`, refused, {
+      status: 200,
+      also: (o) =>
+        skippedFor(o, "survivor_no_live_document") ??
+        (!survivor || survivor.deleted || survivor.live_docs !== 1
+          ? "the survivor lost the moved document anyway"
+          : !dup?.deleted
+            ? "the duplicate was restored"
+            : status !== "user_applied"
+              ? `the proposal is ${status}, not still applied`
+              : null),
+    });
+    // What settles it: the survivor's own document back (soft), or the
+    // survivor deleted (hard: its file is gone). Then undo goes through.
+    if (!hard) await call("POST", `/v1/documents/${s.docA}/restore`);
+    else {
+      const got = await call("GET", `/v1/transactions/${s.A}`);
+      await call("DELETE", `/v1/transactions/${s.A}`, { headers: { "If-Match": got.headers.get("etag") ?? "" } });
+    }
+    const retried = await reconcile("undo", [s.pid]);
+    const back = await stateOf(s.B);
+    const after = await stateOf(s.A);
+    record(G, hard ? "…delete the survivor, undo again" : "…restore the survivor's document, undo again", retried, {
+      status: 200,
+      also: (o) =>
+        o.json?.reverted?.length !== 1
+          ? `not reverted: "${String(o.json?.skipped?.[0]?.reason ?? "").slice(0, 60)}"`
+          : !back || back.deleted || back.live_docs !== 1
+            ? "the duplicate is not live with its document"
+            : hard
+              ? (after?.deleted ? null : "the survivor came back")
+              : after && !after.deleted && after.live_docs === 1 && after.links === 1
+                ? null
+                : "the survivor does not hold exactly its own document",
+    });
+  }
+  // A survivor that never had a document (a manual entry) is not held to
+  // this: the undo returns it to having none, which is where it started.
+  {
+    const docB = await uploadDoc("manual-b");
+    const manual = await txnWithDocs("manual-a", a, b, []);
+    const B = await txnWithDocs("manual-b", a, b, [docB]);
+    const pid = randomUUID();
+    await q(
+      `INSERT INTO reconcile_proposals (id, batch_id, kind, payload, score, status)
+       VALUES ($1, $2, 'dedup', $3::jsonb, 0.9, 'proposed')`,
+      [pid, batchId, JSON.stringify({ duplicate: B.id, duplicate_of: manual.id })],
+    );
+    await reconcile("apply", [pid]);
+    const undo = await reconcile("undo", [pid]);
+    const m = await stateOf(manual.id);
+    const back = await stateOf(B.id);
+    record(G, "apply onto a manual entry, then undo (survivor had no document of its own)", undo, {
+      status: 200,
+      also: (o) =>
+        o.json?.reverted?.length !== 1
+          ? `not reverted: "${String(o.json?.skipped?.[0]?.reason ?? "").slice(0, 60)}"`
+          : m && !m.deleted && m.links === 0 && back && !back.deleted && back.live_docs === 1
+            ? null
+            : "the two transactions are not back as they were",
+    });
   }
 
   // — the cascade report, one linked transaction at a time —
