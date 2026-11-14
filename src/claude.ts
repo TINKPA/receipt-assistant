@@ -245,7 +245,8 @@ export interface RunClaudeOptions {
   sessionId?: string;
   /**
    * Continue an earlier session instead of starting one: the repair round
-   * of a record extraction (wave 1, plan §5). Filled only by server code,
+   * of a record extraction (wave 1; docs/server-writer.md,
+   * "The repair round"). Filled only by server code,
    * and only with the session id the server minted for that same run, so
    * a document can never steer a spawn into somebody else's conversation.
    *

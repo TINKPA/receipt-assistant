@@ -1,6 +1,6 @@
 /**
  * check-projection-replay.ts — does the server applier's projection
- * reproduce the ledger? (wave 1, plan §12.3, §12.4.)
+ * reproduce the ledger? (wave 1; docs/server-writer.md, "Checks" and "Gates".)
  *
  * Usage:
  *   npx tsx scripts/check-projection-replay.ts --pg=<url> --from-ledger [--verbose] [--workspace=<uuid>]
@@ -14,7 +14,7 @@
  * the server does not confirm it. It is meant to run against production
  * as `receipts_ro`; until the owner asks for that, run it against a copy.
  *
- * --from-ledger (the pre-A/B gate, §12.4)
+ * --from-ledger (the pre-A/B gate)
  *
  *   For every live transaction an ingest wrote, it synthesises in memory
  *   the extraction record the legacy agent's reading amounts to, from the
@@ -37,8 +37,8 @@
  *     payment.method the payment text in metadata (`payment_method`,
  *                    `tender`, `payment`, …) read by keyword, else a typed
  *                    `card_last4` (card), else the booked mirror account
- *                    (circular, counted). The plan says so: the mirror
- *                    rule is partly circular here.
+ *                    (circular, counted): the paying-account rule is
+ *                    partly circular here, and the report says how often.
  *     income         the booked deposit and income accounts (circular).
  *     points         the programme from the points account's name.
  *
@@ -51,14 +51,15 @@
  *       record books nothing (X10);
  *     - several legs in one currency (a split tender): the contract has
  *       one pair per currency;
- *     - the payment text names a tender §3.3 books away from Credit Card
+ *     - the payment text names a tender the tender table
+ *       (docs/server-writer.md, "Tenders") books away from Credit Card
  *       (cash, a check, a bank transfer, a debit card, a gift card or a
  *       balance) and the row was booked to Credit Card: the legacy
- *       prompt's default mirror (hole 9), which §3.3 replaces with the
- *       stated method;
- *     - the other way round, a tender §3.3 sends to Credit Card (a card
- *       of no stated kind, a mixed tender, another tender) that the
- *       legacy agent booked to Cash or Checking: the table is the plan's.
+ *       prompt's default mirror (hole 9), which the table replaces with
+ *       the stated method;
+ *     - the other way round, a tender the table sends to Credit Card (a
+ *       card of no stated kind, a mixed tender, another tender) that the
+ *       legacy agent booked to Cash or Checking: that is the table's rule.
  *       A debit card booked to Checking and a gift card or balance booked
  *       to Cash match since the owner's tender decisions, and a debit card
  *       or gift card booked anywhere but its own account or Credit Card
@@ -426,28 +427,29 @@ export function explain(row: LedgerRow, syn: Synthesis, diff: MoneyDiff): string
   if (kinds.has("leg_count") && booked.length > 2 && new Set(booked.map((p) => p.currency)).size === 1) {
     return "legacy shape: several legs in one currency (a split tender), which the contract does not express";
   }
-  // §3.3 derives the mirror from the method the record states. The legacy
-  // prompt said "Mirror side is Credit Card (default)", so an agent that read
-  // a tender §3.3 books elsewhere (cash, a check or bank transfer, and since
-  // the owner's tender decisions a debit card, a gift card or a balance)
-  // and still booked the card is the rule change of hole 9, not a projector
-  // fault. Each method is its own class, so the printout shows which.
+  // The tender table derives the mirror from the method the record
+  // states. The legacy prompt said "Mirror side is Credit Card (default)",
+  // so an agent that read a tender the table books elsewhere (cash, a
+  // check or bank transfer, and since the owner's tender decisions a debit
+  // card, a gift card or a balance) and still booked the card is the rule
+  // change of hole 9, not a projector fault. Each method is its own
+  // class, so the printout shows which.
   const method = syn.raw.payment?.method as keyof typeof MIRROR_BY_METHOD;
   const projectedMirror = MIRROR_BY_METHOD[method];
   if (kinds.size === 1 && kinds.has("mirror_account") && syn.sources.method === "text") {
     if (mainMirror?.account_name === "Credit Card" && projectedMirror !== "Credit Card") {
-      return `hole 9: the payment text names a ${method} tender, which §3.3 books to ${projectedMirror}; the legacy prompt's default mirror was Credit Card`;
+      return `hole 9: the payment text names a ${method} tender, which the applier books to ${projectedMirror}; the legacy prompt's default mirror was Credit Card`;
     }
-    // The other way round: the legacy agent booked a tender §3.3 sends to
-    // Credit Card (a card of no stated kind, a mixed tender, another
-    // tender) to Cash or Checking. A debit card booked to Checking and a
+    // The other way round: the legacy agent booked a tender the table
+    // sends to Credit Card (a card of no stated kind, a mixed tender,
+    // another tender) to Cash or Checking. A debit card booked to Checking and a
     // gift card or balance booked to Cash are no longer here: they match.
     if (projectedMirror === "Credit Card") {
-      return `§3.3 sends this tender (${method}) to Credit Card; the legacy agent chose ${mainMirror?.account_name}`;
+      return `the applier sends this tender (${method}) to Credit Card; the legacy agent chose ${mainMirror?.account_name}`;
     }
   }
   if (kinds.size === 1 && kinds.has("expense_account") && syn.sources.category === "metadata") {
-    return "the legacy agent booked an expense account other than the merchant.category it wrote; the record carries one category and it picks the account (§6.3 d)";
+    return "the legacy agent booked an expense account other than the merchant.category it wrote; the record carries one category and it picks the account";
   }
   return null;
 }
@@ -618,7 +620,8 @@ async function fromLedger(pool: pg.Pool, db: Db, opts: { workspace?: string; ver
     if (!catalogs.has(row.workspace_id)) catalogs.set(row.workspace_id, await readAccountCatalog(db, row.workspace_id));
     if (row.metadata?.classification === "statement_pdf") {
       // X10: the legacy agent booked one transaction per statement row; a
-      // statement record books nothing (plan §6.3, owner question 2).
+      // statement record books nothing (docs/server-writer.md,
+      // "Records that book nothing").
       tally.add("statement row", row.id, gated, "X10: statements are recorded, not booked");
       continue;
     }
@@ -634,9 +637,10 @@ async function fromLedger(pool: pg.Pool, db: Db, opts: { workspace?: string; ver
     let refusedFor = "";
     if (!v.record && v.rules.every((r) => r.startsWith("future_date@"))) {
       // The contract refuses a date more than 2 days after the upload
-      // (§4.2), so arm B would ask for a re-read instead of booking it. The
-      // money is still checked, judged as of the transaction's own date.
-      refusedFor = "dated after its upload (future_date, §4.2); ";
+      // (`future_date`), so arm B would ask for a re-read instead of
+      // booking it. The money is still checked, judged as of the
+      // transaction's own date.
+      refusedFor = "dated after its upload (future_date); ";
       v = validateSynthesis(syn.raw, new Date(`${row.occurred_on}T00:00:00Z`));
     }
     if (!v.record) {

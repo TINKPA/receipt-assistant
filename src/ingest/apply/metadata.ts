@@ -1,10 +1,11 @@
 /**
- * `transactions.metadata` as the server applier writes it (wave 1, plan
- * §6.4): a FIXED key set, built by code from the validated record and the
- * run's own context. Nothing the model wrote reaches metadata except
- * through a named field of the contract, so the open-ended spread of keys
- * the agent used to invent ends here; the printed facts that fit no field
- * travel in the two bounded bags, `receipt_facts` and `other_references`.
+ * `transactions.metadata` as the server applier writes it (wave 1;
+ * docs/server-writer.md, "Transaction metadata"): a FIXED key set, built
+ * by code from the validated record and the run's own context. Nothing
+ * the model wrote reaches metadata except through a named field of the
+ * contract, so the open-ended spread of keys the agent used to invent
+ * ends here; the printed facts that fit no field travel in the two
+ * bounded bags, `receipt_facts` and `other_references`.
  *
  *   source, source_ingest_id, classification, flow, refund_of?, category_hint?
  *   merchant { canonical_name, brand_id, category }           the frontend reads it
@@ -26,7 +27,7 @@
  * `itemsFromMetadataFallback` serves legacy rows only. The FX and points
  * passes add `fx` / `points` after commit, as they do today.
  *
- * Choices the plan leaves open, made here:
+ * Choices made here:
  *   - `payment` is `<network> ****<last4>` when the last four digits are
  *     known (`****<last4>` without a network), else the tender line as
  *     printed, else absent. `cardLast4` in `src/reconcile/dedup.ts` reads
@@ -156,7 +157,7 @@ export function allocationAudit(record: ExtractionV1): Record<string, unknown> |
  * The metadata object for the transaction a receipt record inserts. Keys
  * whose value would be absent are left out, never written as null.
  * `dedup` is what `decide()` found; `ownedItemsNote` is the writer's
- * account of a sold item it could not retire (§6.3 l), the key the legacy
+ * account of a sold item it could not retire (insert step l), the key the legacy
  * prompt used for it.
  */
 export function buildTransactionMetadata(
@@ -212,9 +213,9 @@ export function buildTransactionMetadata(
   const printed = record.printed_totals
     ? Object.fromEntries(Object.entries(record.printed_totals).filter(([, v]) => v !== null && v !== undefined))
     : {};
-  // The frontend's Tax and Tip cells read these two top-level keys only
-  // (plan §6.4 restores tax_minor; tip_minor is the same case: the legacy
-  // agent wrote it, and without it a restaurant receipt loses its Tip cell).
+  // The frontend's Tax and Tip cells read these two top-level keys only.
+  // The legacy agent wrote both; without them a receipt loses its Tax
+  // cell, and a restaurant receipt its Tip cell.
   if (typeof printed.tax_minor === "number") m.tax_minor = printed.tax_minor;
   if (typeof printed.tip_minor === "number") m.tip_minor = printed.tip_minor;
   if (Object.keys(printed).length > 0) m.printed_totals = printed;

@@ -2,7 +2,9 @@
  * check-apply-decide.ts — the server applier's pure half: the duplicate
  * decision (`src/ingest/apply/decide.ts`), the projection to postings and
  * line items (`project.ts`), the metadata key set (`metadata.ts`) and the
- * fingerprint (`fingerprint.ts`) (wave 1, plan §6–§7, §12.3).
+ * fingerprint (`fingerprint.ts`) (wave 1; docs/server-writer.md,
+ * "Attach or insert", "Accounts and postings" and
+ * "Transaction metadata").
  *
  * WHY THIS EXISTS
  *
@@ -10,8 +12,8 @@
  * for a receipt: which account each amount goes to, with which sign, and
  * whether a document becomes a new purchase or evidence for one already
  * booked. A rule that quietly changes there books money wrong or merges
- * two purchases into one. Every rule of plan §7 and every posting shape
- * of §6.3 g is a row of the tables below, run on every build.
+ * two purchases into one. Every rule of the duplicate decision and every
+ * posting shape is a row of the tables below, run on every build.
  *
  * WHAT IT CHECKS
  *
@@ -218,7 +220,7 @@ function expectDecision(
   check(`decide: ${name}`, ok, `got ${json(got)} (${d.reason})`);
 }
 
-// ── decide(): §7 ───────────────────────────────────────────────────────
+// ── decide() ───────────────────────────────────────────────────────────
 
 {
   const r = rec();
@@ -498,7 +500,7 @@ function expectDecision(
   );
 }
 
-// ── project(): §6.3 ────────────────────────────────────────────────────
+// ── project() ──────────────────────────────────────────────────────────
 
 function expectShape(name: string, d: ApplyDraft, want: string[]): void {
   check(`project: ${name}`, shape(d) === [...want].sort().join(" | "), shape(d));
@@ -894,7 +896,7 @@ check(
   json(unbalancedCurrencies([{ amountMinor: 5, currency: "USD" }, { amountMinor: -5, currency: "USD" }, { amountMinor: 1, currency: "EUR" }])) === json(["EUR"]),
 );
 
-// ── metadata: §6.4 ─────────────────────────────────────────────────────
+// ── metadata ───────────────────────────────────────────────────────────
 
 const RUN: MetadataRunContext = {
   ingestId: "i-1",
@@ -1027,7 +1029,7 @@ const RUN: MetadataRunContext = {
   );
 }
 
-// ── fingerprint: §12.3 ─────────────────────────────────────────────────
+// ── fingerprint ────────────────────────────────────────────────────────
 
 {
   const r = rec();

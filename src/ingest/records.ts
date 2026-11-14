@@ -8,8 +8,8 @@
  * `src/schema/document_extractions.ts` for why it exists and what the
  * columns hold.
  *
- * `insertExtractionRecord` runs inside the caller's transaction (T1 in
- * the plan, §6.1) and in it:
+ * `insertExtractionRecord` runs inside the caller's transaction (T1;
+ * docs/server-writer.md, "The evidence store") and in it:
  *
  *   1. serialises with any other record write for the same document (a
  *      transaction-scoped advisory lock on the document id; no row lock,

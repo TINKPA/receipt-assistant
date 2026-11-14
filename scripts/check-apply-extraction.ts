@@ -1,7 +1,7 @@
 /**
  * check-apply-extraction.ts — the server applier (`src/ingest/apply/`)
- * against a real Postgres: every branch of plan §6.3 written and read back
- * (wave 1, P2).
+ * against a real Postgres: every branch of the apply written and read back
+ * (wave 1, P2; docs/server-writer.md, "applyExtraction").
  *
  * WHY THIS EXISTS
  *

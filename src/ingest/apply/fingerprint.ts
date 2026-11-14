@@ -1,7 +1,7 @@
 /**
- * The fingerprint of a receipt transaction (wave 1, plan §12.3): the
- * fields two writers must agree on for the same document, in one
- * canonical form, so two transactions (arm A and arm B of the A/B, or a
+ * The fingerprint of a receipt transaction (wave 1; docs/server-writer.md,
+ * "A/B comparison"): the fields two writers must agree on for the same
+ * document, in one canonical form, so two transactions (arm A and arm B of the A/B, or a
  * ledger row and the re-projection of the record it came from) compare
  * field by field and as one hash.
  *

@@ -198,9 +198,10 @@ export const defaultClaudeExtractor: Extractor = async (input) => {
 
 // ── Record path (wave 1, EXTRACTION_WRITER=server_apply) ──────────────
 
-/** The repair round's own timeout (plan §5). A resumed turn reads the
- *  conversation from the prompt cache and only re-reads what the errors
- *  name, so it gets far less than a first read. */
+/** The repair round's own timeout. A resumed turn reads the conversation
+ *  from the prompt cache and only re-reads what the errors name, so it
+ *  gets far less than a first read (docs/server-writer.md,
+ *  "The repair round"). */
 export const REPAIR_TIMEOUT_MS = 300_000;
 /** The most repair rounds `EXTRACTION_REPAIR_ROUNDS` may ask for. */
 export const MAX_REPAIR_ROUNDS = 2;
@@ -359,7 +360,8 @@ const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
 };
 
 /**
- * One ingest under the server writer, up to the record (plan §2, §5): the
+ * One ingest under the server writer, up to the record
+ * (docs/server-writer.md, "The run flow" and "The repair round"): the
  * spawn, the hand-back, validation and the repair rounds. It writes no
  * database row; the worker stores the result (T1) and applies it (T2).
  *
@@ -379,10 +381,10 @@ const runRecordClaude: RecordSpawn = async (prompt, session, timeoutMs) => {
  *      reply that resends the json but not the receipt-text block keeps
  *      the transcription an earlier reply gave.
  *
- * A missing record is not sent back: there is no field to name, and the
- * plan counts it as its own failure class. A first spawn that fails is
- * not parsed either, even when the transcript holds a record: a run that
- * timed out or crashed did not hand anything back.
+ * A missing record is not sent back: there is no field to name, and it
+ * is a failure class of its own (`artefact_missing`). A first spawn that
+ * fails is not parsed either, even when the transcript holds a record: a
+ * run that timed out or crashed did not hand anything back.
  */
 export async function runRecordExtraction(input: RecordExtractorInput): Promise<RecordExtractionResult> {
   const sessionId = input.sessionId;

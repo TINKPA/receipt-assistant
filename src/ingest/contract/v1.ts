@@ -300,7 +300,7 @@ function bag<V extends z.ZodTypeAny>(value: V, maxKeys: number, maxBytes?: numbe
   });
 }
 
-// ── §3.2 facts ─────────────────────────────────────────────────────────
+// ── facts ──────────────────────────────────────────────────────────────
 
 const Facts = z
   .object({
@@ -367,7 +367,7 @@ const Facts = z
     "The transaction header. Required when classification is receipt_image, receipt_email or receipt_pdf, and only then.",
   );
 
-// ── §3.3 payment, points, income ───────────────────────────────────────
+// ── payment, points, income ────────────────────────────────────────────
 
 const Payment = z
   .object({
@@ -434,7 +434,7 @@ const Income = z
     "Only when facts.flow is income. When left out, Checking and Other are used and the record carries a warning.",
   );
 
-// ── §3.4 merchant and place ────────────────────────────────────────────
+// ── merchant and place ─────────────────────────────────────────────────
 
 const Merchant = z
   .object({
@@ -504,7 +504,7 @@ const Place = z
   .strict()
   .describe("The merchant's location as you resolved it. The server fetches and stores the place record itself.");
 
-// ── §3.5 items ─────────────────────────────────────────────────────────
+// ── items ──────────────────────────────────────────────────────────────
 
 const optText = (max: number, d: string) => z.string().max(max).nullish().describe(d);
 const optMinor = (d: string) => minor().nullish().describe(d);
@@ -608,7 +608,7 @@ const Item = z
   })
   .strict();
 
-// ── §3.1 the rest of the top level ─────────────────────────────────────
+// ── the rest of the top level ──────────────────────────────────────────
 
 const Identifiers = z
   .object(

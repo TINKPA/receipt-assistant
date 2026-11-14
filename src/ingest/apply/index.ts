@@ -1,11 +1,11 @@
 /**
- * The server applier's entry points (wave 1, plan §6): what the worker
- * (`extractRecordAndApply` in `../worker.ts`) calls under
- * `EXTRACTION_WRITER=server_apply`, or for a record stub, once an agent (or
- * the stub) has handed back an extraction record. Nothing calls them on the
- * `agent_sql` path.
+ * The server applier's entry points (wave 1; docs/server-writer.md,
+ * "applyExtraction"): what the worker (`extractRecordAndApply` in
+ * `../worker.ts`) calls under `EXTRACTION_WRITER=server_apply`, or for a
+ * record stub, once an agent (or the stub) has handed back an extraction
+ * record. Nothing calls them on the `agent_sql` path.
  *
- *   recordExtraction       T1 (§6.1): store the record, valid or invalid,
+ *   recordExtraction       T1: store the record, valid or invalid,
  *                          in one fenced transaction. An invalid record
  *                          with no repair round left also errors the
  *                          ingest and finishes the run (`invalid_record`).
@@ -43,6 +43,10 @@
  *
  * The worker's other post-commit steps (SSE, batch completion, reconcile,
  * the lesson append) stay the worker's.
+ *
+ * The short labels in this directory's comments (T1, T2, X9, hole 5, P6,
+ * gate G2, insert step c) are defined in docs/server-writer.md,
+ * "Labels used in the code".
  */
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
@@ -93,7 +97,7 @@ export {
 } from "./write.js";
 export { prefetchPlace, type PlaceFetcher, type PlacePrefetch } from "./places.js";
 
-/** Attempts of one apply transaction: the first and two retries (§6.1). */
+/** Attempts of one apply transaction: the first and two retries. */
 export const APPLY_ATTEMPTS = 3;
 /** SQLSTATEs retried in-process: serialization failure, deadlock, lock timeout. */
 export const TRANSIENT_SQLSTATES: ReadonlySet<string> = new Set(["40001", "40P01", "55P03"]);
@@ -175,7 +179,8 @@ async function runStatsFor(ids: ApplyIds, given: RunStats | null | undefined): P
 }
 
 /**
- * Run `body` in one transaction, retrying a transient failure (§6.1).
+ * Run `body` in one transaction, retrying a transient failure
+ * (docs/server-writer.md, "Failures and retries").
  * Returns the body's value and the attempt it took, or the last error.
  */
 async function withRetries<T>(
@@ -314,7 +319,7 @@ async function applyStored(input: ApplyInput, outcomeOverride?: RunOutcome): Pro
   }
   const { record, rawText } = loaded;
   const receipt = isReceiptClassification(record.classification);
-  // Network, outside any transaction (§6.1): a cache miss is fetched now.
+  // Network, outside any transaction: a cache miss is fetched now.
   const place =
     input.place !== undefined
       ? input.place
@@ -498,8 +503,9 @@ export function rejectedText(outcome: ValidationOutcome): string {
 }
 
 /**
- * T1 (§6.1). Fenced like the apply: a run that no longer owns the ingest
- * stores nothing. A valid record supersedes the document's current one
+ * T1 (docs/server-writer.md, "The evidence store"). Fenced like the
+ * apply: a run that no longer owns the ingest stores nothing. A valid
+ * record supersedes the document's current one
  * (`records.ts`). An invalid record is stored as evidence; when `final`,
  * the ingest errors and the run finishes `invalid_record` /
  * `artefact_invalid` (or `agent_error` with `agentFailure`'s class) in the
@@ -661,7 +667,7 @@ export async function dryRun(p: {
 }
 
 /**
- * After commit (§6.1): value points legs, then convert foreign legs, on
+ * After commit: value points legs, then convert foreign legs, on
  * the transactions an apply wrote. Both passes look for `fx_rate IS NULL`,
  * so running them again changes nothing, and neither throws.
  */

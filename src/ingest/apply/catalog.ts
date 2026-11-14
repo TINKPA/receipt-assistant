@@ -1,7 +1,8 @@
 /**
- * The catalog writes of the server applier (wave 1, plan §6.3 a–e, i, k–n):
- * brands, the points account, the merchant, products and line items, owned
- * items, the sold-item retire, product statistics and the party graph.
+ * The catalog writes of the server applier (wave 1; docs/server-writer.md,
+ * "The insert, in order", steps a–e, i and k–n): brands, the points
+ * account, the merchant, products and line items, owned items, the
+ * sold-item retire, product statistics and the party graph.
  * Every function runs on the caller's apply transaction and takes its
  * values from the draft (`project.ts`) and the server's own context, never
  * from the record directly, and every value is a bound parameter.
@@ -43,7 +44,7 @@ import type { ApplyDraft, DraftParty } from "./project.js";
 
 type Executor = Pick<typeof db, "execute">;
 
-/** §6.3 a: the merchant's brand. Returns whether the stored name was kept
+/** Insert step a: the merchant's brand. Returns whether the stored name was kept
  *  over the record's (a real name that differs). */
 export async function upsertMerchantBrand(
   tx: Executor,
@@ -61,14 +62,15 @@ export async function upsertMerchantBrand(
   return { created: row.created, nameKept: row.name !== brand.name };
 }
 
-/** §6.3 b: a stub for every product brand the lines name (`brandFkGuard`). */
+/** Insert step b: a stub for every product brand the lines name
+ *  (`brandFkGuard`). */
 export async function ensureProductBrands(tx: Executor, items: ApplyDraft["items"]): Promise<void> {
   if (!items.some((i) => i.product_brand_id !== null)) return;
   await tx.execute(itemsBrandGuardSql(items));
 }
 
 /**
- * §6.3 c: the points account the draft names, created when it does not
+ * Insert step c: the points account the draft names, created when it does not
  * exist yet. Returns its id, or null when the record is not in points.
  */
 export async function ensurePointsAccount(
@@ -101,7 +103,8 @@ export async function readMerchant(
   return (res.rows[0] as { id: string; category: string | null } | undefined) ?? null;
 }
 
-/** §6.3 e: today's upsert. An existing row keeps its name and category. */
+/** Insert step e: today's upsert. An existing row keeps its name and
+ *  category. */
 export async function upsertMerchant(
   tx: Executor,
   workspaceId: string,
@@ -123,7 +126,7 @@ export interface WrittenItem {
 }
 
 /**
- * §6.3 i: the products upsert and the line items, run 1, as one statement
+ * Insert step i: the products upsert and the line items, run 1, as one statement
  * (`itemsWriteSql`), each row pointing at the record (`extraction_id`).
  * Product brand stubs must exist first (`ensureProductBrands`).
  */
@@ -154,7 +157,7 @@ export async function writeItems(
 }
 
 /**
- * §6.3 k: one `owned_items` row per unit of each line the draft tracks,
+ * Insert step k: one `owned_items` row per unit of each line the draft tracks,
  * the legacy statement's rules (durable, with a product, live run).
  * Returns how many rows were inserted.
  */
@@ -187,7 +190,7 @@ export interface SoldItemResult {
 }
 
 /**
- * §6.3 l, income only: retire the one live owned instance of the product
+ * Insert step l, income only: retire the one live owned instance of the product
  * the record says was sold. Matched on `product_key` across the
  * workspace's products (a merchant-exclusive and a portable product may
  * share a key; their instances are counted together). Exactly one live
@@ -232,7 +235,7 @@ export async function retireSoldItem(
   return { ...nothing, retiredId: ids[0]! };
 }
 
-/** §6.3 m: the statistics of the products this apply's lines point at,
+/** Insert step m: the statistics of the products this apply's lines point at,
  *  over live transactions only. */
 export async function recomputeTouchedProducts(
   tx: Executor,
@@ -244,7 +247,7 @@ export async function recomputeTouchedProducts(
 }
 
 /**
- * §6.3 n: one row per party, a line-level one pointing at the line item
+ * Insert step n: one row per party, a line-level one pointing at the line item
  * of this apply with its `line_no`. Duplicates by the table's identity
  * are skipped. Returns how many rows were inserted.
  */

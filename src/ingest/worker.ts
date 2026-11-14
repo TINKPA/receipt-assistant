@@ -9,8 +9,9 @@
  *       directly to the ledger via psql, then reads back the `ingests` row
  *       the agent updated, puts it through the #125 / #133 / #134 guards
  *       and builds the SSE event from it (`extractAndClose`).
- *   server_apply (wave 1, plan §2)  the agent reads and hands back an
- *       extraction record; the server writes (`extractRecordAndApply`):
+ *   server_apply (wave 1, docs/server-writer.md)  the agent reads and
+ *       hands back an extraction record; the server writes
+ *       (`extractRecordAndApply`):
  *       the pre-spawn Message-ID check (X9), the decode and the pHash
  *       neighbours, `runRecordExtraction` (spawn, parse, validate, repair
  *       round), T1 (`recordExtraction`: the record is stored, valid or
@@ -818,7 +819,8 @@ async function ingestUploadedAt(ingestId: string): Promise<Date> {
 }
 
 /** `document_extractions.input_meta`: what the run was shown besides the
- *  document (plan §8.2). Attachment hashes are best effort. */
+ *  document (docs/server-writer.md, "The evidence store"). Attachment
+ *  hashes are best effort. */
 async function recordInputMeta(
   neighbours: { documentId: string; transactionId: string; distance: number }[],
   attachments: DecodedAttachment[],
@@ -863,10 +865,10 @@ async function errorIngestOfRun(ids: ApplyIds, err: unknown): Promise<boolean> {
 }
 
 /**
- * One ingest under the server writer (plan §2). The agent reads; the
- * server stores what it handed back and writes the ledger. Every exit
- * finishes the run before the SSE event and the batch bookkeeping, as the
- * legacy path does; here the run is finished by the transaction that
+ * One ingest under the server writer (docs/server-writer.md,
+ * "The run flow"). The agent reads; the server stores what it handed back
+ * and writes the ledger. Every exit finishes the run before the SSE event
+ * and the batch bookkeeping, as the legacy path does; here the run is finished by the transaction that
  * closes the ingest (T1 for a rejected record, T2 for an applied one).
  *
  *   1. Decode an email or HTML upload (the text the agent is shown, and
@@ -1044,7 +1046,8 @@ async function extractRecordAndApply(
 
 /**
  * After an apply (or the X9 link) has committed or failed: the post-commit
- * passes, the SSE event, the batch, and the lesson proposal (plan §6.1).
+ * passes, the SSE event, the batch, and the lesson proposal
+ * (docs/server-writer.md, "The run flow", step 8).
  * The run is already finished, by the apply's own transaction.
  */
 async function closeApplied(

@@ -1,6 +1,6 @@
 /**
- * The merchant's place, as the server applier writes it (wave 1, plan
- * §6.3 o, X5).
+ * The merchant's place, as the server applier writes it (wave 1, X5;
+ * docs/server-writer.md, "The place").
  *
  * The record names a Google place id (the agent's Phase 3a judgment); the
  * server fetches, projects, stores and links it. Two halves, because one

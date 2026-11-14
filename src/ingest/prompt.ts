@@ -1,8 +1,9 @@
 /**
- * The ingest extractor prompt: one template, two renderings (wave 1, plan
- * §9). `ctx.writer` picks one, and every write-specific block is wrapped
- * in `forWriter(writer, legacyText, recordText)` so the reading text the
- * two share has one source and the arms cannot drift.
+ * The ingest extractor prompt: one template, two renderings (wave 1;
+ * docs/server-writer.md, "Two renderings of one prompt"). `ctx.writer`
+ * picks one, and every write-specific block is wrapped in
+ * `forWriter(writer, legacyText, recordText)` so the reading text the two
+ * share has one source and the arms cannot drift.
  *
  *   agent_sql     (legacy, `PROMPT_VERSION`) — the agent writes the v1
  *                 double-entry ledger directly via the `psql` Bash tool;
@@ -190,7 +191,8 @@ you converted yourself, would be booked as if the receipt had printed it.
 `;
 
 /** Record rendering: Phase 4a.0's place. The decision tree, the pHash list
- *  and the candidate query are the server's now (plan §7). */
+ *  and the candidate query are the server's now (docs/server-writer.md,
+ *  "Attach or insert"). */
 const RECORD_DUPLICATES = `**Duplicates are the server's call (#134).** The same purchase may
 already be in the ledger through another copy (a re-shot photo, a
 re-scanned PDF) or another evidence channel (the email for a PDF, the
@@ -204,7 +206,7 @@ duplicate the server cannot see.
 `;
 
 /** Record rendering: how the total was paid, which decides the paying
- *  account (plan §3.3 and the owner's tender decisions, `project.ts`), and
+ *  account (docs/server-writer.md, "Tenders"; `project.ts`), and
  *  the printed totals. Legacy has no counterpart: its template always
  *  credited Credit Card. */
 const RECORD_PAYMENT = `**payment** — how total_minor was paid, read off the tender line. The
@@ -244,10 +246,11 @@ programme code, facts.total_minor the points redeemed (never 0),
 priced in that cash currency says so in its own \`currency\`.`;
 
 /**
- * Record rendering: the hand-back (plan §5). It replaces the legacy Phase
- * 5 close-out, Output and Rules: the ending rule, "omit rather than
- * invent", the one repair round, and the contract itself, rendered from
- * the zod schema the validator enforces so the two cannot drift.
+ * Record rendering: the hand-back (docs/server-writer.md, "The hand-back").
+ * It replaces the legacy Phase 5 close-out, Output and Rules: the ending
+ * rule, "omit rather than invent", the one repair round, and the contract
+ * itself, rendered from the zod schema the validator enforces so the two
+ * cannot drift.
  */
 function recordHandBack(): string {
   return `── Rules ──────────────────────────────────────────────────────────────

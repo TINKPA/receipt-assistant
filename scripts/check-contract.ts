@@ -15,10 +15,11 @@
  *
  * WHAT IT CHECKS
  *
- *   - every §4.2 error rule bounces the record, with the right rule id
+ *   - every error rule (docs/server-writer.md, "Validation") bounces the
+ *     record, with the right rule id
  *     and path, and nothing else fires alongside it;
- *   - every §4.3 warning that can be decided from the record alone, and
- *     every §4.1 normalisation, is recorded;
+ *   - every warning that can be decided from the record alone, and every
+ *     normalisation, is recorded;
  *   - unknown keys are refused anywhere, and each key the record must
  *     never carry (`FORBIDDEN_PAYLOAD_KEYS`) is refused at the top level
  *     and inside the nested objects;
@@ -277,7 +278,7 @@ expectValid("given channel is kept", variant((r) => {
   ];
 }));
 
-// ── §4.1 normalisations ────────────────────────────────────────────────
+// ── Normalisations ─────────────────────────────────────────────────────
 
 {
   const o = expectValid("trim and empty to null", variant((r) => {
@@ -364,7 +365,7 @@ expectValid("given channel is kept", variant((r) => {
   }
 }
 
-// ── §4.2 errors ────────────────────────────────────────────────────────
+// ── Errors ─────────────────────────────────────────────────────────────
 
 expectErrors("not an object", [1, 2], [["schema", ""]]);
 expectErrors("wrong contract version", variant((r) => (r.contract_version = 2)), [["schema", "contract_version"]]);
@@ -496,7 +497,7 @@ expectErrors("receipt facts too large", variant((r) => {
     ["schema", "items[0].confidence"],
     ["schema", "merchant.place_id"],
   ]);
-  // §4.4: the repair request.
+  // The repair request.
   const text = renderRepairRequest(o.report.errors);
   check("repair: header", text.startsWith("Your extraction record was not accepted. Fix only the fields listed"));
   check("repair: asks for the full record in one json block", text.includes("full corrected record in one ```json block"));
@@ -553,7 +554,7 @@ expectErrors("forbidden refund_of inside a party", variant((r) => (r.parties = [
   ["schema", "parties[0].refund_of"],
 ]);
 
-// ── §4.3 warnings decidable from the record ────────────────────────────
+// ── Warnings decidable from the record ─────────────────────────────────
 
 expectValid("lines do not add up", variant((r) => {
   r.facts.total_minor = 2000;

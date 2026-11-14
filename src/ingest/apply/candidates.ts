@@ -1,6 +1,7 @@
 /**
- * Duplicate candidates for one receipt record (wave 1, plan §7): the live
- * transactions `decide()` compares the record with. Read-only.
+ * Duplicate candidates for one receipt record (wave 1; docs/server-writer.md,
+ * "Candidates"): the live transactions `decide()` compares the record
+ * with. Read-only.
  *
  * Run it INSIDE the apply transaction, AFTER `takeWorkspaceApplyLock`.
  * The lock is what makes "look for a duplicate, then insert" atomic: two
@@ -50,8 +51,9 @@ export const MAX_CANDIDATES = 25;
 type Executor = Pick<typeof db, "execute">;
 
 /**
- * The workspace's apply lock (§6.2), held to the end of the caller's
- * transaction. Every server apply in a workspace takes it first, so
+ * The workspace's apply lock, held to the end of the caller's
+ * transaction (docs/server-writer.md, "Prologue and run fence"). Every server
+ * apply in a workspace takes it first, so
  * candidates are computed and the ledger written with no other apply in
  * between. It is an advisory lock, outside the row lock order.
  */

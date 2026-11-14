@@ -109,8 +109,9 @@ Token cost: discovery dominated by WebSearch (1 call per unseen brand).
 Already-cached brands cost only one SELECT. Most receipts hit cache.`;
 
 /**
- * Phase 2.6 in the record rendering (wave 1, plan §9.2). Steps 1–2 of the
- * legacy phase survive as two optional merchant fields; the registry read,
+ * Phase 2.6 in the record rendering (wave 1; docs/server-writer.md,
+ * "Two renderings of one prompt"). Steps 1–2 of the legacy phase survive
+ * as two optional merchant fields; the registry read,
  * the web search for a domain, the upsert and the icon pipeline do not.
  * The server keeps the brand row (it never overwrites a real name with a
  * new one), and icons wait for a server-side enrichment job.

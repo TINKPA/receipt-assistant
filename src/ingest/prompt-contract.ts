@@ -17,7 +17,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /**
- * Which rendering of the ingest prompt (wave 1, plan §9.1). One template,
+ * Which rendering of the ingest prompt (wave 1; docs/server-writer.md,
+ * "Two renderings of one prompt"). One template,
  * two renderings, so the reading text both arms share has one source:
  *
  *   agent_sql     the legacy rendering (`PROMPT_VERSION`): the agent writes

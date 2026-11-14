@@ -1,5 +1,5 @@
 /**
- * The server applier's version (wave 1, plan §9.3).
+ * The server applier's version (wave 1; docs/server-writer.md, "Versions").
  *
  * Under `EXTRACTION_WRITER=server_apply` the ledger rows of a receipt are
  * derived in code from its stored extraction record

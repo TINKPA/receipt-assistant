@@ -1233,8 +1233,9 @@ async function checkProfile(profile: AgentProfileName): Promise<void> {
 }
 
 /**
- * The repair round resumes the run's session (`--resume`, plan §5). The
- * resuming spawn's flags decide the tools, not the session's history (the
+ * The repair round resumes the run's session (`--resume`;
+ * docs/server-writer.md, "The repair round"). The resuming spawn's flags
+ * decide the tools, not the session's history (the
  * P0 probe found this on 2.1.251), so a resume must offer exactly the
  * profile's list again: nothing more, nothing missing.
  */

@@ -1,6 +1,7 @@
 /**
  * Projection: an extraction record to the ledger rows it stands for
- * (wave 1, plan §6.3, rules a–o). Pure: no database, no clock, no ids.
+ * (wave 1; docs/server-writer.md, "Accounts and postings"). Pure: no
+ * database, no clock, no ids.
  *
  * `project(record, catalog)` takes a VALID receipt record (`receipt_image`,
  * `receipt_email`, `receipt_pdf`; see `contract/validate.ts`) and the
@@ -12,9 +13,9 @@
  * re-projected later (`scripts/check-projection-replay.ts`) and reach the
  * same rows.
  *
- * POSTINGS (§6.3 g). The total is signed as the legacy prompt signs it:
- * a refund's total is negative. One pair per currency, so each currency
- * balances within itself:
+ * POSTINGS (insert step g). The total is signed as the legacy prompt
+ * signs it: a refund's total is negative. One pair per currency, so each
+ * currency balances within itself:
  *
  *   purchase, refund   (expense, +T)  (mirror, −T)
  *   income             (deposit, +T)  (income, −T)
@@ -24,8 +25,8 @@
  *
  * The expense account is the record's `merchant.category` (one of the
  * seven), as it was the legacy prompt's. The MIRROR account is derived
- * from `payment.method` (§3.3, with the owner's tender decisions of
- * November 2026), not chosen by the model:
+ * from `payment.method` (docs/server-writer.md, "Tenders": the owner's
+ * tender decisions of November 2026), not chosen by the model:
  *
  *   cash, gift_card → Cash · debit_card, check, bank_transfer → Checking
  *   · points → the points account · card, mixed, other, unknown → Credit
@@ -39,7 +40,7 @@
  * which the writer turns into a review flag on the transaction
  * (`metadata.ts`); the record itself carries the warning `mixed_tender`.
  *
- * Two cases the plan's table leaves open, decided here and warned about
+ * Two cases the tender table leaves open, decided here and warned about
  * as `account_overridden`: `points` on a cash currency names no
  * programme, so it books to Credit Card; income in a points currency is
  * deposited in the points account, whatever `income.deposit_account`
@@ -57,11 +58,11 @@
  * the model: `ProjectionError('account_missing')`, which the writer turns
  * into a failed apply.
  *
- * LINE ITEMS (§6.3 i). The record's items in the ITEM_SCHEMA shape the
- * bound `itemsWriteSql` takes (`src/ingest/items-sql.ts`), `currency` and
- * `line_type` defaulted, `extraction_version = RECORD_PROMPT_VERSION`.
- * `track_as_owned` is not an item column; it becomes the owned-items
- * intent (§6.3 k).
+ * LINE ITEMS (insert step i). The record's items in the ITEM_SCHEMA
+ * shape the bound `itemsWriteSql` takes (`src/ingest/items-sql.ts`),
+ * `currency` and `line_type` defaulted,
+ * `extraction_version = RECORD_PROMPT_VERSION`. `track_as_owned` is not
+ * an item column; it becomes the owned-items intent (insert step k).
  */
 import type { ValidationWarning } from "../contract/validate.js";
 import {
@@ -146,30 +147,31 @@ export interface ApplyDraft {
   applierVersion: string;
   classification: ReceiptClassification;
   flow: Flow;
-  /** `transactions` (§6.3 f). Status is always `posted`. */
+  /** `transactions` (insert step f). Status is always `posted`. */
   header: { payee: string; occurredOn: string; occurredAt: string | null; status: "posted" };
-  /** `brands` upsert for the merchant (§6.3 a): a real name is never
+  /** `brands` upsert for the merchant (insert step a): a real name is never
    *  overwritten, only a slug stub is upgraded (the writer's SQL). */
   merchantBrand: { brandId: string; name: string; domain: string | null };
-  /** `merchants` upsert (§6.3 e). */
+  /** `merchants` upsert (insert step e). */
   merchant: { brandId: string; canonicalName: string; category: string };
   categoryHint: string | null;
   /** How the paying (or, for income, receiving) side was chosen;
    *  `metadata.mirror_account` records `accountName`. */
   mirror: { method: PaymentMethod; accountName: string };
-  /** Present for a points record (§6.3 c): the existing account, or the
+  /** Present for a points record (insert step c): the existing account, or the
    *  one to create under the `Assets` root. */
   pointsAccount: { existingId: string | null; create: { name: string; currency: string; parentId: string } | null } | null;
   postings: DraftPosting[];
   items: DraftItem[];
   /** The rest of `itemsWriteSql`'s parameters that the record decides. */
   itemsWrite: { run: 1; extractionVersion: string };
-  /** §6.3 k: lines to track, and how many instances that makes. */
+  /** Insert step k: lines to track, and how many instances that makes. */
   owned: { lineNos: number[]; instanceCount: number; acquiredOn: string };
-  /** §6.3 l, income only. */
+  /** Insert step l, income only. */
   soldItem: { productKey: string | null; nameAsPrinted: string } | null;
   parties: DraftParty[];
-  /** §6.3 o: what the writer fetches and links, when a place was resolved. */
+  /** Insert step o: what the writer fetches and links, when a place was
+   *  resolved. */
   place: {
     googlePlaceId: string;
     resolvedVia: string;
@@ -194,8 +196,9 @@ export class ProjectionError extends Error {
   }
 }
 
-/** §3.3: the account a payment method pays from. `points` names the
- *  programme's account; the others name a seeded account. */
+/** The tender table (docs/server-writer.md, "Tenders"): the account a
+ *  payment method pays from. `points` names the programme's account; the
+ *  others name a seeded account. */
 export const MIRROR_BY_METHOD: Readonly<Record<PaymentMethod, "Cash" | "Checking" | "Credit Card" | "points">> = {
   cash: "Cash",
   gift_card: "Cash",
@@ -299,7 +302,7 @@ export function project(
   const method = record.payment.method;
   const points = isPointsCurrency(currency);
 
-  // The points account (§6.3 c), whenever the main currency is points.
+  // The points account (insert step c), whenever the main currency is points.
   let pointsAccount: ApplyDraft["pointsAccount"] = null;
   let pointsRef: AccountRef | null = null;
   if (points) {
@@ -409,7 +412,7 @@ export function project(
 
   const items = record.items.map((it) => draftItem(it, currency));
 
-  // §6.3 k: only a purchase adds to what the user owns, only a durable
+  // Insert step k: only a purchase adds to what the user owns, only a durable
   // product line has a product row to own, one instance per unit.
   const owned = { lineNos: [] as number[], instanceCount: 0, acquiredOn: facts.occurred_on };
   record.items.forEach((it, i) => {
@@ -496,10 +499,10 @@ export function project(
 }
 
 /**
- * The currencies whose postings do not sum to zero (§6.3 j). The database
- * trigger checks only the base-currency sum; the writer asserts this one
- * after `SET CONSTRAINTS ALL IMMEDIATE`, and `project` never returns a
- * draft that fails it.
+ * The currencies whose postings do not sum to zero (insert step j). The
+ * database trigger checks only the base-currency sum; the writer asserts
+ * this one after `SET CONSTRAINTS ALL IMMEDIATE`, and `project` never
+ * returns a draft that fails it.
  */
 export function unbalancedCurrencies(postings: readonly { amountMinor: number | bigint | string; currency: string }[]): string[] {
   const sums = new Map<string, bigint>();
