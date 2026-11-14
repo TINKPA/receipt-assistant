@@ -147,7 +147,9 @@ reconcileRouter.post(
 // The inverse of apply, for a proposal in `auto_applied` / `user_applied`:
 // the duplicate is restored and the documents the apply moved to the
 // surviving transaction go back to it, in one database transaction. The
-// proposal ends `reverted` and the pair is not proposed again.
+// proposal ends `reverted` and the pair is not proposed again. A refusal
+// is a 200 with the proposal under `skipped` and a reason that starts
+// with a fixed word (`not_applied`, `no_live_document`, …).
 
 reconcileRouter.post(
   "/:id/reconcile/undo",
@@ -271,7 +273,7 @@ export function registerReconcileOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/batches/{id}/reconcile/undo",
     summary:
-      "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
+      "Undo one or more applied dedup proposals. Restores the duplicate transaction and moves the document links the apply took back to it, in one database transaction; the proposal becomes `reverted`. Skipped, with nothing changed, when the proposal was never applied, when the transaction was deleted again for another reason, when an old proposal left no trace of which documents moved, when every document the apply moved has since been deleted (`no_live_document`: a transaction is not restored without live evidence; restore a document first), or when the surviving transaction has since been folded into another by a later apply (`survivor_folded`: undo that proposal first).",
     tags: ["reconcile"],
     request: {
       params: z.object({ id: Uuid }),
