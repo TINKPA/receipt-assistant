@@ -30,8 +30,27 @@ import { fileURLToPath } from "node:url";
  * two number lines in one column (`1.8` sorting "newer" than `2.19`) is
  * pure liability, and nothing reads or compares either value. The path
  * is distinguished by `metadata.extraction.source ∈ {'ingest','re-extract'}`.
+ *
+ * Wave 1 adds a second line for its own rendering, `RECORD_PROMPT_VERSION`
+ * below; this one stays frozen for the legacy (agent-writes-SQL) prompt.
  */
 export const PROMPT_VERSION = "3.4";
+
+/**
+ * The version of the RECORD rendering of the ingest prompt (wave 1): the
+ * agent reads and hands back an extraction record
+ * (`src/ingest/contract/v1.ts`), and the server writes the ledger. Rows the
+ * server writer derives stamp this on `metadata.extraction.prompt_version`
+ * and `transaction_items.extraction_version`; `metadata.extraction.writer`
+ * tells the two lines apart.
+ *
+ * "4.0" is a clean break: a new output contract, no SQL, no database, no
+ * WebSearch. Bump it on any semantic change to the record rendering, and
+ * always together with `EXTRACTION_CONTRACT_VERSION` when the record's
+ * shape changes. When the legacy writer is retired the two constants
+ * collapse into one `PROMPT_VERSION = "4.0"`.
+ */
+export const RECORD_PROMPT_VERSION = "4.0";
 
 /**
  * The model identifier stamped into `transactions.metadata.extraction.model`
