@@ -855,8 +855,11 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
     }
     // A record names one tender, so the applier books a mixed one whole to
     // Credit Card and flags the transaction for review (`project.ts`).
-    // Income is deposited where `income` says; its method books nothing.
-    if (facts.flow !== "income" && rec.payment.method === "mixed") {
+    // Only a cash pair is paid by the method: income is deposited where
+    // `income` says, and points with no cash part pay from the points
+    // account whatever the method.
+    const cashPair = !isPointsCurrency(facts.currency) || rec.cash_component != null;
+    if (facts.flow !== "income" && cashPair && rec.payment.method === "mixed") {
       warn("mixed_tender", "payment.method", "paid with two or more tenders; the split between them is not booked", true);
     }
   }

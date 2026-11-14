@@ -202,14 +202,14 @@ Warnings are stored and never bounced. Those decided from the record alone are c
 | `no_items` | record | a receipt with no line items |
 | `income_defaults_applied` (money) | record | income without the `income` block |
 | `party_line_dropped` | record | a party's `line_no` matched no item |
-| `mixed_tender` (money) | record | a purchase or refund paid with `mixed` (see "Tenders") |
+| `mixed_tender` (money) | record | a purchase or refund whose cash pair is paid with `mixed`: a cash currency, or the cash part of points plus cash (see "Tenders") |
 | `review_flag_<flag>` | record | one per entry of `audit.review_flags` |
 | `repair_changed_unnamed` (money on money fields) | record | the repair round changed a field no error named |
 | `refund_of_dropped` | apply | several purchases share an identifier with a refund, so none is named |
 | `category_differs_from_merchant` | apply | the merchant row, fixed at first sight, has another category |
 | `place_fetch_failed` | apply | the place was not cached and could not be fetched |
 | `place_not_projectable` | apply | the fetched place has no English body with an address and a location |
-| `account_overridden` (money) | apply | `points` named on a cash currency (booked to Credit Card), or income in a points currency (deposited in the points account) |
+| `account_overridden` (money) | apply | payment method `points` on a record in a cash currency (booked to Credit Card), or income in a points currency (deposited in the points account) |
 | `owned_items_skipped` | apply | `track_as_owned` on a line that cannot be tracked, or a sold item that could not be retired |
 
 ## The repair round
@@ -419,7 +419,7 @@ An insert's verdict goes in `metadata.near_dup_check`: `candidate_transaction_id
   | income | (deposit account, +T) (income account, −T); the deposit and income accounts from the `income` block, Checking and Other by default |
   | points currency | (expense, +N) (points account, −N), and for a `cash_component` a second pair in that currency: (expense, ±C) (the method's account, ∓C), negative on a refund |
 
-- **Points.** The points account is the workspace's account of subtype `points` for that currency, or a new one under `Assets`. `points` named on a cash currency names no programme, so it books to Credit Card; income in a points currency is deposited in the points account. Both raise `account_overridden`. The cash part of a points-and-cash record follows the method, with `points` meaning Credit Card.
+- **Points.** The points account is the workspace's account of subtype `points` for that currency, or a new one under `Assets`. Payment method `points` on a record in a cash currency names no programme, so it books to Credit Card; income in a points currency is deposited in the points account. Both raise `account_overridden`. The cash part of a points-and-cash record follows the method, which on such a record names what paid the cash part; `points` there means Credit Card, without a warning.
 - **Base amounts.** Every posting carries `amount_base_minor = amount_minor` and no `fx_rate`. That NULL is what the points valuation and the FX pass look for after commit, as on the legacy path. Amounts are the record's minor units, untouched (`src/ledger/money.ts` explains why a published rate is never multiplied in here).
 - **Account lookup** is by type and exact name, deterministic when a name is duplicated: an open account before a closed one, a child before a root (the roots are never posted to), then the oldest id.
 - **A missing account** is `account_missing`: a seeding fault, never sent back to the model.
@@ -428,20 +428,22 @@ An insert's verdict goes in `metadata.near_dup_check`: `candidate_transaction_id
 
 | `payment.method` | Means | Books to |
 |---|---|---|
-| `card` | a credit card, or a card whose kind the document does not say; a phone wallet counts as a card unless the document says debit | Credit Card |
-| `debit_card` | a debit, ATM or bank card: the tender line says DEBIT or names a debit-only network | Checking |
+| `card` | a credit card, or a card whose kind the document does not say: a label naming both kinds (CREDIT/DEBIT) or neither ("bank card"); a phone wallet counts as a card unless the document says debit | Credit Card |
+| `debit_card` | only a card the document itself calls debit: the tender line reads DEBIT on its own or names a debit-only network | Checking |
 | `cash` | cash | Cash |
 | `check`, `bank_transfer` | a check, a bank transfer | Checking |
 | `gift_card` | a gift card, store credit, or a balance held in an app or account; never a card linked through one | Cash |
-| `points` | a points or miles redemption | the programme's points account |
+| `points` | a points or miles redemption with no cash part | the programme's points account |
 | `mixed` | two or more tenders that together paid the total | Credit Card, flagged |
 | `other`, `unknown` | any other tender; the document does not say | Credit Card |
 
 The table is `MIRROR_BY_METHOD` in `project.ts`. Why the less obvious rows are what they are:
 
-- A gift card or balance books to Cash: there is no gift-card account, Cash is where the legacy writer put such payments, and a prepaid balance is not a charge on the card statements that reconcile matches against.
-- A gift card or balance that covers only part of an order is not a second tender: the record's total is already what remained to pay, and the method is whatever paid that.
-- A record states one method, so a mixed tender cannot be split. It books whole to Credit Card, the record carries the warning `mixed_tender`, and the inserted transaction is flagged for review through `metadata.near_dup_check.flagged_for_review` with a reason saying the split was not booked. When the duplicate check found candidates, it keeps its verdict and candidates and the reason is appended; with no candidate the flag names none, so reconcile reads no verdict about any pair from it. The flag is set only when the mixed tender actually picked a paying account (a purchase or refund, or the cash part of points plus cash), and only on insert. Income ignores the method.
+- A gift card or balance books to Cash: there is no gift-card account, and a prepaid balance is not a charge on the card statements that reconcile matches against. This is a new rule, not the legacy writer's: the legacy template credited Credit Card by default, and most legacy rows paid this way sit there (see "Expected differences from the legacy writer").
+- A gift card or balance is never counted as a second tender. Its money was counted when it was loaded, so the record's total is what remained to pay (the Phase 2 rule both renderings share), and the method is whatever paid that; when the balance paid everything, the total is 0 and the method `gift_card`. Such a row therefore books little or nothing to Cash.
+- On a points redemption the main pair always pays from the points account, so `payment.method` names what paid the `cash_component`, and is `points` when there is none.
+- A label naming both kinds of card, or a bank card of no stated kind, is `card`: booking a credit card to Checking would split its money from the card statement reconcile matches against, and Credit Card is also where the legacy writer put an unspecified card.
+- A record states one method, so a mixed tender cannot be split. It books whole to Credit Card, the record carries the warning `mixed_tender`, and the inserted transaction is flagged for review through `metadata.near_dup_check.flagged_for_review` with a reason saying the split was not booked. When the duplicate check found candidates, it keeps its verdict and candidates and the tender's reason goes in front of its own, so a display that shows only the start of the reason still shows it; with no candidate the flag names none, so reconcile reads no verdict about any pair from it. The warning and the flag apply only where the method picks a paying account: a purchase or refund in a cash currency, or the cash part of points plus cash. Points with no cash part, and income, ignore the method. The flag is set only on insert. Dismissing it (`POST /v1/transactions/:id/near-dup-review`) books nothing: a split worth booking is a postings edit made first.
 
 ## The place
 

@@ -374,12 +374,14 @@ const Payment = z
     method: z
       .enum(PAYMENT_METHODS)
       .describe(
-        "How total_minor was paid. card: a credit card, or a card whose kind the document does not say (a phone wallet " +
-          "such as Apple Pay pays with a card). debit_card: a debit, ATM or bank card; the tender line says DEBIT or names " +
-          "a debit-only network. gift_card: a gift card, store credit, or a balance held in an app or account, never a card " +
-          "linked through one. mixed: two or more tenders. other: any other tender. unknown when the document does not say. " +
-          "Books to: cash and gift_card → Cash; debit_card, check and bank_transfer → Checking; points → the points account; " +
-          "anything else → Credit Card, and a mixed tender is flagged for review.",
+        "How total_minor was paid; on a points redemption, how its cash_component was paid (points when there is none). " +
+          "card: a credit card, or a card whose kind the document does not say: a label naming both kinds (CREDIT/DEBIT) or " +
+          "neither (\"bank card\"), and a phone wallet such as Apple Pay. debit_card: only when the document itself says " +
+          "debit: the tender line reads DEBIT on its own or names a debit-only network. gift_card: a gift card, store credit, " +
+          "or a balance held in an app or account, never a card linked through one; total_minor is what it left to pay, 0 " +
+          "when it paid everything. mixed: two or more tenders that together paid total_minor. other: any other tender. " +
+          "unknown when the document does not say. Books to: cash and gift_card → Cash; debit_card, check and bank_transfer " +
+          "→ Checking; points → the points account; anything else → Credit Card, and a mixed tender is flagged for review.",
       ),
     card_last4: z
       .string()

@@ -214,17 +214,22 @@ server picks the paying account from \`payment.method\` (the contract
 below says which method books where), so the method is a reading of the
 document, never a guess:
   - A card is \`card\` unless the document itself says debit: the tender
-    line reads DEBIT or names a debit-only network (Interac, Maestro, a
-    "US DEBIT" chip label). Then it is \`debit_card\`. A phone wallet
-    (Apple Pay, Google Pay) pays with a card and follows the same rule.
+    line reads DEBIT on its own or names a debit-only network (Interac,
+    Maestro, a "US DEBIT" chip label). Then it is \`debit_card\`. A label
+    that names both kinds (CREDIT/DEBIT, "Credit/Debit Card") or neither
+    ("bank card", "card") is \`card\`. A phone wallet (Apple Pay, Google
+    Pay) pays with a card and follows the same rule.
   - \`gift_card\` is a gift card, store credit, or a balance held in an
     app or account (a store app's balance, a PayPal or Venmo balance). A
     card linked through PayPal or an app is that card, not a balance.
-  - A gift card or balance that covered only part of the order is not a
-    second tender: total_minor is the residual (Phase 2), and the method
-    is what paid the residual. \`mixed\` is two or more tenders that
-    together paid total_minor (cash and a card, two cards); the server
-    books it whole to Credit Card and flags the transaction for a person.
+  - A gift card or balance is never counted as a second tender:
+    total_minor is the residual (Phase 2), and the method is what paid
+    the residual.
+    When a gift card or balance paid the whole order, total_minor is 0
+    (Phase 2) and the method is \`gift_card\`. \`mixed\` is two or more
+    tenders that together paid total_minor (cash and a card, two cards);
+    the server books it whole to Credit Card and flags the transaction
+    for a person.
 \`unknown\` when the document does not say. Copy card_last4 (exactly four
 digits), card_network and the tender line itself (as_printed) when they
 are printed.
@@ -239,11 +244,13 @@ items[] as well.`;
 const RECORD_POINTS = `
 
 **points** — an award redemption (Phase 2): facts.currency is the
-programme code, facts.total_minor the points redeemed (never 0),
-\`points.programme_name\` the programme as printed, and payment.method
-\`points\`. When the folio ALSO charges cash (a resort fee, parking), add
-\`cash_component\` {amount_minor, currency} for the cash part; a line
-priced in that cash currency says so in its own \`currency\`.`;
+programme code, facts.total_minor the points redeemed (never 0), and
+\`points.programme_name\` the programme as printed. When the folio ALSO
+charges cash (a resort fee, parking), add \`cash_component\`
+{amount_minor, currency} for the cash part; a line priced in that cash
+currency says so in its own \`currency\`. payment.method is what paid
+the cash part, read as above (a card, a debit card, cash, …), or
+\`points\` when there is no cash part.`;
 
 /**
  * Record rendering: the hand-back (docs/server-writer.md, "The hand-back").

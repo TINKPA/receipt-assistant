@@ -1017,7 +1017,7 @@ const RUN: MetadataRunContext = {
   check(
     "metadata: a mixed tender flags a distinct check and keeps its verdict and candidates",
     nd?.verdict === "distinct" && nd.flagged_for_review === false && both.verdict === "distinct" && both.flagged_for_review === true &&
-      json(both.candidate_transaction_ids) === json(nd.candidate_transaction_ids) && both.reason === `${nd.reason}; ${MIXED_TENDER_REVIEW}`,
+      json(both.candidate_transaction_ids) === json(nd.candidate_transaction_ids) && both.reason === `${MIXED_TENDER_REVIEW}; ${nd.reason}`,
     json(both),
   );
   const card = rec();

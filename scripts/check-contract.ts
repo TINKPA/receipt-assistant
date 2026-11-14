@@ -641,6 +641,23 @@ expectValid("the other review flags", variant((r) => (r.audit.review_flags = ["d
     r.income = { deposit_account: "Checking", income_account: "Other" };
     r.payment = { method: "mixed" };
   }), { noWarnings: ["mixed_tender"] });
+  // On a points record the method is what paid the cash part: with one,
+  // a mixed tender warns; with none, the points account pays whatever
+  // the method says, and nothing is left unbooked.
+  const pointsStay = (r: any, cash: boolean) => {
+    r.facts.currency = "EXAMPLE_PT";
+    r.facts.total_minor = 20000;
+    r.facts.total_printed = "20,000 points";
+    r.points = { programme_name: "Example Rewards" };
+    r.payment = { method: "mixed" };
+    r.items = [{ line_no: 1, raw_name: "ROOM", line_total_minor: 20000, item_class: "service", confidence: "high" }];
+    if (cash) {
+      r.cash_component = { amount_minor: 5000, currency: "USD" };
+      r.items.push({ line_no: 2, raw_name: "RESORT FEE", line_total_minor: 5000, currency: "USD", item_class: "service", confidence: "high", line_type: "service_fee" });
+    }
+  };
+  expectValid("mixed tender on the cash part of points plus cash", variant((r) => pointsStay(r, true)), { warnings: ["mixed_tender"] });
+  expectValid("mixed tender on points with no cash part is quiet", variant((r) => pointsStay(r, false)), { noWarnings: ["mixed_tender"] });
 }
 
 // Printed amounts, directly.

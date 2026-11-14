@@ -164,11 +164,14 @@ export type ApplyDecision =
  * and what its dismiss clears, so a row a person must look at for any
  * reason carries it there. A check that already exists keeps its verdict
  * and candidates (reconcile reads those, and a flag says nothing about
- * them) and gains the reason after its own; with no check, the flag names
- * no candidate, so reconcile finds no verdict about any pair in it.
+ * them) and gains the reason in front of its own: a reader that shows
+ * only the start of the reason (the review queue's card cuts it short,
+ * after a sentence of its own about duplicates) still shows this one.
+ * With no check, the flag names no candidate, so reconcile finds no
+ * verdict about any pair in it.
  */
 export function flagForReview(check: NearDupCheck | null, reason: string): NearDupCheck {
-  if (check) return { ...check, flagged_for_review: true, reason: `${check.reason}; ${reason}` };
+  if (check) return { ...check, flagged_for_review: true, reason: `${reason}; ${check.reason}` };
   return {
     candidate_transaction_ids: [],
     verdict: "uncertain",

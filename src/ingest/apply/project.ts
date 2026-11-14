@@ -33,9 +33,13 @@
  *   Card
  *
  * A gift card, store credit or app balance books to Cash: no gift-card
- * account exists, Cash is where the legacy writer put them, and a prepaid
- * balance is not a charge on the credit card that statements reconcile
- * against. A mixed tender cannot be split (the record states one method),
+ * account exists, and a prepaid balance is not a charge on the credit
+ * card that statements reconcile against. This is a new rule, not the
+ * legacy writer's: its template credited Credit Card by default, and most
+ * such legacy rows sit there. The balance's money was counted when it was
+ * loaded, so the reading makes total_minor what it left to pay (0 when it
+ * paid everything), and such a row books little or nothing to Cash.
+ * A mixed tender cannot be split (the record states one method),
  * so it books whole to Credit Card and the draft carries `reviewFlag`,
  * which the writer turns into a review flag on the transaction
  * (`metadata.ts`); the record itself carries the warning `mixed_tender`.
@@ -44,9 +48,10 @@
  * as `account_overridden`: `points` on a cash currency names no
  * programme, so it books to Credit Card; income in a points currency is
  * deposited in the points account, whatever `income.deposit_account`
- * says. The cash part of a points-and-cash record follows the method too,
- * with `points` (the usual method on such a record) meaning Credit Card,
- * as the legacy prompt's "the real credit card account" did.
+ * says. The cash part of a points-and-cash record follows the method too
+ * (on a points record the method is what paid the cash part), with
+ * `points` meaning Credit Card, as the legacy prompt's "the real credit
+ * card account" did.
  *
  * Every posting carries `amount_base_minor = amount_minor` and no
  * `fx_rate`, exactly as the agent wrote them: that NULL is what the FX
