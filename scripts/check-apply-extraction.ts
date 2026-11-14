@@ -43,7 +43,9 @@
  *   invalid JSON · a repair round (flagged: it moved the date and money)
  *   · one that moved a date after the upload (booked as repaired,
  *   flagged) · a date after the upload flagged date_unresolved (booked
- *   as printed, flagged) · one that changed neither (not flagged) · an
+ *   as printed, flagged) · date_unresolved and needs_review on a date
+ *   before the upload (flagged) · one that changed neither (not
+ *   flagged) · an
  *   attach whose record a round changed (noted, the target not flagged)
  *   · a repair round whose spawn failed ·
  *   an identifier match with another total (booked, flagged) · a
@@ -1309,6 +1311,23 @@ await fixture("future_date_unresolved: booked as printed and flagged", async () 
     /^date after the upload, booked as printed/.test(nd?.reason ?? "") && json(nd?.candidate_transaction_ids) === "[]", json(nd));
   check("the review queue lists it", await inQueue(txId));
   check("the run's report says why", r.res.report?.review?.flagged?.length === 1 && r.res.report.review.noted.length === 0, json(r.res.report?.review));
+});
+
+await fixture("date_unresolved and needs_review before the upload: booked and flagged", async () => {
+  const raw = receipt({ brand: "unconfirmed-date", total: 4225 });
+  raw.audit.review_flags = ["date_unresolved", "needs_review"];
+  raw.audit.chosen_date_reason = "no date printed; the file's modification time";
+  const r = await ingest(W, raw);
+  check("no date warning beyond the flags", !r.outcome.report.warnings.some((w) => w.rule === "future_date_unresolved"));
+  const txId = await checkWritten(r);
+  const t = await one(`SELECT occurred_on::text AS d, metadata FROM transactions WHERE id = $1`, [txId]);
+  check("booked on the record's date", t.d === DATE, t.d);
+  const nd = t.metadata.near_dup_check;
+  check("flagged for review, both reasons, naming no candidate", nd?.flagged_for_review === true &&
+    /^the reading could not confirm the date \(date_unresolved\).*; the reading asked for a person to look \(needs_review\)/.test(nd?.reason ?? "") &&
+    json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists it", await inQueue(txId));
+  check("the run's report says why", r.res.report?.review?.flagged?.length === 2 && r.res.report.review.noted.length === 0, json(r.res.report?.review));
 });
 
 await fixture("a repair round that changed nothing date- or money-related: not flagged", async () => {
