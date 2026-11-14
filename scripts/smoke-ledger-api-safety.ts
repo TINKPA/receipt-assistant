@@ -284,6 +284,9 @@ async function groupMetadata(): Promise<void> {
     ["near_dup_check", { flagged_for_review: false }],
     // Removing a null-valued member is still a change to the key.
     ["ocr_audit", { note: null }],
+    // Written only by the server applier (wave 1).
+    ["mirror_account", "Cash"],
+    ["printed_totals", { tax_minor: 1 }],
   ];
   for (const [key, value] of refused) {
     r = await patchTx(id, before.version, { metadata: { [key]: value }, narration: "must not apply" });

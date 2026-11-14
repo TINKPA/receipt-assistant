@@ -185,6 +185,18 @@ export const SERVER_OWNED_TX_METADATA_KEYS = [
   // amounts it explains.
   "fx",
   "points",
+
+  // Server-writer bookkeeping (wave 1). Writer: the server applier's
+  // metadata builder (src/ingest/apply/metadata.ts, plan §6.4), the only
+  // writer of either key. `mirror_account` names the account the applier
+  // derived from `payment.method` for the counter-posting: it records a
+  // decision, and the posting is the fact, so editing the key would only
+  // make the record disagree with its posting. `printed_totals` is the
+  // extraction record's reading of the printed subtotal/tax/tip/discount/
+  // fees, kept as evidence like `ocr_audit`; the editable receipt facts
+  // derived from it (`tax_minor`) stay client-writable.
+  "mirror_account",
+  "printed_totals",
 ] as const;
 
 const SERVER_OWNED = new Set<string>(SERVER_OWNED_TX_METADATA_KEYS);
