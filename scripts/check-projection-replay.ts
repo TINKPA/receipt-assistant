@@ -668,12 +668,15 @@ function shapeOf(d: ApplyDraft): string {
  * when every differing field has a recorded cause: a person's edit (an
  * `updated` event naming the field, or the metadata key it is read from),
  * a re-extract or added line items (items), a posting edited by hand
- * (postings), or a place the apply could not fetch (the run's
- * `apply_report.warnings[].rule`). Null when one field has none.
+ * (postings), a place the apply could not fetch (the run's
+ * `apply_report.warnings[].rule`), or a dedup apply that folded the
+ * transaction into another and moved its documents there (ocr_text
+ * present: a `deleted` event carrying the proposal). Null when one field
+ * has none.
  */
 export function explainRecordDiff(
   fields: string[],
-  events: { event_type: string; new: Record<string, any> | null }[],
+  events: { event_type: string; new: Record<string, any> | null; proposal_id?: string | null }[],
   applyReport: { warnings?: { rule?: string }[] } | null,
 ): string | null {
   const head = new Set<string>();
@@ -681,6 +684,7 @@ export function explainRecordDiff(
   const types = new Set<string>();
   for (const e of events) {
     types.add(e.event_type);
+    if (e.event_type === "deleted" && e.proposal_id) types.add("folded");
     if (e.event_type !== "updated" || !e.new) continue;
     for (const k of Object.keys(e.new)) head.add(k);
     if (e.new.metadata && typeof e.new.metadata === "object") for (const k of Object.keys(e.new.metadata)) meta.add(k);
@@ -699,6 +703,7 @@ export function explainRecordDiff(
     postings: () => ([...types].some((t) => t.startsWith("posting_")) ? "postings edited" : null),
     google_place_id: () =>
       warned.has("place_fetch_failed") || warned.has("place_not_projectable") ? "the place could not be fetched at apply" : null,
+    ocr_text_present: () => (types.has("folded") ? "folded by a dedup apply, its documents moved to the survivor" : null),
   };
   const reasons: string[] = [];
   for (const f of fields) {
@@ -785,10 +790,11 @@ async function records(pool: pg.Pool, db: Db, opts: { workspace?: string; verbos
       continue;
     }
     const ev = await pool.query(
-      `SELECT ev.event_type, ev.payload->'new' AS new
+      `SELECT ev.event_type, ev.payload->'new' AS new, ev.payload->>'proposal_id' AS proposal_id
          FROM transaction_events ev
         WHERE ev.transaction_id = $1::uuid
-          AND ev.event_type IN ('updated', 'items_added', 're_extracted', 'posting_added', 'posting_updated', 'posting_removed')`,
+          AND ev.event_type IN ('updated', 'items_added', 're_extracted', 'posting_added', 'posting_updated', 'posting_removed',
+                                'deleted')`,
       [r.transaction_id],
     );
     const run = await pool.query(
