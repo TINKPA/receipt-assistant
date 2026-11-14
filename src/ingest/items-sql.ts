@@ -27,8 +27,19 @@
  * resulting `item` CTE and must not be spliced into a statement that
  * lacks it.
  *
+ * Two consumers (wave 1). The prompts render the fragments with their
+ * defaults: a dollar-quoted `<ITEMS_JSON_ARRAY>` placeholder, the
+ * workspace id quoted in as a literal, `PROMPT_VERSION` as the version.
+ * Those defaults are the legacy rendering, and
+ * `scripts/check-prompt-render.ts` proves they still render byte for byte.
+ * The server writes the same rows with the same SQL: `itemsBrandGuardSql`,
+ * `itemsWriteSql` and `itemsRecomputeSql` at the bottom pass bound
+ * parameters (`$1::jsonb`, `$2::uuid`, …) as the expressions, so the
+ * DISTINCT ON upsert, the COALESCE rules and the line_no rules exist once.
+ *
  * Plain template literals, never `String.raw` — see `prompt-contract.ts`.
  */
+import { sql, type SQL } from "drizzle-orm";
 import { PROMPT_VERSION } from "./prompt-contract.js";
 
 /**
@@ -39,6 +50,19 @@ import { PROMPT_VERSION } from "./prompt-contract.js";
  * before #164.
  */
 export const ITEMS_JSON_EXPR = `$items$<ITEMS_JSON_ARRAY>$items$::jsonb`;
+
+/**
+ * Where a fragment takes the workspace id from: quoted into the text as a
+ * literal (`workspaceId`, the prompts) or an SQL expression
+ * (`workspaceIdExpr`, the server's bound parameter).
+ */
+export type WorkspaceRef =
+  | { workspaceId: string; workspaceIdExpr?: undefined }
+  | { workspaceIdExpr: string; workspaceId?: undefined };
+
+function workspaceSql(ref: WorkspaceRef): string {
+  return ref.workspaceIdExpr ?? `'${ref.workspaceId}'`;
+}
 
 /** The 26-column record type for `jsonb_to_recordset`. One copy. */
 const ITEM_RECORD_COLUMNS = `line_no int, parent_line_no int, raw_name text, normalized_name text,
@@ -77,10 +101,14 @@ function indentBlock(text: string, pad: string): string {
  * Place these FIRST in the `WITH` list; everything downstream reads
  * `item`.
  */
-export function itemsCte(): string {
+export function itemsCte(opts: {
+  /** SQL expression yielding the items array as jsonb. Default: the
+   *  prompts' dollar-quoted `<ITEMS_JSON_ARRAY>` placeholder. */
+  itemsJsonExpr?: string;
+} = {}): string {
   return `    -- #181: the items[] array enters this statement EXACTLY ONCE, here.
     -- Every CTE below reads \`item\` — do NOT paste the array again.
-    raw AS (SELECT ${ITEMS_JSON_EXPR} AS j),
+    raw AS (SELECT ${opts.itemsJsonExpr ?? ITEMS_JSON_EXPR} AS j),
     item AS (
       SELECT i.*
         FROM raw, jsonb_to_recordset(raw.j) AS i(
@@ -102,10 +130,13 @@ ${indentBlock(ITEM_RECORD_COLUMNS, "          ")}
  * recordset — CTEs are per-statement, so it cannot read `itemsCte()`'s
  * `item`.
  */
-export function brandFkGuard(): string {
+export function brandFkGuard(opts: {
+  /** As `itemsCte`'s. */
+  itemsJsonExpr?: string;
+} = {}): string {
   const stmt = `INSERT INTO brands (brand_id, name)
 SELECT DISTINCT product_brand_id, product_brand_id
-  FROM jsonb_to_recordset(${ITEMS_JSON_EXPR})
+  FROM jsonb_to_recordset(${opts.itemsJsonExpr ?? ITEMS_JSON_EXPR})
     AS item(product_brand_id text)
  WHERE product_brand_id IS NOT NULL
 ON CONFLICT (brand_id) DO NOTHING;`;
@@ -122,8 +153,7 @@ ON CONFLICT (brand_id) DO NOTHING;`;
  * Returned WITHOUT a trailing comma so the call site can place it
  * anywhere in a `WITH` list.
  */
-export function productsUpsert(opts: {
-  workspaceId: string;
+export function productsUpsert(opts: WorkspaceRef & {
   /** SQL expression yielding the merchant id for merchant-exclusive
    *  products, e.g. `(SELECT id FROM m)`. */
   merchantIdExpr: string;
@@ -151,7 +181,7 @@ export function productsUpsert(opts: {
         manufacturer
       )
       SELECT DISTINCT ON (item.product_key, COALESCE(item.product_merchant_exclusive, false))
-             '${opts.workspaceId}',
+             ${workspaceSql(opts)},
              CASE WHEN item.product_merchant_exclusive THEN ${opts.merchantIdExpr} ELSE NULL END,
              item.product_key,
              COALESCE(item.normalized_name, item.raw_name),
@@ -181,8 +211,7 @@ export function productsUpsert(opts: {
  * CTE wrapper) so the ingest path can wrap it as `ti AS ( … )` and the
  * re-extract path can terminate it with `;`.
  */
-export function transactionItemsInsert(opts: {
-  workspaceId: string;
+export function transactionItemsInsert(opts: WorkspaceRef & {
   /** SQL expression yielding the transaction id, e.g. `tx.id`. */
   txIdExpr: string;
   /** SQL expression yielding the extraction_run number, e.g. `1`. */
@@ -202,19 +231,29 @@ export function transactionItemsInsert(opts: {
    *  survivor's number — leaving two LIVE rows with the same line_no and an
    *  ambiguous rendered order. Ingest passes nothing; it has no survivors. */
   lineNoOffsetExpr?: string;
+  /** SQL expression yielding `extraction_version`. Default: this source
+   *  tree's `PROMPT_VERSION` as a literal. */
+  versionExpr?: string;
+  /** SQL expression yielding `extraction_id`, the extraction record the
+   *  rows were projected from. Absent: the column is not named at all,
+   *  which is the prompts' form. */
+  extractionIdExpr?: string;
 }): string {
   const from = opts.fromPrefix ? `${opts.fromPrefix} ` : "";
   const returning = opts.returning ? `\n      RETURNING ${opts.returning}` : "";
   const off = opts.lineNoOffsetExpr ? ` + ${opts.lineNoOffsetExpr}` : "";
+  const version = opts.versionExpr ?? `'${PROMPT_VERSION}'`;
+  const extractionCol = opts.extractionIdExpr ? ", extraction_id" : "";
+  const extractionVal = opts.extractionIdExpr ? `, ${opts.extractionIdExpr}` : "";
   return `      INSERT INTO transaction_items (
         id, workspace_id, transaction_id, line_no, parent_line_no,
         raw_name, normalized_name, product_variant, quantity, unit,
         unit_price_minor, line_total_minor, currency,
         item_class, durability_tier, food_kind, tags, confidence,
         line_type, product_id, tax_minor, tip_share_minor,
-        discount_share_minor, extraction_run, extraction_version
+        discount_share_minor, extraction_run, extraction_version${extractionCol}
       )
-      SELECT gen_random_uuid(), '${opts.workspaceId}', ${opts.txIdExpr}, item.line_no${off},
+      SELECT gen_random_uuid(), ${workspaceSql(opts)}, ${opts.txIdExpr}, item.line_no${off},
              CASE WHEN item.parent_line_no IS NULL THEN NULL
                   ELSE item.parent_line_no${off} END,
              item.raw_name, item.normalized_name, item.product_variant,
@@ -229,7 +268,7 @@ export function transactionItemsInsert(opts: {
                       (CASE WHEN item.product_merchant_exclusive THEN ${opts.merchantIdExpr} ELSE NULL END)
                 LIMIT 1),
              item.tax_minor, item.tip_share_minor, item.discount_share_minor,
-             ${opts.runExpr}, '${PROMPT_VERSION}'
+             ${opts.runExpr}, ${version}${extractionVal}
       FROM ${from}item${returning}`;
 }
 
@@ -247,8 +286,7 @@ export function transactionItemsInsert(opts: {
  *
  * Returns a bare statement (terminated with `;`, no heredoc wrapper).
  */
-export function productAggregateRecompute(opts: {
-  workspaceId: string;
+export function productAggregateRecompute(opts: WorkspaceRef & {
   /** SQL predicate selecting the `transaction_items ti JOIN transactions t`
    *  rows this run touched, e.g. `t.source_ingest_id = '<uuid>'`. */
   touchedPredicate: string;
@@ -270,7 +308,7 @@ export function productAggregateRecompute(opts: {
            SUM(ti.effective_total_minor)    AS total_minor
     FROM transaction_items ti
     JOIN transactions t ON t.id = ti.transaction_id
-    WHERE ti.workspace_id = '${opts.workspaceId}'
+    WHERE ti.workspace_id = ${workspaceSql(opts)}
       AND ti.product_id IN (SELECT product_id FROM touched)
       AND ti.retired_at IS NULL
       AND ti.line_type = 'product'
@@ -284,5 +322,123 @@ export function productAggregateRecompute(opts: {
     updated_at         = NOW()
   FROM stats
   WHERE p.id = stats.product_id
-    AND p.workspace_id = '${opts.workspaceId}';`;
+    AND p.workspace_id = ${workspaceSql(opts)};`;
+}
+
+// ── The same SQL for the server, with every value bound ──────────────
+
+/**
+ * Splice bound parameters into fragment text. A fragment is built with a
+ * marker (`param("items")`) where a value goes, and this turns each marker
+ * into a drizzle parameter: node-postgres then sends the statement with
+ * `$1`, `$2`, … in those places and the values beside it, so nothing the
+ * extraction produced is ever part of the SQL text.
+ */
+const MARKER = /\u0000([a-z_]+)\u0000/g;
+const param = (name: string) => `\u0000${name}\u0000`;
+
+function bindMarkers(text: string, values: Record<string, unknown>): SQL {
+  const out = sql.empty();
+  let last = 0;
+  for (const m of text.matchAll(MARKER)) {
+    const name = m[1]!;
+    if (!(name in values)) throw new Error(`items-sql: no value bound for ${name}`);
+    out.append(sql.raw(text.slice(last, m.index)));
+    out.append(sql`${values[name]}`);
+    last = m.index! + m[0].length;
+  }
+  out.append(sql.raw(text.slice(last)));
+  return out;
+}
+
+/** `JSON.stringify` the items array for a `::jsonb` parameter. A bare JS
+ *  array would be sent as a Postgres array literal instead. */
+function itemsJson(items: readonly unknown[]): string {
+  return JSON.stringify(items);
+}
+
+/**
+ * `brandFkGuard` for the server: a `brands` stub for every distinct
+ * `product_brand_id` in `items`, `ON CONFLICT DO NOTHING`. Its own
+ * statement, run before `itemsWriteSql` (see `brandFkGuard`).
+ */
+export function itemsBrandGuardSql(items: readonly unknown[]): SQL {
+  const text = brandFkGuard({ itemsJsonExpr: `${param("items")}::jsonb` }).trim();
+  return bindMarkers(text, { items: itemsJson(items) });
+}
+
+/**
+ * The products upsert and the `transaction_items` insert for the server:
+ * one statement, `WITH raw, item, p_upsert INSERT …`, built from
+ * `itemsCte`, `productsUpsert` and `transactionItemsInsert` with bound
+ * values, so it is the SQL the prompts render, row rules included:
+ * `DISTINCT ON` the catalog upsert (#181), COALESCE on conflict, one row
+ * per printed line, `parent_line_no` shifted with `line_no`.
+ *
+ * Product brands must exist first (`itemsBrandGuardSql`).
+ */
+export function itemsWriteSql(opts: {
+  /** The ITEM_SCHEMA array, as validated. */
+  items: readonly unknown[];
+  workspaceId: string;
+  transactionId: string;
+  /** The transaction's merchant, used for merchant-exclusive products;
+   *  NULL makes every product portable, as the SQL does today when the
+   *  merchant expression yields nothing. */
+  merchantId: string | null;
+  /** `extraction_run`: 1 at ingest, the next run on a re-extract. */
+  run: number;
+  /** `extraction_version`, e.g. `RECORD_PROMPT_VERSION`. */
+  extractionVersion: string;
+  /** `extraction_id`. Omit (undefined) to leave the column unnamed. */
+  extractionId?: string | null;
+  /** Added to every `line_no` and `parent_line_no` (re-extract shifts a
+   *  run past surviving manual lines, #192). Omit at ingest. */
+  lineNoOffset?: number;
+  /** RETURNING column list, e.g. `id, line_no, product_id`. */
+  returning?: string;
+}): SQL {
+  const merchantIdExpr = `${param("merchant")}::uuid`;
+  const ws = { workspaceIdExpr: `${param("workspace")}::uuid` };
+  const text = `WITH
+${itemsCte({ itemsJsonExpr: `${param("items")}::jsonb` })},
+${productsUpsert({ ...ws, merchantIdExpr })}
+${transactionItemsInsert({
+  ...ws,
+  txIdExpr: `${param("tx")}::uuid`,
+  runExpr: `${param("run")}::int`,
+  merchantIdExpr,
+  versionExpr: `${param("version")}::text`,
+  ...(opts.extractionId !== undefined ? { extractionIdExpr: `${param("extraction")}::uuid` } : {}),
+  ...(opts.lineNoOffset !== undefined ? { lineNoOffsetExpr: `${param("line_offset")}::int` } : {}),
+  ...(opts.returning ? { returning: opts.returning } : {}),
+})}`;
+  return bindMarkers(text, {
+    items: itemsJson(opts.items),
+    workspace: opts.workspaceId,
+    merchant: opts.merchantId,
+    tx: opts.transactionId,
+    run: opts.run,
+    version: opts.extractionVersion,
+    extraction: opts.extractionId ?? null,
+    line_offset: opts.lineNoOffset ?? 0,
+  });
+}
+
+/**
+ * `productAggregateRecompute` for the server, scoped to the products one
+ * transaction's line items touch: the recompute the prompts run, bound.
+ *
+ * It keeps that SQL's semantics, which are not the route's: a product
+ * with no live product line left is not updated, and deleted
+ * transactions count. `recomputeProductStats` (src/catalog/product-stats.ts)
+ * is the helper with a `liveOnly` switch; this one exists so the server
+ * can reproduce exactly what the agent's write does.
+ */
+export function itemsRecomputeSql(opts: { workspaceId: string; transactionId: string }): SQL {
+  const text = productAggregateRecompute({
+    workspaceIdExpr: `${param("workspace")}::uuid`,
+    touchedPredicate: `ti.transaction_id = ${param("tx")}::uuid`,
+  }).trim();
+  return bindMarkers(text, { workspace: opts.workspaceId, tx: opts.transactionId });
 }
