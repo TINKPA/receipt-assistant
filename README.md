@@ -203,10 +203,10 @@ Everything in `scripts/` is run with `npx tsx scripts/<name>.ts` (or directly, f
 |---------|---------|
 | `npm run openapi:generate` | Regenerate `openapi/openapi.json` |
 | `npm run check:prompt-render` | Fail if a legacy extraction or re-extract prompt rendering differs from its golden hash (also runs before every build) |
-| `npm run check:prompt-budget` | Fail if the extraction prompt outgrew its recorded baseline (also runs before every build) |
+| `npm run check:prompt-budget` | Fail if the extraction prompt, legacy or record rendering, outgrew its recorded baseline (also runs before every build) |
 | `npm run check:ingest-classification` | Assert the ingest-failure classifier against real error strings |
-| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants (also runs before every build) |
-| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse |
+| `npm run check:agent-grants` | Fail if the SQL in the prompts is not covered by the extraction agent's database grants, or if the record rendering contains any SQL (also runs before every build) |
+| `npm run check:agent-sandbox` | On the sandbox stack: prove by attempt what the agents' database roles and tool lists allow and refuse, the record profile's resumed session included |
 | `npm run check:contract` | Exercise every rule of the extraction record contract, its validator and its hand-back parser on synthetic records (also runs before every build) |
 | `npm run measure:turns` | Turns, billed tokens and model per extraction, from session JSONL (the parser that also fills `agent_runs`) |
 | `npm run eval:dates` | On the sandbox: extraction accuracy (date, total, payee, classification, flow, currency) plus turns and tokens per run, against a document manifest (`scripts/eval-dates.md`) |

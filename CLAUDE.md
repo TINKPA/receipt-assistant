@@ -311,14 +311,14 @@ Both agents are `claude -p` children of the server, and both read text a strange
 
 `src/claude.ts` is the only place a child is spawned, and every spawn names a profile:
 
-| | `extraction` (ingest, re-extract) | `ask` | `text` (backfill scripts) |
-|---|---|---|---|
-| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | none | none |
-| Permissions | bypassed: Bash is unrestricted here anyway | `dontAsk`, with nothing to approve | none needed |
-| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: the server runs its SQL, as `receipts_ro` | unset |
-| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | none | none |
+| | `extraction` (ingest, re-extract) | `extraction_record` (ingest under the server writer, wave 1) | `ask` | `text` (backfill scripts) |
+|---|---|---|---|---|
+| Tools (`--tools`) | Bash, Read, Write, Edit, WebSearch | Bash, Read, Write | none | none |
+| Permissions | bypassed: Bash is unrestricted here anyway | bypassed, as `extraction` | `dontAsk`, with nothing to approve | none needed |
+| `DATABASE_URL` the child sees | logs in as `receipts_agent` | unset: it hands back a record and the server writes | unset: the server runs its SQL, as `receipts_ro` | unset |
+| Keys passed on | `GOOGLE_MAPS_API_KEY`, `LOGODEV_SECRET_KEY` | `GOOGLE_MAPS_API_KEY` (Phase 3a and Check C) | none | none |
 
-Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`.
+Every profile also gets `--strict-mcp-config` with no config (no MCP servers, which includes the account's claude.ai connectors), `--disable-slash-commands` (no skills) and `--setting-sources ""` (user, project and local settings and their `CLAUDE.md` files are ignored; managed settings, where transcript retention is pinned, still apply). The child's environment is built from an allowlist in `buildClaudeEnv`, never copied from the server's. `runClaude` accepts only `--output-format`, `--model` and `--verbose` from a caller, so widening a profile is always a visible edit to `AGENT_PROFILES`. The argv is put together in one place, `claudeSpawnArgs`, which `check-agent-sandbox` uses too: `-p`, the profile's flags, the caller's flags, then `--session-id <id>` for a new session or `--resume <id>` for a repair round, never both (the CLI refuses the pair).
 
 The flags were read off `claude --help` of the pinned CLI (2.1.251). A CLI bump can change what they mean: re-run `check-agent-sandbox` and `probe-cli` (below) with every bump.
 
@@ -367,7 +367,7 @@ npx tsx scripts/check-agent-sandbox.ts             # runs inside receipt-assista
 npx tsx scripts/check-agent-sandbox.ts --db-only   # database half only, no model calls
 ```
 
-It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Every database statement is inside a transaction that is rolled back.
+It works by attempt. Logged in as each role it tries DROP, TRUNCATE, `COPY … PROGRAM`, DELETE, the columns and tables that are off limits, and expects SQLSTATE 42501 every time; as `receipts_agent` it runs the statements the templates issue and expects every one to succeed. It throws writes, second statements, `ALTER ROLE` and runaway queries at `runLedgerQuery`, selects as `receipts_ro` every table, view and column the Ask prompt's schema digest names, and runs the Ask loop against a scripted model. Then it starts one `claude -p` per profile with the production flags and reads the tool list the CLI reports: a tool outside the profile's list, or any MCP tool or server, is a failure, and Ask's list must be empty. The extraction run executes `psql "$DATABASE_URL"` and must arrive as `receipts_agent`; the record run prints its `$DATABASE_URL`, which must be unset, and is then resumed with `--resume` the way a repair round is, and the resumed session must offer exactly the profile's tools; the Ask run is told to execute `id` and must have nothing to do it with; one real question goes through the Ask loop. Without any model call it also checks the record profile's configuration: no `DATABASE_URL` or logo key in its environment, no WebSearch, and a resume argv with `--resume` and no `--session-id`. Every database statement is inside a transaction that is rolled back.
 
 A check that could not be carried out (usually because `claude` cannot authenticate in the sandbox) is reported as INCONCLUSIVE and fails the run. A green run means every claim was exercised.
 

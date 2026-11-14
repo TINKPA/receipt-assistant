@@ -58,6 +58,28 @@ export const AGENT_PROFILES = {
     databaseUrl: () => roleDatabaseUrl(AGENT_ROLE),
   },
   /**
+   * Ingest under the server writer (wave 1, `EXTRACTION_WRITER=server_apply`).
+   * The agent reads the document and hands back an extraction record in
+   * its final message; the server writes the ledger. So: no database URL
+   * at all, no WebSearch (it fed only the brand domain, which now comes
+   * from the document), no Edit, and of the keys only the Google one,
+   * which Phase 3a and Check C still use. Bash stays for pdftotext,
+   * pdftoppm, python3 and those curl calls, and is unrestricted for the
+   * same reason as above.
+   *
+   * Bash running as the server's Unix user is still what bounds this
+   * agent less than the list suggests: it can read the server's
+   * environment through /proc and reach the HTTP API (CLAUDE.md, "What
+   * this does not bound"). What changes is that nothing it was handed
+   * can write the ledger.
+   */
+  extraction_record: {
+    tools: ["Bash", "Read", "Write"],
+    permissionArgs: () => ["--dangerously-skip-permissions"],
+    env: ["GOOGLE_MAPS_API_KEY"],
+    databaseUrl: null,
+  },
+  /**
    * Ask. No tools and no database URL: the model writes SQL as text and
    * the server runs it as `receipts_ro` (`src/insights/ask.ts`,
    * `src/insights/ledger-query.ts`).
@@ -213,7 +235,7 @@ export interface RunClaudeOptions {
   profile: AgentProfileName;
   /** `--output-format <v>`, `--model <v>` and `--verbose`, nothing else
    *  (see `CALLER_FLAGS`). Never payload — the prompt goes on stdin. `-p`
-   *  and `--session-id` are supplied by this function. */
+   *  and `--session-id` (or `--resume`) are supplied by this function. */
   args?: string[];
   timeoutMs: number;
   /** Pre-allocated session id. The ingest worker and re-extract mint their
@@ -221,6 +243,44 @@ export interface RunClaudeOptions {
    *  exist while the agent is still running and survive its failure;
    *  other callers omit it and get a fresh one back. */
   sessionId?: string;
+  /**
+   * Continue an earlier session instead of starting one: the repair round
+   * of a record extraction (wave 1, plan §5). Filled only by server code,
+   * and only with the session id the server minted for that same run, so
+   * a document can never steer a spawn into somebody else's conversation.
+   *
+   * It REPLACES `--session-id` with `--resume <id>`: the pinned CLI
+   * (2.1.251) refuses the two together unless `--fork-session` is given,
+   * and a plain resume appends to the same transcript, so one run keeps
+   * one session id and one JSONL file. The profile's flags are applied
+   * again, because the resuming spawn's flags, not the session's history,
+   * decide which tools are offered. The prompt (the list of problems)
+   * still goes on stdin. Never pass it with `sessionId`.
+   */
+  resumeSessionId?: string;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The whole argv of a `claude -p` spawn: `-p`, the profile's flags, the
+ * caller's presentation flags, then exactly one of `--session-id <id>` (a
+ * new session) or `--resume <id>` (continue that session). The one place
+ * that argv is put together, so `check-agent-sandbox` can spawn exactly
+ * what the server spawns.
+ */
+export function claudeSpawnArgs(
+  profile: AgentProfileName,
+  args: readonly string[],
+  session: { sessionId: string } | { resumeSessionId: string },
+): string[] {
+  assertCallerArgs(args, profile);
+  const [flag, id] =
+    "resumeSessionId" in session ? ["--resume", session.resumeSessionId] : ["--session-id", session.sessionId];
+  if (!UUID_RE.test(id)) {
+    throw new Error(`runClaude: ${flag} needs a session uuid, got ${JSON.stringify(id.slice(0, 80))}`);
+  }
+  return ["-p", ...buildClaudeArgs(profile), ...args, flag, id];
 }
 
 /**
@@ -583,21 +643,31 @@ export function runSupervised(
  * a group on timeout, and the promise settles only after it has closed.
  * A failure rejects with a `ClaudeRunError` whose message is the text
  * this function has always produced.
+ *
+ * With `resumeSessionId` it continues that session (`--resume`) instead
+ * of starting a new one; see `RunClaudeOptions`.
  */
 export async function runClaude(
   prompt: string,
-  { profile, args = [], timeoutMs, sessionId = randomUUID() }: RunClaudeOptions,
+  { profile, args = [], timeoutMs, sessionId, resumeSessionId }: RunClaudeOptions,
 ): Promise<{ stdout: string; sessionId: string }> {
-  assertCallerArgs(args, profile);
-  const fullArgs = ["-p", ...buildClaudeArgs(profile), ...args, "--session-id", sessionId];
+  if (resumeSessionId !== undefined && sessionId !== undefined) {
+    throw new Error("runClaude: pass sessionId or resumeSessionId, not both (the CLI refuses --session-id with --resume)");
+  }
+  const id = resumeSessionId ?? sessionId ?? randomUUID();
+  const fullArgs = claudeSpawnArgs(
+    profile,
+    args,
+    resumeSessionId !== undefined ? { resumeSessionId: id } : { sessionId: id },
+  );
   assertArgvSafe(fullArgs);
   const stdout = await runAgentChild("claude", fullArgs, {
     env: buildClaudeEnv(profile),
     input: prompt,
     timeoutMs,
-    sessionId,
+    sessionId: id,
   });
-  return { stdout, sessionId };
+  return { stdout, sessionId: id };
 }
 
 /**

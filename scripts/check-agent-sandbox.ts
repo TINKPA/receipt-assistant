@@ -21,6 +21,10 @@
  * It fails (exit 1) if
  *   · a probe run is offered any tool outside its profile's allowlist, or
  *     any MCP tool or server (the Ask profile's allowlist is empty);
+ *   · the record profile (`extraction_record`, wave 1) sees a
+ *     `$DATABASE_URL`, has a logo key or WebSearch, or, once its run is
+ *     resumed with `--resume` as the repair round does, is offered
+ *     anything but exactly its own tools;
  *   · `receipts_agent` can DROP, TRUNCATE, COPY … PROGRAM, DELETE, update
  *     a column it was not granted, or read a table it was not granted;
  *   · `receipts_agent` is refused any statement the prompt templates issue;
@@ -37,7 +41,7 @@
  *     being able to authenticate in the sandbox container.
  *
  * Every database statement runs inside a transaction that is rolled back.
- * The agent half makes about six short model calls on the subscription.
+ * The agent half makes about eight short model calls on the subscription.
  *
  * Flags:
  *   --container=<name>   app container to run in (default receipt-assistant-test)
