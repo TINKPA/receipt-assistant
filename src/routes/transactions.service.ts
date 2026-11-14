@@ -1794,6 +1794,9 @@ export async function deleteTransaction(
       payload: {
         reason: "hard_delete",
         prior_status: current.status,
+        // Since when the row had been soft-deleted, if it was: the row's
+        // last word on whether it was live at an earlier moment.
+        prior_deleted_at: current.deletedAt ? current.deletedAt.toISOString() : null,
         transaction_id: id,
       },
     });

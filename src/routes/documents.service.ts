@@ -18,6 +18,7 @@ import { computePhash, isHashableImageMime } from "../images/phash.js";
 import { newId } from "../http/uuid.js";
 import { lockPostingRowsOf } from "./transactions.service.js";
 import {
+  ConcurrentUpdateProblem,
   DocumentHasLinksProblem,
   HttpProblem,
   NotFoundProblem,
@@ -409,29 +410,43 @@ export async function linkDocumentToTransaction(params: {
   // Both must belong to the caller's workspace. Validate explicitly
   // rather than rely on FK violations — clearer error payload.
   // Soft-deleted documents cannot be linked.
-  const doc = await db
-    .select({ id: documents.id })
-    .from(documents)
-    .where(
-      and(
-        eq(documents.id, documentId),
-        eq(documents.workspaceId, workspaceId),
-        isNull(documents.deletedAt),
-      ),
-    );
-  if (doc.length === 0) throw new NotFoundProblem("Document", documentId);
+  //
+  // LOCK ORDER (CLAUDE.md, "Lock order"): the transaction row, then the
+  // document row, each FOR KEY SHARE — the locks the INSERT's foreign
+  // keys take anyway. Left to the INSERT, they are taken document first
+  // (the FK triggers fire in name order), the other way round from
+  // every path that holds a transaction and then waits for a document.
+  // Taking them here also makes the "not deleted" check hold until the
+  // link is in: a cascade delete holding the document is waited for,
+  // and what it decided is what is read.
+  await db.transaction(async (tx) => {
+    const txn = await tx
+      .select({ id: transactions.id })
+      .from(transactions)
+      .where(and(eq(transactions.id, transactionId), eq(transactions.workspaceId, workspaceId)))
+      .for("key share");
 
-  const tx = await db
-    .select({ id: transactions.id })
-    .from(transactions)
-    .where(and(eq(transactions.id, transactionId), eq(transactions.workspaceId, workspaceId)));
-  if (tx.length === 0) throw new NotFoundProblem("Transaction", transactionId);
+    const doc = await tx
+      .select({ id: documents.id })
+      .from(documents)
+      .where(
+        and(
+          eq(documents.id, documentId),
+          eq(documents.workspaceId, workspaceId),
+          isNull(documents.deletedAt),
+        ),
+      )
+      .for("key share");
+    // The document is reported first when both are missing, as before.
+    if (doc.length === 0) throw new NotFoundProblem("Document", documentId);
+    if (txn.length === 0) throw new NotFoundProblem("Transaction", transactionId);
 
-  // Composite PK is (document_id, transaction_id) — re-link is a no-op.
-  await db
-    .insert(documentLinks)
-    .values({ documentId, transactionId })
-    .onConflictDoNothing();
+    // Composite PK is (document_id, transaction_id) — re-link is a no-op.
+    await tx
+      .insert(documentLinks)
+      .values({ documentId, transactionId })
+      .onConflictDoNothing();
+  });
 }
 
 export async function unlinkDocumentFromTransaction(params: {
@@ -589,11 +604,26 @@ interface CascadeReport {
   unlinked: number;
   txns_soft_deleted: string[];
   txns_hard_deleted: string[];
+  /** Linked transactions that were already soft-deleted and stay that
+   *  way. Never also in `txns_kept`: a deleted row is not in the ledger. */
   txns_skipped: string[];
   /** Linked transactions left in the ledger because another live
    *  document still evidences them. */
   txns_kept: string[];
 }
+
+/**
+ * Thrown inside one attempt of the cascade when, once the document row
+ * was locked, it turned out to be linked to a transaction the attempt
+ * had not locked first. Rolls the attempt back; never leaves this module.
+ */
+class CascadeLinkSetChanged extends Error {}
+
+/** How many times a cascade starts over on a changed link set before it
+ *  answers 409 `concurrent-update`. One retry covers an apply or undo
+ *  that moved the document; needing several means something keeps
+ *  re-linking it, and waiting longer would not help. */
+const CASCADE_LOCK_ATTEMPTS = 4;
 
 /**
  * One-call "delete this whole receipt" orchestration.
@@ -606,19 +636,25 @@ interface CascadeReport {
  * with it, although the other document still stood behind it. Such a
  * transaction is now KEPT, in both modes.
  *
+ * A linked transaction that is ALREADY SOFT-DELETED is looked at first,
+ * before anyone asks what else supports it: it is not in the ledger, so
+ * it is never "kept", whatever documents it still has.
+ *
  * Soft mode (default): the document is soft-deleted. Per linked txn:
+ *   - already soft-deleted → skipped: left alone, link kept for history.
  *   - other live evidence → kept, untouched. The link row stays, as it
  *     does on every soft delete, so restoring the document restores the
  *     association; a soft-deleted document already reads as a tombstone.
- *   - already soft-deleted → left alone, link kept for history.
  *   - draft/error → hard-deleted (no audit value).
  *   - posted → soft-deleted (deleted_at).
  *
  * Hard mode (`hard=true`): the document row goes, and its bytes move to
  * `.trash/`. Per linked txn:
- *   - other live evidence → kept; the link to this document is removed
- *     and a `document_unlinked` event records why.
- *   - otherwise → hard-deleted (postings cascade via FK).
+ *   - other live evidence → the link to this document is removed and a
+ *     `document_unlinked` event records why. Reported as kept — or, if
+ *     the transaction was already soft-deleted, as skipped.
+ *   - otherwise → hard-deleted (postings cascade via FK), soft-deleted
+ *     or not: this is the purge.
  *
  * Both modes refuse, with 409 and no writes, if a transaction they would
  * DELETE is `reconciled`. A reconciled transaction that is merely kept
@@ -628,13 +664,55 @@ interface CascadeReport {
  * the FK nulls the column when the row goes (see src/schema/audit.ts),
  * so the payload copy is the only pointer back to the row (#202).
  *
- * Everything happens in a single DB transaction, with the document and
- * the linked transactions row-locked so two concurrent deletes of a
- * transaction's two documents cannot each see the other as surviving
+ * Everything happens in a single DB transaction, with the linked
+ * transactions and the document row-locked so two concurrent deletes of
+ * a transaction's two documents cannot each see the other as surviving
  * evidence. The file quarantine (hard mode) runs after commit. The bytes
  * are MOVED into `.trash/`, never unlinked; see `quarantineFile` and #72.
+ *
+ * LOCK ORDER: postings, then transaction head rows (id order), then the
+ * document row — the order every other path uses (CLAUDE.md, "Lock
+ * order"). Dedup apply and undo hold two head rows and then reach a
+ * document through the `document_links` foreign key, whose check takes a
+ * KEY SHARE lock on it; re-extract updates the transaction and then the
+ * document. A cascade that locked the document FIRST, as this one did,
+ * deadlocked with either: each side held the row the other needed.
+ *
+ * The transactions are only known through the document's links, so they
+ * are read without a lock, locked, and the links read again once the
+ * document row is held FOR UPDATE. That lock blocks the foreign key's
+ * KEY SHARE, so from then on no link to this document can appear, and
+ * the ones to locked transactions cannot be moved (apply and undo need
+ * those head rows). If the second read names a transaction the first did
+ * not — an apply or undo moved the document while we waited — the
+ * attempt is abandoned and started over on the new link set.
  */
 export async function cascadeDeleteDocument(params: {
+  workspaceId: string;
+  userId: string;
+  documentId: string;
+  hard: boolean;
+}): Promise<CascadeReport & { hardDeletedFilePath?: string | null }> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await cascadeDeleteDocumentOnce(params);
+    } catch (err) {
+      if (!(err instanceof CascadeLinkSetChanged)) throw err;
+      // Expected under a concurrent apply / undo, and rare. One line so
+      // the retry can be seen and counted; nothing was written.
+      console.info(
+        `[documents] cascade delete of ${params.documentId}: its links changed while it waited for locks (attempt ${attempt}/${CASCADE_LOCK_ATTEMPTS}); starting over`,
+      );
+      if (attempt >= CASCADE_LOCK_ATTEMPTS) {
+        throw new ConcurrentUpdateProblem(
+          `Document ${params.documentId} kept being linked to other transactions while it was being deleted. Nothing was changed. Retry the request.`,
+        );
+      }
+    }
+  }
+}
+
+async function cascadeDeleteDocumentOnce(params: {
   workspaceId: string;
   userId: string;
   documentId: string;
@@ -645,46 +723,62 @@ export async function cascadeDeleteDocument(params: {
   let pendingFileUnlink: string | null = null;
 
   const report = await db.transaction(async (tx) => {
-    // Load doc (allow soft-deleted — user may want to fully purge a
-    // soft-deleted row + its surviving links via cascade hard).
-    const docRows = await tx
-      .select()
+    const isThisDocument = and(
+      eq(documents.id, documentId),
+      eq(documents.workspaceId, workspaceId),
+    );
+    // An unknown id is a 404 before any lock is taken. (A soft-deleted
+    // document is found: cascade hard is how one is purged with its links.)
+    const known = await tx
+      .select({ id: documents.id })
       .from(documents)
-      .where(
-        and(eq(documents.id, documentId), eq(documents.workspaceId, workspaceId)),
-      )
-      .for("update");
-    if (docRows.length === 0) throw new NotFoundProblem("Document", documentId);
-    const doc = docRows[0]!;
+      .where(isThisDocument);
+    if (known.length === 0) throw new NotFoundProblem("Document", documentId);
 
-    // A cascade may hard-delete linked transactions, and the FK takes
-    // their postings with them. Lock those postings before the head rows:
-    // every writer of a transaction's postings goes postings first, head
-    // row second (see `lockPostingRow` in transactions.service.ts), and a
-    // delete that went the other way round could deadlock with one.
-    const linkedIds = await tx
+    // 1. Which transactions does the document evidence? Read without a
+    //    lock; step 4 checks the answer.
+    const candidates = await tx
       .select({ transactionId: documentLinks.transactionId })
       .from(documentLinks)
       .where(eq(documentLinks.documentId, documentId));
-    await lockPostingRowsOf(
-      tx,
-      linkedIds.map((l) => l.transactionId),
-    );
+    const candidateIds = candidates.map((l) => l.transactionId);
 
-    // Find all linked transactions with their current state. Locked in
-    // id order so concurrent cascades take the rows in the same sequence.
-    const linkedTxns = await tx
-      .select({
-        id: transactions.id,
-        status: transactions.status,
-        deletedAt: transactions.deletedAt,
-        version: transactions.version,
-      })
+    // 2. Their postings, then their head rows, both in id order. A
+    //    cascade may hard-delete a transaction and the FK takes its
+    //    postings with it; every writer of postings goes postings first,
+    //    head row second (see `lockPostingRow` in transactions.service.ts).
+    await lockPostingRowsOf(tx, candidateIds);
+    const lockedTxns =
+      candidateIds.length === 0
+        ? []
+        : await tx
+            .select({
+              id: transactions.id,
+              status: transactions.status,
+              deletedAt: transactions.deletedAt,
+            })
+            .from(transactions)
+            .where(inArray(transactions.id, candidateIds))
+            .orderBy(transactions.id)
+            .for("update");
+
+    // 3. The document row, last.
+    const docRows = await tx.select().from(documents).where(isThisDocument).for("update");
+    if (docRows.length === 0) throw new NotFoundProblem("Document", documentId);
+    const doc = docRows[0]!;
+
+    // 4. The links again, now that none can be added. Every transaction
+    //    they name must be one of the rows locked in step 2.
+    const linkedNow = await tx
+      .select({ transactionId: documentLinks.transactionId })
       .from(documentLinks)
-      .innerJoin(transactions, eq(transactions.id, documentLinks.transactionId))
-      .where(eq(documentLinks.documentId, documentId))
-      .orderBy(transactions.id)
-      .for("update", { of: transactions });
+      .where(eq(documentLinks.documentId, documentId));
+    const lockedIds = new Set(lockedTxns.map((t) => t.id));
+    if (linkedNow.some((l) => !lockedIds.has(l.transactionId))) {
+      throw new CascadeLinkSetChanged();
+    }
+    const stillLinked = new Set(linkedNow.map((l) => l.transactionId));
+    const linkedTxns = lockedTxns.filter((t) => stillLinked.has(t.id));
 
     // Which of them does some OTHER live document still evidence?
     const supported = new Set<string>();
@@ -705,12 +799,31 @@ export async function cascadeDeleteDocument(params: {
         );
       for (const r of otherEvidence) supported.add(r.transactionId);
     }
-    const kept = linkedTxns.filter((t) => supported.has(t.id));
-    const orphaned = linkedTxns.filter((t) => !supported.has(t.id));
+    // Sort each linked transaction into exactly one of three fates,
+    // looking at whether it is already soft-deleted BEFORE looking at
+    // what else supports it. The other order reported a deleted
+    // transaction with a second document as "kept", which a caller reads
+    // as "the receipt is still in the ledger".
+    //
+    //   skipped  already soft-deleted and staying that way: every such
+    //            row in soft mode; in hard mode the ones another live
+    //            document supports (the rest are purged with this one).
+    //   kept     not deleted, and another live document supports it.
+    //   doomed   this call deletes it.
+    type Linked = (typeof linkedTxns)[number];
+    const skipped: Linked[] = [];
+    const kept: Linked[] = [];
+    const doomed: Linked[] = [];
+    for (const t of linkedTxns) {
+      const alreadyDeleted = t.deletedAt !== null;
+      if (alreadyDeleted && (!hard || supported.has(t.id))) skipped.push(t);
+      else if (!alreadyDeleted && supported.has(t.id)) kept.push(t);
+      else doomed.push(t);
+    }
 
     // Reconciled guard — refuse the whole batch. Only the transactions
     // this call would otherwise delete count.
-    const reconciled = orphaned.filter((t) => t.status === "reconciled");
+    const reconciled = doomed.filter((t) => t.status === "reconciled");
     if (reconciled.length > 0) {
       throw new HttpProblem(
         409,
@@ -723,13 +836,10 @@ export async function cascadeDeleteDocument(params: {
 
     const txnsSoftDeleted: string[] = [];
     const txnsHardDeleted: string[] = [];
-    const txnsSkipped: string[] = [];
+    const txnsSkipped = skipped.map((t) => t.id);
     const txnsKept = kept.map((t) => t.id);
 
-    const hardDeleteTxn = async (
-      t: (typeof linkedTxns)[number],
-      reason: string,
-    ): Promise<void> => {
+    const hardDeleteTxn = async (t: Linked, reason: string): Promise<void> => {
       await tx.insert(transactionEvents).values({
         id: newId(),
         workspaceId,
@@ -740,6 +850,11 @@ export async function cascadeDeleteDocument(params: {
           reason,
           document_id: documentId,
           prior_status: t.status,
+          // When the row was already a tombstone, since when. With
+          // `prior_status` this is all that is left to say whether the
+          // row was live at some earlier moment (scripts/check-ledger.ts
+          // asks exactly that about a row it can no longer read).
+          prior_deleted_at: t.deletedAt ? t.deletedAt.toISOString() : null,
           // Duplicated on purpose — the DELETE below nulls the
           // `transaction_events.transaction_id` column.
           transaction_id: t.id,
@@ -750,9 +865,10 @@ export async function cascadeDeleteDocument(params: {
     };
 
     if (hard) {
-      // The surviving transactions lose this document as evidence; say
-      // so in their history before the link rows go.
-      for (const t of kept) {
+      // The transactions that stay — kept, or skipped as an existing
+      // tombstone — lose this document as evidence; say so in their
+      // history before the link rows go.
+      for (const t of [...kept, ...skipped]) {
         await tx.insert(transactionEvents).values({
           id: newId(),
           workspaceId,
@@ -776,7 +892,7 @@ export async function cascadeDeleteDocument(params: {
       }
       // Hard delete the transactions this document was the last live
       // evidence of. Postings + remaining links cascade.
-      for (const t of orphaned) {
+      for (const t of doomed) {
         await hardDeleteTxn(t, "cascade_delete_document");
       }
       // Hard delete the doc.
@@ -792,12 +908,10 @@ export async function cascadeDeleteDocument(params: {
       };
     }
 
-    // Soft mode. `kept` transactions are not touched at all.
-    for (const t of orphaned) {
-      if (t.deletedAt) {
-        // Already removed. Leave alone; link survives as historical record.
-        txnsSkipped.push(t.id);
-      } else if (t.status === "draft" || t.status === "error") {
+    // Soft mode. `kept` and `skipped` transactions are not touched at
+    // all; their links survive as the historical record.
+    for (const t of doomed) {
+      if (t.status === "draft" || t.status === "error") {
         await hardDeleteTxn(t, "cascade_soft_delete_document");
       } else {
         // posted (reconciled short-circuited above) → soft-delete the

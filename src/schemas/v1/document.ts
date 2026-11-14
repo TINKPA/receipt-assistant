@@ -101,7 +101,8 @@ export const CascadeDeleteReport = z
       description:
         "Linked transactions left in the ledger because another non-deleted " +
         "document still supports them. Non-empty means the receipt is NOT gone: " +
-        "delete the remaining document(s) with cascade, or the transaction itself, to remove it.",
+        "delete the remaining document(s) with cascade, or the transaction itself, to remove it. " +
+        "Never a transaction that was already soft-deleted; those are under `transactions_skipped`.",
     }),
     transactions_soft_deleted: z.array(Uuid).openapi({
       description: "Posted transactions this call soft-deleted (restorable).",
@@ -113,7 +114,10 @@ export const CascadeDeleteReport = z
     }),
     transactions_skipped: z.array(Uuid).openapi({
       description:
-        "Soft mode only: transactions that were already soft-deleted and were left as they were.",
+        "Transactions that were already soft-deleted before this call and stay that way, " +
+        "whatever other documents they have. In soft mode that is every such transaction. " +
+        "Under `?hard=true` it is the ones another non-deleted document still supports " +
+        "(they lose only the link to this document); the rest are in `transactions_hard_deleted`.",
     }),
   })
   .openapi("CascadeDeleteReport");

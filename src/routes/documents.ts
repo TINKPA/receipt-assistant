@@ -585,9 +585,10 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       "?hard=true: hard delete (row removed; file moved to <uploads_dir>/.trash/<timestamp>__<basename>, NOT unlinked); requires no remaining links unless ?cascade=true is also set. " +
       "?cascade=true: also deletes each linked transaction for which this document is the LAST LIVE EVIDENCE. " +
       "A transaction that another non-deleted document still supports is kept — deleting one of an invoice + payment-confirmation pair does not delete the purchase. " +
-      "Of the transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, already-deleted ones are left intact, and a reconciled one aborts the whole operation with 409 (unreconcile first). " +
+      "A transaction that is already soft-deleted is left as it is and reported under `transactions_skipped`, whatever other documents it has; it is never reported as kept. " +
+      "Of the remaining transactions that are not kept: posted ones are soft-deleted, draft/error ones are hard-deleted, and a reconciled one aborts the whole operation with 409 (unreconcile first). " +
       "The document itself is soft-deleted and its link rows stay, so restoring it restores the association. " +
-      "?cascade=true&hard=true: the transactions that are not kept are hard-deleted (postings cascade); kept transactions are only unlinked from this document (a `document_unlinked` event records it). " +
+      "?cascade=true&hard=true: the transactions no other non-deleted document supports are hard-deleted (postings cascade), soft-deleted ones included; kept transactions, and soft-deleted ones another document supports, are only unlinked from this document (a `document_unlinked` event records it). " +
       "The document row is removed and the image file is moved to .trash/ (never unlinked). " +
       "A cascade answers 200 with a report of what happened to each linked transaction; check `transactions_kept` before telling a user the receipt is gone.",
     tags: ["documents"],
@@ -616,7 +617,14 @@ export function registerDocumentsOpenApi(registry: OpenAPIRegistry): void {
       404: { description: "Not found", content: problemContent },
       409: {
         description:
-          "Hard delete refused because document has links (use cascade), or cascade refused because a transaction it would delete is reconciled.",
+          "`document-has-links`: hard delete refused because the document has links (use cascade). " +
+          "`cascade-blocked-reconciled`: cascade refused because a transaction it would delete is reconciled. " +
+          "`concurrent-update`: the cascade collided with another request changing the same records; nothing was changed, retry after `Retry-After`.",
+        content: problemContent,
+      },
+      422: {
+        description:
+          "`hard` or `cascade` is not one of `true`, `1`, `false`, `0`.",
         content: problemContent,
       },
     },
