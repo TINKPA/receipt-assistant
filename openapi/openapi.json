@@ -6328,7 +6328,7 @@
     "/v1/transactions/{id}": {
       "get": {
         "summary": "Get a transaction",
-        "description": "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted or restored — which `version` alone does not record. Treat it as opaque and send it back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made after a document change is applied rather than refused, and the bare `W/\"<version>\"` form (built from the body's `version`) is accepted as well.",
+        "description": "The response `ETag` is `W/\"<version>-<documents tag>\"`. It changes when `version` does and also when the transaction's `documents` do — one is linked, unlinked, soft-deleted or restored — which `version` alone does not record. Treat it as opaque and send it back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made after a document change is applied rather than refused, and the bare `W/\"<version>\"` form (built from the body's `version`) is accepted as well. The exception is DELETE, which compares the whole tag when it is sent whole (see that operation).",
         "tags": [
           "transactions"
         ],
@@ -6463,7 +6463,7 @@
       },
       "delete": {
         "summary": "Delete a transaction",
-        "description": "Default: reversible soft delete (sets deleted_at; the row drops out of every money query but is restorable via POST /:id/restore). ?hard=true forces a physical delete (postings + document_links cascade; irreversible). Reconciled transactions reject either way — unreconcile first.",
+        "description": "Default: reversible soft delete (sets deleted_at; the row drops out of every money query but is restorable via POST /:id/restore). ?hard=true forces a physical delete (postings + document_links cascade; irreversible). Reconciled transactions reject either way — unreconcile first.\n\nUnlike the other writes, a delete sent with the whole ETag (`W/\"<version>-<documents tag>\"`) must match it whole: if a document was linked, unlinked, deleted or restored since the tag was issued, the answer is 412 and nothing is deleted, so a delete cannot silently undo a receipt attached in the meantime. The bare `W/\"<version>\"` form is held to the version only.",
         "tags": [
           "transactions"
         ],
@@ -6509,8 +6509,48 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "404": {
+            "description": "Not found (or, for a soft delete, already deleted)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "409": {
             "description": "Transaction is reconciled — unreconcile first.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "`If-Match` is stale: the version moved, or (whole tag only) the transaction's documents changed since it was issued. Re-fetch and retry.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`hard` is not one of `true`, `1`, `false`, `0`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "If-Match required",
             "content": {
               "application/problem+json": {
                 "schema": {

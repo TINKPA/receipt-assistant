@@ -113,15 +113,23 @@ export function handleIfNoneMatch(
  * blocks (renamed in their own tables) can still change under an
  * unchanged tag; they belong in here when that is taken on.
  *
- * `If-Match` reads the VERSION PART ONLY (`parseTransactionEtag`): it
- * guards writes to the transaction row, and a document change is not
- * one. A client that read the transaction, saw a document deleted
- * elsewhere, and then saves an edit has that edit applied, and the
- * response carries the current documents and the current tag; nothing
- * is lost and nothing is refused that the row lock would have allowed.
- * The bare `W/"<version>"` form stays valid in `If-Match` for the same
- * reason, which is what a client holding only the body's `version` (a
- * bulk `if_match`, a script) sends.
+ * `If-Match` reads the VERSION PART ONLY (`parseTransactionEtag`) on
+ * every write but one: it guards writes to the transaction row, and a
+ * document change is not one. A client that read the transaction, saw a
+ * document deleted elsewhere, and then saves an edit has that edit
+ * applied, and the response carries the current documents and the
+ * current tag; nothing is lost and nothing is refused that the row lock
+ * would have allowed. The bare `W/"<version>"` form stays valid in
+ * `If-Match` for the same reason, which is what a client holding only
+ * the body's `version` (a bulk `if_match`, a script) sends.
+ *
+ * The exception is `DELETE /v1/transactions/:id`. A delete does undo a
+ * document change: a hard delete takes the links with it, and either
+ * kind removes the purchase a receipt was just attached to. Sent with
+ * the whole tag (`fullTransactionEtag`), a delete must match it whole,
+ * documents part included, or it is a 412
+ * (`assertDocumentsMatchEtag` in transactions.service.ts). Sent with the
+ * bare form, it named no documents and is held to the version.
  */
 export function transactionEtag(
   version: number,
@@ -143,6 +151,15 @@ export function parseTransactionEtag(header: string | undefined): number | null 
   if (!m) return null;
   const n = Number(m[1]);
   return Number.isFinite(n) ? n : null;
+}
+
+/** The whole tag, without surrounding whitespace, when `header` is a
+ *  transaction ETag in its current form, `W/"<version>-<documents tag>"`.
+ *  Null for the bare `W/"<version>"` form and for anything else. */
+export function fullTransactionEtag(header: string | undefined): string | null {
+  if (!header) return null;
+  const m = /^\s*(W\/"\d+-[A-Za-z0-9_-]+")\s*$/.exec(header);
+  return m ? m[1]! : null;
 }
 
 // ── Resources without a `version` column ───────────────────────────────

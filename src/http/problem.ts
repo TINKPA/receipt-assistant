@@ -102,12 +102,15 @@ export class NotFoundProblem extends HttpProblem {
 }
 
 export class VersionMismatchProblem extends HttpProblem {
-  constructor(current: number, supplied?: number) {
+  /** `detail` replaces the default sentence when the version matched
+   *  and something else the tag covers did not (a transaction's
+   *  documents, see `transactionEtag`). */
+  constructor(current: number, supplied?: number, detail?: string) {
     super(
       412,
       "version-mismatch",
       "Resource version mismatch",
-      `If-Match supplied version=${supplied ?? "?"}, current=${current}. Re-fetch and retry.`,
+      detail ?? `If-Match supplied version=${supplied ?? "?"}, current=${current}. Re-fetch and retry.`,
       { current_version: current, supplied_version: supplied ?? null },
     );
   }

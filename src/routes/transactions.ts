@@ -39,6 +39,7 @@ import {
   ifNoneMatchSatisfied,
   transactionEtag,
   parseTransactionEtag,
+  fullTransactionEtag,
 } from "../http/etag.js";
 import {
   PreconditionRequiredProblem,
@@ -306,15 +307,22 @@ transactionsRouter.delete(
       const hard = q.hard === "true" || q.hard === "1";
       const currentVersion = await loadVersion(req.ctx.workspaceId, id);
       requireTransactionIfMatch(req, currentVersion);
+      // Unlike the other writes, a delete sent with the whole tag must
+      // match its documents part too (checked under the row lock): a
+      // delete is the one write that undoes a document linked since the
+      // client read the row. See `transactionEtag` in http/etag.ts.
+      const expectedEtag = fullTransactionEtag(req.header("If-Match")) ?? undefined;
       // Default: reversible soft delete (deleted_at). ?hard=true: physical
       // delete. Reconciled transactions reject either way (unreconcile first).
       if (hard) {
         await deleteTransaction(req.ctx.workspaceId, id, currentVersion, {
           userId: req.ctx.userId,
+          expectedEtag,
         });
       } else {
         await softDeleteTransaction(req.ctx.workspaceId, id, currentVersion, {
           userId: req.ctx.userId,
+          expectedEtag,
         });
       }
       res.status(204).end();
@@ -601,7 +609,8 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       "or restored — which `version` alone does not record. Treat it as opaque and send it " +
       "back as `If-Match` on a write. `If-Match` compares the version part only, so an edit made " +
       "after a document change is applied rather than refused, and the bare `W/\"<version>\"` " +
-      "form (built from the body's `version`) is accepted as well.",
+      "form (built from the body's `version`) is accepted as well. The exception is DELETE, " +
+      "which compares the whole tag when it is sent whole (see that operation).",
     tags: ["transactions"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
@@ -666,7 +675,11 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
       "Default: reversible soft delete (sets deleted_at; the row drops out of every " +
       "money query but is restorable via POST /:id/restore). ?hard=true forces a physical " +
       "delete (postings + document_links cascade; irreversible). Reconciled transactions " +
-      "reject either way — unreconcile first.",
+      "reject either way — unreconcile first.\n\n" +
+      "Unlike the other writes, a delete sent with the whole ETag (`W/\"<version>-<documents tag>\"`) " +
+      "must match it whole: if a document was linked, unlinked, deleted or restored since the tag " +
+      "was issued, the answer is 412 and nothing is deleted, so a delete cannot silently undo a " +
+      "receipt attached in the meantime. The bare `W/\"<version>\"` form is held to the version only.",
     tags: ["transactions"],
     request: {
       params: z.object({ id: Uuid }),
@@ -680,10 +693,18 @@ export function registerTransactionsOpenApi(registry: OpenAPIRegistry): void {
     },
     responses: {
       204: { description: "Deleted" },
+      404: { description: "Not found (or, for a soft delete, already deleted)", content: problemContent },
       409: {
         description: "Transaction is reconciled — unreconcile first.",
         content: problemContent,
       },
+      412: {
+        description:
+          "`If-Match` is stale: the version moved, or (whole tag only) the transaction's documents changed since it was issued. Re-fetch and retry.",
+        content: problemContent,
+      },
+      422: { description: "`hard` is not one of `true`, `1`, `false`, `0`.", content: problemContent },
+      428: { description: "If-Match required", content: problemContent },
     },
   });
 
