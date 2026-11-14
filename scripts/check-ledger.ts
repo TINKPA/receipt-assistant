@@ -39,6 +39,14 @@
  *                           proposal moves them back.
  *   document-has-live-txn   a live document that is linked at all is linked
  *                           to at least one live transaction.
+ *   txn-has-live-document   the mirror image: a live transaction that has,
+ *                           or provably had, a document still has one that
+ *                           is not deleted. "Had" is read from what a
+ *                           document leaves behind: a link to a deleted
+ *                           document, an ingest that produced the row, a
+ *                           `document_unlinked` event, or a dedup apply
+ *                           that moved documents off it. A manual entry
+ *                           has none of these and is not looked at.
  *   refund-not-deduped      no row sits deleted as the "duplicate" of a row
  *                           whose money moved the other way: a refund
  *                           folded into the purchase it reverses. Direction
@@ -49,19 +57,31 @@
  *                           transaction (it would still count in product
  *                           statistics).
  *
- * What is NOT a violation: a transaction soft-deleted AFTER an ingest or
- * an applied proposal pointed at it. That is somebody's later decision
- * (or a later fold into another row), the ledger was consistent when the
- * pointer was written, and `deleted_at` proves the order. A target that
- * is missing altogether (hard-deleted) cannot be dated and is reported.
+ * What is NOT a violation: a transaction deleted AFTER an ingest or an
+ * applied proposal pointed at it. That is somebody's later decision (or
+ * a later fold into another row), and the ledger was consistent when the
+ * pointer was written. For a soft delete `deleted_at` proves the order.
+ * For a hard delete ("Delete forever", a cascade with `hard=true`) the
+ * row is gone and its `hard_deleted` event proves it: the event carries
+ * the transaction id, the status and the earlier soft-delete time in its
+ * payload. A missing target with no such event — deleted by a version
+ * that did not write the id, or by hand in SQL — cannot be dated and is
+ * still reported.
  *
- * Two checks describe states that ordinary use still produces, so they
+ * Three checks describe states that ordinary use still produces, so they
  * stay red until the code path behind them changes or the rows are
  * dealt with; `--allow` exists for them:
  *   - document-has-live-txn fires for a receipt whose transaction was
  *     soft-deleted while the document was kept. Either the purchase is
  *     missing from the ledger (re-upload the file: it extracts again) or
  *     the document is not wanted (delete it).
+ *   - txn-has-live-document fires for a transaction whose document was
+ *     deleted on its own (`DELETE /v1/documents/:id` without `cascade`),
+ *     and for one restored after a cascade took it and its document
+ *     together. Both are a person's choice. What it is for is the same
+ *     state reached with nobody choosing it; `/reconcile/undo` refuses
+ *     to create it (`no_live_document`) and the cascade delete removes
+ *     the transaction with its last live document.
  *   - items-under-live-txn fires for every soft-deleted transaction that
  *     has line items: neither a person's delete nor a dedup apply
  *     retires them, and the item and product reads do not look at the
@@ -95,6 +115,29 @@ const LIVE = (alias: string): string =>
  *  not a pointer written at a row that was already gone. */
 const DELETED_AFTER = (alias: string, at: string): string =>
   `(${alias}.status IN ('posted', 'reconciled') AND ${alias}.deleted_at IS NOT NULL AND ${alias}.deleted_at > ${at})`;
+
+/**
+ * Hard-deleted, and provably AFTER the moment `at`, having been live
+ * until then. The row is gone, so the proof is its `hard_deleted` event:
+ * every delete path writes one and copies into the payload what the
+ * foreign key and the DELETE are about to erase — the transaction id
+ * (the FK nulls the event's own `transaction_id` column), the status,
+ * and `prior_deleted_at`, the soft-delete time if the row was already a
+ * tombstone. `idText` is a SQL expression for the missing id, as text.
+ *
+ * A row that was soft-deleted BEFORE `at` and purged afterwards is still
+ * a violation: the pointer was written at a deleted row, and removing
+ * the row for good does not make the file's purchase reappear. That is
+ * what the `prior_deleted_at` clause is for. An event without the key
+ * (none is written without it any more) is taken at its word.
+ */
+const HARD_DELETED_AFTER = (idText: string, at: string): string =>
+  `EXISTS (SELECT 1 FROM transaction_events hd
+            WHERE hd.event_type = 'hard_deleted'
+              AND hd.payload->>'transaction_id' = ${idText}
+              AND hd.payload->>'prior_status' IN ('posted', 'reconciled')
+              AND hd.created_at > ${at}
+              AND COALESCE((hd.payload->>'prior_deleted_at')::timestamptz > ${at}, true))`;
 
 /**
  * Money direction, the way the dedup detector reads it
@@ -142,6 +185,7 @@ const CHECKS: Check[] = [
        WHERE i.status IN ('dedup', 'near_dup')
          AND (t.id IS NULL OR NOT ${LIVE("t")})
          AND NOT COALESCE(${DELETED_AFTER("t", "COALESCE(i.completed_at, i.created_at)")}, false)
+         AND NOT (t.id IS NULL AND ${HARD_DELETED_AFTER("x.tid", "COALESCE(i.completed_at, i.created_at)")})
        ORDER BY i.created_at`,
   },
   {
@@ -178,6 +222,7 @@ const CHECKS: Check[] = [
          AND rp.status IN ('auto_applied', 'user_applied')
          AND (c.id IS NULL OR NOT ${LIVE("c")})
          AND NOT COALESCE(${DELETED_AFTER("c", "COALESCE(rp.resolved_at, rp.created_at)")}, false)
+         AND NOT (c.id IS NULL AND ${HARD_DELETED_AFTER("rp.payload->>'duplicate_of'", "COALESCE(rp.resolved_at, rp.created_at)")})
        ORDER BY rp.created_at`,
   },
   {
@@ -211,6 +256,44 @@ const CHECKS: Check[] = [
                  JOIN transactions t ON t.id = dl.transaction_id
                 WHERE dl.document_id = d.id AND ${LIVE("t")})
        ORDER BY d.created_at`,
+  },
+  {
+    name: "txn-has-live-document",
+    what: "live transactions that have, or had, a document and have no live one left",
+    sql: `
+      SELECT t.id::text AS id,
+             CASE WHEN x.links > 0
+                  THEN x.links || ' linked document(s), all deleted'
+                  ELSE 'no document linked any more; it had one (' ||
+                       CASE WHEN x.unlinked_by_delete THEN 'a document delete unlinked it'
+                            WHEN x.from_ingest THEN 'an ingest produced it'
+                            ELSE 'a dedup apply moved its documents' END || ')'
+             END AS detail
+        FROM transactions t
+       CROSS JOIN LATERAL (
+         SELECT (SELECT count(*) FROM document_links dl WHERE dl.transaction_id = t.id) AS links,
+                EXISTS (SELECT 1 FROM transaction_events e
+                         WHERE e.transaction_id = t.id
+                           AND e.event_type = 'document_unlinked') AS unlinked_by_delete,
+                (t.source_ingest_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM ingests i
+                             WHERE jsonb_exists(COALESCE(i.produced->'transaction_ids', '[]'::jsonb), t.id::text))
+                ) AS from_ingest,
+                EXISTS (SELECT 1 FROM reconcile_proposals rp
+                         WHERE rp.kind = 'dedup'
+                           AND rp.payload->>'duplicate' = t.id::text
+                           AND jsonb_typeof(rp.payload->'applied'->'links') = 'array'
+                           AND jsonb_array_length(rp.payload->'applied'->'links') > 0) AS folded_with_documents
+       ) x
+       WHERE ${LIVE("t")}
+         AND NOT EXISTS (
+               SELECT 1 FROM document_links dl
+                 JOIN documents d ON d.id = dl.document_id
+                WHERE dl.transaction_id = t.id AND d.deleted_at IS NULL)
+         -- A manual entry never had a document: no link, and none of the
+         -- three traces a document leaves behind. It is not looked at.
+         AND (x.links > 0 OR x.unlinked_by_delete OR x.from_ingest OR x.folded_with_documents)
+       ORDER BY t.created_at`,
   },
   {
     name: "refund-not-deduped",

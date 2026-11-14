@@ -14,21 +14,33 @@
  *   body  malformed JSON, oversized bodies, broken multipart → 400 / 413
  *   bool  `?flag=false` means false
  *   cur   pagination cursors that this API did not issue → 400
- *   pg    Postgres constraint and data errors → 400 / 409 / 422
+ *   pg    Postgres constraint and data errors → 400 / 409 / 422; a
+ *         deadlock or serialization failure → 409 `concurrent-update`
+ *         with Retry-After, also when a real route hits one
  *   500   an unexpected error → fixed sentence + trace id; the detail
  *         goes to the server log under that id, never to the client —
  *         including per-item errors reported inside a 200
  *   idem  Idempotency-Key: replay, conflict, concurrent duplicates,
  *         a key reused after its row expired, a key too long to store
- *   etag  document metadata ETag moves when the document does
+ *   etag  document metadata ETag moves when the document does, and a
+ *         transaction's ETag moves when its documents do (soft delete,
+ *         restore, unlink, link, a cascade that keeps the transaction)
+ *         while If-Match still lets an edit through
+ *   state a request the resource is in the wrong state for, where
+ *         cascade delete and dedup apply / undo meet: undo of a proposal
+ *         that was never applied, already reverted, or whose documents
+ *         were deleted since; what the cascade report says for a kept,
+ *         a deleted and an already-deleted transaction; the 409s and the
+ *         422 the delete route can answer
  *   file  asset and document endpoints refuse a stored path outside
  *         their directory, never serve SVG / HTML able to run script on
  *         our origin (a 304 included), and survive a file that cannot
  *         be opened
  *
- * It WRITES to the database it is given — products, a transaction,
- * documents, brand / asset / place rows — and never cleans them up. One
- * case adds a trigger to `derivation_events` for a moment and drops it.
+ * It WRITES to the database it is given — products, transactions,
+ * documents, a batch with dedup proposals, brand / asset / place rows —
+ * and never cleans them up. Two cases add a trigger for a moment and
+ * drop it (on `derivation_events`, and on `documents`).
  * Point it only at a throwaway Postgres (or the sandbox), never at the
  * ledger:
  *
@@ -308,6 +320,7 @@ if (wants("id")) {
     ["POST", `/v1/batches/${BAD}/reconcile`],
     ["POST", `/v1/batches/${BAD}/reconcile/apply`],
     ["POST", `/v1/batches/${BAD}/reconcile/reject`],
+    ["POST", `/v1/batches/${BAD}/reconcile/undo`],
     ["GET", `/v1/ingests/${BAD}`],
     ["POST", `/v1/ingests/${BAD}/retry`],
   ];
@@ -453,6 +466,29 @@ if (wants("body")) {
     status: 400,
     type: "bad-request",
   });
+
+  // The three reconcile routes that take a list of proposal ids. The
+  // body is checked before the batch is looked up, so a well-formed id
+  // that matches no batch is enough to reach it.
+  for (const verb of ["apply", "reject", "undo"]) {
+    const url = `/v1/batches/${NOBODY}/reconcile/${verb}`;
+    record(G, `POST /v1/batches/:id/reconcile/${verb}  body \`{bad\``, await call("POST", url, { headers: J, body: "{bad" }), {
+      status: 400,
+      type: "malformed-body",
+    });
+    for (const [label, body] of [
+      ["no body", undefined],
+      ["{}", {}],
+      ["proposal_ids: []", { proposal_ids: [] }],
+      ["proposal_ids: 'x'", { proposal_ids: "x" }],
+      ["proposal_ids: ['not-a-uuid']", { proposal_ids: [BAD] }],
+    ] as const) {
+      record(G, `POST /v1/batches/:id/reconcile/${verb}  ${label}`, await call("POST", url, body === undefined ? {} : { json: body }), {
+        status: 422,
+        type: "validation",
+      });
+    }
+  }
 
   const big = new FormData();
   big.append("file", new Blob([Buffer.alloc(5 * 1024 * 1024 + 1)], { type: "image/png" }), "big.png");
@@ -666,6 +702,12 @@ if (wants("500") || wants("pg")) {
       })),
     trigger: () => pgErr("23514", "Postings for transaction 0190 do not balance: sum=5 (must be 0)", { routine: "exec_stmt_raise" }),
     not_null: () => drizzle(pgErr("23502", 'null value in column "name" of relation "brands" violates not-null constraint', { column: "name" })),
+    deadlock: () =>
+      drizzle(pgErr("40P01", "deadlock detected", {
+        detail: "Process 11 waits for ShareLock on transaction 22; blocked by process 33. hunter2",
+        where: 'while locking tuple (0,1) in relation "secret_table"',
+      })),
+    serialization: () => drizzle(pgErr("40001", "could not serialize access due to concurrent update")),
     joined: () =>
       new problemModule.HttpProblem(
         422,
@@ -693,6 +735,12 @@ if (wants("500") || wants("pg")) {
   const hit = (name: string): Promise<Obs> => call("GET", `/throw/${name}`, { base: MINI });
   const noSecret = (o: Obs): string | null =>
     /hunter2|secret_|credentials/.test(o.text) ? "body carries the query, a parameter or a path" : null;
+  const retryable = (o: Obs): string | null =>
+    !/^\d+$/.test(o.headers.get("retry-after") ?? "")
+      ? "no Retry-After header"
+      : typeof o.json?.retry_after_seconds !== "number"
+        ? "no retry_after_seconds in the body"
+        : null;
 
   if (wants("500")) {
     const G = "500";
@@ -736,6 +784,10 @@ if (wants("500") || wants("pg")) {
       ["check", 422, "constraint-violation"],
       ["trigger", 422, "constraint-violation", (o) => (/do not balance/.test(o.json?.detail ?? "") ? null : "trigger's own sentence was dropped")],
       ["not_null", 422, "constraint-violation"],
+      // Postgres stopped a correct statement to let a concurrent one
+      // through: nothing was written, and the answer says "send it again".
+      ["deadlock", 409, "concurrent-update", retryable],
+      ["serialization", 409, "concurrent-update", retryable],
       ["joined", 422, "postings-imbalance", (o) => (/do not balance/.test(o.json?.detail ?? "") ? null : "driver sentence was dropped with the SQL")],
     ];
     for (const [name, status, type, also] of cases) {
@@ -763,7 +815,7 @@ if (wants("500") || wants("pg")) {
   // status. Whatever is thrown, the query and its values stay out.
   if (wants("500")) {
     const G = "500";
-    for (const name of ["syntax", "plain", "string", "uuid", "unique", "joined"]) {
+    for (const name of ["syntax", "plain", "string", "uuid", "unique", "deadlock", "joined"]) {
       const message: string = problemModule.publicErrorMessage(thrown[name]!());
       const bad = /hunter2|secret_|credentials|Failed query|params:/.test(message);
       rows.push({
@@ -846,6 +898,48 @@ function txnBody(tag: string, a: string, b: string, occurredOn = "2026-01-15"): 
 }
 const countTxns = async (tag: string): Promise<number> =>
   Number((await q(`SELECT count(*) AS n FROM transactions WHERE payee = $1`, [`check-http-errors ${NONCE} ${tag}`]))[0]!.n);
+
+/** Upload a small text file as a document. The bytes are unique per
+ *  call: the route dedups on sha256. */
+async function uploadDoc(label: string): Promise<string> {
+  const form = new FormData();
+  form.append("file", new Blob([`check-http-errors ${NONCE} ${label} ${randomUUID()}\n`], { type: "text/plain" }), `${label}.txt`);
+  form.append("kind", "other");
+  const up = await call("POST", "/v1/documents", { body: form });
+  if (up.status !== 201) throw new Error(`fixture: upload ${label} → ${up.status}`);
+  return up.json.id as string;
+}
+
+interface TxnFixture {
+  id: string;
+  version: number;
+  etag: string;
+}
+/** A posted transaction evidenced by the given documents. */
+async function txnWithDocs(tag: string, a: string, b: string, documentIds: string[]): Promise<TxnFixture> {
+  const o = await call("POST", "/v1/transactions", {
+    headers: { "Idempotency-Key": `${tag}-${NONCE}-${randomUUID()}` },
+    json: { ...txnBody(tag, a, b), document_ids: documentIds },
+  });
+  if (o.status !== 201) throw new Error(`fixture: transaction ${tag} → ${o.status}`);
+  return { id: o.json.id, version: o.json.version, etag: o.headers.get("etag") ?? "" };
+}
+
+type ReportList = "kept" | "soft_deleted" | "hard_deleted" | "skipped";
+const REPORT_LISTS: ReportList[] = ["kept", "soft_deleted", "hard_deleted", "skipped"];
+/** A `CascadeDeleteReport` must carry all four lists, and exactly the
+ *  ids named here (a list not named must be empty). */
+function reportIs(o: Obs, want: Partial<Record<ReportList, string[]>>): string | null {
+  for (const list of REPORT_LISTS) {
+    const got: unknown = o.json?.[`transactions_${list}`];
+    if (!Array.isArray(got)) return `no transactions_${list} list`;
+    const expected = [...(want[list] ?? [])].sort();
+    if ([...got].sort().join() !== expected.join()) {
+      return `transactions_${list} has ${got.length} id(s), expected ${expected.length}`;
+    }
+  }
+  return null;
+}
 
 // ── pg (live): constraint and data errors reached through the API ──────
 if (wants("pg")) {
@@ -930,6 +1024,52 @@ if (wants("pg")) {
   } else {
     rows.push({ group: G, request: "POST /v1/owned-items  same purchase line twice", status: items.status, shape: "(fixture: could not add a line item)", expect: "409 conflict", ok: false, why: items.text.slice(0, 120) });
   }
+
+  // A deadlock that reaches the central handler through a real route.
+  // One cannot be staged on demand, so a trigger raises the SQLSTATE
+  // Postgres would, on this fixture's document only. Under test: what
+  // the route answers when its DB transaction is aborted that way, and
+  // that the abort left nothing behind.
+  const dlDoc = await uploadDoc("deadlock");
+  const dlTxn = await txnWithDocs("deadlock", a, b, [dlDoc]);
+  if (!/^[0-9a-f-]{36}$/.test(dlDoc)) throw new Error("fixture: document id is not a uuid");
+  await q(`CREATE OR REPLACE FUNCTION check_http_errors_deadlock() RETURNS trigger LANGUAGE plpgsql AS
+           $$ BEGIN RAISE EXCEPTION 'deadlock detected' USING ERRCODE = '40P01'; END $$`);
+  await q(`CREATE TRIGGER check_http_errors_deadlock BEFORE UPDATE ON documents
+           FOR EACH ROW WHEN (OLD.id = '${dlDoc}'::uuid) EXECUTE FUNCTION check_http_errors_deadlock()`);
+  let aborted: Obs;
+  let abortedPlain: Obs;
+  try {
+    aborted = await call("DELETE", `/v1/documents/${dlDoc}?cascade=true`);
+    abortedPlain = await call("DELETE", `/v1/documents/${dlDoc}`);
+  } finally {
+    await q(`DROP TRIGGER IF EXISTS check_http_errors_deadlock ON documents`);
+    await q(`DROP FUNCTION IF EXISTS check_http_errors_deadlock()`);
+  }
+  const untouched = await q<{ t: Date | null; d: Date | null }>(
+    `SELECT (SELECT deleted_at FROM transactions WHERE id = $1) AS t,
+            (SELECT deleted_at FROM documents WHERE id = $2) AS d`,
+    [dlTxn.id, dlDoc],
+  );
+  record(G, "DELETE /v1/documents/:id?cascade=true  aborted by a deadlock (40P01)", aborted, {
+    status: 409,
+    type: "concurrent-update",
+    also: (o) =>
+      !/^\d+$/.test(o.headers.get("retry-after") ?? "")
+        ? "no Retry-After header"
+        : untouched[0]!.t !== null || untouched[0]!.d !== null
+          ? "the aborted cascade left the transaction or the document deleted"
+          : null,
+  });
+  record(G, "DELETE /v1/documents/:id  aborted by a deadlock (40P01)", abortedPlain, {
+    status: 409,
+    type: "concurrent-update",
+    also: (o) => (/^\d+$/.test(o.headers.get("retry-after") ?? "") ? null : "no Retry-After header"),
+  });
+  record(G, "…and the same cascade, retried", await call("DELETE", `/v1/documents/${dlDoc}?cascade=true`), {
+    status: 200,
+    also: (o) => reportIs(o, { soft_deleted: [dlTxn.id] }),
+  });
 }
 
 // ── idem: Idempotency-Key ──────────────────────────────────────────────
@@ -1072,6 +1212,326 @@ if (wants("etag") && uploadedDocId) {
   record(G, "GET /v1/documents/:id/content", content, {
     status: 200,
     also: (o) => (o.headers.get("etag") === `"${g1.json?.sha256}"` ? null : `ETag is ${o.headers.get("etag")}, not the sha256`),
+  });
+}
+
+// ── etag: a transaction's tag covers its documents ─────────────────────
+// The body of GET /v1/transactions/:id lists the linked documents, and
+// nothing that changes that list touches the transaction row, so its
+// `version` stays put. A tag made of the version alone answered every
+// revalidation with 304 and the receipt page kept the old documents.
+if (wants("etag")) {
+  const G = "etag";
+  const [a, b] = await twoAccounts();
+  const d1 = await uploadDoc("etag-1");
+  const d2 = await uploadDoc("etag-2");
+  const t = await txnWithDocs("etag", a, b, [d1, d2]);
+  const url = `/v1/transactions/${t.id}`;
+  const first = await call("GET", url);
+  let tag = first.headers.get("etag") ?? "";
+  const version0: number = first.json?.version;
+  const originalTag = tag;
+  record(G, "GET /v1/transactions/:id  (two documents)", first, {
+    status: 200,
+    also: () =>
+      !tag
+        ? "no ETag"
+        : tag !== t.etag
+          ? "GET and the POST that created it disagree on the ETag"
+          : tag === `W/"${version0}"`
+            ? "ETag is the bare version: it cannot move when a document does"
+            : null,
+  });
+  record(G, "…If-None-Match: <its ETag>", await call("GET", url, { headers: { "If-None-Match": tag } }), { status: 304 });
+
+  /** Make one change to the documents, then revalidate with the tag
+   *  held from before it. The answer must be a fresh 200 under a new
+   *  tag, with `version` where it was. */
+  const afterChange = async (label: string, change: Obs, want: number, docs: (list: any[]) => string | null): Promise<void> => {
+    const o = await call("GET", url, { headers: { "If-None-Match": tag } });
+    record(G, label, o, {
+      status: 200,
+      also: (x) => {
+        if (change.status !== want) return `the change itself answered ${change.status}`;
+        const now = x.headers.get("etag") ?? "";
+        if (!now || now === tag) return "ETag did not move: a revalidating browser keeps the old documents";
+        if (x.json?.version !== version0) return `version moved to ${x.json?.version}`;
+        return docs(x.json?.documents ?? []);
+      },
+    });
+    tag = o.headers.get("etag") ?? tag;
+  };
+  const docState = (list: any[], id: string): string =>
+    !list.some((d) => d.id === id) ? "absent" : list.find((d) => d.id === id).deleted_at ? "deleted" : "live";
+  const expectDoc = (id: string, state: string) => (list: any[]) =>
+    docState(list, id) === state ? null : `document is ${docState(list, id)}, expected ${state}`;
+
+  await afterChange("…after DELETE /v1/documents/:id (soft delete of one document)", await call("DELETE", `/v1/documents/${d1}`), 204, expectDoc(d1, "deleted"));
+  await afterChange("…after POST /v1/documents/:id/restore", await call("POST", `/v1/documents/${d1}/restore`), 200, expectDoc(d1, "live"));
+  await afterChange("…after DELETE /v1/documents/:id/links/:txn (unlink)", await call("DELETE", `/v1/documents/${d2}/links/${t.id}`), 204, expectDoc(d2, "absent"));
+  await afterChange("…after POST /v1/documents/:id/links (link)", await call("POST", `/v1/documents/${d2}/links`, { json: { transaction_id: t.id } }), 204, expectDoc(d2, "live"));
+  const kept = await call("DELETE", `/v1/documents/${d1}?cascade=true`);
+  await afterChange("…after a cascade delete that kept the transaction", kept, 200, (list) => reportIs(kept, { kept: [t.id] }) ?? expectDoc(d1, "deleted")(list));
+
+  // If-Match guards the transaction row, which none of the above wrote.
+  // A client that read the transaction before them and saves an edit now
+  // must not lose it: the edit is applied (a 412 would be honest too; a
+  // 2xx that changed nothing would not).
+  const MERGE = { "Content-Type": "application/merge-patch+json" };
+  const edit = await call("PATCH", url, { headers: { ...MERGE, "If-Match": originalTag }, json: { narration: `edited ${NONCE}` } });
+  record(G, "PATCH  If-Match: <ETag read before the document changes>", edit, {
+    status: 200,
+    also: (o) =>
+      o.json?.narration !== `edited ${NONCE}`
+        ? "answered 200 but the edit is not in the response"
+        : o.json?.version !== version0 + 1
+          ? `version is ${o.json?.version}, expected ${version0 + 1}`
+          : expectDoc(d1, "deleted")(o.json?.documents ?? []) ??
+            (o.headers.get("etag") && o.headers.get("etag") !== originalTag ? null : "response ETag is not the current one"),
+  });
+  const stored = await q<{ narration: string | null }>(`SELECT narration FROM transactions WHERE id = $1`, [t.id]);
+  record(G, "…and the edit is in the database", await call("GET", url), {
+    status: 200,
+    also: () => (stored[0]?.narration === `edited ${NONCE}` ? null : "the row does not carry the edit"),
+  });
+  record(G, "PATCH  If-Match: <that same ETag again>  (its version is now behind)", await call("PATCH", url, { headers: { ...MERGE, "If-Match": originalTag }, json: { narration: "lost update" } }), {
+    status: 412,
+    type: "version-mismatch",
+  });
+  record(G, 'PATCH  If-Match: W/"<version>"  (built from the body\'s version)', await call("PATCH", url, { headers: { ...MERGE, "If-Match": `W/"${version0 + 1}"` }, json: { narration: `bare ${NONCE}` } }), {
+    status: 200,
+    also: (o) => (o.json?.narration === `bare ${NONCE}` ? null : "the edit is not in the response"),
+  });
+  const current = await call("GET", url);
+  record(G, "POST /v1/transactions/bulk  if_match: <the current ETag>", await call("POST", "/v1/transactions/bulk", {
+    json: { operations: [{ op: "update", id: t.id, if_match: current.headers.get("etag"), patch: { narration: `bulk ${NONCE}` } }] },
+  }), {
+    status: 200,
+    also: (o) => (o.json?.results?.[0]?.status === 200 ? null : `per-item status ${o.json?.results?.[0]?.status}`),
+  });
+  record(G, "PATCH  If-Match: <not an ETag>", await call("PATCH", url, { headers: { ...MERGE, "If-Match": '"abc"' }, json: { narration: "x" } }), {
+    status: 412,
+    type: "version-mismatch",
+  });
+}
+
+// ── state: where cascade delete and dedup apply / undo meet ────────────
+// Each of these is a well-formed request the resource is in the wrong
+// state for. None may be a 500, and the ones that answer 200 must say
+// what they did not do.
+if (wants("state")) {
+  const G = "state";
+  const [a, b] = await twoAccounts();
+  const batchId = randomUUID();
+  await q(
+    `INSERT INTO batches (id, workspace_id, status, file_count, auto_reconcile) VALUES ($1, $2, 'reconciled', 0, false)`,
+    [batchId, SEED_WORKSPACE_ID],
+  );
+  const reconcile = (verb: string, ids: string[], batch = batchId): Promise<Obs> =>
+    call("POST", `/v1/batches/${batch}/reconcile/${verb}`, { json: { proposal_ids: ids } });
+  /** Two transactions with one document each, and a dedup proposal on
+   *  file naming the second as the duplicate of the first. */
+  const pair = async (tag: string): Promise<{ A: string; B: string; docA: string; docB: string; pid: string }> => {
+    const docA = await uploadDoc(`${tag}-a`);
+    const docB = await uploadDoc(`${tag}-b`);
+    const A = await txnWithDocs(`${tag}-a`, a, b, [docA]);
+    const B = await txnWithDocs(`${tag}-b`, a, b, [docB]);
+    const pid = randomUUID();
+    await q(
+      `INSERT INTO reconcile_proposals (id, batch_id, kind, payload, score, status)
+       VALUES ($1, $2, 'dedup', $3::jsonb, 0.9, 'proposed')`,
+      [pid, batchId, JSON.stringify({ duplicate: B.id, duplicate_of: A.id })],
+    );
+    return { A: A.id, B: B.id, docA, docB, pid };
+  };
+  const skippedFor = (o: Obs, prefix: string): string | null => {
+    const reason = String(o.json?.skipped?.[0]?.reason ?? "");
+    const acted = (o.json?.reverted ?? o.json?.applied ?? o.json?.rejected ?? []).length;
+    return acted !== 0 ? "the proposal was acted on" : reason.startsWith(prefix) ? null : `skipped reason is "${reason.slice(0, 60)}"`;
+  };
+  const stateOf = async (txn: string): Promise<{ deleted: boolean; links: number; live_docs: number } | null> =>
+    (
+      await q<{ deleted: boolean; links: number; live_docs: number }>(
+        `SELECT t.deleted_at IS NOT NULL AS deleted,
+                (SELECT count(*)::int FROM document_links dl WHERE dl.transaction_id = t.id) AS links,
+                (SELECT count(*)::int FROM document_links dl JOIN documents d ON d.id = dl.document_id
+                  WHERE dl.transaction_id = t.id AND d.deleted_at IS NULL) AS live_docs
+           FROM transactions t WHERE t.id = $1`,
+        [txn],
+      )
+    )[0] ?? null;
+  const proposalStatus = async (pid: string): Promise<string> =>
+    (await q<{ status: string }>(`SELECT status FROM reconcile_proposals WHERE id = $1`, [pid]))[0]?.status ?? "(gone)";
+
+  // — undo, in every state it cannot act on —
+  record(G, "POST /v1/batches/<no such batch>/reconcile/undo", await reconcile("undo", [randomUUID()], NOBODY), {
+    status: 404,
+    type: "not-found",
+  });
+  record(G, "undo  a proposal id this batch does not have", await reconcile("undo", [randomUUID()]), {
+    status: 200,
+    also: (o) => skippedFor(o, "not_found"),
+  });
+  const open = await pair("open");
+  record(G, "undo  a proposal that is still `proposed`", await reconcile("undo", [open.pid]), {
+    status: 200,
+    also: (o) => skippedFor(o, "not_applied"),
+  });
+  await reconcile("reject", [open.pid]);
+  record(G, "undo  a proposal that was rejected", await reconcile("undo", [open.pid]), {
+    status: 200,
+    also: (o) => skippedFor(o, "not_applied"),
+  });
+  record(G, "apply  a proposal that was rejected", await reconcile("apply", [open.pid]), {
+    status: 200,
+    also: (o) => skippedFor(o, "rejected"),
+  });
+
+  const round = await pair("round");
+  const applied = await reconcile("apply", [round.pid]);
+  record(G, "reject  a proposal that was applied", await reconcile("reject", [round.pid]), {
+    status: 200,
+    also: (o) => (applied.json?.applied?.length === 1 ? skippedFor(o, "already_applied") : "fixture: the apply did not apply"),
+  });
+  const undone = await reconcile("undo", [round.pid]);
+  const roundB = await stateOf(round.B);
+  record(G, "undo  an applied proposal", undone, {
+    status: 200,
+    also: (o) => {
+      const r = o.json?.reverted?.[0];
+      if (!r) return "nothing reverted";
+      if (r.restored !== true || r.documents_relinked?.join() !== round.docB) return "the detail does not name the restored document";
+      return roundB && !roundB.deleted && roundB.live_docs === 1 ? null : "the duplicate is not live with its document";
+    },
+  });
+  record(G, "undo  the same proposal again", await reconcile("undo", [round.pid]), {
+    status: 200,
+    also: (o) => skippedFor(o, "already_reverted"),
+  });
+  record(G, "apply  a proposal that was reverted", await reconcile("apply", [round.pid]), {
+    status: 200,
+    also: (o) => skippedFor(o, "reverted"),
+  });
+
+  // — apply, then the moved document is cascade-deleted, then undo —
+  // The cascade keeps the survivor (it has its own document). Undo must
+  // not answer by bringing the duplicate back with nothing live behind it.
+  for (const hard of [false, true]) {
+    const mode = hard ? "hard" : "soft";
+    const s = await pair(`seam-${mode}`);
+    await reconcile("apply", [s.pid]);
+    const cascade = await call("DELETE", `/v1/documents/${s.docB}?cascade=true${hard ? "&hard=true" : ""}`);
+    record(G, `apply, then ${mode} cascade delete of the document it moved`, cascade, {
+      status: 200,
+      also: (o) => (o.json?.hard === hard && o.json?.document_id === s.docB ? reportIs(o, { kept: [s.A] }) : "report does not describe this call"),
+    });
+    const refused = await reconcile("undo", [s.pid]);
+    const dup = await stateOf(s.B);
+    const status = await proposalStatus(s.pid);
+    record(G, `…then undo: nothing live to give the duplicate back (${mode})`, refused, {
+      status: 200,
+      also: (o) =>
+        skippedFor(o, "no_live_document") ??
+        (!dup?.deleted
+          ? "the duplicate was restored with no live document"
+          : status !== "user_applied"
+            ? `the proposal is ${status}, not still applied`
+            : null),
+    });
+    if (!hard) {
+      await call("POST", `/v1/documents/${s.docB}/restore`);
+      const retried = await reconcile("undo", [s.pid]);
+      const back = await stateOf(s.B);
+      const survivor = await stateOf(s.A);
+      record(G, "…restore that document, undo again", retried, {
+        status: 200,
+        also: (o) =>
+          o.json?.reverted?.length !== 1
+            ? `not reverted: "${String(o.json?.skipped?.[0]?.reason ?? "").slice(0, 60)}"`
+            : back && !back.deleted && back.live_docs === 1 && survivor?.links === 1
+              ? null
+              : "the two transactions do not each hold their own document",
+      });
+    }
+  }
+
+  // — the cascade report, one linked transaction at a time —
+  const r1 = await uploadDoc("report-1");
+  const r2 = await uploadDoc("report-2");
+  const two = await txnWithDocs("report", a, b, [r1, r2]);
+  record(G, "cascade delete of one of a transaction's two documents", await call("DELETE", `/v1/documents/${r1}?cascade=true`), {
+    status: 200,
+    also: (o) => reportIs(o, { kept: [two.id] }),
+  });
+  record(G, "…of its last live document", await call("DELETE", `/v1/documents/${r2}?cascade=true`), {
+    status: 200,
+    also: (o) => reportIs(o, { soft_deleted: [two.id] }),
+  });
+  record(G, "…of that document again (transaction already deleted)", await call("DELETE", `/v1/documents/${r2}?cascade=true`), {
+    status: 200,
+    also: (o) => reportIs(o, { skipped: [two.id] }),
+  });
+
+  // A transaction that is ALREADY soft-deleted and still has two live
+  // documents. It is not in the ledger, so it is never "kept".
+  const softDelete = (t: TxnFixture): Promise<Obs> => call("DELETE", `/v1/transactions/${t.id}`, { headers: { "If-Match": t.etag } });
+  const g1 = await uploadDoc("gone-1");
+  const g2 = await uploadDoc("gone-2");
+  const gone = await txnWithDocs("gone", a, b, [g1, g2]);
+  await softDelete(gone);
+  record(G, "cascade delete, linked transaction already soft-deleted (has another live document)", await call("DELETE", `/v1/documents/${g1}?cascade=true`), {
+    status: 200,
+    also: (o) => reportIs(o, { skipped: [gone.id] }),
+  });
+  const purge = await call("DELETE", `/v1/documents/${g2}?cascade=true&hard=true`);
+  const purgeEvent = await q<{ prior: string | null }>(
+    `SELECT payload->>'prior_deleted_at' AS prior FROM transaction_events
+      WHERE event_type = 'hard_deleted' AND payload->>'transaction_id' = $1`,
+    [gone.id],
+  );
+  record(G, "…hard cascade of its last live document (the purge)", purge, {
+    status: 200,
+    also: (o) =>
+      reportIs(o, { hard_deleted: [gone.id] }) ??
+      (purgeEvent.length === 1 && purgeEvent[0]!.prior ? null : "the hard_deleted event does not say the row was already soft-deleted, or since when"),
+  });
+  const h1 = await uploadDoc("gone-hard-1");
+  const h2 = await uploadDoc("gone-hard-2");
+  const goneHard = await txnWithDocs("gone-hard", a, b, [h1, h2]);
+  await softDelete(goneHard);
+  const unlinkOnly = await call("DELETE", `/v1/documents/${h1}?cascade=true&hard=true`);
+  const goneHardNow = await stateOf(goneHard.id);
+  record(G, "hard cascade, linked transaction already soft-deleted (has another live document)", unlinkOnly, {
+    status: 200,
+    also: (o) => reportIs(o, { skipped: [goneHard.id] }) ?? (goneHardNow?.deleted && goneHardNow.links === 1 ? null : "the tombstone did not simply lose this one link"),
+  });
+
+  // — refusals —
+  const k1 = await uploadDoc("reconciled");
+  const matched = await txnWithDocs("reconciled", a, b, [k1]);
+  await call("POST", `/v1/transactions/${matched.id}/reconcile`, { headers: { "If-Match": matched.etag } });
+  const blocked = await call("DELETE", `/v1/documents/${k1}?cascade=true`);
+  const k1Row = await q<{ deleted_at: Date | null }>(`SELECT deleted_at FROM documents WHERE id = $1`, [k1]);
+  record(G, "cascade delete, last evidence of a reconciled transaction", blocked, {
+    status: 409,
+    type: "cascade-blocked-reconciled",
+    also: (o) =>
+      o.json?.reconciled_transaction_ids?.join() !== matched.id
+        ? "reconciled_transaction_ids does not name it"
+        : k1Row[0]?.deleted_at
+          ? "refused, but the document was deleted anyway"
+          : null,
+  });
+  record(G, "DELETE /v1/documents/:id?hard=true  (linked, no cascade)", await call("DELETE", `/v1/documents/${k1}?hard=true`), {
+    status: 409,
+    type: "document-has-links",
+  });
+  for (const qs of ["cascade=maybe", "cascade=true&hard=yes", "hard="]) {
+    record(G, `DELETE /v1/documents/:id?${qs}`, await call("DELETE", `/v1/documents/${k1}?${qs}`), { status: 422, type: "validation" });
+  }
+  record(G, "DELETE /v1/documents/<no such document>?cascade=true", await call("DELETE", `/v1/documents/${NOBODY}?cascade=true`), {
+    status: 404,
+    type: "not-found",
   });
 }
 

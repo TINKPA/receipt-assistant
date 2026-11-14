@@ -65,6 +65,10 @@
  *        is the newer one; two reconciled rows are not paired
  *   ch   applies built on each other                → undo refuses the inner one until the outer
  *        is undone; newest-first restores every row with exactly its own document
+ *   cd   cascade delete between apply and undo      → deleting the moved document keeps the
+ *        survivor and says so; undo is then refused (`no_live_document`) instead of restoring
+ *        a row with no live document; soft: restore the document and undo works; hard: the
+ *        refusal stands
  *
  * Agent decision tree (--with-claude):
  *   b2   re-encoded copy of extracted receipt       → branch-2 attach (near_dup, no new txn)
@@ -1301,6 +1305,79 @@ async function main(): Promise<void> {
       );
     }
     notes.push("C→B then B→A: undo of C→B refused until B→A is undone; newest-first leaves A, B, C each with its own document");
+  });
+
+  // cd — a cascade delete between apply and undo. The apply moved the
+  // duplicate's document onto the survivor; deleting that document with
+  // cascade keeps the survivor, which still has its own. Undo must not
+  // then bring the duplicate back with nothing live behind it.
+  await runCase("cd", false, async (notes) => {
+    for (const hard of [false, true]) {
+      const mode = hard ? "hard" : "soft";
+      const base = {
+        payee: `Cascade Seam ${mode} ${NONCE}`,
+        occurred_on: "2026-06-16",
+        total_minor: amt(hard ? 28 : 27),
+      };
+      const first = await seedOne(base);
+      const second = await seedOne(base);
+      const [prop] = await proposalsBetween(first.tx.id, second.tx.id);
+      assert(prop && prop.status === "proposed", `[${mode}] expected an open proposal to work with`);
+      const dup = prop.payload.duplicate === first.tx.id ? first : second;
+      const surv = dup === first ? second : first;
+      assert(prop.payload.duplicate_of === surv.tx.id, `[${mode}] proposal does not name the pair`);
+      const undoUrl = `/v1/batches/${prop.batch_id}/reconcile/undo`;
+
+      const applied = await postJson(`/v1/batches/${prop.batch_id}/reconcile/apply`, { proposal_ids: [prop.id] });
+      assert(applied.json.applied?.length === 1, `[${mode}] apply: ${applied.body}`);
+      assert((await linksOf(surv.tx.id)).length === 2, `[${mode}] apply did not move the document`);
+
+      // Delete the moved document, the way "Document + transaction" does.
+      const del = await api(`/v1/documents/${dup.docId}?cascade=true${hard ? "&hard=true" : ""}`, { method: "DELETE" });
+      assert(del.status === 200, `[${mode}] cascade delete → ${del.status}: ${del.body}`);
+      assert(
+        del.json.transactions_kept.join() === surv.tx.id &&
+          del.json.transactions_soft_deleted.length === 0 &&
+          del.json.transactions_hard_deleted.length === 0 &&
+          del.json.transactions_skipped.length === 0,
+        `[${mode}] cascade report should keep the survivor and name nothing else: ${del.body}`,
+      );
+      assert(isLive(await txState(surv.tx.id)), `[${mode}] cascade removed the survivor`);
+      assert(
+        (await linksOf(surv.tx.id)).join() === (hard ? [surv.docId] : [surv.docId, dup.docId].sort()).join(),
+        `[${mode}] survivor's links after the cascade are wrong`,
+      );
+
+      // Undo: refused by name, and nothing moved.
+      const undo = await postJson(undoUrl, { proposal_ids: [prop.id] });
+      assert(undo.status === 200, `[${mode}] undo → ${undo.status}: ${undo.body}`);
+      const reason = String(undo.json.skipped?.[0]?.reason ?? "");
+      assert(
+        undo.json.reverted.length === 0 && reason.startsWith("no_live_document"),
+        `[${mode}] undo with no live document was not refused by name: ${undo.body}`,
+      );
+      assert((await txState(dup.tx.id)).deleted_at !== null, `[${mode}] undo restored a transaction with no live document`);
+      assert((await linksOf(dup.tx.id)).length === 0, `[${mode}] refused undo still moved a link`);
+      const [still] = await proposalsBetween(first.tx.id, second.tx.id);
+      assert(still!.status === "user_applied", `[${mode}] refused undo left the proposal ${still!.status}`);
+
+      if (hard) {
+        // The file is gone for good: the refusal says so, and stands.
+        assert(reason.includes("1 gone"), `[hard] reason should say the document is gone: ${reason}`);
+        notes.push("apply → hard cascade of the moved document → undo refused (no_live_document, gone); duplicate stays deleted, survivor keeps its own document");
+        continue;
+      }
+      // Soft: the document is a tombstone. Bring it back and undo works.
+      assert(reason.includes("1 deleted"), `[soft] reason should say the document is deleted: ${reason}`);
+      const restored = await api(`/v1/documents/${dup.docId}/restore`, { method: "POST" });
+      assert(restored.status === 200, `[soft] document restore → ${restored.status}`);
+      const again = await postJson(undoUrl, { proposal_ids: [prop.id] });
+      assert(again.json.reverted?.length === 1, `[soft] undo after restoring the document: ${again.body}`);
+      assert(isLive(await txState(dup.tx.id)), "[soft] duplicate was not restored");
+      assert((await linksOf(dup.tx.id)).join() === dup.docId, "[soft] restored row is missing its document");
+      assert((await linksOf(surv.tx.id)).join() === surv.docId, "[soft] survivor kept the moved document");
+      notes.push("apply → soft cascade of the moved document → undo refused (no_live_document); restore the document → undo restores the row with it");
+    }
   });
 
   // b2 — branch 2: re-encoded copy of an extracted receipt → attach
