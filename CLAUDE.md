@@ -280,7 +280,7 @@ Regression checks, each against a throwaway Postgres (usage in the file header):
 Not done:
 
 - The frontend (separate repo) formats every amount as hundredths, so a JPY receipt's own amount renders as ¥50.00 for ¥5,000, and its detail page shows `postings.fx_rate` as "the rate" where `metadata.fx.rates[].rate` is the published one.
-- `products.total_spent_minor` is still a sum of native line amounts (`transaction_items.effective_total_minor`), shown as dollars. It is written in three places that must agree: `recomputeProductStats` and the merge handler in `src/routes/products.ts`, and the ingest-time SQL in `src/ingest/items-sql.ts`, which is prompt text.
+- `products.total_spent_minor` is still a sum of native line amounts (`transaction_items.effective_total_minor`), shown as dollars. It is written in two places: `recomputeProductStats` in `src/catalog/product-stats.ts` (the products route's recompute and merge call it, and the server applier will), and the ingest and re-extract SQL in `src/ingest/items-sql.ts`, which is prompt text. They agree except on two points, both deliberate: the helper resets a product with no counted line left to zero, where the prompt SQL leaves its old numbers (a product a re-extract dropped keeps its count); and the helper takes `liveOnly`, which the routes pass as `false` (deleted transactions count, as in the prompt SQL) and the applier will pass as `true`.
 - A points leg whose valuation pass never ran (`fx_rate` NULL, as opposed to valued at 0) sits in the totals at its points count and is in neither disclosure block.
 
 ## Agent sandbox: what the two agents can reach
