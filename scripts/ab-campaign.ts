@@ -852,6 +852,9 @@ async function runUnit(ctx: Ctx, item: WorkItem, attempt: Attempt): Promise<Reco
   const dir = attempt.dir;
   const log = path.join(dir, "unit.log");
   const tm = await writeTrialManifest(ctx.args.out, ctx.fixtures, trial);
+  // app.log starts at the recreate, so it carries the boot line naming the
+  // writer as well as everything the unit's runs logged.
+  const recreatedAt = new Date();
   await recreate({ arm, concurrency: 1 }, ctx);
   await resetLedger(ctx, log);
   const since = new Date();
@@ -889,7 +892,7 @@ async function runUnit(ctx: Ctx, item: WorkItem, attempt: Attempt): Promise<Reco
       path.join(dir, "replay-records.txt"),
     );
   }
-  const logs = sh("docker", ["logs", "--since", since.toISOString(), SANDBOX.app]);
+  const logs = sh("docker", ["logs", "--since", recreatedAt.toISOString(), SANDBOX.app]);
   await writeFile(path.join(dir, "app.log"), logs.stdout + logs.stderr);
   if (ev.code !== 0) {
     throw new StackFailure(`eval-dates exited ${ev.code} (see ${path.join(dir, "eval-dates.log")}); the unit is redone on the next run`);
