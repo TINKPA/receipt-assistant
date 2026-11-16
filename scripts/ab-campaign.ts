@@ -1219,6 +1219,7 @@ function printPlan(args: Args, fixtures: PlannedFixture[], trials: number): void
   let ext = 0;
   let tok = 0;
   let min = 0;
+  let reextracts = 0;
   L.push("");
   L.push("  item        writer        extractions   ~billed input   ~minutes");
   for (const item of workItems(trials)) {
@@ -1234,6 +1235,7 @@ function printPlan(args: Args, fixtures: PlannedFixture[], trials: number): void
     } else if (item.kind === "c5") {
       n = 3;
       note = "0 when it reuses the last B unit's ledger; plus 6 re-extracts";
+      reextracts += 6;
       tokens = 3 * EST.tokens.B + 6 * EST.tokens.reextract;
       minutes = 3 * EST.minutes.B + 6 * EST.minutes.reextract;
     } else if (item.kind === "c3") {
@@ -1256,7 +1258,7 @@ function printPlan(args: Args, fixtures: PlannedFixture[], trials: number): void
     );
   }
   L.push("");
-  L.push(`  total: about ${ext} extractions + 6 re-extracts, ~${(tok / 1e6).toFixed(0)}M billed input, ~${(min / 60).toFixed(1)} h`);
+  L.push(`  total: about ${ext} extractions${reextracts ? ` + ${reextracts} re-extracts` : ""}, ~${(tok / 1e6).toFixed(0)}M billed input, ~${(min / 60).toFixed(1)} h`);
   L.push(`  per-run estimates from plan §12.2 (A ~${EST.tokens.A / 1e6}M, B ~${EST.tokens.B / 1e6}M) and the P0/P3 runs; rough.`);
   if (args.standIn) L.push("  REHEARSAL (--stand-in-claude): every spawn reaches the stand-in; no model is called and no quota is spent.");
   console.log(L.join("\n"));
