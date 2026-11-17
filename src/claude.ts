@@ -170,6 +170,19 @@ export function buildClaudeEnv(profileName: AgentProfileName): NodeJS.ProcessEnv
 }
 
 /**
+ * Whether a child of `profileName` will find `name` set: the variable is on
+ * the profile's allowlist and the server has a non-empty value for it, the
+ * test `buildClaudeEnv` applies. The record rendering of the ingest prompt
+ * tells its agent whether the Google key is set, so the agent never spends
+ * a turn testing it (or printing it).
+ */
+export function childEnvHas(profileName: AgentProfileName, name: string): boolean {
+  const profile: AgentProfile = AGENT_PROFILES[profileName];
+  const value = process.env[name];
+  return [...BASE_ENV, ...profile.env].includes(name) && value !== undefined && value !== "";
+}
+
+/**
  * The flags that make a profile what it is. Callers add only presentation
  * (`--output-format`, `--verbose`) and `--model`; `runClaude` refuses
  * anything else.

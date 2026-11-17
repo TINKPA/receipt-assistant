@@ -36,7 +36,8 @@
  *      `WebSearch`, logo.dev key or Google place-record endpoint. Rendered
  *      with decoded email text and an attachment so every branch of it is
  *      read. It is not part of the grant tables: nothing it says may need
- *      a grant.
+ *      a grant. It also states whether the Google key is set for the run
+ *      (rendered both ways), and never asks the agent to test the key.
  *
  * It is a reader of prose, not a SQL parser. It errs toward seeing a
  * statement where there is only a mention; if it ever trips on a sentence,
@@ -389,15 +390,27 @@ for (const entry of ASK_SCHEMA_DIGEST) {
 // carry out, and the first thing a turned agent would go looking around for.
 
 {
-  const recordPrompt = buildExtractorPrompt({
-    ...ctx,
-    writer: "server_apply",
-    filePath: "/data/uploads/x.eml",
-    phashNeighbors: [],
-    sourceText: "From: Example <orders@example.com>\nSubject: Receipt\n\nWidget 1 $1.00\nTotal $1.00",
-    attachments: [{ path: "/tmp/x/attachment-1.pdf", filename: "invoice.pdf", bytes: 1 }],
-  });
+  const render = (googleKeySet: boolean) =>
+    buildExtractorPrompt({
+      ...ctx,
+      writer: "server_apply",
+      filePath: "/data/uploads/x.eml",
+      phashNeighbors: [],
+      sourceText: "From: Example <orders@example.com>\nSubject: Receipt\n\nWidget 1 $1.00\nTotal $1.00",
+      attachments: [{ path: "/tmp/x/attachment-1.pdf", filename: "invoice.pdf", bytes: 1 }],
+      googleKeySet,
+    });
+  const recordPrompt = render(true);
   const before = violations.length;
+  // The server says whether the Google key is set, so the agent never
+  // spends a turn testing it (and once printed its first characters).
+  const noKey = render(false);
+  if (/GOOGLE_MAPS_API_KEY is empty|\[ -[nz] "\$GOOGLE_MAPS_API_KEY"/.test(recordPrompt + noKey)) {
+    violations.push("record prompt: asks the agent to test the Google key; the server states whether it is set");
+  }
+  if (!recordPrompt.includes("The server has\nset that key for this run") || !noKey.includes("No Google key is set for\nthis run")) {
+    violations.push("record prompt: does not state whether the Google key is set for the run");
+  }
   const saved = new Map(used);
   used.clear();
   scanBothWays("record prompt", recordPrompt);

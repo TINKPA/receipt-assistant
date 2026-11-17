@@ -146,7 +146,7 @@ Wave 1 adds constants for the server writer, all shipped dark. Until the agent-S
 
 When the legacy writer is retired the prompt constants collapse into one `PROMPT_VERSION = "4.0"`.
 
-One exception was taken on purpose: the tender decisions of November 2026 (`debit_card`, gift cards to Cash, the mixed-tender flag) went in under contract 1, record prompt 4.0 and applier 1.0, because no record had yet been written outside throwaway and sandbox databases (production's `document_extractions` was empty). Once production holds records, every such change bumps its constant.
+One exception was taken on purpose: the tender decisions of November 2026 (`debit_card`, gift cards to Cash, the mixed-tender flag), and after the P3 smoke the dates booked as printed, the misread-key attach and the record rendering's turn economy, went in under contract 1, record prompt 4.0 and applier 1.0, because no record had yet been written outside throwaway and sandbox databases (production's `document_extractions` was empty; check it read-only before relying on this). **The exception ends with the first P4 A/B trial.** From then on any change to the record rendering bumps `RECORD_PROMPT_VERSION`, any change to a projection, dedup or catalog rule bumps `APPLIER_VERSION`, and any change to the record's shape bumps `EXTRACTION_CONTRACT_VERSION` (with the prompt version), so every trial's rows name the text and rules that produced them. The known gaps the A/B treats as known (one store read as two brand slugs; a purchase paid wholly from a balance has total 0, which some legacy rows ignore) are under "Known gaps" in the design doc.
 
 ### Extraction records (`document_extractions`, wave 1)
 
@@ -158,7 +158,7 @@ Under the server writer (`EXTRACTION_WRITER=server_apply`) the agent writes no S
 | `src/ingest/contract/validate.ts` | normalisations, errors and warnings, each with a stable rule id; `renderRepairRequest`; `diffRepair` |
 | `src/ingest/contract/artefact.ts` | finding the record in stdout or the transcript, the size caps, `pgSafeText` |
 | `src/ingest/records.ts` | the only writer of `document_extractions` |
-| `src/ingest/prompt.ts` and the modules it stitches | the record rendering, `buildExtractorPrompt({ writer: 'server_apply', … })`: every write-specific block is `forWriter(writer, legacyText, recordText)`. Lessons tagged `[write]` in `lessons.md` are left out of it and `[record]` lines are its own; see the file's header. |
+| `src/ingest/prompt.ts` and the modules it stitches | the record rendering, `buildExtractorPrompt({ writer: 'server_apply', … })`: every write-specific block is `forWriter(writer, legacyText, recordText)`. Lessons tagged `[write]` in `lessons.md` are left out of it and `[record]` lines are its own; see the file's header. Its context carries `googleKeySet`, which the worker fills (`childEnvHas` in `src/claude.ts`) so the prompt says whether the key is set and the agent never spends a turn testing or printing it; the rendering also rules out idle tool calls and folds the PDF text read and the two Phase 3a lookups into one command each ("Two renderings of one prompt" in the design doc). |
 | `src/claude.ts` | the `extraction_record` profile (Bash, Read, Write; `GOOGLE_MAPS_API_KEY` only; no `DATABASE_URL`) and `runClaude`'s `resumeSessionId`, which only server code fills, with the session id it minted for the run |
 | `src/ingest/extractor.ts::runRecordExtraction` | spawn, parse, validate and the repair rounds; writes nothing |
 
@@ -178,9 +178,12 @@ The code that turns a stored record into ledger rows. The worker calls it under 
 | `accounts.ts` | the chart of accounts as `project` takes it |
 | `metadata.ts` | `transactions.metadata` as a fixed key set (`APPLIER_METADATA_KEYS`) |
 | `catalog.ts`, `places.ts` | the catalog and place writes; every value is a bound parameter |
-| `candidates.ts`, `decide.ts` | the duplicate candidates, read after `takeWorkspaceApplyLock`, and the pure attach-or-insert decision. It reuses `IDENTIFIER_KEYS`, `compareIdentifiers`, `flowsDisagree` and `cardLast4` from `src/reconcile/dedup.ts`; change those there. |
+| `candidates.ts`, `decide.ts` | the duplicate candidates, read after `takeWorkspaceApplyLock`, and the pure attach-or-insert decision. It reuses `IDENTIFIER_KEYS`, `compareIdentifiers`, `flowsDisagree` and `cardLast4` from `src/reconcile/dedup.ts`; change those there. An identifier alone never attaches, and a conflicting key blocks an attach, with one exception (rule 2 (ii), tiebreaker `hard_tuple_misread`): exactly one key conflicts and its two values, four characters or more, are the same length and differ in one character; at least two other keys match under the same key with two different values, one of them `payment_id` or `approval_code` (a second charge, such as a second refund under one order, carries its own); the hard tuple holds and the cards agree. That reads one checkout whose key was misread; the attach flags the target for review (`near_dup_check`, the reason naming the key and the two-charge alternative, also in `merge_audit` and `apply_report`), and an `uncertain` verdict on the target a person had dismissed is kept as `distinct`. The exception lives here only: `src/reconcile/` is shared with the legacy writer and unchanged. |
 | `fingerprint.ts` | the fields two writers must agree on for one document, canonicalised and hashed |
+| `review.ts` | the record's own review reasons, read off its stored validation report: every flag in `audit.review_flags` (`date_unresolved` at any date; with a date after the upload, booked as printed), and a repair round that changed the date, the time or money |
 | `version.ts` | `APPLIER_VERSION` |
+
+**Dates are booked as printed.** A date the document does not print is never booked silently (the owner's rule). A date more than two days after the upload is the error `future_date` unless the record flags `date_unresolved`; then it is the warning `future_date_unresolved`, the transaction is booked on the printed date, and it is flagged for review. The repair request for `future_date`, Check A step 5 of the record prompt and its repair paragraph all ask for the same thing: an earlier printed charge date; where the document prints only service dates, the email's Date header or the PDF's creation date as the charge date; otherwise the same date flagged; never another. `date_unresolved` flags the insert at any date, as does every other flag the reading puts in `audit.review_flags` (`total_unresolved`, `handwritten_amount`, `partial_document`, `needs_review`): the lessons have the agent book an upload date or a file's mtime as `date_unresolved` when nothing is printed. A repair round whose reply changed `facts.occurred_on`, `facts.occurred_at` or a money field also gets the insert flagged (`validation.repairs[].changed` records what each round changed). The flag is the mixed tender's: `metadata.near_dup_check.flagged_for_review` with the reason first; an attach only lists the reasons in `apply_report.review.noted`. See "The repair round" and "Review flags from the reading" in the design doc.
 
 **When an apply fails.** The ingest errors with `apply failed: <code>` (the codes are listed under "Failures and retries" in the design doc), the run ends `failed` / `apply` with the failure in `apply_report`, and the record stays valid and unapplied. `account_missing` is a chart of accounts the applier does not expect, a seeding fault, not a bad reading. The log lines:
 
@@ -234,7 +237,7 @@ SELECT metadata->'extraction' FROM transactions WHERE id = $1;
 
 **Arm B's rows differ from arm A's on purpose.** The list (X1–X13, plus the tenders) is under "Expected differences from the legacy writer" in the design doc; the A/B adjudicates those as expected, not as regressions. One of them already reaches the `agent_sql` side: since d224b7b, which production runs, reconcile's `cardLast4` reads a typed `metadata.card_last4` first on every row, legacy rows included. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one); a change in what reconcile proposes may come from it rather than from the writer. The rollout itself (sandbox check, A/B gates, flip, watch, rollback triggers) is under "Rollout".
 
-**Stubs.** A stub upload (sandbox only) takes the path it names, whatever `EXTRACTION_WRITER` says: a `terminal` stub the legacy one (run writer `stub`), a `record` stub the server writer's (run writer `server_apply`, record origin `stub`, no model or CLI on the run). A record stub's child prints its record as the agent's final message, so the real parser, validator, repair round, T1 and applier run on it; it can also supply the email envelope, a pHash, a pause between T1 and T2, and a failing child for the repair round only (`repair_child`). See RECORD MODE in `src/ingest/stub-extractor.ts`.
+**Stubs.** A stub upload (sandbox only) takes the path it names, whatever `EXTRACTION_WRITER` says: a `terminal` stub the legacy one (run writer `stub`), a `record` stub the server writer's (run writer `server_apply`, record origin `stub`, no model or CLI on the run). The one exception is a `follow_writer` stub, which carries both parts and takes the path the variable names, for rehearsing both arms of the A/B with one manifest. A record stub's child prints its record as the agent's final message, so the real parser, validator, repair round, T1 and applier run on it; it can also supply the email envelope, a pHash, a pause between T1 and T2, and a failing child for the repair round only (`repair_child`). See RECORD MODE in `src/ingest/stub-extractor.ts`.
 
 ### Three ways to re-run a layer
 
@@ -760,6 +763,8 @@ npm run eval:dates -- --dry-run            # resolve and copy only; no upload
 npm run eval:dates -- --reset --limit=6    # the six-fixture sanity set
 ```
 
+The wave-1 A/B is run with `scripts/ab-campaign.ts` (unattended, sandbox only, resumable: one unit per trial and arm with the container recreated for the arm's writer, `eval-dates --dump`, `check-ledger` and `--records` per unit, plus the `eval-dedup`, `check-apply-extraction` and re-extract steps; it stops and voids the trial pair on a quota, overload, auth or rate-limit failure) and judged with `scripts/diff-arms.ts` (the gates G1-G9, pending until every planned unit has run, and a private adjudication worksheet whose answers are cleared when the values they judged change). Recipe, outputs and the no-model rehearsal: `scripts/ab-campaign.md`.
+
 ### Dedup regression matrix — `scripts/eval-dedup.ts`
 
 The dedup system (#134/#135) has a dedicated regression harness that
@@ -823,10 +828,24 @@ what keeps it at one transaction; without the lock it fails 0/3.
 `--with-claude` adds the agent decision-tree branches (`b2` attach,
 `b3` distinct-despite-pHash, `b4` flag+review round-trip) and the
 same-batch `race` case (~15 min total); those do need a reset sandbox.
+Their receipts are real documents, so they are named in a private
+manifest outside the repository (`--claude-manifest`, default
+`~/Developer/receipt-assistant-data/eval/dedup-claude.manifest.json`;
+the script's header says what each file must be), and the cases find
+their rows by ingest and document, never by a merchant name.
+`--only=<cases>` selects cases (a name that matches none is an error),
+`--repeat=<n> --reset-between` runs them n times on a reset sandbox
+each round (the A/B's `race` ×3), and `--json=<file>` writes the
+results for `scripts/ab-campaign.ts`.
 The in-batch pass no longer removes a row on date + payee + amount
 alone, so `race` only converges on its second path when both
 extractions wrote the same identifier. That path has not been re-run
-since the change.
+since the change. Under `server_apply` the applier decides the second
+copy under the apply lock; when its reading differs from the first in
+one character of one identifier and agrees on the hard tuple and two
+other keys, one of them the approval code or payment id, it attaches
+(`hard_tuple_misread`) and flags the target, so `race` still expects one
+live transaction.
 
 The stub extractor is double-gated (`EXTRACTOR_STUB_ALLOWED=1`,
 test compose only + `{"__stub__":true}` file magic) — never enable
@@ -837,7 +856,11 @@ session of its own as the CLI's Bash tool runs commands), for testing the
 timeout and slot-release path without a real run. Its record mode
 (`"record"` instead of `"terminal"`) stands in for the server writer's
 agent: that child prints the record, and a `repair_record` on `--resume`;
-see the header of `src/ingest/stub-extractor.ts`. Don't run the claude cases while
+see the header of `src/ingest/stub-extractor.ts`. A `follow_writer` stub
+carries both parts and takes the path `EXTRACTION_WRITER` names, and a
+failing child can print the CLI's words for an outage (`child.fail_as`:
+`quota`, `overloaded`, `auth`); both exist to rehearse the A/B campaign
+runner without a model. Don't run the claude cases while
 an `eval-dates` batch is draining: both share the worker queue and
 the auth pool, and harness poll timeouts will fire while queued.
 

@@ -44,8 +44,9 @@
  * `RECORD_PROMPT_VERSION` (`prompt-contract.ts`). One exception was
  * taken: `debit_card` joined `PAYMENT_METHODS` inside version 1 (November
  * 2026), because no record had been written outside throwaway and sandbox
- * databases yet, so no stored version-1 record lacks it. Once production
- * holds records, there are no more exceptions.
+ * databases yet, so no stored version-1 record lacks it. From the first
+ * P4 A/B trial on, there are no more exceptions (docs/server-writer.md,
+ * "Versions").
  */
 import { z } from "zod";
 import type { IdentifierKey } from "../../reconcile/dedup.js";

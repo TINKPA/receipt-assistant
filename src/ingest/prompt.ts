@@ -100,6 +100,12 @@ export interface ExtractorPromptContext {
   sourceText?: string | null;
   /** PDF attachments of an `.eml`, already written to the scratch dir. */
   attachments?: DecodedAttachment[];
+  /** The record rendering's: whether the agent's environment has the
+   *  Google key (`childEnvHas('extraction_record', 'GOOGLE_MAPS_API_KEY')`,
+   *  filled by the worker), so the prompt can say so and the agent never
+   *  spends a turn testing or printing it. Left out, the rendering says it
+   *  is set. The legacy rendering ignores it. */
+  googleKeySet?: boolean;
 }
 
 /** Render the pHash-neighbor context block for Phase 4a.0. */
@@ -265,8 +271,11 @@ function recordHandBack(): string {
 - \`.eml\` with a PDF attachment: prefer the source with richer data
   (usually the attachment). Say which in source_used.
 - Reason in plain text BEFORE writing the record. Show your arithmetic
-  (the lines against the printed subtotal, tax, tip and total) so
-  mistakes are visible in the session transcript.
+  (the lines against the printed subtotal, tax, tip and total) in your
+  reply, not in a command, so mistakes are visible in the session
+  transcript.
+- When the reading is settled, write the record in that same reply: no
+  closing command, no echo, no clean-up.
 - Every run ends with a record, an unsupported document and a statement
   included. If you cannot read the document at all, hand back
   classification \`unsupported\` with reason \`unreadable\` and a one-line
@@ -346,6 +355,16 @@ and end that reply with the full corrected record again, the
 receipt-text block too if you gave one. It never tells you a value;
 never change a field it did not name to make the list go away.
 
+A date after the upload comes back as \`future_date\`. It is the one
+problem you may answer by keeping your value. Look for an earlier charge
+or transaction date on the document, or, where it prints only service
+dates (a stay, a pickup, travel), the email's Date header or the PDF's
+creation date that Check A step 5 allows. If there is none, send the
+date unchanged with \`date_unresolved\` in audit.review_flags, and the
+server books it as printed and has a person check it. Never answer it
+with a date the document does not show (another year included) just to
+pass the check.
+
 ${renderContractForPrompt()}
 
 Remember: your final message ends with the optional \`\`\`receipt-text block
@@ -393,9 +412,9 @@ and supplies every id itself. You never see a ledger id and never write
 one, in the record or anywhere else.`,
 )}
 
-${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest", writer: ctx.writer })}
+${agentHygiene({ scratchDir, filePath: ctx.filePath, path: "ingest", writer: ctx.writer, googleKeySet: ctx.googleKeySet })}
 ${renderActiveLessons({ writer: ctx.writer })}
-${phase0DocumentRead({ filePath: ctx.filePath, scratchDir })}
+${phase0DocumentRead({ filePath: ctx.filePath, scratchDir, writer: ctx.writer })}
 ${renderDecodedSource(
   ctx.sourceText,
   ctx.attachments,
@@ -661,14 +680,22 @@ Google record for that id itself (or finds it cached), stores it and
 links it. You resolve the id; you never fetch the place record.`,
 )}
 
-For receipt_image / receipt_email / receipt_pdf only. The API key is
-in the GOOGLE_MAPS_API_KEY environment variable.
+For receipt_image / receipt_email / receipt_pdf only. ${w(
+  `The API key is
+in the GOOGLE_MAPS_API_KEY environment variable.`,
+  ctx.googleKeySet === false
+    ? `No Google key is
+set for this run: skip Phase 3, and with it Check C.`
+    : `The server has
+set the API key for this run in GOOGLE_MAPS_API_KEY: use it as written
+below, never test it, never print it.`,
+)}
 
 ### Phase 3a — Resolve google_place_id
 
 Decision tree (stop at first match):
 
-  (a) \$GOOGLE_MAPS_API_KEY is empty → skip the rest of Phase 3.
+  (a) ${w("\$GOOGLE_MAPS_API_KEY is empty", "No Google key for this run (said above)")} → skip the rest of Phase 3.
   (b) Receipt shows a full street address → Geocoding API:
 
         ADDR='1380 Stockton St, San Francisco, CA 94133'
@@ -709,7 +736,12 @@ Decision tree (stop at first match):
         'Source = "google_places".',
         `place.resolved_via = "find_place_text"
       ("find_place_phone" when you searched by phone number,
-      inputtype=phonenumber).`,
+      inputtype=phonenumber).
+
+      With a full street address, send (b) and (c) in ONE Bash command
+      (the two curls one after the other) and apply the quality gate to
+      the two answers together: the gate sends most addresses on to (c),
+      and a second turn costs far more than a second request.`,
       )}
 
   (d) Only merchant name, no locality anywhere on receipt → skip the
@@ -983,8 +1015,17 @@ ${dateSelfCheck({ writer: ctx.writer })}
 
 ### Check C — Payee cross-check via Google (KEEP — evidence-proven)
 
-Only if you geocoded successfully in Phase 3. Call Places Details to
-get the business's canonical name:
+${w(
+  `Only if you geocoded successfully in Phase 3. Call Places Details to
+get the business's canonical name:`,
+  `Only if Phase 3a found a place. When the Find-Place answer you used
+carries the business's \`name\` in the same script as the printed payee
+(both Latin, or both Chinese or Japanese characters), that is Google's
+name: compare with it and make no further call. That request asks for
+zh-CN names, so a shop printed in English may come back in Chinese;
+then, and for a place found by geocoding alone, call Places Details for
+the name (it asks for no language):`,
+)}
 
   curl -sS "https://maps.googleapis.com/maps/api/place/details/json?place_id=<PLACE_ID>&fields=name&key=$GOOGLE_MAPS_API_KEY"
 

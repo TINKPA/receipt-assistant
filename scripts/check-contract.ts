@@ -23,8 +23,15 @@
  *   - unknown keys are refused anywhere, and each key the record must
  *     never carry (`FORBIDDEN_PAYLOAD_KEYS`) is refused at the top level
  *     and inside the nested objects;
- *   - the repair request names paths and rules and never a value, and the
- *     repair diff finds the fields a repair changed without being asked;
+ *   - a date after the upload: an error, unless the record flags it
+ *     `date_unresolved`, when it validates with `future_date_unresolved`
+ *     and is kept as printed;
+ *   - the repair request names paths and rules and never a value (the
+ *     future_date line asks for an earlier printed charge date, the
+ *     derived charge date the prompt allows where only service dates are
+ *     printed, or the same date flagged, never another), and the repair
+ *     diff finds the fields a
+ *     repair changed without being asked, and what each round changed;
  *   - the artefact parser on prose before the fence, two fences, a fence
  *     inside the receipt text, chatter after the fence, CRLF, the
  *     transcript fallback (with decoy records in a tool result, a tool
@@ -57,6 +64,7 @@ import {
   RECORD_WARNING_RULES,
   diffRepair,
   formatPath,
+  noteRepairRound,
   parsePrintedAmount,
   renderRepairRequest,
   validateArtefact,
@@ -414,6 +422,57 @@ expectErrors("three days after upload", variant((r) => {
   r.facts.occurred_on = "2026-06-18";
   r.facts.occurred_at = null;
 }), [["future_date", "facts.occurred_on"]]);
+// A printed date after the upload is booked as printed, never replaced by
+// one the document does not show (the owner's rule): with date_unresolved
+// it validates, as a warning the applier turns into a review flag.
+{
+  const later = (flags: string[] | undefined) =>
+    variant((r) => {
+      r.facts.occurred_on = "2026-10-01";
+      r.facts.occurred_at = "2026-10-01T09:00:00-07:00";
+      if (flags) r.audit.review_flags = flags;
+    });
+  const o = expectValid("a date after the upload, flagged date_unresolved", later(["date_unresolved"]), {
+    warnings: ["future_date_unresolved", "review_flag_date_unresolved"],
+  });
+  const w = o.report.warnings.find((x) => x.rule === "future_date_unresolved");
+  check("future_date_unresolved: at facts.occurred_on, not money", w?.path === "facts.occurred_on" && !w.money, JSON.stringify(w));
+  check("future_date_unresolved: the date is kept as printed", o.status === "valid" && o.record.facts?.occurred_on === "2026-10-01");
+  expectErrors("a date after the upload, flagged only needs_review", later(["needs_review"]), [["future_date", "facts.occurred_on"]]);
+  const bad = expectErrors("a date after the upload, unflagged", later(undefined), [["future_date", "facts.occurred_on"]]);
+  expectValid("a date within the slack is no warning", variant((r) => {
+    r.facts.occurred_on = "2026-06-17";
+    r.facts.occurred_at = null;
+    r.audit.review_flags = ["date_unresolved"];
+  }), { noWarnings: ["future_date_unresolved"] });
+
+  const text = renderRepairRequest(bad.report.errors);
+  check("future_date repair: names the path and rule", text.includes("- facts.occurred_on — future_date:"), text);
+  check("future_date repair: an earlier printed charge date wins", text.includes("earlier charge or transaction date"), text);
+  check("future_date repair: a derived charge date only where only service dates are printed, as Check A says",
+    text.includes("only service dates") && text.includes("Check A, step 5"), text);
+  check("future_date repair: else resend unchanged with date_unresolved", text.includes("send it again unchanged") && text.includes("date_unresolved"), text);
+  check("future_date repair: never a date the document does not show", text.includes("Never change a printed date to one the document does not show"), text);
+  check("future_date repair: names no value", !/2026|10-01|\d{4}-\d{2}-\d{2}/.test(text), text);
+
+  // Answering it touches the date's own time and the audit block (the flag,
+  // the reason): named, not `repair_changed_unnamed`.
+  const resent = later(["date_unresolved"]);
+  resent.audit.chosen_date_reason = "the only date printed, three times";
+  const d = diffRepair(later(undefined), resent, bad.report.errors);
+  check("future_date repair diff: the flag and the audit are named", d.unnamed.length === 0 && d.changed.some((c) => c.path.startsWith("audit.review_flags")),
+    JSON.stringify(d));
+  const moved = variant((r) => {
+    r.facts.occurred_on = "2026-06-01";
+    r.facts.occurred_at = "2026-06-01T09:00:00-07:00";
+  });
+  const dm = diffRepair(later(undefined), moved, bad.report.errors);
+  check("future_date repair diff: the date and its time are named, and listed as changed",
+    dm.unnamed.length === 0 && JSON.stringify(dm.changed.map((c) => c.path)) === JSON.stringify(["facts.occurred_at", "facts.occurred_on"]), JSON.stringify(dm));
+  const report = noteRepairRound({ errors: [], warnings: [], normalizations: [] }, 1, bad.report.errors, dm.changed);
+  check("a repair round's note keeps what it changed", JSON.stringify(report.repairs?.[0]?.changed?.map((c) => c.path)) === JSON.stringify(["facts.occurred_at", "facts.occurred_on"]));
+  check("a round with no record changed nothing", JSON.stringify(noteRepairRound({ errors: [], warnings: [], normalizations: [] }, 1, []).repairs?.[0]?.changed) === "[]");
+}
 expectErrors("before 2000", variant((r) => {
   r.facts.occurred_on = "1999-12-31";
   r.facts.occurred_at = null;

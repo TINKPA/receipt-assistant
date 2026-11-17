@@ -20,7 +20,11 @@
  *   decide()   the direction gate (flow, legs, unknown) and `refund_of`;
  *              no candidate; strong by identifier (same key, cross key,
  *              short cross key), by the hard tuple and each way the tuple
- *              fails; the three same-merchant tests; an identifier match
+ *              fails; one key misread by one character (attached, the
+ *              target flagged) and each way that is blocked (two
+ *              characters, a length, two conflicting keys, one other
+ *              matching key or only cross-key ones, no hard tuple, a card
+ *              conflict, another merchant); the three same-merchant tests; an identifier match
  *              blocked by a conflicting key, another total or another
  *              card (partial refunds, split charges, the next invoice of
  *              one order); several strong; a conflict on every candidate;
@@ -38,6 +42,11 @@
  *              allocation audit, the dedup keys, a mixed tender's flag in
  *              near_dup_check, and that the keys it introduces are
  *              server-owned.
+ *   review     the record's own review reasons (`review.ts`): every
+ *              review flag the reading raised, date_unresolved at any
+ *              date, a date booked as printed, a repair that moved the
+ *              date, the time or money (and one that did not), and their
+ *              place in front of a mixed tender's and a decision's reason.
  *   fingerprint  order and offset independence, and that an amount
  *              change shows.
  *
@@ -47,9 +56,15 @@
  *   npm run check:apply-decide -- --list  print every check
  */
 import { validateExtraction, type ValidationContext } from "../src/ingest/contract/validate.js";
-import type { ExtractionV1 } from "../src/ingest/contract/v1.js";
+import { REVIEW_FLAGS, type ExtractionV1 } from "../src/ingest/contract/v1.js";
 import type { AccountCatalog, CatalogAccount } from "../src/ingest/apply/accounts.js";
-import { decide, type ApplyCandidate, type ApplyDecision } from "../src/ingest/apply/decide.js";
+import {
+  decide,
+  differsByOneCharacter,
+  flagStoredForReview,
+  type ApplyCandidate,
+  type ApplyDecision,
+} from "../src/ingest/apply/decide.js";
 import {
   MIRROR_BY_METHOD,
   MIXED_TENDER_REVIEW,
@@ -64,6 +79,7 @@ import {
   buildTransactionMetadata,
   type MetadataRunContext,
 } from "../src/ingest/apply/metadata.js";
+import { FUTURE_DATE_REVIEW, REVIEW_FLAG_REASONS, recordReviewReasons } from "../src/ingest/apply/review.js";
 import { diffFingerprints, fingerprint, fingerprintFromDraft } from "../src/ingest/apply/fingerprint.js";
 import { APPLIER_VERSION } from "../src/ingest/apply/version.js";
 import { RECORD_PROMPT_VERSION } from "../src/ingest/prompt-contract.js";
@@ -443,6 +459,124 @@ function expectDecision(
     x.facts.occurred_at = null;
   });
   expectDecision("hard tuple fails (no time on the record) → uncertain", decide(noTime, [tuple()]), { action: "insert", verdict: "uncertain" });
+}
+
+// 2(ii). One identifier misread by one character: two readings of one
+// photo that agree on the card, the minute, the total, every line total
+// and two other keys. Everything short of all of that still blocks.
+{
+  const ids = { order_number: "A-000100", invoice_number: "INV-000001", approval_code: "AP0001" };
+  const r = rec((x) => (x.identifiers = { ...ids }));
+  const copy = (over: Partial<ApplyCandidate> = {}, idsOver: Record<string, string> = {}) =>
+    sameBrand({
+      card_last4: "0000",
+      occurred_at: "2026-06-10T19:30:41.000Z",
+      native_total: 1234,
+      item_totals: [234, 1000],
+      identifiers: { ...ids, order_number: "A-000101", ...idsOver },
+      matched_on: ["amount", "identifier"],
+      ...over,
+    });
+  const d = decide(r, [copy()]);
+  expectDecision("misread: one key one character off, the hard tuple and two other keys → attach", d, { action: "attach", target: "c-1" });
+  check("misread: its own tiebreaker", d.action === "attach" && d.tiebreaker === "hard_tuple_misread", json(d.action === "attach" ? d.tiebreaker : d.reason));
+  check(
+    "misread: the target is flagged, the reason naming the key first",
+    d.action === "attach" && (d.reviewFlag ?? "").startsWith("a document was attached although order_number differs by one character") &&
+      /invoice_number, approval_code match/.test(d.reviewFlag ?? ""),
+    json(d.action === "attach" ? d.reviewFlag : null),
+  );
+  check("misread: the verdict names the key", d.considered[0]?.misreadKey === "order_number" && d.considered[0]?.strong === true);
+  check("misread: an ordinary attach flags nothing", (() => {
+    const plain = decide(r, [copy({}, { order_number: "A-000100" })]);
+    return plain.action === "attach" && plain.tiebreaker === "identifier" && plain.reviewFlag === null;
+  })());
+
+  for (const [why, over, idsOver] of [
+    ["two characters differ", {}, { order_number: "A-000111" }],
+    ["the lengths differ", {}, { order_number: "A-0001000" }],
+    ["the lengths differ by a dropped character", {}, { order_number: "A-00010" }],
+    ["two keys conflict", {}, { approval_code: "AP0002" }],
+    ["no hard tuple (another minute)", { occurred_at: "2026-06-10T19:31:00.000Z" }, {}],
+    ["no hard tuple (other line totals)", { item_totals: [1234] }, {}],
+    ["a card conflict", { card_last4: "1111" }, {}],
+  ] as [string, Partial<ApplyCandidate>, Record<string, string>][]) {
+    const nd = decide(r, [copy(over, idsOver)]);
+    expectDecision(`misread blocked (${why}) → uncertain, flagged`, nd, { action: "insert", verdict: "uncertain", flagged: true });
+    check(`misread blocked (${why}): no misread key`, nd.considered[0]?.misreadKey === null);
+  }
+  const onlyOne = rec((x) => (x.identifiers = { order_number: "A-000100", approval_code: "AP0001" }));
+  expectDecision(
+    "misread blocked (only one other key matches) → uncertain, flagged",
+    decide(onlyOne, [copy({ identifiers: { order_number: "A-000101", approval_code: "AP0001" } })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  // The same value under two different keys is not a second matching key.
+  const crossOnly = rec((x) => (x.identifiers = { order_number: "A-000100", invoice_number: "INV-000001", payment_id: "PAY-000001" }));
+  expectDecision(
+    "misread blocked (the other matches are cross-key only) → uncertain",
+    decide(crossOnly, [copy({ identifiers: { order_number: "A-000101", confirmation_number: "INV-000001", approval_code: "PAY-000001" } })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  // A short id: one character is most of it.
+  const short = rec((x) => (x.identifiers = { ...ids, order_number: "107" }));
+  const shortNd = decide(short, [copy({}, { order_number: "108" })]);
+  expectDecision("misread blocked (a value shorter than four characters) → uncertain", shortNd, { action: "insert", verdict: "uncertain", flagged: true });
+  check("misread blocked (short): no misread key", shortNd.considered[0]?.misreadKey === null);
+  // Two refunds (or two halves of a split check) share the order and the
+  // invoice, and their per-charge ids are one apart: no per-charge key
+  // matches, so the second is booked, not attached.
+  const perOrder = { order_number: "A-000100", invoice_number: "INV-000001", payment_id: "RF-004512" };
+  expectDecision(
+    "misread blocked (only order-level keys match; the per-charge id is one apart) → uncertain",
+    decide(rec((x) => (x.identifiers = { ...perOrder })), [copy({ identifiers: { ...perOrder, payment_id: "RF-004513" } })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  const perCharge = { order_number: "A-000100", approval_code: "AP0001", payment_id: "PAY-004512" };
+  expectDecision(
+    "misread: a per-charge id one character off, with the approval code matching → attach",
+    decide(rec((x) => (x.identifiers = { ...perCharge })), [copy({ identifiers: { ...perCharge, payment_id: "PAY-004518" } })]),
+    { action: "attach", target: "c-1" },
+  );
+  // One printed value filed under two keys is one piece of evidence.
+  const twice = { order_number: "A-000100", invoice_number: "AP000001", approval_code: "AP000001" };
+  expectDecision(
+    "misread blocked (the two other matches carry one value) → uncertain",
+    decide(rec((x) => (x.identifiers = { ...twice })), [copy({ identifiers: { ...twice, order_number: "A-000101" } })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+  expectDecision(
+    "misread blocked (another merchant) → uncertain",
+    decide(r, [copy({ merchant_brand_id: "another-shop", payee: "Another Shop", merchant_canonical_name: "Another Shop" })]),
+    { action: "insert", verdict: "uncertain", flagged: true },
+  );
+
+  check(
+    "differsByOneCharacter: trimmed, one position, same length, per character",
+    differsByOneCharacter(" A-1 ", "A-2") && !differsByOneCharacter("A-1", "A-1") && !differsByOneCharacter("A-1", "A-12") &&
+      !differsByOneCharacter("", "") && differsByOneCharacter("单号1", "单号7") && !differsByOneCharacter("AB", "BA"),
+  );
+  const fresh = flagStoredForReview(null, "why");
+  check("flagStoredForReview: no stored check → one naming nobody", fresh.flagged_for_review === true && fresh.verdict === "uncertain" &&
+    json(fresh.candidate_transaction_ids) === "[]" && fresh.reason === "why", json(fresh));
+  const legacy = flagStoredForReview({ candidate_transaction_id: "t-9", verdict: "distinct", flagged_for_review: false, reason: "agent said so" }, "why");
+  check("flagStoredForReview: a stored check keeps its verdict and candidate, the reason in front", legacy.verdict === "distinct" &&
+    legacy.candidate_transaction_id === "t-9" && legacy.flagged_for_review === true && legacy.reason === "why; agent said so", json(legacy));
+  check("flagStoredForReview: a stored check without a reason", flagStoredForReview({ verdict: "uncertain" }, "why").reason === "why");
+  const dismissed = flagStoredForReview(
+    { candidate_transaction_ids: ["t-9"], verdict: "uncertain", flagged_for_review: false, reviewed_at: "2026-06-11T10:00:00.000Z", reason: "same total" },
+    "why",
+  );
+  check(
+    "flagStoredForReview: an uncertain verdict a person dismissed stays distinct for reconcile",
+    dismissed.verdict === "distinct" && dismissed.flagged_for_review === true && dismissed.reviewed_at === "2026-06-11T10:00:00.000Z" &&
+      dismissed.reason === "why; same total",
+    json(dismissed),
+  );
+  check(
+    "flagStoredForReview: an open uncertain verdict stays uncertain",
+    flagStoredForReview({ candidate_transaction_ids: ["t-9"], verdict: "uncertain", flagged_for_review: true, reason: "r" }, "why").verdict === "uncertain",
+  );
 }
 
 // Several strong; conflicts; residue.
@@ -1026,6 +1160,92 @@ const RUN: MetadataRunContext = {
   check(
     "metadata: a single tender leaves the decision's check as it is",
     json(buildTransactionMetadata(card, project(card, FULL), RUN, { refundOf: null, nearDupCheck: cardNd }).near_dup_check) === json(cardNd),
+  );
+}
+
+// The record's own review reasons (`review.ts`): a date booked as printed,
+// and a repair round that moved the date, the time or money. They flag the
+// insert ahead of a mixed tender's reason.
+{
+  const later = validateExtraction(
+    (() => {
+      const r = base();
+      r.facts.occurred_on = "2026-10-01";
+      r.facts.occurred_at = null;
+      r.audit.review_flags = ["date_unresolved"];
+      return r;
+    })(),
+    CTX,
+  );
+  check("review: the fixture validates with future_date_unresolved", later.status === "valid" && later.report.warnings.some((w) => w.rule === "future_date_unresolved"));
+  check("review: a date after the upload, booked as printed", json(recordReviewReasons(later.report)) === json([FUTURE_DATE_REVIEW]), json(recordReviewReasons(later.report)));
+  const plain = validateExtraction(base(), CTX);
+  check("review: a plain record needs no one", recordReviewReasons(plain.report).length === 0 && recordReviewReasons(null).length === 0);
+  // Every flag the reading raised reaches a person, at any date: the
+  // lessons book an upload date or a file's mtime as date_unresolved.
+  const flagged = (flags: (typeof REVIEW_FLAGS)[number][], date?: string) =>
+    validateExtraction(
+      (() => {
+        const r = base();
+        if (date) {
+          r.facts.occurred_on = date;
+          r.facts.occurred_at = null;
+        }
+        r.audit.review_flags = flags;
+        return r;
+      })(),
+      CTX,
+    );
+  const unconfirmed = flagged(["date_unresolved"]);
+  check(
+    "review: date_unresolved on a date before the upload is flagged",
+    unconfirmed.status === "valid" && json(recordReviewReasons(unconfirmed.report)) === json([REVIEW_FLAG_REASONS.date_unresolved]),
+    json(recordReviewReasons(unconfirmed.report)),
+  );
+  const all = flagged([...REVIEW_FLAGS].reverse());
+  check(
+    "review: every review flag is a reason, in the contract's order",
+    all.status === "valid" && json(recordReviewReasons(all.report)) === json(REVIEW_FLAGS.map((f) => REVIEW_FLAG_REASONS[f])),
+    json(recordReviewReasons(all.report)),
+  );
+  const laterToo = flagged(["needs_review", "date_unresolved"], "2026-10-01");
+  check(
+    "review: a date after the upload says so, once, and other flags follow",
+    json(recordReviewReasons(laterToo.report)) === json([FUTURE_DATE_REVIEW, REVIEW_FLAG_REASONS.needs_review]),
+    json(recordReviewReasons(laterToo.report)),
+  );
+
+  const round = (changed: { path: string; money: boolean }[]) => ({
+    ...plain.report,
+    repairs: [{ round: 1, errors: [{ rule: "future_date" as const, path: "facts.occurred_on", message: "x" }], changed }],
+  });
+  const dated = recordReviewReasons(round([{ path: "facts.occurred_on", money: false }, { path: "audit.chosen_date_reason", money: false }]));
+  check("review: a repair that moved the date names it, and only it", dated.length === 1 && dated[0]!.startsWith("a repair round changed facts.occurred_on:"), json(dated));
+  const money = recordReviewReasons(round([{ path: "items[0].line_total_minor", money: true }, { path: "facts.occurred_at", money: false }]));
+  check("review: a repair that moved money or the time names both", money.length === 1 && /facts\.occurred_at, items\[0\]\.line_total_minor/.test(money[0]!), json(money));
+  check("review: a repair that changed neither flags nothing", recordReviewReasons(round([{ path: "items[0].confidence", money: false }])).length === 0);
+  check("review: a round noted before `changed` existed flags nothing", recordReviewReasons({ ...plain.report, repairs: [{ round: 1, errors: [] }] }).length === 0);
+  const many = recordReviewReasons(round(Array.from({ length: 8 }, (_, i) => ({ path: `items[${i}].line_total_minor`, money: true }))));
+  check("review: a long list is cut and counted", /and 3 more:/.test(many[0] ?? ""), json(many));
+
+  const mixed = rec((x) => (x.payment = { method: "mixed" }));
+  const nd = buildTransactionMetadata(mixed, project(mixed, FULL), RUN, { refundOf: null, nearDupCheck: null, reviewReasons: [FUTURE_DATE_REVIEW] })
+    .near_dup_check as Record<string, unknown>;
+  check(
+    "review: the record's reason first, then the mixed tender's, in one flag naming nobody",
+    nd?.flagged_for_review === true && nd.reason === `${FUTURE_DATE_REVIEW}; ${MIXED_TENDER_REVIEW}` && json(nd.candidate_transaction_ids) === "[]",
+    json(nd),
+  );
+  const card = rec();
+  const distinct = decide(card, [sameBrand({ identifiers: { order_number: "A-000200" } })]);
+  const dnd = distinct.action === "insert" ? distinct.nearDupCheck : null;
+  const kept = buildTransactionMetadata(card, project(card, FULL), RUN, { refundOf: null, nearDupCheck: dnd, reviewReasons: dated })
+    .near_dup_check as Record<string, unknown>;
+  check(
+    "review: a decision's check keeps its verdict and candidates, the reason goes in front",
+    kept.verdict === "distinct" && kept.flagged_for_review === true && kept.reason === `${dated[0]}; ${dnd?.reason}` &&
+      json(kept.candidate_transaction_ids) === json(dnd?.candidate_transaction_ids),
+    json(kept),
   );
 }
 

@@ -181,4 +181,5 @@
 - [receipt_email] Ride and micromobility receipts (Lime, Waymo, Lyft) have no merchant premise — any address shown is a trip endpoint — so skip Phase 3. A printed "referral code" is a permanent per-user token, never an identifier key.
 
 # Dates
-- [receipt_email] A confirmation saved as .html instead of .eml has no RFC822 Date header, and travel bookings print only future travel dates: use a SingleFile "saved date" comment if present, else the upload date with metadata.date_unresolved + needs_review — never the travel date.
+- [write] [receipt_email] A confirmation saved as .html instead of .eml has no RFC822 Date header, and travel bookings print only future travel dates: use a SingleFile "saved date" comment if present, else the upload date with metadata.date_unresolved + needs_review — never the travel date.
+- [record] [receipt_email] A confirmation saved as .html instead of .eml has no RFC822 Date header, and travel bookings print only travel dates: use a SingleFile "saved date" comment if present (it is part of the file); else keep the printed travel date with date_unresolved in audit.review_flags (Check A step 5) — never the upload date, which the document does not show.

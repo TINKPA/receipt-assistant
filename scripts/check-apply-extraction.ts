@@ -31,7 +31,8 @@
  *   balance (Cash), a mixed tender (Credit Card, warned and flagged),
  *   points + cash on a debit card · JPY and EUR
  *   (the post-commit FX pass, rates from a seeded cache) · attach by
- *   identifier · attach by the hard tuple · attach refused: not a
+ *   identifier · attach by the hard tuple · attach with one identifier
+ *   misread by one character (the target flagged) · attach refused: not a
  *   candidate · attach refused: target deleted while the apply waited on
  *   its lock · attach refused: other direction · distinct · uncertain ·
  *   unsupported (text stamped) · statement (recorded, not booked) ·
@@ -39,7 +40,14 @@
  *   (channel defaulted, line-level maker) · cached place · uncached place
  *   from a supplied envelope, unprojectable, unfetchable · extras
  *   colliding with metadata keys · missing fence (and a stale run's) ·
- *   invalid JSON · a repair round · a repair round whose spawn failed ·
+ *   invalid JSON · a repair round (flagged: it moved the date and money)
+ *   · one that moved a date after the upload (booked as repaired,
+ *   flagged) · a date after the upload flagged date_unresolved (booked
+ *   as printed, flagged) · date_unresolved and needs_review on a date
+ *   before the upload (flagged) · one that changed neither (not
+ *   flagged) · an
+ *   attach whose record a round changed (noted, the target not flagged)
+ *   · a repair round whose spawn failed ·
  *   an identifier match with another total (booked, flagged) · a
  *   document hard-deleted between T1 and T2, and before T1 · one
  *   soft-deleted during the apply · characters Postgres cannot store · a
@@ -490,6 +498,10 @@ const postingsOf = async (txId: string) =>
     [txId],
   );
 
+/** Whether the review queue's predicate (`?flagged=near_dup`) lists a row. */
+const inQueue = async (txId: string) =>
+  (await q(`SELECT 1 FROM transactions WHERE id = $1 AND (metadata->'near_dup_check'->>'flagged_for_review')::boolean IS TRUE`, [txId])).length === 1;
+
 // ── The fixtures ───────────────────────────────────────────────────────
 
 const W = await makeWorkspace("check-apply-extraction");
@@ -842,6 +854,38 @@ await fixture("attach by the hard tuple (card, minute, total, line totals)", asy
   const r = await ingest(W, receipt({ brand: "tuple", total: 1500, card: "0042", at: "2026-06-10T09:15:40-07:00", items }));
   check("attached to the target", r.res.outcome === "attached" && r.res.transactionIds[0] === target, json(r.res));
   check("by the hard tuple", r.res.report?.decision?.tiebreaker === "hard_tuple");
+});
+
+await fixture("attach with one identifier misread by one character: the target flagged for review", async () => {
+  const items = [
+    { line_no: 1, raw_name: "A", line_total_minor: 3000, item_class: "consumable", confidence: "high", product_key: `${slug("misread")}-a` },
+    { line_no: 2, raw_name: "B", line_total_minor: 1300, item_class: "consumable", confidence: "high", product_key: `${slug("misread")}-b` },
+  ];
+  const ids = { order_number: `M${N}-4300`, invoice_number: `MI-${N}`, approval_code: `MA${N}` };
+  const target = await seed(receipt({ brand: "misread", total: 4300, card: "0077", at: "2026-06-10T10:05:12-07:00", items, ids }));
+  const before = await one(`SELECT version, metadata FROM transactions WHERE id = $1`, [target]);
+  const expect = await watch(W);
+  const r = await ingest(W, receipt({ brand: "misread", total: 4300, card: "0077", at: "2026-06-10T10:05:12-07:00", items,
+    ids: { ...ids, order_number: `M${N}-4308` } }));
+  check("attached to the target", r.res.outcome === "attached" && json(r.res.transactionIds) === json([target]), json(r.res));
+  check("by its own tiebreaker", r.res.report?.decision?.tiebreaker === "hard_tuple_misread", json(r.res.report?.decision));
+  const t = await one(`SELECT version, metadata FROM transactions WHERE id = $1`, [target]);
+  const nd = t.metadata.near_dup_check;
+  check("the target is flagged, naming the key, reason first", nd?.flagged_for_review === true &&
+    (nd?.reason ?? "").startsWith("a document was attached although order_number differs by one character") &&
+    json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists the target", await inQueue(target));
+  const audit = t.metadata.merge_audit;
+  check("merge_audit records the tiebreaker and the flag", Array.isArray(audit) && audit.length === 1 &&
+    audit[0].tiebreaker === "hard_tuple_misread" && audit[0].flagged_for_review === nd?.reason, json(audit));
+  check("apply_report records it", json(r.res.report?.review) === json({ flagged: [nd?.reason], noted: [] }) &&
+    r.res.report?.decision?.flagged_for_review === nd?.reason, json(r.res.report?.review));
+  const rest = { ...t.metadata };
+  delete rest.merge_audit;
+  delete rest.near_dup_check;
+  check("nothing else on the target changed, and version moved once", canon(rest) === canon(before.metadata) &&
+    Number(t.version) === Number(before.version) + 1, json({ v0: before.version, v1: t.version }));
+  await expect({ document_links: 1, transaction_events: 1, document_extractions: 1 });
 });
 
 await fixture("attach refused: not a candidate (another workspace, outside the window)", async () => {
@@ -1199,16 +1243,118 @@ await fixture("a repair round: errors named, an unnamed money change warned", as
   const diff = diffRepair(first, second, bad.report.errors);
   check("the total change is unnamed and money", diff.unnamed.some((c) => c.path === "facts.total_minor" && c.money));
   appendWarnings(good.report, diff.warnings);
-  noteRepairRound(good.report, 1, bad.report.errors);
+  noteRepairRound(good.report, 1, bad.report.errors, diff.changed);
   const st = await stage(W);
   const rec = await A.recordExtraction({ ...st, origin: "stub", outcome: good, rawText: "R", repairRounds: 1, final: true, stats: STATS });
   const stored = await one(`SELECT validation FROM document_extractions WHERE id = $1`, [rec.extractionId]);
-  check("the record carries the round and the warning", stored.validation.repairs?.[0]?.round === 1 &&
+  check("the record carries the round, what it changed, and the warning", stored.validation.repairs?.[0]?.round === 1 &&
+    stored.validation.repairs[0].changed?.some((c: any) => c.path === "facts.occurred_on") &&
     stored.validation.warnings.some((w: any) => w.rule === "repair_changed_unnamed" && w.money === true));
   const res = await A.applyExtraction({ ...st, extractionId: rec.extractionId!, stats: STATS, placeFetcher: refuseFetch });
-  await checkWritten({ st, outcome: good, rec, res });
+  const txId = await checkWritten({ st, outcome: good, rec, res });
   const run = await one(`SELECT repair_rounds FROM agent_runs WHERE id = $1`, [st.runId]);
   check("the run counts the round", run.repair_rounds === 1);
+  const t = await one(`SELECT metadata FROM transactions WHERE id = $1`, [txId]);
+  const nd = t.metadata.near_dup_check;
+  check("flagged for review: the round moved the date and the money", nd?.flagged_for_review === true &&
+    /^a repair round changed facts\.occurred_on, facts\.total_minor, items\[0\]\.line_total_minor: /.test(nd?.reason ?? ""), json(nd));
+});
+
+/** A record that went through one repair round: `first` was refused,
+ *  `second` is the reply, noted with what it changed. */
+function repaired(first: Rec, second: Rec): ValidationOutcome {
+  const bad = validateExtraction(first, { uploadedAt: UPLOAD, receiptText: "R" });
+  if (bad.status !== "invalid") throw new Error("the first record of a repair fixture must be refused");
+  const good = validate(second, "R");
+  const diff = diffRepair(first, second, bad.report.errors);
+  appendWarnings(good.report, diff.warnings);
+  noteRepairRound(good.report, 1, bad.report.errors, diff.changed);
+  return good;
+}
+
+async function applyRepaired(ws: Ws, outcome: ValidationOutcome): Promise<Ran> {
+  const st = await stage(ws);
+  const rec = await A.recordExtraction({ ...st, origin: "stub", outcome, rawText: "R", repairRounds: 1, final: true, stats: STATS });
+  const res = await A.applyExtraction({ ...st, extractionId: rec.extractionId!, stats: STATS, placeFetcher: refuseFetch });
+  return { st, outcome, rec, res };
+}
+
+await fixture("a repair round that moved the date: booked as repaired, flagged with the reason", async () => {
+  // The P3 smoke: a date after the upload bounced, and the reply moved it
+  // to a date printed nowhere. The server cannot tell that from an earlier
+  // printed charge date, so either way a person looks.
+  const r = await applyRepaired(W, repaired(
+    receipt({ brand: "repair-date", total: 4210, date: "2026-10-01" }),
+    receipt({ brand: "repair-date", total: 4210 }),
+  ));
+  const txId = await checkWritten(r);
+  const t = await one(`SELECT occurred_on::text AS d, metadata FROM transactions WHERE id = $1`, [txId]);
+  check("booked on the repaired date", t.d === DATE, t.d);
+  const nd = t.metadata.near_dup_check;
+  check("flagged, reason first, naming no candidate", nd?.flagged_for_review === true && nd?.verdict === "uncertain" &&
+    nd?.reason === "a repair round changed facts.occurred_on: check against the document" && json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists it", await inQueue(txId));
+  check("the run's report says why", json(r.res.report?.review) === json({ flagged: [nd?.reason], noted: [] }), json(r.res.report?.review));
+});
+
+await fixture("future_date_unresolved: booked as printed and flagged", async () => {
+  const raw = receipt({ brand: "later-date", total: 4220, date: "2026-10-01", at: "2026-10-01T09:30:00-07:00" });
+  raw.audit.review_flags = ["date_unresolved"];
+  raw.audit.chosen_date_reason = "the only date printed, three times";
+  const r = await ingest(W, raw);
+  check("the record carries the warning", r.outcome.report.warnings.some((w) => w.rule === "future_date_unresolved"));
+  const txId = await checkWritten(r);
+  const t = await one(`SELECT occurred_on::text AS d, metadata FROM transactions WHERE id = $1`, [txId]);
+  check("booked on the printed date", t.d === "2026-10-01", t.d);
+  const nd = t.metadata.near_dup_check;
+  check("flagged for review, saying the date is booked as printed", nd?.flagged_for_review === true &&
+    /^date after the upload, booked as printed/.test(nd?.reason ?? "") && json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists it", await inQueue(txId));
+  check("the run's report says why", r.res.report?.review?.flagged?.length === 1 && r.res.report.review.noted.length === 0, json(r.res.report?.review));
+});
+
+await fixture("date_unresolved and needs_review before the upload: booked and flagged", async () => {
+  const raw = receipt({ brand: "unconfirmed-date", total: 4225 });
+  raw.audit.review_flags = ["date_unresolved", "needs_review"];
+  raw.audit.chosen_date_reason = "no date printed; the file's modification time";
+  const r = await ingest(W, raw);
+  check("no date warning beyond the flags", !r.outcome.report.warnings.some((w) => w.rule === "future_date_unresolved"));
+  const txId = await checkWritten(r);
+  const t = await one(`SELECT occurred_on::text AS d, metadata FROM transactions WHERE id = $1`, [txId]);
+  check("booked on the record's date", t.d === DATE, t.d);
+  const nd = t.metadata.near_dup_check;
+  check("flagged for review, both reasons, naming no candidate", nd?.flagged_for_review === true &&
+    /^the reading could not confirm the date \(date_unresolved\).*; the reading asked for a person to look \(needs_review\)/.test(nd?.reason ?? "") &&
+    json(nd?.candidate_transaction_ids) === "[]", json(nd));
+  check("the review queue lists it", await inQueue(txId));
+  check("the run's report says why", r.res.report?.review?.flagged?.length === 2 && r.res.report.review.noted.length === 0, json(r.res.report?.review));
+});
+
+await fixture("a repair round that changed nothing date- or money-related: not flagged", async () => {
+  const first = receipt({ brand: "repair-plain", total: 4230 });
+  first.items[0].confidence = "certain";
+  const r = await applyRepaired(W, repaired(first, receipt({ brand: "repair-plain", total: 4230 })));
+  const txId = await checkWritten(r);
+  const stored = await one(`SELECT validation FROM document_extractions WHERE id = $1`, [r.rec.extractionId]);
+  check("the round is noted with what it changed", json(stored.validation.repairs?.[0]?.changed?.map((c: any) => c.path)) === json(["items[0].confidence"]),
+    json(stored.validation.repairs));
+  const t = await one(`SELECT metadata FROM transactions WHERE id = $1`, [txId]);
+  check("no review flag and no near_dup_check", !("near_dup_check" in t.metadata), json(t.metadata.near_dup_check));
+  check("nothing in the report's review", r.res.report?.review === undefined, json(r.res.report?.review));
+});
+
+await fixture("an attach whose record a repair round changed: noted, the target not flagged", async () => {
+  const ids = { order_number: `RA-${N}-1` };
+  const target = await seed(receipt({ brand: "repair-attach", total: 4240, ids }));
+  const first = receipt({ brand: "repair-attach", total: 4240, ids, at: "2026-06-10T25:10:00-07:00" });
+  const r = await applyRepaired(W, repaired(first, receipt({ brand: "repair-attach", total: 4240, ids, at: "2026-06-10T15:10:00-07:00" })));
+  check("attached by identifier", r.res.outcome === "attached" && r.res.transactionIds[0] === target && r.res.report?.decision?.tiebreaker === "identifier",
+    json(r.res));
+  check("the report notes the round's change, flags nothing",
+    json(r.res.report?.review) === json({ flagged: [], noted: ["a repair round changed facts.occurred_at: check against the document"] }),
+    json(r.res.report?.review));
+  const t = await one(`SELECT metadata FROM transactions WHERE id = $1`, [target]);
+  check("the target carries no review flag", !(await inQueue(target)) && !("near_dup_check" in t.metadata), json(t.metadata.near_dup_check));
 });
 
 await fixture("double apply and a stale run are fenced out", async () => {

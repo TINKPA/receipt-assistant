@@ -22,7 +22,9 @@
  *
  * A stub upload (sandbox only, `EXTRACTOR_STUB_ALLOWED=1`) carries its own
  * path whatever the variable says: a `terminal` stub the legacy one (run
- * writer `stub`), a `record` stub the server writer's (`server_apply`).
+ * writer `stub`), a `record` stub the server writer's (`server_apply`),
+ * and a `follow_writer` stub, which has both parts, the one the variable
+ * names.
  *
  * Design notes
  *   - Concurrency is capped by `MAX_CLAUDE_CONCURRENCY` (code default 1;
@@ -80,6 +82,7 @@ import {
   type RecordStub,
 } from "./stub-extractor.js";
 import { appendLessonProposal } from "./prompt.js";
+import { childEnvHas } from "../claude.js";
 import {
   applyExtraction,
   applyMessageIdDuplicate,
@@ -128,7 +131,7 @@ type ExtractionPath =
  */
 async function pickPath(absPath: string): Promise<ExtractionPath> {
   if (process.env.EXTRACTOR_STUB_ALLOWED === "1") {
-    const stub = await readStubMode(absPath);
+    const stub = await readStubMode(absPath, extractionWriter());
     if (stub?.mode === "legacy") return { writer: "stub", extractor: stubFileExtractor };
     if (stub?.mode === "record") return { writer: "server_apply", stub: stub.stub };
   }
@@ -949,6 +952,9 @@ async function extractRecordAndApply(
     attachments: decoded.attachments,
     sessionId: run.sessionId,
     uploadedAt: await ingestUploadedAt(ingestId),
+    // The prompt tells the agent whether its key is set, so it never spends
+    // a turn testing it or prints it.
+    googleKeySet: childEnvHas("extraction_record", "GOOGLE_MAPS_API_KEY"),
     ...(stub ? { spawn: recordStubSpawn(stub) } : {}),
   });
   // A stub renders the prompt but sends it nowhere: no prompt size, and

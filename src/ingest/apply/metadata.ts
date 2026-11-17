@@ -19,7 +19,9 @@
  *   tax_minor?, tip_minor?, printed_totals?                     the UI's Tax and Tip cells
  *   ocr_audit { …audit, payee_as_printed, payee_source }
  *   allocation_audit?                                          only when the lines miss the total
- *   near_dup_check?                                            from `decide()`, flagged for a mixed tender
+ *   near_dup_check?                                            from `decide()`, flagged for review (a mixed
+ *                                                              tender, a date booked as printed, a repair
+ *                                                              that moved the date or money)
  *   receipt_facts?
  *   owned_items_note?                                          income: why no sold item was retired
  *
@@ -153,18 +155,31 @@ export function allocationAudit(record: ExtractionV1): Record<string, unknown> |
   return others.length > 0 ? { ...residualOut(main), other_currencies: others.map(residualOut) } : residualOut(main);
 }
 
+/** Every reason an inserted transaction is flagged for review: the
+ *  record's own first, then a mixed tender's (`draft.reviewFlag`). */
+export function transactionReviewReasons(draft: Pick<ApplyDraft, "reviewFlag">, recordReasons: readonly string[] = []): string[] {
+  return [...recordReasons, ...(draft.reviewFlag ? [draft.reviewFlag] : [])];
+}
+
 /**
  * The metadata object for the transaction a receipt record inserts. Keys
  * whose value would be absent are left out, never written as null.
  * `dedup` is what `decide()` found; `ownedItemsNote` is the writer's
  * account of a sold item it could not retire (insert step l), the key the legacy
- * prompt used for it.
+ * prompt used for it; `reviewReasons` are the record's own reasons for a
+ * person to look (`recordReviewReasons`, `review.ts`). They and a mixed
+ * tender's reason, in that order, flag `near_dup_check` for review.
  */
 export function buildTransactionMetadata(
   record: ExtractionV1,
   draft: ApplyDraft,
   ctx: MetadataRunContext,
-  dedup: { refundOf: string | null; nearDupCheck: NearDupCheck | null; ownedItemsNote?: string | null } = {
+  dedup: {
+    refundOf: string | null;
+    nearDupCheck: NearDupCheck | null;
+    ownedItemsNote?: string | null;
+    reviewReasons?: readonly string[];
+  } = {
     refundOf: null,
     nearDupCheck: null,
   },
@@ -229,7 +244,8 @@ export function buildTransactionMetadata(
   }
   const allocation = allocationAudit(record);
   if (allocation) m.allocation_audit = allocation;
-  const nearDupCheck = draft.reviewFlag ? flagForReview(dedup.nearDupCheck, draft.reviewFlag) : dedup.nearDupCheck;
+  const review = transactionReviewReasons(draft, dedup.reviewReasons);
+  const nearDupCheck = review.length > 0 ? flagForReview(dedup.nearDupCheck, review.join("; ")) : dedup.nearDupCheck;
   if (nearDupCheck) m.near_dup_check = nearDupCheck;
   if (record.receipt_facts && Object.keys(record.receipt_facts).length > 0) m.receipt_facts = record.receipt_facts;
   if (dedup.ownedItemsNote) m.owned_items_note = dedup.ownedItemsNote;

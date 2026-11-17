@@ -422,8 +422,15 @@ export const ListTransactionsQuery = z.object({
    *  metadata.near_dup_check.flagged_for_review=true: the review queue.
    *  Usually #134 branch 4 (a same-amount/date candidate existed but
    *  neither side had a strong tiebreaker, so the writer inserted AND
-   *  flagged); the server writer also flags a mixed tender, which names
-   *  no candidate (src/ingest/apply/decide.ts::flagForReview). */
+   *  flagged); the server writer also flags a mixed tender, a problem the
+   *  reading flagged (audit.review_flags: an unconfirmed date, a date
+   *  booked as printed after the upload, …), a repair that moved the date
+   *  or money, and the target of an attach whose one identifier differs by
+   *  one character. Those reasons name no candidate of their own; a check
+   *  that already named candidates keeps them and its verdict, and
+   *  verdict "distinct" means the duplicate was ruled out
+   *  (src/ingest/apply/decide.ts::flagForReview, flagStoredForReview,
+   *  review.ts). */
   flagged: z
     .enum(["near_dup"])
     .optional()
@@ -431,9 +438,15 @@ export const ListTransactionsQuery = z.object({
       description:
         "near_dup: only transactions with metadata.near_dup_check.flagged_for_review = true, the rows a person " +
         "must look at. Usually the duplicate check found a candidate it could neither rule in nor out " +
-        "(near_dup_check names it). A row paid with a mixed tender is flagged too, with no " +
-        "candidate: it was booked whole to Credit Card and the split between its tenders was not booked. " +
-        "metadata.near_dup_check.reason says which, the tender first when both apply.",
+        "(near_dup_check names it, verdict uncertain). The server writer also flags a row paid with a mixed " +
+        "tender (booked whole to Credit Card, the split between its tenders not booked), a row whose reading " +
+        "flagged a problem for a person (audit.review_flags: a date it could not confirm, a date after the " +
+        "document's upload booked as printed, a total it could not confirm, a handwritten amount, a partial " +
+        "document), a row whose date, time or money a repair round of the extraction changed, and a row a " +
+        "document was attached to although one identifier differs by one character. Those reasons name no " +
+        "candidate of their own. When the row's duplicate check had already named candidates, it keeps them " +
+        "and its verdict: verdict distinct means the duplicate was ruled out and the flag is about something " +
+        "else. metadata.near_dup_check.reason says which; those reasons come before the duplicate check's own.",
     }),
   sort: z.enum(["occurred_on", "amount", "created_at"]).optional(),
   order: z.enum(["asc", "desc"]).optional(),

@@ -11,12 +11,40 @@
  *     you can throw away: the sandbox (docker-compose.test.yml sets the
  *     env), or `npx tsx src/server.ts` pointed at a scratch Postgres
  *   - for the Claude cases only: a RESET sandbox (scripts/sandbox-reset.sh)
- *     and the corpus images under --uploads-dir
+ *     and the private manifest naming their corpus images (below)
  *
  * Usage (from the repo root):
  *   npx tsx scripts/eval-dedup.ts --base=http://<host>:<port> \
  *       --pg=postgresql://postgres:postgres@<host>:<port>/receipts \
- *       [--writer=agent_sql|server_apply] [--only=g1,rf] [--with-claude]
+ *       [--writer=agent_sql|server_apply] [--only=g1,rf] [--with-claude] \
+ *       [--claude-manifest=<path>] [--uploads-dir=<dir>] \
+ *       [--repeat=<n> [--reset-between]] [--json=<path>]
+ *
+ *   --only=<case,…>        Run only these cases. A name that matches no case
+ *                          is an error (exit 2), not a silent no-op.
+ *   --repeat=<n>           Run the selected cases n times in a row, each
+ *                          round with a fresh nonce; the summary counts
+ *                          passes per case. For the A/B's "race x3".
+ *   --reset-between        Before every round after the first, wait for the
+ *                          stack to go idle and run scripts/sandbox-reset.sh.
+ *                          The Claude cases need it (a second round's copy
+ *                          would attach to the first round's row). Only for
+ *                          the sandbox (--base on port 3001).
+ *   --json=<path>          Also write every case result, per round, as JSON
+ *                          (scripts/ab-campaign.ts reads it).
+ *   --claude-manifest=<p>  The private manifest of the Claude cases' files:
+ *                          `{ "uploads_dir": <dir|null>, "b2": {"file": …},
+ *                          "b3": {"file": …}, "race": {"file": …} }`, each
+ *                          file a receipt photo under the uploads dir. Default
+ *                          ~/Developer/receipt-assistant-data/eval/dedup-claude.manifest.json.
+ *                          Real documents never go in this repository; the
+ *                          manifest holds them, with notes on what each is.
+ *                          b2 must be a receipt a re-encoded copy of which is
+ *                          the same purchase; b3 another purchase from the same
+ *                          printed template (a pHash neighbour of b2's) with
+ *                          different receipt numbers; race any receipt with
+ *                          printed identifiers. None may be in the eval-dates
+ *                          corpus.
  *
  * Stub cases are deterministic and fast (about a minute in total): every
  * seed carries a per-run nonce, so they can run against a dirty database
@@ -125,13 +153,17 @@
  *   race two byte-different copies in ONE batch     → ledger converges to 1 live txn
  *        (L3a attach in-flight, or the in-batch pass repairs after — which needs the two
  *        extractions to agree on an identifier; without one it is a 0.9 proposal for a
- *        person, and this case then fails by design)
+ *        person, and this case then fails by design). Under server_apply the applier
+ *        also attaches a copy whose reading differs in one character of one identifier
+ *        when the hard tuple and two other keys agree, one of them the approval code or
+ *        the payment id (`hard_tuple_misread`), and flags the target
  */
 import "dotenv/config";
-import { readFile, mkdtemp } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 
@@ -144,7 +176,7 @@ function argOf(name: string): string | null {
 const BASE = argOf("base") ?? "http://localhost:3001";
 const PG_URL =
   argOf("pg") ?? "postgresql://postgres:postgres@localhost:5433/receipts";
-const ONLY = argOf("only")?.split(",") ?? null;
+const ONLY = argOf("only")?.split(",").map((s) => s.trim()).filter(Boolean) ?? null;
 const WITH_CLAUDE = process.argv.includes("--with-claude");
 const WRITER = argOf("writer") ?? "agent_sql";
 if (WRITER !== "agent_sql" && WRITER !== "server_apply") {
@@ -158,32 +190,82 @@ const UPLOADS_DIR =
     process.env.HOME ?? "~",
     "Documents/10_Projects/2026_Dev_ReceiptAssistant/data/uploads/uploads",
   );
+const CLAUDE_MANIFEST =
+  argOf("claude-manifest") ??
+  path.join(process.env.HOME ?? "~", "Developer/receipt-assistant-data/eval/dedup-claude.manifest.json");
+const REPEAT = Number(argOf("repeat") ?? "1");
+if (!Number.isInteger(REPEAT) || REPEAT < 1 || REPEAT > 20) {
+  console.error(`--repeat must be an integer 1..20, got ${JSON.stringify(argOf("repeat"))}`);
+  process.exit(2);
+}
+const RESET_BETWEEN = process.argv.includes("--reset-between");
+if (RESET_BETWEEN) {
+  const u = new URL(BASE);
+  if (u.port !== "3001" || !["localhost", "127.0.0.1", "[::1]"].includes(u.hostname)) {
+    console.error(
+      `--reset-between runs scripts/sandbox-reset.sh, which empties the sandbox's database; --base=${BASE} ` +
+        `is not the sandbox (127.0.0.1:3001), so the reset would not touch the stack under test.`,
+    );
+    process.exit(2);
+  }
+}
+const JSON_OUT = argOf("json");
 
-// Corpus images (verified NOT in eval-dates.fixtures.json):
-const STARBUCKS_1 =
-  "28b476e69f7c903ca18268a69c20ab49a5b2e7b89457ed9ce9a130cac96db3f3.jpg"; // Cold Brew $4.95, Feb 17, receipt #66143296
-const STARBUCKS_2 =
-  "c8960015470c53cd1a334df9afa1b722c107cfaff605b93d5c35588d505f6f28.jpg"; // Nitro $5.95, May 12, receipt #65985696 (pHash d≈2 from #1)
-const RACE_IMAGE =
-  "17ee7d85d17cad886f5c66454987781371e3fabc9765c806ee411ad7e4a13a03.jpg"; // Mitsuwa $75.16, 2026-06-09
+/**
+ * The Claude cases' corpus files, from the private manifest. Real
+ * documents never go in this repository: the manifest names them (and
+ * says what each one is), and only the cases that upload one read it.
+ */
+interface ClaudeManifest {
+  uploads_dir?: string | null;
+  b2: { file: string };
+  b3: { file: string };
+  race: { file: string };
+}
+let claudeManifest: ClaudeManifest | null = null;
+async function claudeFile(caseName: "b2" | "b3" | "race"): Promise<string> {
+  if (!claudeManifest) {
+    let parsed: ClaudeManifest;
+    try {
+      parsed = JSON.parse(await readFile(CLAUDE_MANIFEST, "utf8")) as ClaudeManifest;
+    } catch (err) {
+      throw new Error(
+        `the Claude cases read their files from the private manifest ${CLAUDE_MANIFEST} ` +
+          `(--claude-manifest): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    claudeManifest = parsed;
+  }
+  const entry = claudeManifest[caseName];
+  if (!entry || typeof entry.file !== "string" || entry.file.includes("/") || entry.file.includes("\\")) {
+    throw new Error(`${CLAUDE_MANIFEST}: "${caseName}.file" must be a file name in the uploads directory`);
+  }
+  return path.join(claudeManifest.uploads_dir ?? UPLOADS_DIR, entry.file);
+}
 
 const db = new pg.Client({ connectionString: PG_URL });
 
-// Per-run nonce: stub seeds carry it in payees/order-numbers so reruns
+// Per-round nonce: stub seeds carry it in payees/order-numbers so reruns
 // against a dirty database never cross-match a previous run's rows
 // (fixed values would near-dup-match across runs and remove each
 // other — observed before this existed). Claude cases (b2/b3/race) use
-// real corpus images and DO require a reset sandbox.
-const NONCE = randomUUID().slice(0, 6);
+// real corpus images and DO require a reset sandbox. `newRound` draws a
+// new one for every --repeat round.
+let NONCE = randomUUID().slice(0, 6);
 
-// Per-run AMOUNTS too. Reconcile pairs rows on an equal total inside a
+// Per-round AMOUNTS too. Reconcile pairs rows on an equal total inside a
 // ±3-day window whatever their payee, so a fixed amount would pair this
 // run's seeds with a previous run's (or with a real row, on a
 // production-shaped copy) and the "no proposal" assertions below would
-// be measuring that noise. `amt(k)` is unique per (run, k): give every
+// be measuring that noise. `amt(k)` is unique per (round, k): give every
 // sub-case its own k unless it WANTS two rows to share a total.
-const NONCE_NUM = parseInt(NONCE, 16);
+let NONCE_NUM = parseInt(NONCE, 16);
 const amt = (k: number): number => 100_000 + (NONCE_NUM % 1_000_000) * 100 + k;
+
+function newRound(): void {
+  NONCE = randomUUID().slice(0, 6);
+  NONCE_NUM = parseInt(NONCE, 16);
+}
 
 // ── helpers ────────────────────────────────────────────────────────────
 async function q<T = Record<string, unknown>>(
@@ -751,12 +833,41 @@ async function rerunReconcile(batchId: string): Promise<void> {
   assert(res.json.status === "reconciled", `reconcile left batch ${res.json.status}`);
 }
 
+/** Scratch for re-encoded copies of the receipts, some of them private
+ *  (the Claude cases'): each copy is removed once read, and the directory
+ *  when the process exits. */
 let tmp = "";
-async function reencode(srcName: string, quality: number): Promise<Buffer> {
-  const src = path.join(UPLOADS_DIR, srcName);
-  const out = path.join(tmp, `${quality}-${srcName}`);
+async function reencode(src: string, quality: number): Promise<Buffer> {
+  const out = path.join(tmp, `${quality}-${randomUUID().slice(0, 8)}.jpg`);
   execFileSync("sips", ["-s", "format", "jpeg", "-s", "formatOptions", String(quality), src, "--out", out], { stdio: "ignore" });
-  return readFile(out);
+  try {
+    return await readFile(out);
+  } finally {
+    await rm(out, { force: true });
+  }
+}
+
+/** Wait until nothing is queued, processing or reconciling: a reset under
+ *  a running extraction or reconcile lets it write into the fresh ledger. */
+async function waitIdle(timeoutMs = 1_800_000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const ing = await api(`/v1/ingests?status=queued,processing&limit=100`);
+    const bat = await api(`/v1/batches?status=reconciling&limit=100`);
+    if (ing.status === 200 && bat.status === 200 && (ing.json.items ?? []).length === 0 && (bat.json.items ?? []).length === 0) {
+      return;
+    }
+    if (Date.now() - start > timeoutMs) throw new Error(`the stack did not go idle in ${timeoutMs / 60_000} min`);
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
+/** --reset-between: the sandbox back to an empty ledger between rounds. */
+async function resetSandbox(): Promise<void> {
+  await waitIdle();
+  const script = path.join(path.dirname(new URL(import.meta.url).pathname), "sandbox-reset.sh");
+  const r = spawnSync(script, [], { stdio: ["ignore", "inherit", "inherit"] });
+  if (r.status !== 0) throw new Error(`scripts/sandbox-reset.sh exited ${r.status}`);
 }
 
 function makeEml(opts: {
@@ -793,10 +904,21 @@ function makeEml(opts: {
 // ── case framework ─────────────────────────────────────────────────────
 interface CaseResult {
   name: string;
+  /** 1-based --repeat round. */
+  round: number;
   pass: boolean;
   notes: string[];
 }
 const results: CaseResult[] = [];
+interface Skip {
+  name: string;
+  round: number;
+  reason: string;
+}
+const skips: Skip[] = [];
+/** Every case name the matrix knows, to refuse an --only that names none. */
+const KNOWN_CASES = new Set<string>();
+let ROUND = 1;
 
 async function runCase(
   name: string,
@@ -804,25 +926,30 @@ async function runCase(
   fn: (notes: string[]) => Promise<void>,
   skipReason: string | null = null,
 ): Promise<void> {
+  KNOWN_CASES.add(name);
   if (ONLY && !ONLY.includes(name)) return;
+  const label = REPEAT > 1 ? `${name} (round ${ROUND}/${REPEAT})` : name;
   if (needsClaude && !WITH_CLAUDE) {
-    console.log(`~ ${name}: skipped (needs --with-claude)`);
+    console.log(`~ ${label}: skipped (needs --with-claude)`);
+    skips.push({ name, round: ROUND, reason: "needs --with-claude" });
     return;
   }
   if (skipReason) {
-    console.log(`~ ${name}: skipped (${skipReason})`);
+    console.log(`~ ${label}: skipped (${skipReason})`);
+    skips.push({ name, round: ROUND, reason: skipReason });
     return;
   }
   const notes: string[] = [];
-  process.stdout.write(`▶ ${name} ... `);
+  process.stdout.write(`▶ ${label} ... `);
   try {
     await fn(notes);
     console.log("PASS");
-    results.push({ name, pass: true, notes });
+    results.push({ name, round: ROUND, pass: true, notes });
   } catch (err) {
     console.log(`FAIL — ${err instanceof Error ? err.message : String(err)}`);
     results.push({
       name,
+      round: ROUND,
       pass: false,
       notes: [...notes, err instanceof Error ? err.message : String(err)],
     });
@@ -838,7 +965,75 @@ function assert(cond: unknown, msg: string): asserts cond {
 async function main(): Promise<void> {
   await db.connect();
   tmp = await mkdtemp(path.join(tmpdir(), "eval-dedup-"));
-  console.log(`# eval-dedup  base=${BASE}  writer=${WRITER}  claude-cases=${WITH_CLAUDE ? "ON" : "off"}\n`);
+  const scratch = tmp;
+  process.on("exit", () => rmSync(scratch, { recursive: true, force: true }));
+  console.log(
+    `# eval-dedup  base=${BASE}  writer=${WRITER}  claude-cases=${WITH_CLAUDE ? "ON" : "off"}` +
+      (REPEAT > 1 ? `  rounds=${REPEAT}${RESET_BETWEEN ? " (reset between)" : ""}` : "") +
+      "\n",
+  );
+  const rounds: { round: number; nonce: string; started_at: string }[] = [];
+  for (ROUND = 1; ROUND <= REPEAT; ROUND++) {
+    if (ROUND > 1) {
+      if (RESET_BETWEEN) {
+        console.log(`\n# round ${ROUND}: waiting for the stack to go idle, then sandbox-reset.sh`);
+        await resetSandbox();
+      }
+      newRound();
+    }
+    if (REPEAT > 1) console.log(`\n# round ${ROUND}/${REPEAT} (nonce ${NONCE})`);
+    rounds.push({ round: ROUND, nonce: NONCE, started_at: new Date().toISOString() });
+    await runCases();
+    if (ROUND === 1 && ONLY) {
+      const unknown = ONLY.filter((n) => !KNOWN_CASES.has(n));
+      if (unknown.length) {
+        console.error(`--only names no case called ${unknown.join(", ")} (known: ${[...KNOWN_CASES].join(", ")})`);
+        await db.end();
+        process.exit(2);
+      }
+    }
+  }
+
+  // ── summary ──────────────────────────────────────────────────────────
+  console.log("\n# summary");
+  let failed = 0;
+  const names = [...new Set(results.map((r) => r.name))];
+  for (const name of names) {
+    const rs = results.filter((r) => r.name === name);
+    const passed = rs.filter((r) => r.pass).length;
+    console.log(`  ${passed === rs.length ? "PASS" : "FAIL"}  ${name}${REPEAT > 1 ? ` ${passed}/${rs.length}` : ""}`);
+  }
+  failed = results.filter((r) => !r.pass).length;
+  console.log(`\n${results.length - failed}/${results.length} passed`);
+  if (JSON_OUT) {
+    await writeFile(
+      JSON_OUT,
+      JSON.stringify(
+        {
+          base: BASE,
+          writer: WRITER,
+          with_claude: WITH_CLAUDE,
+          only: ONLY,
+          repeat: REPEAT,
+          reset_between: RESET_BETWEEN,
+          rounds,
+          finished_at: new Date().toISOString(),
+          passed: results.length - failed,
+          total: results.length,
+          results,
+          skipped: skips,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+  await db.end();
+  process.exit(failed > 0 ? 1 : 0);
+}
+
+/** One round of the matrix, in its fixed order. */
+async function runCases(): Promise<void> {
 
   // g1 — near_dup claimed, no link → forced error (#134 guard)
   await runCase("g1", false, SERVER_APPLY ? g1Record : async (notes) => {
@@ -2023,9 +2218,17 @@ async function main(): Promise<void> {
       const files = [1, 2, 3].map(() => recordStub(rec, { child: { sleep_s: 1 } }));
       const { batchId, ingestIds } = await postBatch(files);
       await pollReconciled(batchId);
-      const statuses = (await Promise.all(ingestIds.map(ingestState))).map((s) => s.status).sort();
+      // One query at a time: `db` is a single client, and a query issued
+      // while another is still running is deprecated in pg 8 and refused
+      // in pg 9.
+      const statuses: string[] = [];
+      const runs: RunState[] = [];
+      for (const id of ingestIds) {
+        statuses.push((await ingestState(id)).status);
+        runs.push(await runOf(id));
+      }
+      statuses.sort();
       const txs = await q<{ id: string }>(`SELECT id FROM transactions WHERE source_ingest_id = ANY($1)`, [ingestIds]);
-      const runs = await Promise.all(ingestIds.map(runOf));
       const overlap = maxOverlap(runs);
       notes.push(`round ${round}: [${statuses.join(", ")}], ${txs.length} transaction(s), ${overlap} run(s) in flight at once`);
       if (statuses.join() === "done,near_dup,near_dup" && txs.length === 1 && (await linksOf(txs[0]!.id)).length === 3) {
@@ -2081,47 +2284,47 @@ async function main(): Promise<void> {
     notes.push("second partial refund (another amount) and second invoice (another invoice number) of one order → each booked, uncertain + flagged, never attached");
   });
 
-  // b2 — branch 2: re-encoded copy of an extracted receipt → attach
-  let starbucks1Tx: string | null = null;
+  // b2 — branch 2: re-encoded copy of an extracted receipt → attach.
+  // The receipt is the manifest's b2 file (private; see --claude-manifest).
+  let b2SeedTx: string | null = null;
   await runCase("b2", true, async (notes) => {
-    const seed = await postBatch([
-      { name: "starbucks-1.jpg", bytes: await readFile(path.join(UPLOADS_DIR, STARBUCKS_1)), mime: "image/jpeg" },
-    ]);
+    const src = await claudeFile("b2");
+    const seed = await postBatch([{ name: "b2-seed.jpg", bytes: await readFile(src), mime: "image/jpeg" }]);
     await pollBatch(seed.batchId);
     await assertRunWriter(seed.ingestIds[0]!);
     const [seedIng] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [seed.ingestIds[0]]);
     assert(seedIng!.status === "done", `seed extraction: ${seedIng!.status}`);
-    starbucks1Tx = seedIng!.produced.transaction_ids[0];
-    notes.push(`seed txn ${String(starbucks1Tx).slice(0, 8)}… (branch-1 INSERT ✓)`);
+    b2SeedTx = seedIng!.produced.transaction_ids[0];
+    notes.push(`seed txn ${String(b2SeedTx).slice(0, 8)}… (branch-1 INSERT ✓)`);
 
-    const copy = await postBatch([
-      { name: "starbucks-1-copy.jpg", bytes: await reencode(STARBUCKS_1, 70), mime: "image/jpeg" },
-    ]);
+    const copy = await postBatch([{ name: "b2-copy.jpg", bytes: await reencode(src, 70), mime: "image/jpeg" }]);
     await pollBatch(copy.batchId);
     await assertRunWriter(copy.ingestIds[0]!);
     const [ing] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [copy.ingestIds[0]]);
     assert(ing!.status === "near_dup", `expected near_dup, got ${ing!.status}`);
-    assert(ing!.produced.transaction_ids[0] === starbucks1Tx, "pointer mismatch");
-    const links = await q(`SELECT 1 FROM document_links WHERE transaction_id = $1`, [starbucks1Tx]);
+    assert(ing!.produced.transaction_ids[0] === b2SeedTx, "pointer mismatch");
+    const links = await q(`SELECT 1 FROM document_links WHERE transaction_id = $1`, [b2SeedTx]);
     assert(links.length === 2, `expected 2 links, got ${links.length}`);
     notes.push("re-encoded copy attached; zero new transactions");
   });
 
-  // b3 — branch 3: same app template, different purchase → INSERT distinct
+  // b3 — branch 3: same printed template, different purchase → INSERT
+  // distinct. The manifest's b3 file is a pHash neighbour of b2's with
+  // other receipt numbers; run after b2, whose row is the candidate.
   await runCase("b3", true, async (notes) => {
-    const before = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted' AND deleted_at IS NULL`);
-    const up = await postBatch([
-      { name: "starbucks-2.jpg", bytes: await readFile(path.join(UPLOADS_DIR, STARBUCKS_2)), mime: "image/jpeg" },
-    ]);
+    const up = await postBatch([{ name: "b3.jpg", bytes: await readFile(await claudeFile("b3")), mime: "image/jpeg" }]);
     await pollBatch(up.batchId);
     await assertRunWriter(up.ingestIds[0]!);
     const [ing] = await q<{ status: string; produced: any }>(
       `SELECT status, produced FROM ingests WHERE id = $1`, [up.ingestIds[0]]);
     assert(ing!.status === "done", `expected done (distinct INSERT), got ${ing!.status} — a near_dup here means pHash overrode the differing receipt numbers (calibration regression!)`);
-    const after = await q(`SELECT count(*)::int AS n FROM transactions WHERE payee ILIKE '%starbucks%' AND status='posted' AND deleted_at IS NULL`);
-    assert((after[0] as any).n === (before[0] as any).n + 1, "no new txn inserted");
+    // A new live row of this ingest's own, and not b2's.
+    const tx = await txBySourceIngest(up.ingestIds[0]!).catch(() => null);
+    assert(tx && isLive(tx), "no new live transaction inserted");
+    assert(tx.id !== b2SeedTx, "booked onto b2's row");
+    if (!b2SeedTx) notes.push("WARN: b2 did not run in this round, so there was no neighbour to tell apart");
     const [meta] = await q<{ check: any }>(
       `SELECT metadata->'near_dup_check' AS check FROM transactions WHERE id = $1`,
       [ing!.produced.transaction_ids[0]],
@@ -2184,11 +2387,13 @@ async function main(): Promise<void> {
     notes.push("flagged list → dismiss → unflagged round-trip ✓ (audit event written)");
   });
 
-  // race — two byte-different copies in ONE batch → ledger converges to 1 live txn
+  // race — two byte-different copies in ONE batch → ledger converges to
+  // 1 live txn. The receipt is the manifest's race file.
   await runCase("race", true, async (notes) => {
+    const src = await claudeFile("race");
     const up = await postBatch([
-      { name: "race-a.jpg", bytes: await reencode(RACE_IMAGE, 70), mime: "image/jpeg" },
-      { name: "race-b.jpg", bytes: await reencode(RACE_IMAGE, 64), mime: "image/jpeg" },
+      { name: "race-a.jpg", bytes: await reencode(src, 70), mime: "image/jpeg" },
+      { name: "race-b.jpg", bytes: await reencode(src, 64), mime: "image/jpeg" },
     ]);
     // two concurrent heavy extractions + icon pipeline legitimately exceed
     // 10 min; wait for reconcile too, since path B is repaired by it.
@@ -2197,29 +2402,27 @@ async function main(): Promise<void> {
     const ings = await q<{ status: string }>(
       `SELECT status FROM ingests WHERE batch_id = $1`, [up.batchId]);
     const statuses = ings.map((i) => i.status).sort();
-    // Soft delete keeps status `posted`: a live count must filter deleted_at.
+    // The live rows this batch's two documents stand behind: booked by one
+    // of its ingests, or linked to one of its documents. Soft delete keeps
+    // status `posted`: a live count must filter deleted_at.
     const live = await q(
-      `SELECT id FROM transactions WHERE payee ILIKE '%mitsuwa%' AND status = 'posted' AND deleted_at IS NULL`);
+      `SELECT DISTINCT t.id FROM transactions t
+        WHERE t.status = 'posted' AND t.deleted_at IS NULL
+          AND (t.source_ingest_id = ANY($1)
+               OR t.id IN (SELECT dl.transaction_id FROM document_links dl
+                            JOIN ingests i ON i.document_id = dl.document_id
+                           WHERE i.id = ANY($1)))`,
+      [up.ingestIds],
+    );
     notes.push(`ingest outcomes: [${statuses.join(", ")}]`);
     if (statuses.join(",") === "done,near_dup") {
       notes.push("path A: second extraction saw the first's txn → L3a attach");
     } else if (statuses.join(",") === "done,done") {
       notes.push("path B: both raced past L3a → the in-batch pass must repair (needs a shared identifier)");
     }
-    assert(live.length === 1, `expected exactly 1 live Mitsuwa txn, got ${live.length} — the race left a duplicate the system did not repair`);
+    assert(live.length === 1, `expected exactly 1 live transaction behind the two copies, got ${live.length} — the race left a duplicate the system did not repair`);
     notes.push("ledger converged to 1 live transaction ✓");
   });
-
-  // ── summary ──────────────────────────────────────────────────────────
-  console.log("\n# summary");
-  let failed = 0;
-  for (const r of results) {
-    console.log(`  ${r.pass ? "PASS" : "FAIL"}  ${r.name}`);
-    if (!r.pass) failed++;
-  }
-  console.log(`\n${results.length - failed}/${results.length} passed`);
-  await db.end();
-  process.exit(failed > 0 ? 1 : 0);
 }
 
 main().catch(async (err) => {
