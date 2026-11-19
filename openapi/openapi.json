@@ -10048,7 +10048,7 @@
     },
     "/v1/ingests/problems": {
       "get": {
-        "summary": "List uploads needing attention (#158) — every ingest that didn't reach `done` and isn't still in flight (default: error, unsupported, dedup, near_dup). Each row carries `category`, `retryable`, and `dedup_of` so a client can choose the right affordance without string-parsing `error`.",
+        "summary": "List uploads needing attention (#158) — every ingest that didn't reach `done` and isn't still in flight (default: error, unsupported, dedup, near_dup). Each row carries `category`, `retryable`, and `dedup_of` so a client can choose the right affordance without string-parsing `error`. An errored ingest is left out once a later ingest of the same document (a retry, or the same bytes uploaded again) ended as done, dedup, near_dup or unsupported.",
         "tags": [
           "ingest"
         ],

@@ -810,6 +810,9 @@ export async function listIngests(params: {
   limit?: number;
   batchId?: string;
   statuses?: IngestStatus[];
+  /** Leave out an errored ingest whose document a later ingest settled
+   *  (see the WHERE clause below). The problem inbox passes it. */
+  hideSettledErrors?: boolean;
 }): Promise<{ items: IngestRow[]; next_cursor: string | null }> {
   const limit = clampLimit(params.limit ?? DEFAULT_PAGE_LIMIT);
   const cur = decodeCursor<IngestListCursor>(params.cursor);
@@ -824,6 +827,25 @@ export async function listIngests(params: {
       sql`, `,
     );
     whereParts.push(sql`status IN (${list})`);
+  }
+  if (params.hideSettledErrors) {
+    // A retry does not touch the ingest it retries: it queues a new one
+    // for the same stored document, and so does uploading the same bytes
+    // again. The old row stays `error` for good. Listing it as a problem
+    // after that asks the owner to retry a file that is already in the
+    // ledger (or was already found unsupported): in November 2026 the
+    // inbox showed 14 such rows, 12 of them long since booked. An error is
+    // still a problem only while no later attempt at its document has
+    // reached an end that is not itself an error.
+    whereParts.push(sql`NOT (
+      status = 'error' AND EXISTS (
+        SELECT 1 FROM ingests later
+         WHERE later.workspace_id = ingests.workspace_id
+           AND later.document_id = ingests.document_id
+           AND (later.created_at, later.id) > (ingests.created_at, ingests.id)
+           AND later.status IN ('done', 'dedup', 'near_dup', 'unsupported')
+      )
+    )`);
   }
   if (cur) {
     whereParts.push(

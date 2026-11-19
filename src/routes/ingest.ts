@@ -287,6 +287,7 @@ ingestsRouter.get(
       cursor: q.cursor,
       limit: q.limit,
       statuses: parseStatusFilter(q.status) ?? PROBLEM_INGEST_STATUSES,
+      hideSettledErrors: true,
     });
     emitNextLink(req, res, out.next_cursor);
     res.json(out);
@@ -444,7 +445,10 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
       "reach `done` and isn't still in flight (default: " +
       "error, unsupported, dedup, near_dup). Each row carries `category`, " +
       "`retryable`, and `dedup_of` so a client can choose the right " +
-      "affordance without string-parsing `error`.",
+      "affordance without string-parsing `error`. An errored ingest is " +
+      "left out once a later ingest of the same document (a retry, or the " +
+      "same bytes uploaded again) ended as done, dedup, near_dup or " +
+      "unsupported.",
     tags: ["ingest"],
     request: { query: IngestProblemsQuery },
     responses: {
