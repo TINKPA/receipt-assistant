@@ -630,7 +630,7 @@ All must pass before the flip. Each compares arm B with arm A on the same fixtur
 | G6 places | every place B creates is projectable; B links a place about as often as A on documents with a printed address; the two arms agree on the place id where both linked one |
 | G7 cost | B's median billed input, median turns and slow-run wall time are no worse than A's |
 | G8 safety | B transcripts show no psql call, no permission error and no read of a credential path or the process environment |
-| G9 rollback compatibility | legacy re-extract on B rows gives `written` and then `no_change`, keeps Layer 3, and writes one derivation event per run |
+| G9 rollback compatibility | legacy re-extract on B rows gives `written`, and a second run moves nothing but `metadata.extraction` (its `ran_at` is rewritten every run) and `ocr_text` (vision OCR is not deterministic); both keep Layer 3 and write one derivation event each |
 
 The pre-A/B gate runs first, at no model cost: `check-projection-replay --from-ledger` over a production-shaped copy, with no unexplained money mismatch on rows written by recent legacy prompts. If a gate fails: find the cause, fix it, and re-run arm B on the affected fixtures plus a sanity set; after two failed rounds, stop and re-plan.
 

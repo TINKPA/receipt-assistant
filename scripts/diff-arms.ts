@@ -75,6 +75,7 @@ import * as path from "node:path";
 import { score } from "./eval-dates.js";
 import type { FingerprintFields } from "../src/ingest/apply/fingerprint.js";
 import { MIRROR_BY_METHOD } from "../src/ingest/apply/project.js";
+import { secondReExtractIsQuiet } from "./g9-rule.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -977,14 +978,22 @@ async function main(): Promise<number> {
   });
 
   // ── G9 rollback compatibility ──
-  const c5 = step("c5") as { transactions?: { runs: { outcome: string; layer3_kept: boolean; derivation_events_added: number }[] }[]; g9_pass?: boolean } | null;
+  const c5 = step("c5") as { transactions?: { runs: { outcome: string; changed_keys?: string[] | null; layer3_kept: boolean; derivation_events_added: number }[] }[]; g9_pass?: boolean } | null;
   const c5runs = c5?.transactions ?? [];
+  // Judged here from the recorded runs, not from the stored `g9_pass`, so
+  // a campaign run before the rule was corrected is read by the same rule.
+  const g9pass = c5runs.length > 0 && c5runs.every((t) => {
+    const [r1, r2] = t.runs;
+    return !!r1 && !!r2 && r1.outcome === "written" && secondReExtractIsQuiet(r2) &&
+      r1.layer3_kept && r2.layer3_kept && r1.derivation_events_added === 1 && r2.derivation_events_added === 1;
+  });
   gates.push({
     gate: "G9 rollback compatibility",
-    threshold: "C5: legacy re-extract on 3 B rows gives written then no_change, keeps Layer 3, one derivation_events row per run",
-    status: !c5 ? "pending" : c5.g9_pass ? "pass" : "fail",
+    threshold: "C5: legacy re-extract on 3 B rows gives written, then a run that moves nothing but metadata.extraction and ocr_text; keeps Layer 3; one derivation_events row per run",
+    status: !c5 ? "pending" : g9pass ? "pass" : "fail",
     evidence: c5
       ? `${c5runs.length} transactions: outcomes ${c5runs.map((t) => t.runs.map((x) => x.outcome).join(">")).join(", ")}; ` +
+        `keys moved by the second run ${c5runs.map((t) => (t.runs[1]?.changed_keys ?? []).join("+") || "none").join(", ")}; ` +
         `Layer 3 kept after every run ${c5runs.every((t) => t.runs.every((x) => x.layer3_kept)) ? "yes" : "no"}; ` +
         `derivation events per run ${c5runs.map((t) => t.runs.map((x) => x.derivation_events_added).join("+")).join(", ")}.`
       : "c5 not done.",
