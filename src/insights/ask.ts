@@ -227,9 +227,11 @@ export const ASK_SCHEMA_DIGEST: readonly DigestTable[] = [
       "condition",
       ["retired_at", " TIMESTAMPTZ NULL"],
       "target_days",
+      "cost_basis_minor",
+      "sale_proceeds_minor",
       "notes",
     ],
-    note: "things the user owns, one row per unit. HERE retired_at = sold, broken or given away (NULL = still owned). Its cost is the transaction_items row it points at (NULL for a gift); target_days = how long the user plans to keep it",
+    note: "things the user owns, one row per unit. HERE retired_at = sold, broken or given away (NULL = still owned). Its cost is cost_basis_minor when set (base currency, the user's figure for a financed or gifted item), else the transaction_items row it points at (NULL for a gift); sale_proceeds_minor = what it was sold or traded in for (base currency); target_days = how long the user plans to keep it",
   },
   {
     table: "wish_items",

@@ -21,7 +21,9 @@ import {
   uuid,
   text,
   integer,
+  bigint,
   date,
+  check,
   timestamp,
   jsonb,
   index,
@@ -62,6 +64,15 @@ export const ownedItems = pgTable(
     /** Achievement-plan horizon in days (board screen 11): "use it for
      *  5 years" → 1825. NULL = no plan; the UI offers class defaults. */
     targetDays: integer("target_days"),
+    /** What this instance cost in full, workspace base currency, minor
+     *  units. User truth (Layer 3): set when the linked receipt line does
+     *  not carry the price — a carrier-financed phone whose receipt shows
+     *  only the sales tax, a gift with a known value. NULL → the cost is
+     *  whatever the linked line says. Extraction never writes it. */
+    costBasisMinor: bigint("cost_basis_minor", { mode: "number" }),
+    /** What the instance was sold or traded in for, same unit. NULL →
+     *  not sold, or the amount is unknown. */
+    saleProceedsMinor: bigint("sale_proceeds_minor", { mode: "number" }),
     notes: text("notes"),
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -79,6 +90,10 @@ export const ownedItems = pgTable(
     index("owned_items_workspace_product_idx").on(
       t.workspaceId,
       t.productId,
+    ),
+    check(
+      "owned_items_amounts_nonnegative",
+      sql`${t.costBasisMinor} >= 0 AND ${t.saleProceedsMinor} >= 0`,
     ),
   ],
 );

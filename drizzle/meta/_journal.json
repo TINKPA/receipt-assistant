@@ -309,6 +309,13 @@
       "when": 1794631822338,
       "tag": "0043_document_extractions",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1795082880311,
+      "tag": "0044_owned_item_cost_basis",
+      "breakpoints": true
     }
   ]
 }

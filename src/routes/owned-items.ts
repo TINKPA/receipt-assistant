@@ -66,6 +66,11 @@ function toIsoDateOrNull(v: unknown): string | null {
   return String(v);
 }
 
+/** bigint columns come back as strings from a raw query. */
+function numOrNull(v: unknown): number | null {
+  return v === null || v === undefined ? null : Number(v);
+}
+
 function rowToDto(row: any) {
   return {
     id: row.id,
@@ -89,6 +94,10 @@ function rowToDto(row: any) {
       (row.targetDays ?? row.target_days) === undefined
         ? null
         : Number(row.targetDays ?? row.target_days),
+    cost_basis_minor: numOrNull(row.costBasisMinor ?? row.cost_basis_minor),
+    sale_proceeds_minor: numOrNull(
+      row.saleProceedsMinor ?? row.sale_proceeds_minor,
+    ),
     notes: row.notes ?? null,
     metadata: row.metadata ?? {},
     created_at: toIsoString(row.createdAt ?? row.created_at),
@@ -110,6 +119,9 @@ function expandedExtras(row: any) {
       row.paid_base_minor === null || row.paid_base_minor === undefined
         ? null
         : Number(row.paid_base_minor),
+    effective_cost_minor: numOrNull(
+      row.cost_basis_minor ?? row.paid_base_minor,
+    ),
     payee: row.payee ?? null,
     merchant_brand_id: row.merchant_brand_id ?? null,
   };
@@ -281,6 +293,8 @@ ownedItemsRouter.post(
           acquiredOn: body.acquired_on ?? null,
           warrantyUntil: body.warranty_until ?? null,
           condition: body.condition ?? null,
+          costBasisMinor: body.cost_basis_minor ?? null,
+          saleProceedsMinor: body.sale_proceeds_minor ?? null,
           notes: body.notes ?? null,
           metadata: body.metadata ?? {},
         })
@@ -311,6 +325,8 @@ ownedItemsRouter.patch(
         updates["retiredAt"] = body.retired_at ? new Date(body.retired_at) : null;
       }
       if (body.target_days !== undefined) updates["targetDays"] = body.target_days;
+      if (body.cost_basis_minor !== undefined) updates["costBasisMinor"] = body.cost_basis_minor;
+      if (body.sale_proceeds_minor !== undefined) updates["saleProceedsMinor"] = body.sale_proceeds_minor;
       if (Object.keys(updates).length === 0 && body.metadata === undefined) {
         throw new HttpProblem(
           400,

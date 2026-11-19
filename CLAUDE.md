@@ -36,6 +36,8 @@ Postgres, managed by Drizzle migrations in `drizzle/`. `src/schema/` is the sour
 | `agent_runs` | One row per `claude -p` run for a document (ingest or re-extract), written only by the server: writer, session id, model requested and observed, CLI version, turns, tokens, exit, outcome and error class. See "Run records" under "Agent transcripts". |
 | `document_extractions` | One immutable row per reading of a document: the extraction record a run handed back under the server writer, as validated, with its errors, warnings and normalisations. `transaction_items`, `derivation_events` and `agent_runs` point back at it through `extraction_id`. Nothing writes it while `EXTRACTION_WRITER=agent_sql`, except a record stub in a sandbox. See "Extraction records" below. |
 
+An owned item's cost is its linked receipt line unless the user set `owned_items.cost_basis_minor` (base currency, minor units): a carrier-financed phone's receipt shows only the sales tax, because the instalments are on the monthly bill, which is not a receipt. `GET /v1/owned-items?expand=product` returns the figure to use as `effective_cost_minor`. `sale_proceeds_minor` is what the thing was sold or traded in for. Neither column is in `AGENT_GRANTS`, so extraction cannot write them, and the ledger's postings are not changed by either.
+
 A "receipt" surfaces to the user as the pair `(documents row, linked transaction row(s))`. The agent reads a document, then writes a balanced transaction with its postings and items, and a `document_links` row.
 
 ### Delete semantics
@@ -98,7 +100,7 @@ Every derived value belongs to one of three layers, and the rule is that a lower
 |---|---|---|
 | 1. Raw | What we fetched or were given, kept verbatim | the document file, `places.raw_response`, `place_snapshots` |
 | 2. Projection | Derived from Layer 1 by a prompt or by code | `transactions.payee` / `occurred_on`, items, `places.display_name_*` |
-| 3. User truth | An explicit user decision | `places.custom_name`, `transactions.narration`, any field the user PATCHed |
+| 3. User truth | An explicit user decision | `places.custom_name`, `transactions.narration`, `owned_items.cost_basis_minor` / `sale_proceeds_minor`, any field the user PATCHed |
 
 ### Provenance: `metadata.extraction`
 
