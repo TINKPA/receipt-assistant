@@ -192,7 +192,12 @@ export function fingerprintFromDraft(
       line_total_minor: i.line_total_minor,
       line_type: i.line_type,
       item_class: i.item_class,
-      product_key: i.product_key,
+      // The item write links a product only to a `product` line
+      // (items-sql.ts: line_type = 'product' AND product_key IS NOT NULL).
+      // A surcharge or fee the reading gave a product_key (a paper-bag
+      // fee) is stored without one, so the draft must say the same or
+      // --records reports a difference that is not there.
+      product_key: (i.line_type ?? "product") === "product" ? i.product_key : null,
       tax_minor: i.tax_minor,
       tip_share_minor: i.tip_share_minor,
       discount_share_minor: i.discount_share_minor,

@@ -123,6 +123,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { isInside, readContainer, type StackConditions } from "./eval-dates.js";
+import { secondReExtractIsQuiet } from "./g9-rule.js";
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -1131,9 +1132,9 @@ async function runC5(ctx: Ctx, attempt: Attempt): Promise<Record<string, unknown
     }
     await watch.close();
     const pass = per.every((p) => {
-      const [r1, r2] = p.runs as { outcome: string; layer3_kept: boolean; derivation_events_added: number }[];
+      const [r1, r2] = p.runs as { outcome: string; changed_keys?: string[] | null; layer3_kept: boolean; derivation_events_added: number }[];
       return (
-        r1!.outcome === "written" && r2!.outcome === "no_change" &&
+        r1!.outcome === "written" && secondReExtractIsQuiet(r2!) &&
         r1!.layer3_kept && r2!.layer3_kept &&
         r1!.derivation_events_added === 1 && r2!.derivation_events_added === 1
       );
