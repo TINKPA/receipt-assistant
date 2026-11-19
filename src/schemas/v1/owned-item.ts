@@ -34,6 +34,14 @@ export const OwnedItem = z
     retired_at: IsoDateTime.nullable(),
     /** Achievement-plan horizon in days (1825 = 5 years). NULL = unset. */
     target_days: z.number().int().nullable(),
+    cost_basis_minor: z.number().int().nonnegative().nullable().openapi({
+      description:
+        "The instance's full cost in the workspace base currency, minor units, as entered by the user. Set it when the linked receipt line does not carry the price: a carrier-financed phone whose receipt shows only the sales tax, a gift with a known value. Null means the cost is whatever the linked line says (`paid_base_minor`). Extraction never writes it.",
+    }),
+    sale_proceeds_minor: z.number().int().nonnegative().nullable().openapi({
+      description:
+        "What the instance was sold or traded in for, workspace base currency, minor units. Null: not sold, or the amount is unknown.",
+    }),
     notes: z.string().nullable(),
     metadata: Metadata,
     created_at: IsoDateTime,
@@ -69,6 +77,11 @@ export const OwnedItemExpanded = OwnedItem.extend({
    *  `paid_minor`, which is the exact substitution this field exists to
    *  stop. */
   paid_base_minor: z.number().int().nullable().optional(),
+  /** What the item cost, base currency: `cost_basis_minor` when the user
+   *  set one, else `paid_base_minor`. Null when neither is known. This is
+   *  the figure to show and to divide; `paid_base_minor` stays what the
+   *  receipt line says. */
+  effective_cost_minor: z.number().int().nullable().optional(),
   payee: z.string().nullable().optional(),
   merchant_brand_id: z.string().nullable().optional(),
 }).openapi("OwnedItemExpanded");
@@ -87,6 +100,8 @@ export const CreateOwnedItemRequest = z
     acquired_on: IsoDate.optional(),
     warranty_until: IsoDate.optional(),
     condition: z.string().optional(),
+    cost_basis_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    sale_proceeds_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     notes: z.string().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
@@ -106,6 +121,10 @@ export const UpdateOwnedItemRequest = z
     retired_at: IsoDateTime.nullable().optional(),
     /** Achievement-plan horizon in days; null clears the plan. */
     target_days: z.number().int().positive().nullable().optional(),
+    /** Base currency, minor units; null clears it (the cost falls back to
+     *  the linked receipt line). */
+    cost_basis_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable().optional(),
+    sale_proceeds_minor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable().optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()

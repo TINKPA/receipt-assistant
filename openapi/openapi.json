@@ -2104,6 +2104,22 @@
               "null"
             ]
           },
+          "cost_basis_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "The instance's full cost in the workspace base currency, minor units, as entered by the user. Set it when the linked receipt line does not carry the price: a carrier-financed phone whose receipt shows only the sales tax, a gift with a known value. Null means the cost is whatever the linked line says (`paid_base_minor`). Extraction never writes it."
+          },
+          "sale_proceeds_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "What the instance was sold or traded in for, workspace base currency, minor units. Null: not sold, or the amount is unknown."
+          },
           "notes": {
             "type": [
               "string",
@@ -2138,6 +2154,8 @@
           "condition",
           "retired_at",
           "target_days",
+          "cost_basis_minor",
+          "sale_proceeds_minor",
           "notes",
           "created_at",
           "updated_at"
@@ -2176,6 +2194,12 @@
                 ]
               },
               "paid_base_minor": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "effective_cost_minor": {
                 "type": [
                   "integer",
                   "null"
@@ -2235,6 +2259,16 @@
           },
           "condition": {
             "type": "string"
+          },
+          "cost_basis_minor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sale_proceeds_minor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
           "notes": {
             "type": "string"
@@ -2307,6 +2341,22 @@
               "null"
             ],
             "exclusiveMinimum": 0
+          },
+          "cost_basis_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sale_proceeds_minor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
           "metadata": {
             "type": "object",
