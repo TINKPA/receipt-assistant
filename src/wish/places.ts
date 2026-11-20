@@ -25,7 +25,17 @@ import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchAddressComponents, f
 import { findPlaceByText } from "../google/find-place.js";
 import { searchPlacesByText } from "../google/text-search.js";
 import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
-import { BOROUGH_TOWNS, CITY_ALIASES, CITY_REGIONS, NEW_YORK_BOROUGHS, NEW_YORK_SPELLINGS, hanCitiesIn, isKnownCity } from "./cities.js";
+import {
+  BOROUGH_TOWNS,
+  CITY_ALIASES,
+  CITY_REGIONS,
+  NEW_YORK_BOROUGHS,
+  NEW_YORK_COUNTIES,
+  NEW_YORK_PARTS,
+  NEW_YORK_SPELLINGS,
+  hanCitiesIn,
+  isKnownCity,
+} from "./cities.js";
 import { toAddressComponents, type GoogleAddressComponent } from "../google/text-search.js";
 import { comparable, hasCjk, looseTokens, nameMatches, nameScore, nameTokens } from "./names.js";
 
@@ -412,22 +422,29 @@ const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\
 
 /** The names a read locality may be filed under, as `placeKey`s, each
  *  marked when it is a city Google files as a region ("豫园/城隍庙，上海" →
- *  豫园, 城隍庙, 上海 and shanghai, both regions; "NYC" → new york and the
- *  five boroughs; "Downtown Los Angeles" → itself and los angeles). */
-export function localityKeys(locality: string | null | undefined): { key: string; region: boolean }[] {
-  const out = new Map<string, boolean>();
-  const add = (name: string, region = false) => {
+ *  豫园, 城隍庙, 上海 and shanghai, both regions; "Downtown Los Angeles" →
+ *  itself and los angeles), and when it counts only inside New York City
+ *  (`nyc`): "NYC" → new york and the five boroughs and Queens'
+ *  neighbourhoods, which are also towns elsewhere (Glendale CA, Corona CA,
+ *  Woodside CA, Elmhurst IL); a borough read by itself ("Manhattan", not
+ *  Manhattan KS). A Han city's name that is a street's (北京路, 南京东路)
+ *  is not that city (`hanCitiesIn`). */
+export function localityKeys(locality: string | null | undefined): { key: string; region: boolean; nyc: boolean }[] {
+  const out = new Map<string, { region: boolean; nyc: boolean }>();
+  const add = (name: string, region = false, nyc = false) => {
     const k = placeKey(name);
     if (k.length < 2) return;
-    out.set(k, Boolean(out.get(k)) || region || REGION_KEYS.has(k));
+    const prev = out.get(k);
+    // Read as itself anywhere, it is not held to New York.
+    out.set(k, { region: Boolean(prev?.region) || region || REGION_KEYS.has(k), nyc: prev ? prev.nyc && nyc : nyc });
   };
   // `read` is what the post wrote: only New York's own spellings bring in
   // the five boroughs ("Manhattan" is an alias of New York, and brings in
   // none of them).
   const withCity = (name: string, read: string, region = false) => {
-    add(name, region);
-    if (NEW_YORK_SPELLINGS.has(read)) for (const b of NEW_YORK_BOROUGHS) add(b);
-    for (const t of BOROUGH_TOWNS[name] ?? []) add(t);
+    add(name, region, NEW_YORK_PARTS.has(name));
+    if (NEW_YORK_SPELLINGS.has(read)) for (const b of NEW_YORK_BOROUGHS) add(b, false, true);
+    for (const t of BOROUGH_TOWNS[name] ?? []) add(t, false, true);
   };
   const parts = (locality ?? "")
     .split(/[\/,，、;；|·()（）]+|\s{2,}/u)
@@ -441,8 +458,8 @@ export function localityKeys(locality: string | null | undefined): { key: string
       // in 店 (驻马店) is kept whole too.
       const bare = p.replace(/分?店$/u, "");
       if (bare !== p) add(bare);
-      for (const [han, city] of Object.entries(CITY_ALIASES)) {
-        if (!HAN.test(han) || !p.includes(han)) continue;
+      for (const han of hanCitiesIn(p)) {
+        const city = CITY_ALIASES[han]!;
         const region = REGION_KEYS.has(placeKey(city));
         add(han, region);
         withCity(city, han, region);
@@ -458,21 +475,41 @@ export function localityKeys(locality: string | null | undefined): { key: string
       if (alias) withCity(alias, n);
     }
   }
-  return [...out].map(([key, region]) => ({ key, region }));
+  return [...out].map(([key, v]) => ({ key, ...v }));
+}
+
+const NYC_PART_KEYS = new Set([...NEW_YORK_PARTS, ...NEW_YORK_COUNTIES].map(placeKey));
+/** Google's structured address puts the place in New York City: the state
+ *  is New York and a borough, one of its counties, or the city itself is a
+ *  city-level or county-level component. */
+export function inNewYorkCity(sets: GoogleAddressComponent[][]): boolean {
+  return sets.some((set) => {
+    const keys = (c: GoogleAddressComponent) => [placeKey(c.long), placeKey(c.short)];
+    const state = set.some((c) => c.types.includes("administrative_area_level_1") && keys(c).some((k) => k === "ny" || k === "newyork"));
+    if (!state) return false;
+    return set.some(
+      (c) =>
+        isCityLevel(c) &&
+        keys(c).some((k) => NYC_PART_KEYS.has(k) || (k === "newyork" && c.types.includes("locality"))),
+    );
+  });
 }
 
 /** The read locality is a whole city-level part of Google's structured
  *  address in some language asked: a locality, sublocality, neighbourhood,
  *  postal town or county-level area, never a street; a state or a country
- *  only for the cities Google files that way (`CITY_REGIONS`). */
+ *  only for the cities Google files that way (`CITY_REGIONS`); a borough or
+ *  a Queens neighbourhood read for New York only inside New York City. */
 export function localityConfirmed(locality: string | null | undefined, sets: GoogleAddressComponent[][]): boolean {
   const keys = localityKeys(locality);
   if (keys.length === 0) return false;
+  const nyc = inNewYorkCity(sets);
+  const usable = keys.filter((k) => !k.nyc || nyc);
   return sets.some((set) =>
     set.some((c) => {
       const names = [placeKey(c.long), placeKey(c.short)];
-      if (isCityLevel(c)) return keys.some((k) => names.includes(k.key));
-      if (isRegionLevel(c)) return keys.some((k) => k.region && names.includes(k.key));
+      if (isCityLevel(c)) return usable.some((k) => names.includes(k.key));
+      if (isRegionLevel(c)) return usable.some((k) => k.region && names.includes(k.key));
       return false;
     }),
   );
@@ -608,7 +645,9 @@ function judgeAddress(address: string | null | undefined, c: Seen): MatchReason 
  *   ("San Francisco" is not "South San Francisco"), never a state or a
  *   country ("USA", "Taiwan", "California"), except for a city Google
  *   files as one (`CITY_REGIONS`: 上海, Taipei, Tokyo, Singapore); "New
- *   York", "NYC" and 纽约 are confirmed by the five boroughs;
+ *   York", "NYC" and 纽约 are confirmed by the five boroughs, inside New
+ *   York City only (`inNewYorkCity`: not Glendale CA); a Han city's name
+ *   that is a street's (北京路) is not that city;
  * - either way, a read city this app knows (`src/wish/cities.ts`) must be
  *   confirmed too (`cityContradicted`): Katz's on E Houston St read as
  *   "Chicago" is a suggestion;

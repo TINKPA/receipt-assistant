@@ -2580,7 +2580,8 @@
               "type": "string",
               "format": "uuid",
               "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
-            }
+            },
+            "description": "Other place wishes in the workspace at the same place, any status. A thing wish is never listed, and a thing wish's list is empty: visiting a place settles no thing to buy."
           },
           "title": {
             "type": "string"

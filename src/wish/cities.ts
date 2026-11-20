@@ -71,8 +71,26 @@ export function isKnownCity(locality: string): boolean {
   return CITIES.has(locality.trim().toLowerCase().replace(/\s+/g, " "));
 }
 
+/** What follows a city's name when the name is a street's: 北京路, 南京东路,
+ *  上海街, 香港中路, 西安大道. Such a street is in any city, not in that one. */
+const HAN_STREET_AFTER = /^[东西南北中東]?(大道|大街|路|街|道|巷|弄|胡同)/u;
+
 /** The Han city names of CITY_ALIASES a Han locality carries ("旧金山唐人街"
- *  → 旧金山). */
+ *  → 旧金山), except where the name is a street's ("北京路" → none,
+ *  "南京东路" → none). */
 export function hanCitiesIn(locality: string): string[] {
-  return Object.keys(CITY_ALIASES).filter((k) => /\p{Script=Han}/u.test(k) && locality.includes(k));
+  return Object.keys(CITY_ALIASES).filter((k) => {
+    if (!/\p{Script=Han}/u.test(k)) return false;
+    for (let at = locality.indexOf(k); at >= 0; at = locality.indexOf(k, at + 1)) {
+      if (!HAN_STREET_AFTER.test(locality.slice(at + k.length))) return true;
+    }
+    return false;
+  });
 }
+
+/** New York City's own parts: a borough or a Queens neighbourhood read for
+ *  New York confirms a place only inside the city, never a namesake town
+ *  (Glendale CA, Corona CA, Woodside CA, Elmhurst IL, Manhattan KS). */
+export const NEW_YORK_PARTS = new Set(["manhattan", "brooklyn", "bronx", "the bronx", "staten island", "queens"]);
+/** The city's counties, as Google writes them (`administrative_area_level_2`). */
+export const NEW_YORK_COUNTIES = new Set(["new york county", "kings county", "bronx county", "richmond county", "queens county"]);

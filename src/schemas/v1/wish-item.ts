@@ -118,9 +118,13 @@ export const WishItem = z
     /** A guessed place waiting for the person to confirm or reject it;
      *  null when the wish has a place or nothing was guessed. */
     place_suggestion: WishPlaceSuggestion.nullable(),
-    /** Other wishes in the workspace at the same place (any status): the
-     *  same restaurant saved twice, from two screenshots or typed again. */
-    same_place_wish_ids: z.array(Uuid),
+    /** Other place wishes in the workspace at the same place (any status):
+     *  the same restaurant saved twice, from two screenshots or typed
+     *  again. Never a thing wish, and empty on one. */
+    same_place_wish_ids: z.array(Uuid).openapi({
+      description:
+        "Other place wishes in the workspace at the same place, any status. A thing wish is never listed, and a thing wish's list is empty: visiting a place settles no thing to buy.",
+    }),
     title: z.string(),
     notes: z.string().nullable(),
     /** What you'd pay, in minor units. Drives the projected $/day. */

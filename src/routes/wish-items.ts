@@ -98,6 +98,9 @@ const WISH_SELECT = sql`
          ws.base_currency AS ct_currency,
          ARRAY(SELECT o.id FROM wish_items o
                 WHERE o.workspace_id = w.workspace_id AND o.place_id = w.place_id AND o.id <> w.id
+                  -- Places only: visiting a place settles no thing to buy
+                  -- that happens to name it.
+                  AND w.kind = 'place' AND o.kind = 'place'
                 ORDER BY o.created_at, o.id) AS same_place_ids
     FROM wish_items w
     JOIN workspaces ws ON ws.id = w.workspace_id

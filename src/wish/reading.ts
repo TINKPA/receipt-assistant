@@ -257,9 +257,13 @@ export const WishReading = z
         v !== null && /^[^,，\s]+(大道|大街|路|街|巷|弄|胡同)$/u.test(v.trim()) && !/(唐人街|中华街|中華街|步行街|商业街|商業街)$/u.test(v.trim());
       const titleBranch = branch ? branchArea(branch) : null;
       const readBranch = !branch && /店$/u.test(o.locality?.trim() ?? "") ? locality : null;
-      const streetBranch = o.address ? null : isStreet(titleBranch) ? titleBranch : isStreet(readBranch) ? readBranch : null;
+      // A locality that is a Han street by itself ("北京路", Guangzhou's
+      // shopping street; "南京东路") is a street too, never the city it is
+      // named after.
+      const readStreet = !branch && readBranch === null && isStreet(locality) ? locality : null;
+      const streetBranch = o.address ? null : isStreet(titleBranch) ? titleBranch : isStreet(readBranch) ? readBranch : readStreet;
       if (streetBranch) {
-        const own = o.locality && o.locality.trim() !== branch && readBranch === null ? locality : null;
+        const own = o.locality && o.locality.trim() !== branch && readBranch === null && readStreet === null ? locality : null;
         return { ...o, title: t.name, name_local: n ? n.name : o.name_local, address: streetBranch, locality: own === streetBranch ? null : own };
       }
       return {

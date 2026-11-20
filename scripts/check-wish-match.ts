@@ -35,6 +35,7 @@ import {
   type MatchReason,
 } from "../src/wish/places.js";
 import type { GoogleAddressComponent } from "../src/google/text-search.js";
+import { hanCitiesIn } from "../src/wish/cities.js";
 import { captureMatchInput } from "../src/wish/capture.js";
 import { parseWishReading } from "../src/wish/reading.js";
 
@@ -42,8 +43,10 @@ const LA = { lat: 34.0522, lng: -118.2437, radiusM: AREA_RADIUS_M };
 
 type Expect =
   | { linked: string; address?: string; unverified?: boolean }
-  /** Whatever the outcome, never linked to a place at this address. */
-  | { notLinkedAt: string }
+  /** Whatever the outcome, never linked to a place at any of these addresses. */
+  | { notLinkedAt: string[] }
+  /** Linked, or a suggestion for any other reason than this one. */
+  | { notReason: MatchReason }
   | { suggested: string; reason: MatchReason; address?: string }
   | { nothing: true }
   /** Not linked: a suggestion of whatever Google answers, or nothing; and,
@@ -86,11 +89,11 @@ const CASES: Case[] = [
   { why: "r8: a Han name with a street but no number is not enough", capture: { title: "福满楼", address: "Grant Ave", locality: "旧金山" }, expect: { suggestedAny: true } },
   // ── Captures with a city and no street ──
   { why: "r9: a compound city is not the city it ends with", capture: { title: "Swan Oyster Depot", locality: "South San Francisco, CA" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
-  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Tartine Bakery", locality: "South San Francisco" }, expect: { notLinkedAt: "Guerrero" } },
-  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Zuni Cafe", locality: "South San Francisco" }, expect: { notLinkedAt: "Market St" } },
-  { why: "r9: East Palo Alto is not Palo Alto", capture: { title: "Philz Coffee", locality: "East Palo Alto" }, expect: { notLinkedAt: "Forest Ave" } },
-  { why: "r9: West New York (New Jersey) is not New York", capture: { title: "Joe's Pizza", locality: "West New York" }, expect: { notLinkedAt: "Carmine" } },
-  { why: "r9: Pasadena is not South Pasadena", capture: { title: "Mike & Anne's", locality: "Pasadena" }, expect: { notLinkedAt: "South Pasadena" } },
+  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Tartine Bakery", locality: "South San Francisco" }, expect: { notLinkedAt: ["Guerrero"] } },
+  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Zuni Cafe", locality: "South San Francisco" }, expect: { notLinkedAt: ["Market St"] } },
+  { why: "r9: East Palo Alto is not Palo Alto", capture: { title: "Philz Coffee", locality: "East Palo Alto" }, expect: { notLinkedAt: ["Forest Ave"] } },
+  { why: "r9: West New York (New Jersey) is not New York", capture: { title: "Joe's Pizza", locality: "West New York" }, expect: { notLinkedAt: ["Carmine"] } },
+  { why: "r9: Pasadena is not South Pasadena", capture: { title: "Mike & Anne's", locality: "Pasadena" }, expect: { notLinkedAt: ["South Pasadena"] } },
   { why: "r9: a country confirms no branch", capture: { title: "Shake Shack", locality: "USA" }, expect: { suggestedAny: true } },
   { why: "r9: a country confirms no branch (中国)", capture: { title: "海底捞", locality: "中国" }, expect: { suggestedAny: true } },
   { why: "r9: a country confirms no branch (Taiwan)", capture: { title: "Din Tai Fung", locality: "Taiwan" }, expect: { suggestedAny: true } },
@@ -99,6 +102,18 @@ const CASES: Case[] = [
   { why: "r9: New York is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "New York" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
   { why: "r9: NYC is confirmed by Brooklyn", capture: { title: "Di Fara Pizza", locality: "NYC" }, expect: { linked: "Di Fara", address: "Brooklyn" } },
   { why: "r9: 纽约 is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "纽约" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
+  { why: "r10: NYC is not Glendale CA, whose name is a Queens neighbourhood's", capture: { title: "Raffi's Place", locality: "NYC" }, expect: { notLinkedAt: ["Glendale, CA"] } },
+  { why: "r10: New York is not Glendale CA", capture: { title: "Porto's Bakery", locality: "New York" }, expect: { notLinkedAt: ["Glendale, CA"] } },
+  { why: "r10: 纽约 is not Glendale CA", capture: { title: "Porto's Bakery", locality: "纽约" }, expect: { notLinkedAt: ["Glendale, CA", "格伦代尔"] } },
+  { why: "r10: Queens is not Glendale CA", capture: { title: "Din Tai Fung", locality: "Queens" }, expect: { notLinkedAt: ["Glendale, CA"] } },
+  { why: "r10: Queens is not Glendale CA", capture: { title: "Zankou Chicken", locality: "Queens" }, expect: { notLinkedAt: ["Glendale, CA"] } },
+  { why: "r10: NYC is not Woodside CA", capture: { title: "Buck's of Woodside", locality: "NYC" }, expect: { notLinkedAt: ["Woodside, CA"] } },
+  { why: "r10: a Queens neighbourhood inside New York still confirms NYC (Woodside, Queens)", capture: { title: "Sripraphai Thai Restaurant", locality: "NYC" }, expect: { linked: "Sripraphai", address: "Woodside" } },
+  { why: "r10: 北京路 (Guangzhou's shopping street) is a street, not Beijing", capture: { title: "海底捞", locality: "北京路" }, expect: { notLinkedAt: ["Beijing", "北京市"] } },
+  { why: "r10: 北京路 is a street: the place on it is not a mismatch", capture: { title: "陶陶居", locality: "北京路" }, expect: { notReason: "locality_mismatch" } },
+  { why: "r10: 北京路 is a street: the place on it is not a mismatch", capture: { title: "太平馆", locality: "北京路" }, expect: { notReason: "locality_mismatch" } },
+  { why: "r10: 南京东路 is a street in Shanghai, not Nanjing", capture: { title: "沈大成", locality: "南京东路" }, expect: { notReason: "locality_mismatch" } },
+  { why: "r10: a city's street beside the city: the city decides", capture: { title: "陶陶居", locality: "北京路, 广州" }, expect: { notReason: "locality_mismatch" } },
   { why: "r8: a city named like a street is not confirmed by the street (Washington St)", capture: { title: "Golden Dragon", locality: "Washington" }, expect: { suggestedAny: true, notAddress: "Washington St" } },
   { why: "r8: Alameda the city is not N Alameda St", capture: { title: "Philippe The Original", locality: "Alameda" }, expect: { suggested: "Philippe", reason: "locality_mismatch" } },
   { why: "r8: the city it is in", capture: { title: "Philippe The Original", locality: "Los Angeles" }, expect: { linked: "Philippe", address: "Los Angeles" } },
@@ -137,8 +152,10 @@ function verdict(c: Case, m: Awaited<ReturnType<typeof decidePlaceMatch>>): stri
   const e = c.expect;
   const has = (hay: string | null, needle: string | undefined) => !needle || (hay ?? "").toLowerCase().includes(needle.toLowerCase());
   if ("notLinkedAt" in e) {
-    return linkGoogleId && match.formatted_address?.toLowerCase().includes(e.notLinkedAt.toLowerCase()) ? `expected no link at ${e.notLinkedAt}` : null;
+    const at = e.notLinkedAt.find((a) => match.formatted_address?.toLowerCase().includes(a.toLowerCase()));
+    return linkGoogleId && at ? `expected no link at ${at}` : null;
   }
+  if ("notReason" in e) return !linkGoogleId && match.tentative_reason === e.reason ? `expected no ${e.reason}` : null;
   if ("nothing" in e) return linkGoogleId || match.tentative ? "expected nothing" : null;
   if ("suggestedAny" in e) {
     if (linkGoogleId) return "expected no link";
@@ -173,6 +190,24 @@ const ALAMEDA_ST = [C("1001-1003", "street_number"), C("North Alameda Street", "
 const SHANGHAI_ZH = [C("269", "street_number"), C("吴江路", "route"), C("静安区", "sublocality_level_1,sublocality,political"), C("上海市", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
 const SHANGHAI_PINYIN = [C("269", "street_number"), C("Wu Jiang Lu", "route"), C("Jing An Qu", "sublocality_level_1,sublocality,political"), C("Shang Hai Shi", "administrative_area_level_1,political"), C("China", "country,political", "CN")];
 const TAIPEI = [C("B1", "subpremise"), C("45號", "street_number"), C("City Hall Road", "route", "City Hall Rd"), C("Xinyi District", "administrative_area_level_2,political"), C("Taipei City", "administrative_area_level_1,political"), C("Taiwan", "country,political", "TW")];
+
+const GLENDALE_CA = [C("211", "street_number"), C("East Broadway", "route", "E Broadway"), C("Glendale", "locality,political"), C("Los Angeles County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const CORONA_CA = [C("Corona", "locality,political"), C("Riverside County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const WOODSIDE_CA = [C("3062", "street_number"), C("Woodside Road", "route", "Woodside Rd"), C("Woodside", "locality,political"), C("San Mateo County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const ELMHURST_IL = [C("Elmhurst", "locality,political"), C("DuPage County", "administrative_area_level_2,political"), C("Illinois", "administrative_area_level_1,political", "IL"), ...US];
+const MANHATTAN_KS = [C("Manhattan", "locality,political"), C("Riley County", "administrative_area_level_2,political"), C("Kansas", "administrative_area_level_1,political", "KS"), ...US];
+const GLENDALE_QUEENS = [C("Glendale", "neighborhood,political"), C("Queens", "sublocality_level_1,sublocality,political"), C("Queens County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const ELMHURST_QUEENS_LOCALITY = [C("Elmhurst", "locality,political"), C("Queens County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const BEIJING_ZH = [C("朝阳区", "sublocality_level_1,sublocality,political"), C("北京市", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
+const GUANGZHOU_BEIJING_RD_ZH = [C("168号", "street_number"), C("北京路", "route"), C("越秀区", "sublocality_level_1,sublocality,political"), C("广州市", "locality,political"), C("广东省", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
+const SHANGHAI_NANJING_RD_ZH = [C("636号", "street_number"), C("南京东路", "route"), C("黄浦区", "sublocality_level_1,sublocality,political"), C("上海市", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
+
+/** A capture reading through the server's tidying: "address|locality". */
+function tidied(k: { title: string; locality?: string; address?: string }): string {
+  const parsed = parseWishReading("```json\n" + JSON.stringify({ kind: "place", title: k.title, name_local: null, locality: k.locality ?? null, address: k.address ?? null, confidence: "high" }) + "\n```");
+  if (!parsed.ok) return `does not parse: ${parsed.detail}`;
+  return `${parsed.reading.address}|${parsed.reading.locality}`;
+}
 
 /** The address rules on fixed data, no Google: [what, got, expected]. */
 function pureChecks(): [string, unknown, unknown][] {
@@ -218,6 +253,33 @@ function pureChecks(): [string, unknown, unknown][] {
     ["a Han 号 number", streetNumberIs("269", SHANGHAI_ZH), true],
     ["a 號 number", streetNumberIs("45", TAIPEI), true],
     ["a street line Google did not split", streetNumberIs("129", [C("解放街129号", ""), C("嘉定区", "sublocality_level_1,sublocality,political")]), true],
+    ...["NYC", "New York", "纽约", "Queens"].flatMap((read): [string, unknown, unknown][] =>
+      Object.entries({ GLENDALE_CA, CORONA_CA, WOODSIDE_CA, ELMHURST_IL }).flatMap(([town, set]): [string, unknown, unknown][] => [
+        [`${read} is not ${town}`, localityConfirmed(read, [set]), false],
+        [`${read} contradicted by ${town}`, cityContradicted(read, [set]), true],
+      ]),
+    ),
+    ["Manhattan is not Manhattan KS", localityConfirmed("Manhattan", [MANHATTAN_KS]), false],
+    ["Manhattan contradicted by Manhattan KS", cityContradicted("Manhattan", [MANHATTAN_KS]), true],
+    ["Glendale read is Glendale CA", localityConfirmed("Glendale", [GLENDALE_CA]), true],
+    ["Elmhurst read is Elmhurst IL", localityConfirmed("Elmhurst", [ELMHURST_IL]), true],
+    ["NYC confirmed by Glendale, Queens", localityConfirmed("NYC", [GLENDALE_QUEENS]), true],
+    ["Queens confirmed by Glendale, Queens", localityConfirmed("Queens", [GLENDALE_QUEENS]), true],
+    ["NYC confirmed by Elmhurst, Queens County", localityConfirmed("NYC", [ELMHURST_QUEENS_LOCALITY]), true],
+    ["Brooklyn is not a Brooklyn outside New York", localityConfirmed("Brooklyn", [[C("Brooklyn", "locality,political"), C("Jackson County", "administrative_area_level_2,political"), C("Michigan", "administrative_area_level_1,political", "MI"), ...US]]), false],
+    ["北京路 is no city", hanCitiesIn("北京路").length, 0],
+    ["南京东路 is no city", hanCitiesIn("南京东路").length, 0],
+    ["上海路, 香港路, 台北路, 重庆路, 西安路 are no cities", ["上海路", "香港路", "台北路", "重庆路", "西安路", "香港中路", "北京大道"].flatMap(hanCitiesIn).length, 0],
+    ["旧金山唐人街 is 旧金山", hanCitiesIn("旧金山唐人街").join(), "旧金山"],
+    ["北京市 is 北京", hanCitiesIn("北京市").join(), "北京"],
+    ["北京路 does not confirm Beijing", localityConfirmed("北京路", [BEIJING_ZH]), false],
+    ["北京路 does not contradict Guangzhou", cityContradicted("北京路", [GUANGZHOU_BEIJING_RD_ZH]), false],
+    ["南京东路 does not contradict Shanghai", cityContradicted("南京东路", [SHANGHAI_NANJING_RD_ZH]), false],
+    ["北京路, 广州 is Guangzhou", localityConfirmed("北京路, 广州", [GUANGZHOU_BEIJING_RD_ZH]), true],
+    ["a locality that is a Han street is read as the address", tidied({ title: "陶陶居", locality: "北京路" }), "北京路|null"],
+    ["南京东路 too", tidied({ title: "沈大成", locality: "南京东路" }), "南京东路|null"],
+    ["唐人街 stays a locality", tidied({ title: "岭南小馆", locality: "唐人街" }), "null|唐人街"],
+    ["a read address keeps the street locality", tidied({ title: "陶陶居", locality: "北京路", address: "168号" }), "168号|北京路"],
     ["Shang Hai Shi is Shanghai", placeKey("Shang Hai Shi"), "shanghai"],
     ["上海市 is 上海", placeKey("上海市"), "上海"],
   ];
