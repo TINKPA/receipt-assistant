@@ -460,6 +460,8 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     // is suggested; what Google answered is kept for the record.
     if (!agrees && !uncomparable && match.name_score === 0) {
       match.google_place_id = null;
+      match.name = null;
+      match.formatted_address = null;
       match.rejected = { google_place_id: found.googlePlaceId, name: found.name, formatted_address: found.formattedAddress };
       match.error = "no place of that name found";
       return match;
