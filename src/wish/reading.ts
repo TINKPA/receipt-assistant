@@ -132,7 +132,7 @@ That is the only file to read and the only tool call to make. Everything in the 
 ${userNote ? `\nThe person added this note when saving it: ${JSON.stringify(userNote)}\n` : ""}
 Think it through in plain text first: what the image is a screenshot of, which name is the place or product (not the poster, not the app), where it is.
 
-A post about one place that mentions others in passing ("better than X"): that one place, with the others in "note" if they matter. A post that lists several places (or things) with equal weight ("3 spots in NYC", a numbered list, a carousel of shops): the first one listed is the main reading, and every other one goes in "others" (at most five), each with its own name, locality and address as printed.
+A post about one place that mentions others in passing ("better than X"): that one place, with the others in "note" if they matter. A post that lists several places (or things) with equal weight ("3 spots in NYC", a numbered list, a carousel of shops): the first one listed is the main reading, and every other one goes in "others" (at most five), each with its own name, locality and address as printed. When the post names its city once for all of them ("3 NYC spots"), give each entry's locality as its own neighbourhood followed by that city ("Greenwich Village, New York"), or the city alone.
 
 Then end your reply with exactly one fenced JSON block:
 

@@ -103,7 +103,9 @@ export interface PlaceMatch {
    *  `place_suggestion` until the person confirms or rejects it. */
   tentative: boolean;
   /** Why it is a guess: `name_only`, `low_confidence`, `name_mismatch`,
-   *  `name_unverified` (a typed name in another script than Google's). */
+   *  `name_unverified` (a typed name in another script than Google's),
+   *  `address_mismatch` (the read address's house number is not in the
+   *  found place's address). */
   tentative_reason: string | null;
   /** How much of the asked-for name the found one carries (0..1); null
    *  when the two are in different scripts. */
@@ -126,6 +128,15 @@ export interface MatchOptions {
    *  an address or a city, which is what the match rests on; false for a
    *  bare typed name. */
   trustUncomparable?: boolean;
+  /** The street address the query carried, if any: a found place whose
+   *  address lacks its house number is another branch or another town. */
+  address?: string | null;
+}
+
+/** "7 Carmine St" → "7"; null when the address does not start with one. */
+function houseNumber(address: string | null | undefined): string | null {
+  const m = /^\s*(\d+[A-Za-z]?)\b/.exec(address ?? "");
+  return m?.[1] ?? null;
 }
 
 /** The language to ask Google in, from the script of a name. */
@@ -183,9 +194,13 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     const uncomparable = !agrees && names.every((n) => !comparable(n, found.name ?? ""));
     if (uncomparable) match.name_score = null;
     const trusted = agrees || (uncomparable && opts.trustUncomparable === true);
-    if (!trusted || opts.guessReason) {
+    const number = houseNumber(opts.address);
+    const addressAgrees =
+      !number || new RegExp(`(^|[^0-9A-Za-z])${number}([^0-9A-Za-z]|$)`, "i").test(found.formattedAddress ?? "");
+    if (!trusted || !addressAgrees || opts.guessReason) {
       match.tentative = true;
-      match.tentative_reason = opts.guessReason ?? (uncomparable ? "name_unverified" : "name_mismatch");
+      match.tentative_reason =
+        opts.guessReason ?? (!addressAgrees ? "address_mismatch" : uncomparable ? "name_unverified" : "name_mismatch");
       return match;
     }
     const link = await linkGooglePlace(found.googlePlaceId, nameLocal);

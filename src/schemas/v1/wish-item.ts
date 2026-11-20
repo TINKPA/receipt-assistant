@@ -49,7 +49,8 @@ export const WishPlaceSuggestion = z
     /** `name_only` (no city or address to go on), `low_confidence` (the
      *  reading was a guess), `name_mismatch` (Google's place has another
      *  name), `name_unverified` (a typed name in another script than
-     *  Google's, so the two cannot be compared). */
+     *  Google's, so the two cannot be compared), `address_mismatch` (the
+     *  address in the image is not the found place's). */
     reason: z.string().nullable(),
   })
   .openapi("WishPlaceSuggestion");

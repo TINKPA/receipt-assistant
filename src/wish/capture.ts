@@ -39,6 +39,8 @@ import {
 } from "./reading.js";
 
 export const WISH_TITLE_WHILE_READING = "Reading…";
+/** The title of a capture that could not be read (nothing came back). */
+export const WISH_TITLE_UNREAD = "Unread capture";
 const READ_TIMEOUT_MS = 180_000;
 
 export function wishImageRoot(): string {
@@ -199,7 +201,9 @@ interface Placeable {
 
 function placeQuery(r: Placeable): { query: string; basis: "address" | "locality" | "name_only" } {
   const name = r.name_local && r.name_local !== r.title ? `${r.title} ${r.name_local}` : r.title;
-  if (r.address) return { query: `${name} ${r.address}`, basis: "address" };
+  // The address with its neighbourhood or city: "7 Carmine St" alone is a
+  // street in many towns.
+  if (r.address) return { query: [name, r.address, r.locality].filter(Boolean).join(" "), basis: "address" };
   if (r.locality) return { query: `${name} ${r.locality}`, basis: "locality" };
   return { query: name, basis: "name_only" };
 }
@@ -217,6 +221,7 @@ async function matchPlace(workspaceId: string, r: Placeable, confidence: WishRea
     // An address or a city is what the match rests on; a Han name and
     // Google's English one cannot be compared word by word.
     trustUncomparable: basis !== "name_only",
+    address: r.address,
     // With no city in the image, the person's own area is the best guess.
     locationBias: basis === "name_only" ? await workspaceArea(workspaceId) : null,
   });
@@ -239,7 +244,8 @@ async function failCapture(id: string, capture: Record<string, unknown>, describ
   await db.execute(sql`
     UPDATE wish_items
        SET capture_status = CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb THEN 'done' ELSE 'failed' END,
-           title = CASE WHEN title = ${WISH_TITLE_WHILE_READING} THEN coalesce(${describedAs}::text, 'Unread capture') ELSE title END,
+           title = CASE WHEN title IN (${WISH_TITLE_WHILE_READING}, ${WISH_TITLE_UNREAD}) AND NOT coalesce(capture->'user_set' ? 'title', false)
+                        THEN coalesce(${describedAs}::text, ${WISH_TITLE_UNREAD}) ELSE title END,
            capture = ${JSON.stringify({ ...capture, prompt_version: WISH_READ_PROMPT_VERSION })}::jsonb
                      || ${keepCaptureKeys}
                      || CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb
@@ -327,7 +333,10 @@ async function splitSiblings(id: string, workspaceId: string, r: WishReading, ba
   const siblings: string[] = [];
   const skipped: { title: string; reason: string; wish_id?: string }[] = [];
   for (const o of r.others as WishReadingOther[]) {
-    const match = r.kind === "place" ? await matchPlace(workspaceId, o, r.confidence) : null;
+    // A list post usually names its city once ("3 NYC spots"): an entry
+    // with no place of its own is in the main one's.
+    const where = o.locality || o.address ? o : { ...o, locality: r.locality };
+    const match = r.kind === "place" ? await matchPlace(workspaceId, where, r.confidence) : null;
     if (match?.place_id) {
       const dup = await db.execute(sql`
         SELECT id FROM wish_items WHERE workspace_id = ${workspaceId}::uuid AND place_id = ${match.place_id}::uuid AND status <> 'declined' LIMIT 1`);
