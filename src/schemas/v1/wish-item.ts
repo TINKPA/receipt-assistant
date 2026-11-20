@@ -61,9 +61,13 @@ export const WishPlaceSuggestion = z
      *  with), `locality_mismatch` (the city or neighbourhood the image
      *  names is not a whole city-level part of Google's structured address,
      *  or the city is not although the street is: a namesake in another
-     *  town, "South San Francisco" for San Francisco, a state or a country
-     *  only, or a neighbourhood Google does not name), `outside_area` (a
-     *  typed name found outside the workspace's usual area). */
+     *  town, "South San Francisco" for San Francisco, a state, a country
+     *  or a county only, a bare generic neighbourhood such as "Downtown"
+     *  with no city, or a neighbourhood Google does not name),
+     *  `several_branches` (the image names a city or neighbourhood and no
+     *  street, and two or more places of that name are in it: the first is
+     *  offered), `outside_area` (a typed name found outside the workspace's
+     *  usual area). */
     reason: z.string().nullable(),
   })
   .openapi("WishPlaceSuggestion");

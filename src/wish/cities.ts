@@ -56,6 +56,27 @@ export const CITY_REGIONS = new Set([
   "macau", "macao",
 ]);
 
+/** A county (`administrative_area_level_2`) that is one city, so naming it
+ *  names the city: San Francisco is a city and county in one. Any other
+ *  county ("Orange County", "King County", "Los Angeles County") holds many
+ *  towns and confirms no branch by itself. A district filed at that level
+ *  (Taipei's "Xinyi District", a 区) is part of a city and still confirms. */
+export const CITY_COUNTIES = new Set([
+  "san francisco county", "city and county of san francisco", "city and county of honolulu", "honolulu county",
+  "city and county of denver", "denver county", "philadelphia county",
+]);
+
+/** A neighbourhood word many cities have: by itself it says no city
+ *  ("Downtown" is Culver City's as well as Los Angeles's), so it confirms
+ *  a place only together with a city that is confirmed too. */
+export const GENERIC_NEIGHBOURHOODS = [
+  "downtown", "midtown", "uptown", "old town", "old city", "chinatown", "koreatown", "japantown", "little italy",
+  "little saigon", "financial district", "arts district", "fashion district", "theater district", "theatre district",
+  "historic district", "city center", "city centre", "town center", "town centre", "centre", "center", "waterfront",
+  "市中心", "市区", "市區", "唐人街", "中国城", "中國城", "华埠", "華埠", "老城", "老城区", "老城區", "韩国城", "韓國城",
+  "韩国街", "韓國街", "日本城", "小意大利", "金融区", "金融區", "下城", "中城", "上城",
+];
+
 /** Cities (and New York's boroughs, which posts use as cities). */
 const CITIES = new Set([
   ...Object.values(CITY_ALIASES),

@@ -98,6 +98,14 @@ const CASES: Case[] = [
   { why: "r9: a country confirms no branch (中国)", capture: { title: "海底捞", locality: "中国" }, expect: { suggestedAny: true } },
   { why: "r9: a country confirms no branch (Taiwan)", capture: { title: "Din Tai Fung", locality: "Taiwan" }, expect: { suggestedAny: true } },
   { why: "a state confirms no branch", capture: { title: "In-N-Out Burger", locality: "California" }, expect: { suggestedAny: true } },
+  { why: "r11: a county is not a city: one of Orange County's branches is not confirmed", capture: { title: "Din Tai Fung", locality: "Orange County" }, expect: { suggestedAny: true } },
+  { why: "r11: King County holds Tukwila, Bellevue and Seattle", capture: { title: "Din Tai Fung", locality: "King County" }, expect: { suggestedAny: true } },
+  { why: "r11: Los Angeles County is not a city", capture: { title: "In-N-Out Burger", locality: "Los Angeles County" }, expect: { suggestedAny: true } },
+  { why: "r11: Santa Clara County is not a city", capture: { title: "Philz Coffee", locality: "Santa Clara County" }, expect: { suggestedAny: true } },
+  { why: "r11: a bare Downtown names no city (Culver City has one)", capture: { title: "Philz Coffee", locality: "Downtown" }, expect: { suggestedAny: true } },
+  { why: "r11: a bare Downtown names no city (Santa Monica has one)", capture: { title: "Din Tai Fung", locality: "Downtown" }, expect: { suggestedAny: true } },
+  { why: "r11: Downtown with its city is that city's", capture: { title: "Philz Coffee", locality: "Downtown, Culver City" }, expect: { linked: "Philz", address: "Culver City" } },
+  { why: "r11: a chain with several branches in the city is a suggestion", capture: { title: "Din Tai Fung", locality: "Seattle" }, expect: { notReason: "locality_mismatch" } },
   { why: "a city Google files as a region (Taipei City is administrative_area_level_1)", capture: { title: "Din Tai Fung", address: "City Hall Rd", locality: "Taipei" }, expect: { linked: "Din Tai Fung", address: "Taipei" } },
   { why: "r9: New York is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "New York" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
   { why: "r9: NYC is confirmed by Brooklyn", capture: { title: "Di Fara Pizza", locality: "NYC" }, expect: { linked: "Di Fara", address: "Brooklyn" } },
@@ -121,8 +129,9 @@ const CASES: Case[] = [
   { why: "r8: a Han name and only a city: Google's English guess is not linked", capture: { title: "张记小馆", locality: "旧金山" }, expect: { suggestedAny: true } },
   { why: "r8: a Han name and only a city", capture: { title: "王记牛肉面", locality: "旧金山" }, expect: { suggestedAny: true } },
   { why: "r8: a description, not a name", capture: { title: "小红书推荐的火锅", locality: "洛杉矶" }, expect: { suggestedAny: true } },
-  { why: "r8: Google writes Manhattan as New York", capture: { title: "Joe's Pizza", locality: "Manhattan" }, expect: { linked: "Joe's Pizza", address: "New York" } },
-  { why: "r8: 曼哈顿 too", capture: { title: "Joe's Pizza", locality: "曼哈顿" }, expect: { linked: "Joe's Pizza", address: "New York" } },
+  // r11: Joe's Pizza has several Manhattan branches (Carmine St, Broadway, 14th St): the city alone cannot say which.
+  { why: "r8: Google writes Manhattan as New York; r11: several branches there", capture: { title: "Joe's Pizza", locality: "Manhattan" }, expect: { suggested: "Joe's Pizza", reason: "several_branches", address: "New York" } },
+  { why: "r8: 曼哈顿 too", capture: { title: "Joe's Pizza", locality: "曼哈顿" }, expect: { suggested: "Joe's Pizza", reason: "several_branches", address: "New York" } },
   { why: "r2: a branch by its city", capture: { title: "Din Tai Fung", locality: "Glendale" }, expect: { linked: "Din Tai Fung", address: "Glendale" } },
   { why: "r7: a namesake in another city is not linked", capture: { title: "Swan Oyster Depot", locality: "Los Angeles" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
   { why: "r7: Katz's is in New York, not Chicago", capture: { title: "Katz's Delicatessen", locality: "Chicago" }, expect: { suggested: "Katz", reason: "locality_mismatch" } },
@@ -191,6 +200,8 @@ const SHANGHAI_ZH = [C("269", "street_number"), C("吴江路", "route"), C("静�
 const SHANGHAI_PINYIN = [C("269", "street_number"), C("Wu Jiang Lu", "route"), C("Jing An Qu", "sublocality_level_1,sublocality,political"), C("Shang Hai Shi", "administrative_area_level_1,political"), C("China", "country,political", "CN")];
 const TAIPEI = [C("B1", "subpremise"), C("45號", "street_number"), C("City Hall Road", "route", "City Hall Rd"), C("Xinyi District", "administrative_area_level_2,political"), C("Taipei City", "administrative_area_level_1,political"), C("Taiwan", "country,political", "TW")];
 
+const COSTA_MESA = [C("3333", "street_number"), C("Bristol Street", "route", "Bristol St"), C("Costa Mesa", "locality,political"), C("Orange County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const CULVER_DOWNTOWN = [C("9300", "street_number"), C("Culver Boulevard", "route", "Culver Blvd"), C("Downtown", "neighborhood,political"), C("Culver City", "locality,political"), C("Los Angeles County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
 const GLENDALE_CA = [C("211", "street_number"), C("East Broadway", "route", "E Broadway"), C("Glendale", "locality,political"), C("Los Angeles County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
 const CORONA_CA = [C("Corona", "locality,political"), C("Riverside County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
 const WOODSIDE_CA = [C("3062", "street_number"), C("Woodside Road", "route", "Woodside Rd"), C("Woodside", "locality,political"), C("San Mateo County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
@@ -215,7 +226,18 @@ function pureChecks(): [string, unknown, unknown][] {
     ["Washington St is not Washington", localityConfirmed("Washington", [SF]), false],
     ["Washington DC is", localityConfirmed("Washington", [DC]), true],
     ["华盛顿 is not Washington St", localityConfirmed("华盛顿", [SF]), false],
-    ["Chinatown, a neighbourhood", localityConfirmed("Chinatown", [SF]), true],
+    // r11: a generic neighbourhood word names no city (every big city has a Chinatown, many a Downtown).
+    ["Chinatown alone confirms nothing", localityConfirmed("Chinatown", [SF]), false],
+    ["Chinatown, SF", localityConfirmed("Chinatown, SF", [SF]), true],
+    ["唐人街 alone confirms nothing", localityConfirmed("唐人街", [SF]), false],
+    ["Downtown alone confirms nothing", localityConfirmed("Downtown", [CULVER_DOWNTOWN]), false],
+    ["Downtown, Culver City", localityConfirmed("Downtown, Culver City", [CULVER_DOWNTOWN]), true],
+    ["Downtown Culver City", localityConfirmed("Downtown Culver City", [CULVER_DOWNTOWN]), true],
+    ["Orange County is not a city", localityConfirmed("Orange County", [COSTA_MESA]), false],
+    ["Los Angeles County is not a city", localityConfirmed("Los Angeles County", [GLENDALE_CA]), false],
+    ["San Francisco County is one city", localityConfirmed("San Francisco County", [SF]), true],
+    ["a Taipei district at level 2", localityConfirmed("Xinyi", [TAIPEI]), true],
+    ["Costa Mesa", localityConfirmed("Costa Mesa", [COSTA_MESA]), true],
     ["SF, an abbreviation", localityConfirmed("SF", [SF]), true],
     ["South San Francisco is not San Francisco", localityConfirmed("South San Francisco, CA", [SF]), false],
     ["San Francisco is not South San Francisco", localityConfirmed("San Francisco", [SSF]), false],

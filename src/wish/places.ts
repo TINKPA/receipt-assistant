@@ -28,7 +28,9 @@ import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
 import {
   BOROUGH_TOWNS,
   CITY_ALIASES,
+  CITY_COUNTIES,
   CITY_REGIONS,
+  GENERIC_NEIGHBOURHOODS,
   NEW_YORK_BOROUGHS,
   NEW_YORK_COUNTIES,
   NEW_YORK_PARTS,
@@ -149,10 +151,14 @@ export interface PlaceMatch {
  * - `street_unverified`: Google's address names no street to compare;
  * - `locality_mismatch`: no part of the read city or neighbourhood is a
  *   whole city-level part of Google's structured address in any language
- *   asked (`localityConfirmed`; a state or a country alone confirms
- *   nothing), or a read city is not, whatever street agrees (a namesake in
- *   another town, "South San Francisco" for San Francisco, or a
- *   neighbourhood Google does not name);
+ *   asked (`localityConfirmed`; a state, a country or a county alone
+ *   confirms nothing, nor does a generic neighbourhood word such as
+ *   "Downtown" without a city that is confirmed too), or a read city is
+ *   not, whatever street agrees (a namesake in another town, "South San
+ *   Francisco" for San Francisco, or a neighbourhood Google does not name);
+ * - `several_branches`: a capture with a city or neighbourhood and no
+ *   street, where two or more places of that name are confirmed by it (a
+ *   chain in a big city): the first is offered;
  * - `outside_area`: a typed name found outside the workspace's area.
  */
 export type MatchReason =
@@ -164,6 +170,7 @@ export type MatchReason =
   | "street_mismatch"
   | "street_unverified"
   | "locality_mismatch"
+  | "several_branches"
   | "outside_area";
 
 export interface MatchOptions {
@@ -389,6 +396,20 @@ const CITY_LEVEL_TYPES = new Set([
 function isCityLevel(c: GoogleAddressComponent): boolean {
   return c.types.some((t) => CITY_LEVEL_TYPES.has(t) || t.startsWith("sublocality"));
 }
+/** A component that confirms a read locality: city-level, but not a
+ *  county (`administrative_area_level_2` and nothing more specific), which
+ *  holds many towns ("Orange County", "King County"), unless it is one
+ *  city (`CITY_COUNTIES`) or a district of one (Taipei's "Xinyi
+ *  District", a 区). */
+function confirmsLocality(c: GoogleAddressComponent): boolean {
+  if (!isCityLevel(c)) return false;
+  const countyOnly = c.types.includes("administrative_area_level_2") && !c.types.some((t) => t !== "administrative_area_level_2" && t !== "political" && (CITY_LEVEL_TYPES.has(t) || t.startsWith("sublocality")));
+  if (!countyOnly) return true;
+  return [c.long, c.short].some((v) => {
+    const f = fold(v).trim().replace(/\s+/g, " ");
+    return COUNTY_CITY_KEYS.has(placeKey(v)) || /\b(district|ward)$|-(gu|ku)$/.test(f) || /[区區구]$/u.test(f);
+  });
+}
 function isRegionLevel(c: GoogleAddressComponent): boolean {
   return c.types.includes("administrative_area_level_1") || c.types.includes("country");
 }
@@ -416,6 +437,8 @@ export function placeKey(name: string): string {
 }
 
 const REGION_KEYS = new Set([...CITY_REGIONS].map(placeKey));
+const COUNTY_CITY_KEYS = new Set([...CITY_COUNTIES].map(placeKey));
+const GENERIC_KEYS = new Set(GENERIC_NEIGHBOURHOODS.map(placeKey));
 /** "Downtown Los Angeles" is in Los Angeles; "South San Francisco" is not
  *  in San Francisco, so only these words come off. */
 const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\s+/;
@@ -429,7 +452,9 @@ const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\
  *  Woodside CA, Elmhurst IL); a borough read by itself ("Manhattan", not
  *  Manhattan KS). A Han city's name that is a street's (北京路, 南京东路)
  *  is not that city (`hanCitiesIn`). */
-export function localityKeys(locality: string | null | undefined): { key: string; region: boolean; nyc: boolean }[] {
+export function localityKeys(
+  locality: string | null | undefined,
+): { key: string; region: boolean; nyc: boolean; generic: boolean }[] {
   const out = new Map<string, { region: boolean; nyc: boolean }>();
   const add = (name: string, region = false, nyc = false) => {
     const k = placeKey(name);
@@ -475,7 +500,7 @@ export function localityKeys(locality: string | null | undefined): { key: string
       if (alias) withCity(alias, n);
     }
   }
-  return [...out].map(([key, v]) => ({ key, ...v }));
+  return [...out].map(([key, v]) => ({ key, ...v, generic: GENERIC_KEYS.has(key) }));
 }
 
 const NYC_PART_KEYS = new Set([...NEW_YORK_PARTS, ...NEW_YORK_COUNTIES].map(placeKey));
@@ -497,18 +522,21 @@ export function inNewYorkCity(sets: GoogleAddressComponent[][]): boolean {
 
 /** The read locality is a whole city-level part of Google's structured
  *  address in some language asked: a locality, sublocality, neighbourhood,
- *  postal town or county-level area, never a street; a state or a country
- *  only for the cities Google files that way (`CITY_REGIONS`); a borough or
- *  a Queens neighbourhood read for New York only inside New York City. */
+ *  postal town or district, never a street; a county only when it is one
+ *  city (`confirmsLocality`); a state or a country only for the cities
+ *  Google files that way (`CITY_REGIONS`); a borough or a Queens
+ *  neighbourhood read for New York only inside New York City. A generic
+ *  neighbourhood word ("Downtown", "Chinatown", 唐人街) confirms nothing by
+ *  itself: some other part of the read locality must be confirmed too. */
 export function localityConfirmed(locality: string | null | undefined, sets: GoogleAddressComponent[][]): boolean {
   const keys = localityKeys(locality);
   if (keys.length === 0) return false;
   const nyc = inNewYorkCity(sets);
-  const usable = keys.filter((k) => !k.nyc || nyc);
+  const usable = keys.filter((k) => (!k.nyc || nyc) && !k.generic);
   return sets.some((set) =>
     set.some((c) => {
       const names = [placeKey(c.long), placeKey(c.short)];
-      if (isCityLevel(c)) return usable.some((k) => names.includes(k.key));
+      if (confirmsLocality(c)) return usable.some((k) => names.includes(k.key));
       if (isRegionLevel(c)) return usable.some((k) => k.region && names.includes(k.key));
       return false;
     }),
@@ -640,7 +668,12 @@ function judgeAddress(address: string | null | undefined, c: Seen): MatchReason 
  *   (`address_unverified`);
  * - a capture with a city or neighbourhood and no address: one of its
  *   parts is a whole city-level component (`localityConfirmed`: locality,
- *   sublocality, neighbourhood, postal town, county level), never a route
+ *   sublocality, neighbourhood, postal town, district; a county only when
+ *   it is one city, `CITY_COUNTIES`: "Orange County" confirms nothing; a
+ *   generic neighbourhood word, "Downtown", "Chinatown", 唐人街, only
+ *   beside a city that is confirmed too), and it is the only place of that
+ *   name in Find Place's and Text Search's answers the locality confirms
+ *   (two or more: `several_branches`, the first offered), never a route
  *   ("Washington" is not "Washington St"), never a part of a longer name
  *   ("San Francisco" is not "South San Francisco"), never a state or a
  *   country ("USA", "Taiwan", "California"), except for a city Google
@@ -800,11 +833,15 @@ export async function decidePlaceMatch(
     }
     const firstSeen = seen.get(first.googlePlaceId)!;
     const firstJudged = await judge(firstSeen);
-    if (linkable(firstJudged)) return finish(firstSeen, firstJudged, null);
+    // A house number or a street names one branch. A city or neighbourhood
+    // alone does only when no other branch of the name is in it, which
+    // Text Search below counts.
+    if (linkable(firstJudged) && firstJudged.by !== "locality") return finish(firstSeen, firstJudged, null);
 
     // Text Search, in the name's script and in English, for a place that
-    // qualifies further down Google's list. Not for a bare name with
-    // nothing to check it against.
+    // qualifies further down Google's list, and for the other branches a
+    // locality alone cannot tell apart. Not for a bare name with nothing to
+    // check it against.
     let searched = false;
     if (opts.guessReason !== "name_only") {
       for (const languageCode of [...new Set([lang, undefined])]) {
@@ -824,8 +861,15 @@ export async function decidePlaceMatch(
       const c = seen.get(id)!;
       judged.push({ c, j: await judge(c) });
     }
-    const ok = judged.find(({ j }) => linkable(j));
+    const ok = judged.find(({ j }) => linkable(j) && j.by !== "locality");
     if (ok) return finish(ok.c, ok.j, null);
+    // Confirmed by the locality alone: linked only when it is the one place
+    // of that name the locality confirms ("Din Tai Fung, King County" has
+    // Tukwila, Bellevue and Seattle; Joe's Pizza in Manhattan has several).
+    // When Text Search could not run, Find Place's answer is all there is.
+    const byLocality = judged.filter(({ j }) => linkable(j) && j.by === "locality");
+    if (byLocality.length === 1) return finish(byLocality[0]!.c, byLocality[0]!.j, null);
+    if (byLocality.length > 1) return finish(byLocality[0]!.c, byLocality[0]!.j, "several_branches");
 
     // Google's address names no street to check the read one against
     // (mainland China: "四牌楼 Huangpu, China"): linked on the name and the
