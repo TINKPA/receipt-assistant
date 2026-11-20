@@ -8728,7 +8728,7 @@
         "tags": [
           "wish-items"
         ],
-        "description": "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from `GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in `capture.place_match.error`. Only a found place inside the workspace's usual area (50 km around its purchases) whose name carries the title is linked; anything else (another name, another region, or a workspace with too few purchases to have an area) is offered as `place_suggestion`. A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
+        "description": "A wish sent with `place_id` or `google_place_id` and no `kind` is a place wish. A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from `GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in `capture.place_match.error`. Only a found place inside the workspace's usual area (50 km around its purchases) whose name carries the title is linked; anything else (another name, another region, or a workspace with too few purchases to have an area) is offered as `place_suggestion`; a found place whose name shares nothing with the title (another place) is not offered at all. A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -8831,7 +8831,7 @@
       },
       "patch": {
         "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
-        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing). `status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made; `Z` or a UTC offset). `currency` changes the currency of `target_price_minor` (the amount is not converted). Changing `converted_transaction_id` (a live transaction) or `converted_at` on a receipt conversion makes it `converted_by: user`. Leaving `converted` (to active or declined) dismisses its transaction for good; `status: active` from converted or declined starts the wish over: only a purchase from then on converts it, and that is checked at once. `google_place_id` stores the picked place and links it (confirming a `place_suggestion`); `place_id: null` removes a place or rejects the suggestion. Setting `title`, `kind` or the place on a captured wish records it in `capture.user_set`, which no reading overwrites; on a wish whose capture failed it also marks the capture `done` (`capture.resolved_by: user`, the error kept). A new place, product or kind is checked against the ledger at once.",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing). `status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made; `Z` or a UTC offset). `currency` changes the currency of `target_price_minor` (the amount is not converted). Changing `converted_transaction_id` (a live transaction) or `converted_at` on a receipt conversion makes it `converted_by: user`. Leaving `converted` (to active or declined) dismisses its transaction for good; `status: active` from converted or declined starts the wish over: only a purchase from then on converts it, and that is checked at once. `google_place_id` stores the picked place and links it (confirming a `place_suggestion`); `place_id: null` removes a place or rejects the suggestion. Setting `title`, `kind` or the place on a captured wish records it in `capture.user_set`, which no reading overwrites; on a wish whose capture failed it also marks the capture `done` (`capture.resolved_by: user`, the error kept). A new `title` on a place wish with no place (a failed capture being named) is matched as a typed place wish is (`capture.place_match`, `place_suggestion`), unless the person removed a place by hand. A new place, product or kind is checked against the ledger at once.",
         "tags": [
           "wish-items"
         ],
@@ -8926,6 +8926,7 @@
       },
       "delete": {
         "summary": "Hard-delete a wish",
+        "description": "Its captured image is deleted too, unless another wish (one split from the same capture) still shows it.",
         "tags": [
           "wish-items"
         ],
@@ -9059,7 +9060,7 @@
     "/v1/wish-items/capture": {
       "post": {
         "summary": "Save a wish from an image (a screenshot of a post, a chat, a map; a photo)",
-        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed). Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one in `capture.duplicate_of`. A street the image names is checked against the found place's address (its house number, or with no number the street itself); a place that fails it is offered as `place_suggestion`. HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
+        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed and makes it a `thing`). Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one in `capture.duplicate_of`. A street the image names is checked against the found place's address (its house number, or with no number the street itself); a place that fails it is offered as `place_suggestion`. HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`; nothing is stored or read. The same bytes uploaded again answer 200 with the wish they made the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
         "tags": [
           "wish-items"
         ],
@@ -9097,7 +9098,7 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "Not an image this endpoint reads",
+            "description": "Not an image this endpoint reads (`unsupported_image`), or one that does not decode (`unreadable_image`)",
             "content": {
               "application/problem+json": {
                 "schema": {

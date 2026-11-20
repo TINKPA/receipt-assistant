@@ -997,11 +997,17 @@ productsRouter.post(
         };
       });
 
-      // The moved wishes are checked against the target's purchases: a
-      // conversion by a moved line item stands, and one by a target line
-      // item converts an active wish.
-      const { moved_wish_ids: movedWishIds, ...answer } = result;
-      if (movedWishIds.length > 0) await settleWishesSafely({ wishIds: movedWishIds });
+      // Every wish for the target is checked against the target's
+      // purchases, which now include the moved line items: a moved wish's
+      // conversion by a moved line stands, a target line converts a moved
+      // wish, and a moved line converts a wish that was already for the
+      // target.
+      const { moved_wish_ids: _movedWishIds, ...answer } = result;
+      const targetWishes = await db
+        .select({ id: wishItems.id })
+        .from(wishItems)
+        .where(and(eq(wishItems.productId, body.target_id), eq(wishItems.workspaceId, req.ctx.workspaceId)));
+      if (targetWishes.length > 0) await settleWishesSafely({ wishIds: targetWishes.map((w) => w.id) });
       res.json(answer);
     } catch (err) {
       next(err);

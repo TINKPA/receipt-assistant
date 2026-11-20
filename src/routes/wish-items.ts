@@ -14,7 +14,7 @@ import multer from "multer";
 import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishItems, products, places } from "../schema/index.js";
-import { startCapture, retryCapture, wishImageRoot } from "../wish/capture.js";
+import { startCapture, retryCapture, wishImageRoot, removeWishImageIfUnused } from "../wish/capture.js";
 import { distanceM, linkGooglePlace, matchPlaceByText, workspaceArea, type PlaceLink, type PlaceMatch } from "../wish/places.js";
 import { settleWishesSafely } from "../wish/loop.js";
 import { nameTokens } from "../wish/names.js";
@@ -235,6 +235,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  *  day's grace, since the client may send the start of a local day) and
  *  not in the future (a day's grace for clocks). */
 function assertConvertedAt(at: Date, createdAt: Date): void {
+  if (Number.isNaN(at.getTime())) {
+    throw new ValidationProblem([{ path: "converted_at", code: "invalid_date", message: "converted_at is not a real date and time" }]);
+  }
   if (at.getTime() < createdAt.getTime() - DAY_MS || at.getTime() > Date.now() + DAY_MS) {
     throw new ValidationProblem([
       {
@@ -496,7 +499,9 @@ wishItemsRouter.post(
         throw new ValidationProblem([{ path: "google_place_id", code: "conflict", message: "Send place_id or google_place_id, not both" }]);
       }
       if (body.place_id) await assertPlaceExists(body.place_id);
-      const kind = body.kind ?? "thing";
+      // A place sent without a kind is a place wish: as a thing wish its
+      // place would never be matched by a visit.
+      const kind = body.kind ?? (body.place_id || body.google_place_id ? "place" : "thing");
       // A picked place is stored before the row, so a failure leaves no row.
       const placeId = body.place_id ?? (body.google_place_id ? await placeFromGoogleId(body.google_place_id) : null);
       // A place wish typed in with only a name: match it now, as a capture
@@ -598,6 +603,25 @@ wishItemsRouter.patch(
       if (body.google_place_id !== undefined) {
         updates["placeId"] = await placeFromGoogleId(body.google_place_id);
       }
+      // A place wish with no place, named now (a failed capture the
+      // person names, an unmatched one renamed): looked up as a typed
+      // place wish is, outside the transaction (a Google call). Not when
+      // the person removed a place by hand, or sends one now.
+      let namedMatch: PlaceMatch | null = null;
+      if (body.title !== undefined && body.place_id === undefined && body.google_place_id === undefined) {
+        const [w] = await db
+          .select({ kind: wishItems.kind, placeId: wishItems.placeId, title: wishItems.title, capture: wishItems.capture })
+          .from(wishItems)
+          .where(where);
+        const userSetPlace = Boolean((w?.capture as { user_set?: { place?: unknown } } | null)?.user_set?.place);
+        if (w && (body.kind ?? w.kind) === "place" && !w.placeId && !userSetPlace && body.title.trim() !== w.title.trim()) {
+          const area = await workspaceArea(req.ctx.workspaceId);
+          namedMatch = await matchPlaceByText(body.title, "title", null, { names: [body.title], locationBias: area, requireInArea: area });
+          if (namedMatch.error) console.warn(`[wish] named place "${body.title.slice(0, 80)}" not linked: ${namedMatch.error}`);
+          else if (namedMatch.tentative) console.log(`[wish] named place "${body.title.slice(0, 80)}" suggested, not linked: ${namedMatch.name ?? "?"}`);
+          if (namedMatch.place_id) updates["placeId"] = namedMatch.place_id;
+        }
+      }
       await db.transaction(async (tx) => {
         const current = await tx.select().from(wishItems).where(where).for("update");
         if (current.length === 0) throw new NotFoundProblem("WishItem", id);
@@ -667,8 +691,14 @@ wishItemsRouter.patch(
           ...(body.kind !== undefined ? { kind: true } : {}),
           ...(body.place_id !== undefined || body.google_place_id !== undefined ? { place: true } : {}),
         };
-        if (Object.keys(setByHand).length > 0 && (cur.capture !== null || cur.captureStatus !== null)) {
+        // Only while the wish still has no place: a place set meanwhile wins.
+        if (namedMatch && cur.placeId) {
+          namedMatch = null;
+          delete updates["placeId"];
+        }
+        if (namedMatch || (Object.keys(setByHand).length > 0 && (cur.capture !== null || cur.captureStatus !== null))) {
           const capture = { ...((cur.capture as Record<string, unknown> | null) ?? {}) };
+          if (namedMatch) capture["place_match"] = namedMatch;
           capture["user_set"] = { ...((capture["user_set"] as Record<string, unknown> | undefined) ?? {}), ...setByHand };
           if (cur.captureStatus === "failed") {
             updates["captureStatus"] = "done";
@@ -716,8 +746,10 @@ wishItemsRouter.delete(
         .where(
           and(eq(wishItems.id, id), eq(wishItems.workspaceId, req.ctx.workspaceId)),
         )
-        .returning({ id: wishItems.id });
+        .returning({ id: wishItems.id, imagePath: wishItems.imagePath });
       if (deleted.length === 0) throw new NotFoundProblem("WishItem", id);
+      // The screenshot goes with the last wish that shows it.
+      await removeWishImageIfUnused(deleted[0]!.imagePath);
       res.status(204).end();
     } catch (err) {
       next(err);
@@ -770,12 +802,13 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     summary: "Add a wish",
     tags: ["wish-items"],
     description:
+      "A wish sent with `place_id` or `google_place_id` and no `kind` is a place wish. " +
       "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from " +
       "`GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title " +
       "with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in " +
       "`capture.place_match.error`. Only a found place inside the workspace's usual area (50 km around its purchases) whose name carries " +
       "the title is linked; anything else (another name, another region, or a workspace with too few purchases to have an area) is offered " +
-      "as `place_suggestion`. " +
+      "as `place_suggestion`; a found place whose name shares nothing with the title (another place) is not offered at all. " +
       "A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
     request: {
       body: { content: { "application/json": { schema: CreateWishItemRequest } } },
@@ -815,21 +848,22 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. " +
       "The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and " +
-      "`capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed). " +
+      "`capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed and makes it a `thing`). " +
       "Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place " +
       "the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. " +
       "An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), " +
       "except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one " +
       "in `capture.duplicate_of`. A street the image names is checked against the found place's address (its house number, or with no " +
       "number the street itself); a place that fails it is offered as `place_suggestion`. " +
-      "HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made " +
+      "HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`; nothing is stored or read. " +
+      "The same bytes uploaded again answer 200 with the wish they made " +
       "the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
     tags: ["wish-items"],
     request: { body: { content: { "multipart/form-data": { schema: CaptureWishForm } } } },
     responses: {
       200: { description: "This image was captured before: the existing wish", content: { "application/json": { schema: WishItem } } },
       202: { description: "Accepted; reading", content: { "application/json": { schema: WishItem } } },
-      422: { description: "Not an image this endpoint reads", content: problemContent },
+      422: { description: "Not an image this endpoint reads (`unsupported_image`), or one that does not decode (`unreadable_image`)", content: problemContent },
     },
   });
 
@@ -877,6 +911,8 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "`google_place_id` stores the picked place and links it (confirming a `place_suggestion`); `place_id: null` removes a place " +
       "or rejects the suggestion. Setting `title`, `kind` or the place on a captured wish records it in `capture.user_set`, which " +
       "no reading overwrites; on a wish whose capture failed it also marks the capture `done` (`capture.resolved_by: user`, the error kept). " +
+      "A new `title` on a place wish with no place (a failed capture being named) is matched as a typed place wish is (`capture.place_match`, " +
+      "`place_suggestion`), unless the person removed a place by hand. " +
       "A new place, product or kind is checked against the ledger at once.",
     tags: ["wish-items"],
     request: {
@@ -902,6 +938,7 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     method: "delete",
     path: "/v1/wish-items/{id}",
     summary: "Hard-delete a wish",
+    description: "Its captured image is deleted too, unless another wish (one split from the same capture) still shows it.",
     tags: ["wish-items"],
     request: { params: z.object({ id: Uuid }) },
     responses: {

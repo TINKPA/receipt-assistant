@@ -168,6 +168,7 @@ export const WishItem = z
 export const CreateWishItemRequest = z
   .object({
     title: Title,
+    /** Default `place` when `place_id` or `google_place_id` is sent, else `thing`. */
     kind: WishKind.optional(),
     /** A place the ledger already has. */
     place_id: Uuid.optional(),
@@ -226,12 +227,26 @@ export const UpdateWishItemRequest = z
     converted_at: z
       .string()
       .datetime({ offset: true })
+      // The format check takes any two-digit offset and any day up to 31;
+      // `+24:00` or `02-30` would then be an Invalid Date or another day.
+      .refine(isRealInstant, { message: "Not a real date, time and UTC offset" })
       .optional()
       .openapi({ format: "date-time", example: "2026-11-20T00:00:00+09:00" }),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
   .openapi("UpdateWishItemRequest");
+
+/** An ISO 8601 date-time that names a real instant: its calendar day
+ *  exists, and its UTC offset is within ±23:59. */
+function isRealInstant(s: string): boolean {
+  if (Number.isNaN(Date.parse(s))) return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T/.exec(s);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  return day.getUTCFullYear() === y && day.getUTCMonth() === mo - 1 && day.getUTCDate() === d;
+}
 
 export const ListWishItemsQuery = z.object({
   status: WishStatus.optional(),

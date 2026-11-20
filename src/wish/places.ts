@@ -119,6 +119,9 @@ export interface PlaceMatch {
   /** How much of the asked-for name the found one carries (0..1); null
    *  when the two are in different scripts. */
   name_score: number | null;
+  /** Google's answer when it shared no word with the asked-for name: not
+   *  linked and not suggested (`error` says so). Absent otherwise. */
+  rejected?: { google_place_id: string; name: string | null; formatted_address: string | null };
   /** True when the query was biased to the workspace's usual area. */
   location_biased: boolean;
   error: string | null;
@@ -379,17 +382,20 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     let names1 = await nameAgreement(found);
     let addressIssue = await addressAgreement(found, opts.address, q, opts.locationBias);
 
-    // Google's first answer is at another address: a branch on the read
-    // street may be further down the list. Text Search, in the name's
-    // script and in English, and take the first whose name and address
-    // both agree.
+    // Google's first answer is at another address, or is another place
+    // altogether (a name it can compare that does not agree: "Kang Ho
+    // Dong Baekjeong 6th St" answered with another restaurant on 6th St):
+    // the place meant may be further down the list. Text Search, in the
+    // name's script and in English, and take the first whose name and
+    // address both agree.
     /** Google's addresses of the first answer, in every language seen. */
     const firstAddresses: (string | null)[] = [found.formattedAddress];
     /** Other places of the asked-for name whose address cannot rule them
      *  out either (Google gives no street for them). */
     let otherUnrefuted = 0;
     let searched = false;
-    if (addressIssue) {
+    const otherName = !names1.agrees && names.some((n) => comparable(n, found.name ?? ""));
+    if (addressIssue || otherName) {
       const seen = new Set([found.googlePlaceId]);
       const firstId = found.googlePlaceId;
       const langs = [...new Set([lang ?? languageFor([opts.address ?? ""]), undefined])];
@@ -448,6 +454,15 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
       else if (found.lat === null || found.lng === null || distanceM(area, { lat: found.lat, lng: found.lng }) > area.radiusM) {
         areaIssue = "outside_area";
       }
+    }
+    // Google's answer shares no word with the name asked for: it is
+    // another place, and offering it would suggest the wrong one. Nothing
+    // is suggested; what Google answered is kept for the record.
+    if (!agrees && !uncomparable && match.name_score === 0) {
+      match.google_place_id = null;
+      match.rejected = { google_place_id: found.googlePlaceId, name: found.name, formatted_address: found.formattedAddress };
+      match.error = "no place of that name found";
+      return match;
     }
     if (!trusted || addressIssue || areaIssue || opts.guessReason) {
       match.tentative = true;

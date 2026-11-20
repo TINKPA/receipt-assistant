@@ -19,7 +19,7 @@ const optionalShort = (max: number) =>
 
 /** Bumped with any change to what the prompt asks for; recorded on every
  *  capture as `capture.prompt_version`. */
-export const WISH_READ_PROMPT_VERSION = "1.4";
+export const WISH_READ_PROMPT_VERSION = "1.5";
 
 /** A link the server keeps: http(s) only. A bare domain ("instagram.com/x")
  *  is read as https; anything else (javascript:, data:, a phone number) is
@@ -60,6 +60,26 @@ export function splitBranch(title: string): { name: string; branch: string | nul
   const br = /^(.+?)\s*[(（]([^()（）]{1,40}?(?:店|分店|branch|location))[)）]\s*$/iu.exec(title);
   if (br?.[1] && br[2]) return { name: br[1].trim(), branch: br[2].trim() };
   return { name: title, branch: null };
+}
+
+/** "外滩店" → "外滩": a branch written as a locality names its area, not a
+ *  shop. Left alone when nothing would remain ("店"). */
+export function branchArea(locality: string): string {
+  const t = locality.trim();
+  const m = /^(.+?)\s*(分店|店)$/u.exec(t);
+  return m?.[1] && m[1].trim().length >= 1 ? m[1].trim() : t;
+}
+
+/** A list post names its city once: an entry whose locality lacks the
+ *  main reading's city ("Nob Hill, San Francisco") gets it appended
+ *  ("Hayes Valley" → "Hayes Valley, San Francisco"). Only a city the main
+ *  locality gives after a comma; nothing is invented. */
+export function withListCity(locality: string | null, mainLocality: string | null): string | null {
+  if (!locality || !mainLocality) return locality;
+  const parts = mainLocality.split(/[,，]/u).map((p) => p.trim()).filter(Boolean);
+  if (parts.length < 2) return locality;
+  const city = parts[parts.length - 1]!;
+  return locality.toLowerCase().includes(city.toLowerCase()) ? locality : `${locality}, ${city}`;
 }
 
 /** The app names a reading may give, folded to one spelling each. */
@@ -166,7 +186,7 @@ export const WishReading = z
         title: t.name,
         name_local: n ? n.name : o.name_local,
         // "黄河路店" → "黄河路": the branch's area.
-        locality: o.locality ?? (branch ? branch.replace(/(分店|店)$/u, "").trim() || branch : null),
+        locality: o.locality ? branchArea(o.locality) : branch ? branchArea(branch) : null,
       };
     };
     const place = r.kind === "place";
@@ -181,7 +201,12 @@ export const WishReading = z
       others: r.others
         .map((o) => unbranch(o, place))
         .filter((o) => o.title.trim().toLowerCase() !== main.title.trim().toLowerCase())
-        .map((o) => ({ ...o, name_local: sameAsTitle(o.name_local, o.title), locality: dropGloss(o.locality), category: dropGloss(o.category) })),
+        .map((o) => ({
+          ...o,
+          name_local: sameAsTitle(o.name_local, o.title),
+          locality: withListCity(dropGloss(o.locality), dropGloss(main.locality)),
+          category: dropGloss(o.category),
+        })),
     };
   });
 export type WishReading = z.infer<typeof WishReading>;
@@ -199,7 +224,7 @@ ${userNote ? `\nThe person added this note when saving it: ${JSON.stringify(user
   }
 Think it through in plain text first: what the image is a screenshot of, which name is the place or product (not the poster, not the app), where it is.
 
-A post about one place that mentions others in passing ("better than X"): that one place, with the others in "note" if they matter. A post that lists several places (or things) with equal weight ("3 spots in NYC", a numbered list, a carousel of shops): the first one listed is the main reading, and every other one goes in "others" (at most five), each with its own name, locality, address, highlights and note as printed (an entry's own tip goes in that entry's "note"). When the post names its city once for all of them ("3 NYC spots"), give each entry's locality as its own neighbourhood followed by that city ("Greenwich Village, New York"), or the city alone.
+A post about one place that mentions others in passing ("better than X"): that one place, with the others in "note" if they matter. A post that lists several places (or things) with equal weight ("3 spots in NYC", a numbered list, a carousel of shops): the first one listed is the main reading, and every other one goes in "others" (at most five), each with its own name, locality, address, highlights and note as printed (an entry's own tip goes in that entry's "note"). When the post names its city once for all of them ("3 NYC spots"), every locality, the main reading's included, is its own neighbourhood followed by that city ("Greenwich Village, New York"), or the city alone (see the rules).
 
 Then end your reply with exactly one fenced JSON block:
 
@@ -227,12 +252,15 @@ Then end your reply with exactly one fenced JSON block:
 
 Rules:
 - Copy names exactly as printed. Do not translate a name that is printed in one script only; put it in "title" as it is.
+- "title" is the whole name. A sign or menu that prints the name in parts ("PHILIPPE / The Original", "JOE'S / Pizza") gives the whole name ("Philippe The Original", "Joe's Pizza"), not only its largest word.
 - "title" is the place's name without a branch suffix: "佳家汤包(黄河路店)" is "佳家汤包", "Din Tai Fung - Glendale" is "Din Tai Fung"; the branch ("黄河路", "Glendale") goes in "locality" when nothing else gives one.
 - "address" is the street as the image gives it, with or without a house number: "天平路", "Valley Blvd", "700 S Grand Ave". Copy only what is printed or said; do not add cross streets, a city or anything in brackets. "locality" is only a city, district, neighbourhood or branch area, never a street: "天平路那家老店" in Shanghai is address "天平路", locality "上海". A street given only as a landmark ("near Commercial St", "近 Commercial St", "between X and Y", "at the corner of X", "南京路与西藏路交叉口", "天平路附近") is not the address: give "address" null and keep the phrase in "note".
+- A locality nickname is written out as the neighbourhood's own name: "K-town" is "Koreatown", "DTLA" is "Downtown Los Angeles", "WeHo" is "West Hollywood". Add a city only when the image gives it.
+- A post that names its city once ("3 San Francisco classics", "上海5家必吃") puts that city in every locality, the main one too: "Nob Hill, San Francisco", "Hayes Valley, San Francisco", or "San Francisco" for an entry with no neighbourhood.
 - Write "note", "highlights", "category" and "locality" in the language the image is mainly written in, with no translation or gloss in brackets after them.
 - "name_local" is only for a name printed in two forms (a translation or romanisation beside the original). A name printed once goes in "title" and "name_local" is null.
-- "highlights": at most five items the image itself singles out as worth having or the reason to go (named as a must, the best, recommended, ordered by the poster). A plain menu is not a recommendation, and neither is a shop's own listing (its title, bullet points, feature list, rating): give [] or the one or two items a person in the image singles out. Each highlight names a dish, a product or a feature; a sentence of advice ("go Hot if you're brave", "get the chocolate banana", "eat it at the beach") goes in "note". A practical tip ("keep your ticket", "cash only", "book ahead", "sells out by 11", "eat it at the beach", "go Hot if you're brave"), a rating, a wait, opening hours or payment details is never a highlight: it goes in "note".
-- "recommended_by" is a person: a chat partner's display name, or a post's author as shown on the post. A phrase that mentions someone without naming them ("a friend brought me", "朋友带我来的", "my coworker") is not a name: then give the post's author, or null.
+- "highlights": at most five items the image itself singles out as worth having or the reason to go (named as a must, the best, recommended, ordered by the poster). A plain menu is not a recommendation, and neither is a shop's or site's own listing: a product title's features ("Auto NC Optimizer", "Crystal Clear Hands-Free Calling"), bullet points, a feature list, a rating, or a site's "Popular dishes" strip. Give [] or the one or two items a person in the image singles out (a reviewer's "the mole flight is a must"). Each highlight names a dish, a product or a feature; a sentence of advice ("go Hot if you're brave", "get the chocolate banana", "eat it at the beach") goes in "note". A practical tip ("keep your ticket", "cash only", "book ahead", "sells out by 11", "eat it at the beach", "go Hot if you're brave"), a rating, a wait, opening hours or payment details is never a highlight: it goes in "note".
+- "recommended_by" is a person who recommends it to the reader: a chat partner's display name, or a post's author as shown on the post. A reviewer on a listing page (Yelp, Google Maps, 大众点评, Amazon) is a stranger, not a recommender: null. A phrase that mentions someone without naming them ("a friend brought me", "朋友带我来的", "my coworker") is not a name: then give the post's author, or null.
 - "source_app": name the app or site only from what identifies it on screen (its logo, its name, its distinctive layout), spelled as one of: Google Maps, Apple Maps, Yelp, Instagram, 小红书, WeChat, 大众点评, 抖音, TikTok, Amazon, X, Facebook, or the site's own name for anything else. A chat names its app only when the app's name or logo is on screen: never guess it from bubble colours or avatars (null).
 - "others" is [] unless the post lists several places or things with equal weight.
 - Never invent a locality, an address or a link. Null is the right answer when the image does not show it.

@@ -19,7 +19,7 @@
  * screenshot of a restaurant post is none of that.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, writeFile, access } from "node:fs/promises";
+import { mkdir, writeFile, access, unlink } from "node:fs/promises";
 import path from "node:path";
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -97,19 +97,13 @@ export async function startCapture(input: CaptureInput): Promise<CaptureStarted>
   const stored = `${sha}.${image.ext}`;
   const abs = resolveInside(wishImageRoot(), stored);
   if (!abs) throw new Error("wish image path left its root");
-  await mkdir(wishImageRoot(), { recursive: true });
-  try {
-    await access(abs);
-  } catch {
-    await writeFile(abs, image.bytes, { flag: "wx" }).catch((err: NodeJS.ErrnoException) => {
-      if (err.code !== "EEXIST") throw err;
-    });
-  }
   const id = randomUUID();
   const capture: Record<string, unknown> = { queued_at: new Date().toISOString() };
   if (image.convertedFrom) capture.converted_from = image.convertedFrom;
-  // A place until the reading says otherwise: that is what most captures
-  // are. Two uploads of one image at once: the unique index lets one in.
+  // The row first, the file after: a request the database refuses (a
+  // note it cannot store) leaves no file behind. A place until the
+  // reading says otherwise: that is what most captures are. Two uploads
+  // of one image at once: the unique index lets one in.
   const ins = await db.execute(sql`
     INSERT INTO wish_items (id, workspace_id, kind, title, notes, image_path, image_sha256, image_source_sha256, image_mime_type, capture_status, capture)
     VALUES (${id}::uuid, ${input.workspaceId}::uuid, 'place', ${WISH_TITLE_WHILE_READING}, ${input.note},
@@ -124,8 +118,38 @@ export async function startCapture(input: CaptureInput): Promise<CaptureStarted>
     }
     throw new Error("wish capture insert conflicted with a row that is gone");
   }
+  try {
+    await mkdir(wishImageRoot(), { recursive: true });
+    try {
+      await access(abs);
+    } catch {
+      await writeFile(abs, image.bytes, { flag: "wx" }).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "EEXIST") throw err;
+      });
+    }
+  } catch (err) {
+    await db.execute(sql`DELETE FROM wish_items WHERE id = ${id}::uuid`);
+    throw err;
+  }
   enqueue(id);
   return { id, existing: false };
+}
+
+/** Remove a wish image from disk once no wish (in any workspace) refers
+ *  to it: siblings split from one capture share their image, and one
+ *  image can be captured in two workspaces. Best effort. */
+export async function removeWishImageIfUnused(imagePath: string | null): Promise<void> {
+  if (!imagePath) return;
+  try {
+    const res = await db.execute(sql`SELECT 1 FROM wish_items WHERE image_path = ${imagePath} LIMIT 1`);
+    if (res.rows.length > 0) return;
+    const abs = resolveInside(wishImageRoot(), imagePath);
+    if (!abs) return;
+    await unlink(abs);
+    console.log(`[wish] removed image ${imagePath}: no wish refers to it`);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") console.warn(`[wish] could not remove image ${imagePath}:`, (err as Error).message);
+  }
 }
 
 /** `capture` keys that outlive a reading: what the upload was converted
@@ -252,10 +276,14 @@ function userSetOf(capture: unknown): UserSet {
 
 async function failCapture(id: string, capture: Record<string, unknown>, describedAs: string | null = null): Promise<void> {
   // A wish the person already named or placed by hand is theirs: the
-  // failure is kept as history and the wish stays resolved.
+  // failure is kept as history and the wish stays resolved. An image read
+  // as showing nothing to go to or buy (`describedAs`) is not a place:
+  // the insert's guess of `place` is dropped for `thing`, the kind that
+  // needs nothing (no place, no visit), unless the person set a kind.
   await db.execute(sql`
     UPDATE wish_items
-       SET capture_status = CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb THEN 'done' ELSE 'failed' END,
+       SET kind = CASE WHEN ${describedAs !== null} AND NOT coalesce(capture->'user_set' ? 'kind', false) THEN 'thing' ELSE kind END,
+           capture_status = CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb THEN 'done' ELSE 'failed' END,
            title = CASE WHEN title IN (${WISH_TITLE_WHILE_READING}, ${WISH_TITLE_UNREAD}) AND NOT coalesce(capture->'user_set' ? 'title', false)
                         THEN coalesce(${describedAs}::text, ${WISH_TITLE_UNREAD}) ELSE title END,
            capture = ${JSON.stringify({ ...capture, prompt_version: WISH_READ_PROMPT_VERSION })}::jsonb

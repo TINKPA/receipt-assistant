@@ -86,10 +86,30 @@ async function toJpeg(input: Buffer, kind: "heic" | "avif"): Promise<Buffer> {
   }
 }
 
+/** The first bytes only say what a file claims to be: a truncated or
+ *  corrupt file with a JPEG header would still be stored, queued and sent
+ *  to a model. Decoding every pixel (`stats` reads them all) is what
+ *  tells, and costs far less than a reading. */
+async function assertDecodes(buf: Buffer): Promise<void> {
+  try {
+    const meta = await sharp(buf, { failOn: "error" }).metadata();
+    if (!meta.width || !meta.height) throw new Error("no dimensions");
+    await sharp(buf, { failOn: "error" }).stats();
+  } catch (err) {
+    console.warn(`[wish] upload does not decode: ${(err as Error).message.slice(0, 200)}`);
+    throw new ValidationProblem([
+      { path: "file", code: "unreadable_image", message: "The file could not be decoded as an image: it may be truncated or damaged" },
+    ]);
+  }
+}
+
 /** The bytes to store for an upload, or a 422 for anything else. */
 export async function storableImage(upload: Buffer): Promise<StoredImage> {
   const kind = sniffImage(upload);
-  if (kind) return { bytes: upload, ...kind, convertedFrom: null };
+  if (kind) {
+    await assertDecodes(upload);
+    return { bytes: upload, ...kind, convertedFrom: null };
+  }
   const heif = heifKind(upload);
   if (!heif) {
     throw new ValidationProblem([
