@@ -28,6 +28,8 @@
  * new columns out without a re-fetch.
  */
 
+import { toAddressComponents, type GoogleAddressComponent } from "./text-search.js";
+
 const V1_BASE = "https://places.googleapis.com/v1";
 
 interface FetchOpts {
@@ -120,4 +122,29 @@ export async function fetchPlaceV1Dual(
     },
     fetched_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Google's structured address of a place in one language: Place Details
+ * with the field mask `addressComponents` only. Used by the wish matcher
+ * (`src/wish/places.ts`) to confirm a read city against the city Google
+ * files the place under, never against words of its formatted address.
+ */
+export async function fetchAddressComponents(
+  googlePlaceId: string,
+  languageCode: string,
+  opts: FetchOpts = {},
+): Promise<GoogleAddressComponent[]> {
+  const apiKey = opts.apiKey ?? process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) throw new GooglePlacesApiKeyMissing();
+  const url = `${V1_BASE}/places/${encodeURIComponent(googlePlaceId)}?languageCode=${encodeURIComponent(languageCode)}`;
+  const resp = await fetch(url, {
+    headers: { "X-Goog-Api-Key": apiKey, "X-Goog-FieldMask": "addressComponents" },
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new GooglePlacesError(resp.status, googlePlaceId, languageCode, body);
+  }
+  return toAddressComponents(((await resp.json()) as { addressComponents?: unknown }).addressComponents);
 }

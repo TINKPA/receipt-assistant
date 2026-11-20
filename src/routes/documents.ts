@@ -24,6 +24,7 @@
  */
 import { Router, type Request, type Response, type NextFunction } from "express";
 import multer from "multer";
+import { settleWishesSafely } from "../wish/loop.js";
 import * as path from "path";
 import { z } from "zod";
 import type { OpenAPIRegistry } from "@asteasolutions/zod-to-openapi";
@@ -357,6 +358,8 @@ documentsRouter.delete(
         transactions_hard_deleted: report.txns_hard_deleted,
         transactions_skipped: report.txns_skipped,
       };
+      // A wish one of them converted loses its proof.
+      await settleWishesSafely({ transactionIds: [...report.txns_soft_deleted, ...report.txns_hard_deleted] });
       res.status(200).json(body);
       return;
     }
@@ -416,6 +419,10 @@ documentsRouter.post(
       { transactionId: transaction_id },
     );
     if (!out) throw new NotFoundProblem("Document", id);
+    // A new date can make the transaction a visit to a wished-for place,
+    // or stop it being one. The target is decided inside the service, so
+    // the workspace is the scope.
+    await settleWishesSafely({ workspaceId: req.ctx.workspaceId });
     res.json(out);
   }),
 );

@@ -68,6 +68,7 @@ import {
 } from "./transactions.service.js";
 import { ProblemDetails, paginated, IdParam, Uuid } from "../schemas/v1/common.js";
 import { SERVER_OWNED_TX_METADATA_KEYS } from "../projection/metadata-patch.js";
+import { settleWishesSafely } from "../wish/loop.js";
 
 export const transactionsRouter: Router = Router();
 
@@ -133,6 +134,9 @@ transactionsRouter.post(
         req.ctx.userId,
         body,
       );
+      // This body carries no place, merchant or items, so today nothing it
+      // books can convert a wish; the check is here for when it does.
+      await settleWishesSafely({ transactionIds: [result.id] });
       res.setHeader("Location", `/v1/transactions/${result.id}`);
       setTransactionEtag(res, result);
       res.status(201).json(result);
@@ -202,6 +206,7 @@ transactionsRouter.post(
               expected,
               op.patch,
             );
+            await settleWishesSafely({ transactionIds: [op.id] });
             results.push({ index: i, status: 200, body: out });
           } else if (op.op === "reconcile") {
             const out = await reconcileTransaction(
@@ -279,6 +284,9 @@ transactionsRouter.patch(
         currentVersion,
         patch,
       );
+      // A date, status or flow edit can make it a visit to a wished-for
+      // place, or stop it being one.
+      await settleWishesSafely({ transactionIds: [id] });
       setTransactionEtag(res, result);
       res.json(result);
     } catch (err) {
@@ -325,6 +333,8 @@ transactionsRouter.delete(
           expectedEtag,
         });
       }
+      // A wish this purchase converted loses its proof.
+      await settleWishesSafely({ transactionIds: [id] });
       res.status(204).end();
     } catch (err) {
       next(err);
@@ -347,6 +357,7 @@ transactionsRouter.post(
         currentVersion,
         { userId: req.ctx.userId },
       );
+      await settleWishesSafely({ transactionIds: [id] });
       setTransactionEtag(res, result);
       res.status(200).json(result);
     } catch (err) {
@@ -420,6 +431,7 @@ transactionsRouter.post(
         currentVersion,
         body,
       );
+      await settleWishesSafely({ transactionIds: [id] });
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -448,6 +460,8 @@ transactionsRouter.post(
         id,
         body.items,
       );
+      // A line with a wished-for product converts a thing wish.
+      if (body.items.some((i) => i.product_id)) await settleWishesSafely({ transactionIds: [id] });
       res.status(201).json(result);
     } catch (err) {
       next(err);
@@ -476,6 +490,8 @@ transactionsRouter.patch(
         currentVersion,
         patch,
       );
+      // Postings decide whether it is money going out.
+      await settleWishesSafely({ transactionIds: [params.tid] });
       res.json(result);
     } catch (err) {
       next(err);
@@ -502,6 +518,7 @@ transactionsRouter.delete(
         params.pid,
         currentVersion,
       );
+      await settleWishesSafely({ transactionIds: [params.tid] });
       res.status(204).end();
     } catch (err) {
       next(err);

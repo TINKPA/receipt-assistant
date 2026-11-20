@@ -2011,6 +2011,9 @@
           "moved_owned_items": {
             "type": "integer"
           },
+          "moved_wish_items": {
+            "type": "integer"
+          },
           "derivation_event_id": {
             "type": "string",
             "format": "uuid",
@@ -2022,6 +2025,7 @@
           "target_id",
           "moved_transaction_items",
           "moved_owned_items",
+          "moved_wish_items",
           "derivation_event_id"
         ]
       },
@@ -2455,6 +2459,79 @@
           "rating"
         ]
       },
+      "WishPlaceSuggestion": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "google_place_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formatted_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "google_place_id",
+          "name",
+          "formatted_address",
+          "reason"
+        ]
+      },
+      "WishConvertedTransaction": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "occurred_on": {
+            "type": "string",
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "example": "2026-04-19"
+          },
+          "payee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "occurred_on",
+          "payee",
+          "total_minor",
+          "currency"
+        ]
+      },
       "WishItem": {
         "type": "object",
         "properties": {
@@ -2493,6 +2570,18 @@
           },
           "place": {
             "$ref": "#/components/schemas/WishPlace"
+          },
+          "place_suggestion": {
+            "$ref": "#/components/schemas/WishPlaceSuggestion"
+          },
+          "same_place_wish_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "description": "Other place wishes in the workspace at the same place, any status. A thing wish is never listed, and a thing wish's list is empty: visiting a place settles no thing to buy."
           },
           "title": {
             "type": "string"
@@ -2550,6 +2639,26 @@
             ],
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "converted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "converted_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "user",
+              "receipt"
+            ]
+          },
+          "converted_transaction": {
+            "$ref": "#/components/schemas/WishConvertedTransaction"
           },
           "source_url": {
             "type": [
@@ -2600,6 +2709,8 @@
           "kind",
           "place_id",
           "place",
+          "place_suggestion",
+          "same_place_wish_ids",
           "title",
           "notes",
           "target_price_minor",
@@ -2609,6 +2720,9 @@
           "snoozed_until",
           "status",
           "converted_transaction_id",
+          "converted_at",
+          "converted_by",
+          "converted_transaction",
           "source_url",
           "has_image",
           "capture_status",
@@ -2622,7 +2736,8 @@
         "properties": {
           "title": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 300
           },
           "kind": {
             "type": "string",
@@ -2636,6 +2751,12 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "google_place_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{10,300}$",
+            "description": "A Google place id (`ChIJ…`), as place search returns it.",
+            "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
+          },
           "source_url": {
             "type": "string",
             "maxLength": 2000,
@@ -2647,14 +2768,16 @@
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
           "notes": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 5000
           },
           "target_price_minor": {
             "type": "integer",
             "exclusiveMinimum": 0
           },
           "currency": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[A-Z]{3}$"
           },
           "planned_days": {
             "type": "integer",
@@ -2689,7 +2812,8 @@
         "properties": {
           "title": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 300
           },
           "kind": {
             "type": "string",
@@ -2705,6 +2829,12 @@
             ],
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "google_place_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{10,300}$",
+            "description": "A Google place id (`ChIJ…`), as place search returns it.",
+            "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
           },
           "source_url": {
             "type": [
@@ -2726,7 +2856,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "maxLength": 5000
           },
           "target_price_minor": {
             "type": [
@@ -2734,6 +2865,10 @@
               "null"
             ],
             "exclusiveMinimum": 0
+          },
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$"
           },
           "planned_days": {
             "type": [
@@ -2775,6 +2910,11 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "converted_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2026-11-20T00:00:00+09:00"
+          },
           "metadata": {
             "type": "object",
             "additionalProperties": {}
@@ -2787,7 +2927,7 @@
         "properties": {
           "file": {
             "type": "string",
-            "description": "A JPEG, PNG, WebP or GIF image: a screenshot or a photo.",
+            "description": "A JPEG, PNG, WebP, GIF, HEIC or AVIF image: a screenshot or a photo. HEIC and AVIF are stored (and read) as JPEG.",
             "format": "binary"
           },
           "note": {
@@ -2798,6 +2938,74 @@
         },
         "required": [
           "file"
+        ]
+      },
+      "WishPlaceCandidate": {
+        "type": "object",
+        "properties": {
+          "google_place_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formatted_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rating": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "user_rating_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "primary_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "google_place_id",
+          "name",
+          "formatted_address",
+          "rating",
+          "user_rating_count",
+          "primary_type"
+        ]
+      },
+      "WishPlaceSearchResponse": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "location_biased": {
+            "type": "boolean"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WishPlaceCandidate"
+            }
+          }
+        },
+        "required": [
+          "query",
+          "location_biased",
+          "candidates"
         ]
       },
       "Insight": {
@@ -7984,7 +8192,7 @@
     },
     "/v1/products/{id}/merge_into": {
       "post": {
-        "summary": "Merge this product into the target — re-points transaction_items + owned_items, retires source",
+        "summary": "Merge this product into the target — re-points transaction_items, owned_items and wish_items, retires source",
         "tags": [
           "products"
         ],
@@ -8521,6 +8729,7 @@
         "tags": [
           "wish-items"
         ],
+        "description": "A wish sent with `place_id` or `google_place_id` and no `kind` is a place wish. A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from `GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in `capture.place_match.error`. Only a found place inside the workspace's usual area (50 km around its purchases) whose name carries the title is linked; anything else (another name, another region, or a workspace with too few purchases to have an area) is offered as `place_suggestion`. A found place outside the area whose name does not carry the whole title is offered only when it shares the title's words and the rest of the title is in its address (`El Farolito Mission District` → Taquería El Farolito, Mission St), after any branch inside the area that carries the title's first word; one named for somewhere else (`Sugarfish Little Tokyo` → SUGARFISH Little Italy, San Diego, with no branch in the area) or whose name shares nothing with the title is not offered at all. A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -8545,7 +8754,27 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "Validation failed",
+            "description": "Validation failed (also: Google has no such `google_place_id`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google failed while fetching the picked place",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`google_place_id` sent, and the server has no Google Maps key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8603,7 +8832,7 @@
       },
       "patch": {
         "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
-        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing). `status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made; `Z` or a UTC offset). `currency` changes the currency of `target_price_minor` (the amount is not converted). Changing `converted_transaction_id` (a live transaction) or `converted_at` on a receipt conversion makes it `converted_by: user`. Leaving `converted` (to active or declined) dismisses its transaction for good; `status: active` from converted or declined starts the wish over: only a purchase from then on converts it, and that is checked at once. `google_place_id` stores the picked place and links it (confirming a `place_suggestion`); `place_id: null` removes a place or rejects the suggestion. Setting `title`, `kind` or the place on a captured wish records it in `capture.user_set`, which no reading overwrites; on a wish whose capture failed it also marks the capture `done` (`capture.resolved_by: user`, the error kept). A new `title` on a place wish with no place (a failed capture being named) is matched as a typed place wish is (`capture.place_match`, `place_suggestion`), unless the person removed a place by hand. A new place, product or kind is checked against the ledger at once.",
         "tags": [
           "wish-items"
         ],
@@ -8645,10 +8874,47 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/BadRequest"
+            "description": "No field to change",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           },
           "404": {
             "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed (also: Google has no such `google_place_id`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google failed while fetching the picked place",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`google_place_id` sent, and the server has no Google Maps key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8661,6 +8927,7 @@
       },
       "delete": {
         "summary": "Hard-delete a wish",
+        "description": "Its captured image is deleted too, unless another wish (one split from the same capture) still shows it.",
         "tags": [
           "wish-items"
         ],
@@ -8696,10 +8963,105 @@
         }
       }
     },
+    "/v1/wish-items/place-search": {
+      "get": {
+        "summary": "Search Google for a wish's place (up to five candidates)",
+        "description": "Google Places Text Search with the server's key. With `near`, the locality the wish's image reading found is added to the query; otherwise the search prefers the workspace's usual area (`location_biased`). Candidates that share no word with `q` are not returned. Pick a candidate by sending its `google_place_id` in `PATCH /v1/wish-items/{id}`.",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300,
+              "description": "What to look for: a name, with a city if you know it."
+            },
+            "required": true,
+            "name": "q",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "A wish whose reading names a locality: the query is biased to it (a place wish captured from a post about Los Angeles searches Los Angeles).",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": false,
+            "name": "near",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishPlaceSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`near` is not a UUID",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No wish `near`",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`q` missing or empty",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google answered with an error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server has no Google Maps key",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/wish-items/capture": {
       "post": {
         "summary": "Save a wish from an image (a screenshot of a post, a chat, a map; a photo)",
-        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload.",
+        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed and makes it a `thing`). Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one in `capture.duplicate_of`. A place is linked only when its name agrees and the location the image names is confirmed by Google's structured address (its address components) in English or the name's own script: the house number is its street number on the read street, else the street (numbered ones such as `6th Ave` included) is its route, else the city or neighbourhood is a whole city-level part of it (`South San Francisco` is not `San Francisco`; a state or a country such as `USA` or `Taiwan` confirms nothing; `New York` and `NYC` are confirmed by the five boroughs). A place that fails it is offered as `place_suggestion` with the reason; one whose name shares nothing is not offered. For a shop's listing (Amazon and the like) with no person recommending it, `capture.reading.highlights` is empty: the listing's own words are not highlights. HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`, and one over 50 million pixels a 422 `image_too_large` (checked from its header, before any pixel is decoded); nothing is stored or read. The same bytes uploaded again answer 200 with the wish they made the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
         "tags": [
           "wish-items"
         ],
@@ -8713,6 +9075,16 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "This image was captured before: the existing wish",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
           "202": {
             "description": "Accepted; reading",
             "content": {
@@ -8727,7 +9099,7 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "Not an image this endpoint reads",
+            "description": "Not an image this endpoint reads (`unsupported_image`), one that does not decode (`unreadable_image`), or one over 50 million pixels (`image_too_large`)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8742,6 +9114,7 @@
     "/v1/wish-items/{id}/capture/retry": {
       "post": {
         "summary": "Read a captured image again",
+        "description": "Fields the person set by hand (`capture.user_set`) are kept; if the new reading fails, a wish they had named or placed stays `done`. A wish split from another capture (`capture.sibling_of`) is not read on its own while that capture exists: 409, read the original. Once the original is deleted it is read on its own, for its own entry of the image (no further split). An image file that is no longer on disk fails the capture with `capture.error: image_missing` before anything is read, and the wish keeps its kind.",
         "tags": [
           "wish-items"
         ],
@@ -8782,7 +9155,7 @@
             }
           },
           "409": {
-            "description": "No image, or it is being read now",
+            "description": "No image, it is being read now, or it was split from a capture that still exists",
             "content": {
               "application/problem+json": {
                 "schema": {

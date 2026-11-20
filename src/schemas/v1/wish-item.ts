@@ -13,6 +13,80 @@ export const WishStatus = z.enum(["active", "converted", "declined"]);
  *  it has no price or lifespan, and "converted" means visited. */
 export const WishKind = z.enum(["thing", "place"]);
 export const WishCaptureStatus = z.enum(["reading", "done", "failed"]);
+/** Who converted a wish: the user, or a receipt booked at its place. */
+export const WishConvertedBy = z.enum(["user", "receipt"]);
+
+/** A Google place id as Google issues it. */
+export const GooglePlaceId = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{10,300}$/, "not a Google place id")
+  .openapi({ description: "A Google place id (`ChIJ…`), as place search returns it.", example: "ChIJN1t_tDeuEmsRUsoyG83frY4" });
+
+/** The transaction that converted a wish, as much as a card needs. */
+export const WishConvertedTransaction = z
+  .object({
+    id: Uuid,
+    occurred_on: IsoDate,
+    payee: z.string().nullable(),
+    /** What it cost: the sum of its expense legs, in the workspace base
+     *  currency, minor units. */
+    total_minor: z.number().int(),
+    /** The workspace base currency. */
+    currency: z.string(),
+  })
+  .openapi("WishConvertedTransaction");
+
+/** A place found for the wish's name that is only a guess. A place is
+ *  linked only when its name agrees with the wish's and the location the
+ *  image gave (its street, else its city or neighbourhood) is confirmed by
+ *  Google's structured address, or, for a typed name, it is inside the workspace's usual area;
+ *  anything weaker is offered here. Not linked, so it converts nothing.
+ *  Confirm it with PATCH `google_place_id`, reject it with PATCH
+ *  `place_id: null`. */
+export const WishPlaceSuggestion = z
+  .object({
+    google_place_id: z.string(),
+    name: z.string().nullable(),
+    formatted_address: z.string().nullable(),
+    /** `name_only` (no city or address to go on, or only a street with no
+     *  house number and no city: "Main Street" is in most towns), `low_confidence` (the
+     *  reading was a guess), `name_mismatch` (Google's place has another
+     *  name; for a typed name, also a branch of the same brand inside the
+     *  workspace's area when the typed words for where match no branch),
+     *  `name_unverified` (a name in another script than Google's, so the
+     *  two cannot be compared, and no house number confirms the place),
+     *  `address_mismatch` (the house number in the image is not the found
+     *  place's house number on the street the image names), `street_mismatch`
+     *  (the street the image names, "6th Ave" or "天平路", is not in it;
+     *  a street of the same name and another type, "Pike St" for "Pike Pl",
+     *  is another street),
+     *  `street_unverified` (Google's address names no street to compare it
+     *  with), `locality_mismatch` (the city or neighbourhood the image
+     *  names is not a whole city-level part of Google's structured address,
+     *  or the city is not although the street is: a namesake in another
+     *  town, "South San Francisco" for San Francisco, a state, a country
+     *  or a county only, a bare generic neighbourhood such as "Downtown"
+     *  with no city, or a neighbourhood Google does not name),
+     *  `several_branches` (the image names a street and no house number,
+     *  or a city or neighbourhood and no street, and two or more places of
+     *  that name are on it or in it: the first is offered), `outside_area` (a typed name found outside the workspace's
+     *  usual area). */
+    reason: z.string().nullable(),
+  })
+  .openapi("WishPlaceSuggestion");
+
+/** http(s) links only: anything else (javascript:, data:) is refused. */
+export const HttpUrl = z
+  .string()
+  .max(2000)
+  .url()
+  .refine((s) => /^https?:\/\//i.test(s), { message: "only http and https links" });
+
+/** An ISO 4217 code, as the rest of the API spells currencies. */
+const CurrencyCode = z.string().regex(/^[A-Z]{3}$/, "a three-letter ISO 4217 code, upper case");
+
+const Title = z.string().trim().min(1).max(300);
+const Notes = z.string().max(5000);
 
 /** The matched place of a place wish, as much as a card needs. */
 export const WishPlace = z
@@ -40,11 +114,24 @@ export const WishItem = z
     workspace_id: Uuid,
     /** NULL for free-text wishes (a course, a used chair). */
     product_id: Uuid.nullable(),
+    /** A capture is `place` until its reading says otherwise; a reading
+     *  of an image with nothing to save leaves it `place` with
+     *  `capture_status: failed` and `capture.error: nothing_to_save`. */
     kind: WishKind,
     /** The matched place of a place wish; null until matched, or after
      *  the user removed a wrong match. */
     place_id: Uuid.nullable(),
     place: WishPlace.nullable(),
+    /** A guessed place waiting for the person to confirm or reject it;
+     *  null when the wish has a place or nothing was guessed. */
+    place_suggestion: WishPlaceSuggestion.nullable(),
+    /** Other place wishes in the workspace at the same place (any status):
+     *  the same restaurant saved twice, from two screenshots or typed
+     *  again. Never a thing wish, and empty on one. */
+    same_place_wish_ids: z.array(Uuid).openapi({
+      description:
+        "Other place wishes in the workspace at the same place, any status. A thing wish is never listed, and a thing wish's list is empty: visiting a place settles no thing to buy.",
+    }),
     title: z.string(),
     notes: z.string().nullable(),
     /** What you'd pay, in minor units. Drives the projected $/day. */
@@ -58,6 +145,20 @@ export const WishItem = z
     status: WishStatus,
     /** Set when status=converted: the transaction that realized the wish. */
     converted_transaction_id: Uuid.nullable(),
+    /** When it was bought or visited: the converting transaction's time
+     *  (or the start of its day), or when the user marked it. A receipt
+     *  conversion follows its transaction: editing the transaction's date
+     *  or time moves it. Null unless converted. */
+    converted_at: IsoDateTime.nullable(),
+    /** `receipt`: a purchase booked at the wish's place (or with its
+     *  product) converted it. `user`: the user marked it. Null unless
+     *  converted. */
+    converted_by: WishConvertedBy.nullable(),
+    /** The converting transaction while it is live, or null (none, or it
+     *  was deleted: a receipt conversion whose transaction is deleted goes
+     *  back to active, or to another purchase there). */
+    converted_transaction: WishConvertedTransaction.nullable(),
+    /** An http(s) link, or null. */
     source_url: z.string().nullable(),
     /** True when the wish was captured from an image:
      *  `GET /v1/wish-items/{id}/image` serves it. */
@@ -66,8 +167,18 @@ export const WishItem = z
      *  read and the title is a placeholder; poll until it changes. */
     capture_status: WishCaptureStatus.nullable(),
     /** What the reading found (`reading`: highlights, category,
-     *  recommended_by, …), how the place was matched (`place_match`), or
-     *  why it failed (`error`, `detail`). Written by the server only. */
+     *  recommended_by, …), how the place was matched (`place_match`, also
+     *  on a typed place wish; `place_match.address_unverified: true` when it
+     *  was linked although Google's address names no street to check the
+     *  read one against), or why it failed (`error`, `detail`; kept
+     *  after the user fixed the wish by hand, with `resolved_by: "user"`).
+     *  `user_set` lists what the person set by hand (`title`, `kind`,
+     *  `place`), which a reading never overwrites. `sibling_of` names the
+     *  wish whose image listed this place too; that wish lists them in
+     *  `siblings`. `duplicate_of` names an earlier wish (not declined) at
+     *  the same place, when this capture's place was already wished for.
+     *  `converted_from` names a HEIC / AVIF upload stored as JPEG.
+     *  Written by the server only. */
     capture: z.record(z.string(), z.unknown()).nullable(),
     metadata: Metadata,
     created_at: IsoDateTime,
@@ -77,14 +188,20 @@ export const WishItem = z
 
 export const CreateWishItemRequest = z
   .object({
-    title: z.string().min(1),
+    title: Title,
+    /** Default `place` when `place_id` or `google_place_id` is sent, else `thing`. */
     kind: WishKind.optional(),
+    /** A place the ledger already has. */
     place_id: Uuid.optional(),
-    source_url: z.string().url().max(2000).optional(),
+    /** A place picked from place search: the server fetches and stores it
+     *  and sets `place_id`. A place wish sent with neither is matched by
+     *  its title (Google Find Place); `capture.place_match` says how. */
+    google_place_id: GooglePlaceId.optional(),
+    source_url: HttpUrl.optional(),
     product_id: Uuid.optional(),
-    notes: z.string().optional(),
+    notes: Notes.optional(),
     target_price_minor: z.number().int().positive().optional(),
-    currency: z.string().optional(),
+    currency: CurrencyCode.optional(),
     planned_days: z.number().int().positive().optional(),
     urgency: WishUrgency.optional(),
     snoozed_until: IsoDate.optional(),
@@ -95,25 +212,62 @@ export const CreateWishItemRequest = z
 
 export const UpdateWishItemRequest = z
   .object({
-    title: z.string().min(1).optional(),
+    title: Title.optional(),
     kind: WishKind.optional(),
-    /** Null removes a wrong match. */
+    /** Null removes a wrong match, or rejects a `place_suggestion`. */
     place_id: Uuid.nullable().optional(),
-    source_url: z.string().url().max(2000).nullable().optional(),
+    /** A place picked from place search: stored and linked as `place_id`.
+     *  Not together with `place_id`. */
+    google_place_id: GooglePlaceId.optional(),
+    source_url: HttpUrl.nullable().optional(),
     product_id: Uuid.nullable().optional(),
-    notes: z.string().nullable().optional(),
+    notes: Notes.nullable().optional(),
     target_price_minor: z.number().int().positive().nullable().optional(),
+    /** The currency of `target_price_minor`; the amount is not converted. */
+    currency: CurrencyCode.optional(),
     planned_days: z.number().int().positive().nullable().optional(),
     urgency: WishUrgency.optional(),
     snoozed_until: IsoDate.nullable().optional(),
     /** active → converted | declined; converting may carry the realizing
-     *  transaction id. Setting back to active un-decides. */
+     *  transaction id and when (`converted_at`, default now), and is
+     *  recorded as `converted_by: "user"`. Leaving converted (to active
+     *  or declined) means its transaction did not settle it: that
+     *  transaction never converts it again. Setting it to active from
+     *  either ("Want again", un-decline) starts the wish over: only a
+     *  purchase from then on converts it, checked at once. */
     status: WishStatus.optional(),
+    /** A live transaction of the workspace. Changing it (or
+     *  `converted_at`) on a wish a receipt converted makes the conversion
+     *  the user's (`converted_by: "user"`). */
     converted_transaction_id: Uuid.nullable().optional(),
+    /** Only with a conversion (status converted, sent or current); not
+     *  before the wish was made (a day's grace for time zones) nor more
+     *  than a day ahead. ISO 8601 with `Z` or a UTC offset
+     *  (`2026-11-20T00:00:00+09:00`, the start of a local day); returned
+     *  in UTC. */
+    converted_at: z
+      .string()
+      .datetime({ offset: true })
+      // The format check takes any two-digit offset and any day up to 31;
+      // `+24:00` or `02-30` would then be an Invalid Date or another day.
+      .refine(isRealInstant, { message: "Not a real date, time and UTC offset" })
+      .optional()
+      .openapi({ format: "date-time", example: "2026-11-20T00:00:00+09:00" }),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
   .openapi("UpdateWishItemRequest");
+
+/** An ISO 8601 date-time that names a real instant: its calendar day
+ *  exists, and its UTC offset is within ±23:59. */
+function isRealInstant(s: string): boolean {
+  if (Number.isNaN(Date.parse(s))) return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T/.exec(s);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  return day.getUTCFullYear() === y && day.getUTCMonth() === mo - 1 && day.getUTCDate() === d;
+}
 
 export const ListWishItemsQuery = z.object({
   status: WishStatus.optional(),
@@ -126,7 +280,46 @@ export const ListWishItemsQuery = z.object({
 /** `POST /v1/wish-items/capture`: multipart, one image in `file`. */
 export const CaptureWishForm = z
   .object({
-    file: z.string().openapi({ type: "string", format: "binary", description: "A JPEG, PNG, WebP or GIF image: a screenshot or a photo." }),
+    file: z.string().openapi({
+      type: "string",
+      format: "binary",
+      description: "A JPEG, PNG, WebP, GIF, HEIC or AVIF image: a screenshot or a photo. HEIC and AVIF are stored (and read) as JPEG.",
+    }),
     note: z.string().max(2000).optional().openapi({ description: "What you want to remember about it. Stored as the wish's notes and shown to the reader." }),
   })
   .openapi("CaptureWishForm");
+
+/** `GET /v1/wish-items/place-search` */
+export const WishPlaceSearchQuery = z.object({
+  q: z.string().trim().min(1).max(300).openapi({ description: "What to look for: a name, with a city if you know it." }),
+  near: Uuid.optional().openapi({
+    description: "A wish whose reading names a locality: the query is biased to it (a place wish captured from a post about Los Angeles searches Los Angeles).",
+  }),
+});
+
+export const WishPlaceCandidate = z
+  .object({
+    google_place_id: z.string(),
+    name: z.string().nullable(),
+    formatted_address: z.string().nullable(),
+    rating: z.number().nullable(),
+    user_rating_count: z.number().int().nullable(),
+    primary_type: z.string().nullable(),
+  })
+  .openapi("WishPlaceCandidate");
+
+export const WishPlaceSearchResponse = z
+  .object({
+    /** The text sent to Google, after the `near` bias. */
+    query: z.string(),
+    /** True when the search preferred the workspace's usual area (the
+     *  places of its purchases); false with `near` and a locality, or a
+     *  workspace with too few places to tell. */
+    location_biased: z.boolean(),
+    /** Up to five, best first (with `location_biased`, those within 50 km
+     *  of the workspace's area first). Empty when Google has none, or when none
+     *  of them shares a word with `q` (Google answers nonsense with
+     *  whatever it has). */
+    candidates: z.array(WishPlaceCandidate),
+  })
+  .openapi("WishPlaceSearchResponse");

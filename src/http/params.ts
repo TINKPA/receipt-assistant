@@ -67,6 +67,7 @@ export const UUID_QUERY_PARAMS: ReadonlySet<string> = new Set([
   "account_id",
   "batch_id",
   "merchant_id",
+  "near",
   "product_id",
   "source_ingest_id",
   "transaction_id",

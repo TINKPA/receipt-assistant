@@ -20,6 +20,13 @@
  * post, a chat, a map): `image_path` is that file under
  * `<UPLOAD_DIR>/wish/`, `capture_status` says where its reading stands,
  * and `capture` keeps what was read and how the place was matched.
+ *
+ * Visiting closes the loop (src/wish/loop.ts): a live purchase booked at
+ * an active place wish's place, on or after the day it was wished for,
+ * converts it (`converted_by = 'receipt'`). "Want again" sets it back to
+ * active, and the transaction that converted it goes into
+ * `dismissed_transaction_ids` so it never converts it again;
+ * `reactivated_at` moves the "wished since" day forward.
  */
 import {
   pgTable,
@@ -30,6 +37,7 @@ import {
   timestamp,
   jsonb,
   index,
+  uniqueIndex,
   check,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -74,11 +82,31 @@ export const wishItems = pgTable(
       () => transactions.id,
       { onDelete: "set null" },
     ),
+    /** When it was bought or visited: the converting transaction's
+     *  occurred_at (or the start of its occurred_on), or when the user
+     *  marked it. NULL unless converted. */
+    convertedAt: timestamp("converted_at", { withTimezone: true }),
+    /** user | receipt; NULL unless converted. */
+    convertedBy: text("converted_by"),
+    /** Transactions the user said did not fulfil the wish ("Want again"
+     *  after a receipt converted it). The loop never uses them again. */
+    dismissedTransactionIds: uuid("dismissed_transaction_ids")
+      .array()
+      .notNull()
+      .default(sql`'{}'::uuid[]`),
+    /** Set back to active from converted: a purchase must be on or after
+     *  this day (and after created_at) to convert it again. */
+    reactivatedAt: timestamp("reactivated_at", { withTimezone: true }),
     /** Where the wish came from, when it has a link (a post, a menu). */
     sourceUrl: text("source_url"),
     /** The captured image, relative to `<UPLOAD_DIR>/wish/`. */
     imagePath: text("image_path"),
+    /** The sha256 of the stored file (the ETag and the file name). */
     imageSha256: text("image_sha256"),
+    /** The sha256 of the bytes as uploaded: differs from image_sha256 when
+     *  a HEIC / AVIF upload was stored as JPEG. One per workspace, so the
+     *  same image uploaded twice is the same wish. */
+    imageSourceSha256: text("image_source_sha256"),
     imageMimeType: text("image_mime_type"),
     /** NULL (typed in by hand) | reading | done | failed. */
     captureStatus: text("capture_status"),
@@ -96,10 +124,17 @@ export const wishItems = pgTable(
   (t) => [
     index("wish_items_workspace_status_idx").on(t.workspaceId, t.status),
     index("wish_items_place_idx").on(t.placeId),
+    uniqueIndex("wish_items_image_source_uq")
+      .on(t.workspaceId, t.imageSourceSha256)
+      .where(sql`${t.imageSourceSha256} IS NOT NULL`),
     check("wish_items_kind_check", sql`${t.kind} IN ('thing', 'place')`),
     check(
       "wish_items_capture_status_check",
       sql`${t.captureStatus} IS NULL OR ${t.captureStatus} IN ('reading', 'done', 'failed')`,
+    ),
+    check(
+      "wish_items_converted_by_check",
+      sql`${t.convertedBy} IS NULL OR ${t.convertedBy} IN ('user', 'receipt')`,
     ),
   ],
 );
