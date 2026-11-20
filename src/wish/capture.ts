@@ -28,7 +28,7 @@ import { getUploadDir } from "../routes/documents.service.js";
 import { resolveInside } from "../http/files.js";
 import { HttpProblem } from "../http/problem.js";
 import { storableImage } from "./image.js";
-import { matchPlaceByText, workspaceArea, type PlaceMatch } from "./places.js";
+import { isLandmarkAddress, matchPlaceByText, workspaceArea, type PlaceMatch } from "./places.js";
 import { settleWishesSafely } from "./loop.js";
 import {
   WISH_READ_PROMPT_VERSION,
@@ -212,6 +212,8 @@ function placeQuery(r: Placeable): { query: string; basis: "address" | "locality
   const name = r.name_local && r.name_local !== r.title ? `${r.title} ${r.name_local}` : r.title;
   // The address with its neighbourhood or city: "7 Carmine St" alone is a
   // street in many towns.
+  // A landmark ("near X St") with no city says too little to rest on.
+  if (r.address && isLandmarkAddress(r.address) && !r.locality) return { query: `${name} ${r.address}`, basis: "name_only" };
   if (r.address) return { query: [name, r.address, r.locality].filter(Boolean).join(" "), basis: "address" };
   if (r.locality) return { query: `${name} ${r.locality}`, basis: "locality" };
   return { query: name, basis: "name_only" };
@@ -231,6 +233,7 @@ async function matchPlace(workspaceId: string, r: Placeable, confidence: WishRea
     // Google's English one cannot be compared word by word.
     trustUncomparable: basis !== "name_only",
     address: r.address,
+    locality: r.locality,
     // With no city in the image, the person's own area is the best guess.
     locationBias: basis === "name_only" ? await workspaceArea(workspaceId) : null,
   });

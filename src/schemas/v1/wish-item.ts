@@ -147,7 +147,9 @@ export const WishItem = z
     capture_status: WishCaptureStatus.nullable(),
     /** What the reading found (`reading`: highlights, category,
      *  recommended_by, …), how the place was matched (`place_match`, also
-     *  on a typed place wish), or why it failed (`error`, `detail`; kept
+     *  on a typed place wish; `place_match.address_unverified: true` when it
+     *  was linked although Google's address names no street to check the
+     *  read one against), or why it failed (`error`, `detail`; kept
      *  after the user fixed the wish by hand, with `resolved_by: "user"`).
      *  `user_set` lists what the person set by hand (`title`, `kind`,
      *  `place`), which a reading never overwrites. `sibling_of` names the

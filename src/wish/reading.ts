@@ -19,7 +19,7 @@ const optionalShort = (max: number) =>
 
 /** Bumped with any change to what the prompt asks for; recorded on every
  *  capture as `capture.prompt_version`. */
-export const WISH_READ_PROMPT_VERSION = "1.3";
+export const WISH_READ_PROMPT_VERSION = "1.4";
 
 /** A link the server keeps: http(s) only. A bare domain ("instagram.com/x")
  *  is read as https; anything else (javascript:, data:, a phone number) is
@@ -228,7 +228,7 @@ Then end your reply with exactly one fenced JSON block:
 Rules:
 - Copy names exactly as printed. Do not translate a name that is printed in one script only; put it in "title" as it is.
 - "title" is the place's name without a branch suffix: "佳家汤包(黄河路店)" is "佳家汤包", "Din Tai Fung - Glendale" is "Din Tai Fung"; the branch ("黄河路", "Glendale") goes in "locality" when nothing else gives one.
-- "address" is the street as the image gives it, with or without a house number: "天平路", "Valley Blvd", "700 S Grand Ave". Copy only what is printed or said; do not add cross streets, a city or anything in brackets. "locality" is only a city, district, neighbourhood or branch area, never a street: "天平路那家老店" in Shanghai is address "天平路", locality "上海".
+- "address" is the street as the image gives it, with or without a house number: "天平路", "Valley Blvd", "700 S Grand Ave". Copy only what is printed or said; do not add cross streets, a city or anything in brackets. "locality" is only a city, district, neighbourhood or branch area, never a street: "天平路那家老店" in Shanghai is address "天平路", locality "上海". A street given only as a landmark ("near Commercial St", "近 Commercial St", "between X and Y", "at the corner of X", "南京路与西藏路交叉口", "天平路附近") is not the address: give "address" null and keep the phrase in "note".
 - Write "note", "highlights", "category" and "locality" in the language the image is mainly written in, with no translation or gloss in brackets after them.
 - "name_local" is only for a name printed in two forms (a translation or romanisation beside the original). A name printed once goes in "title" and "name_local" is null.
 - "highlights": at most five items the image itself singles out as worth having or the reason to go (named as a must, the best, recommended, ordered by the poster). A plain menu is not a recommendation, and neither is a shop's own listing (its title, bullet points, feature list, rating): give [] or the one or two items a person in the image singles out. Each highlight names a dish, a product or a feature; a sentence of advice ("go Hot if you're brave", "get the chocolate banana", "eat it at the beach") goes in "note". A practical tip ("keep your ticket", "cash only", "book ahead", "sells out by 11", "eat it at the beach", "go Hot if you're brave"), a rating, a wait, opening hours or payment details is never a highlight: it goes in "note".
