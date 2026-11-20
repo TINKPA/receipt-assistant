@@ -11,12 +11,10 @@
  * under one advisory lock per Google id, so links of one new place that
  * arrive together store it once and count it once.
  *
- * A match found from text (`matchPlaceByText`) is linked only when it is
- * likely the place meant. It is a guess, kept as a suggestion with
- * `tentative: true` and no `place_id`, when the name Google found shares
- * too little with the name asked for (src/wish/names.ts), or when the
- * caller says the query itself is a guess (a capture with a name and no
- * city, a reading the model was not sure of). The wish then exposes it as
+ * A match found from text (`matchPlaceByText`) is linked only when its name
+ * agrees and the read location is confirmed by Google's address
+ * (`decidePlaceMatch` has the rule). Anything weaker is kept as a
+ * suggestion with `tentative: true`, a reason and no `place_id`. The wish then exposes it as
  * `place_suggestion` for the person to confirm (PATCH `google_place_id`)
  * or reject (PATCH `place_id: null`); a suggestion never converts a wish.
  */
@@ -24,10 +22,11 @@ import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { liveTransactions } from "../db/live.js";
 import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchPlaceV1Dual } from "../google/places-fetch.js";
-import { findPlaceByText, type FoundPlace } from "../google/find-place.js";
+import { findPlaceByText } from "../google/find-place.js";
 import { searchPlacesByText } from "../google/text-search.js";
 import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
-import { comparable, hasCjk, nameMatches, nameScore, nameTokens } from "./names.js";
+import { CITY_ALIASES } from "./cities.js";
+import { comparable, hasCjk, looseTokens, nameMatches, nameScore, nameTokens } from "./names.js";
 
 export interface PlaceLink {
   placeId: string | null;
@@ -103,14 +102,8 @@ export interface PlaceMatch {
   /** True when the match is a guess: not linked, offered as
    *  `place_suggestion` until the person confirms or rejects it. */
   tentative: boolean;
-  /** Why it is a guess: `name_only`, `low_confidence`, `name_mismatch`,
-   *  `name_unverified` (a typed name in another script than Google's),
-   *  `address_mismatch` (the read address's house number is not in the
-   *  found place's address), `street_mismatch` (the read street, given
-   *  with no number, is not in it), `street_unverified` (Google's address
-   *  names no street to compare), `outside_area` (a typed name found
-   *  outside the workspace's usual area). */
-  tentative_reason: string | null;
+  /** Why it is a guess (see `MatchReason`). */
+  tentative_reason: MatchReason | null;
   /** Linked although Google's address names no street to check the read
    *  one against: the name agreed (score 0.9 or more), the read locality
    *  is in Google's address, and no other place of that name could be at
@@ -119,48 +112,74 @@ export interface PlaceMatch {
   /** How much of the asked-for name the found one carries (0..1); null
    *  when the two are in different scripts. */
   name_score: number | null;
-  /** Google's answer when it shared no word with the asked-for name, or
-   *  (a typed name) was outside the workspace's area with a name that does
-   *  not agree and no branch of the brand was found inside it: not linked
-   *  and not suggested (`error` says so). Absent otherwise. */
+  /** Google's answer when it was not offered at all: its name shares no
+   *  word with the asked-for one, or (a typed name) it is outside the
+   *  workspace's area and named for somewhere its address is not.
+   *  `error` says so. Absent otherwise. */
   rejected?: { google_place_id: string; name: string | null; formatted_address: string | null };
   /** True when the query was biased to the workspace's usual area. */
   location_biased: boolean;
   error: string | null;
 }
 
+/**
+ * Why a found place is only a suggestion:
+ * - `name_only`: a capture with no city or address, or a typed name in a
+ *   workspace with no usual area yet;
+ * - `low_confidence`: the reading itself was a guess;
+ * - `name_mismatch`: Google's name does not carry the asked-for one (for a
+ *   typed name, also a branch of the brand inside the area);
+ * - `name_unverified`: a typed name in another script than Google's;
+ * - `address_mismatch`: the read house number is not in Google's address;
+ * - `street_mismatch`: the read street is not in it;
+ * - `street_unverified`: Google's address names no street to compare;
+ * - `locality_mismatch`: no part of the read city or neighbourhood is in
+ *   Google's address in any language asked (a namesake in another town,
+ *   or a neighbourhood Google's address does not name);
+ * - `outside_area`: a typed name found outside the workspace's area.
+ */
+export type MatchReason =
+  | "name_only"
+  | "low_confidence"
+  | "name_mismatch"
+  | "name_unverified"
+  | "address_mismatch"
+  | "street_mismatch"
+  | "street_unverified"
+  | "locality_mismatch"
+  | "outside_area";
+
 export interface MatchOptions {
   /** The names the query is about (a title, its original-script form). */
   names: string[];
   /** The query itself is a guess (`name_only`, `low_confidence`): a match
    *  is only a suggestion, whatever its name. */
-  guessReason?: string | null;
-  /** Bias Find Place to this area (the workspace's usual one). */
+  guessReason?: "name_only" | "low_confidence" | null;
+  /** Bias the lookups to this area (the workspace's usual one). */
   locationBias?: { lat: number; lng: number; radiusM: number } | null;
   /** Link a match whose name cannot be compared with the asked-for one
-   *  (a Han name, an English answer). True for a capture whose query had
-   *  an address or a city, which is what the match rests on; false for a
-   *  bare typed name. */
+   *  (a Han name, an English answer) once its location is confirmed. True
+   *  for a capture whose query had an address or a city; false for a bare
+   *  typed name. */
   trustUncomparable?: boolean;
-  /** The street address the query carried, if any: a found place whose
-   *  address lacks its house number, or (with no number) its street, is
-   *  another branch or another town. */
+  /** The street address the query carried, if any. */
   address?: string | null;
   /** The city, district or neighbourhood the query carried, if any. */
   locality?: string | null;
-  /** A bare name with nothing to say where (a typed wish): link only a
-   *  place inside this area (the workspace's usual one); anything else,
-   *  or anything at all when the workspace has no area yet (`null`), is a
-   *  suggestion. Undefined: no such check. */
+  /** A bare name with nothing to say where (a typed wish): the location to
+   *  confirm is this area (the workspace's usual one); with no area yet
+   *  (`null`) nothing can be confirmed. Undefined for a capture. */
   requireInArea?: { lat: number; lng: number; radiusM: number } | null;
 }
 
 /** "7 Carmine St" → "7", "豫园路85号" → "85", "天平路123弄5号" → "123";
  *  null when the address carries none. */
 export function houseNumber(address: string | null | undefined): string | null {
-  const m = /^\s*(\d+[A-Za-z]?)\b/.exec(address ?? "");
-  if (m?.[1]) return m[1];
-  const han = /(?:大道|大街|路|街|道|巷|弄|胡同)\s*(\d+)(?:\s*[-－]\s*\d+)?\s*[号號弄]/u.exec(address ?? "");
+  const a = address ?? "";
+  // "6th Ave" is a street, not number 6.
+  const m = /^\s*(\d+[A-Za-z]?)(?![A-Za-z])\b/.exec(a);
+  if (m?.[1] && !/^\s*\d+(st|nd|rd|th)\b/i.test(a)) return m[1];
+  const han = /(?:大道|大街|路|街|道|巷|弄|胡同)\s*(\d+)(?:\s*[-－]\s*\d+)?\s*[号號弄]/u.exec(a);
   return han?.[1] ?? null;
 }
 
@@ -182,6 +201,18 @@ export function isLandmarkAddress(address: string | null | undefined): boolean {
   return false;
 }
 
+/** A landmark phrase as query words: the "near" / "近" / "附近" taken
+ *  off, which Google reads as part of the name ("R&G Lounge near
+ *  Commercial St" finds nothing; "R&G Lounge Commercial St" finds it). */
+export function landmarkQueryText(address: string): string {
+  return address
+    .trim()
+    .replace(/^(near|nr\.?|off|between|btwn\.?|at the corner of|on the corner of|corner of|at|across from|opposite|next to|behind)\s+/i, "")
+    .replace(/^(近|靠近|临近|鄰近|邻近|挨着|离|在)\s*/u, "")
+    .replace(/\s*(附近|旁边|旁邊|对面|對面|一带|一帶)$/u, "")
+    .trim();
+}
+
 /** Words that say what kind of street it is, or which side: dropped before
  *  two spellings of one street are compared ("Valley Blvd", "Valley
  *  Boulevard"; "S Grand Ave", "South Grand Avenue"). */
@@ -192,24 +223,38 @@ const STREET_WORDS = new Set([
   "n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west",
   "lu", "jie", "dao", "nan", "bei", "dong", "xi", "zhong",
 ]);
+/** "Sixth" and "6th" are one street. */
+const ORDINAL_WORDS: Record<string, string> = {
+  first: "1st", second: "2nd", third: "3rd", fourth: "4th", fifth: "5th", sixth: "6th", seventh: "7th", eighth: "8th",
+  ninth: "9th", tenth: "10th", eleventh: "11th", twelfth: "12th",
+};
+const ORDINAL = /^\d+(st|nd|rd|th)$/;
 /** What a Han street name ends with: 路, 街, 道, … ("天平路" → "天平"). */
 const HAN_STREET_SUFFIX = /(大道|大街|路|街|道|巷|弄|里|胡同|通り|通|길|로)$/u;
-const HAN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/u;
+const HAN = /[㐀-䶿一-鿿豈-﫿぀-ヿ가-힯]/u;
 
 function fold(s: string): string {
   // Accents off; recomposed after, so a Hangul syllable stays one letter.
   return s.normalize("NFKD").replace(/\p{M}/gu, "").normalize("NFC").toLowerCase().replace(/['’`]/g, "");
 }
 
+/** The words of an address, folded, an ordinal word written as a number. */
+function addressWords(s: string): string[] {
+  return fold(s)
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .map((w) => ORDINAL_WORDS[w] ?? w);
+}
+
 /** The street of a read address, reduced to what names it: Latin words
- *  without the street type, side or number, and Han names without their
- *  路 / 街. Null when nothing is left (no street to check). */
+ *  without the street type or side ("6th" and "3rd" kept: a numbered
+ *  street is named by its number), and Han names without their 路 / 街.
+ *  Null when nothing is left (no street to check). */
 export function streetCore(address: string | null | undefined): { latin: string[]; han: string[] } | null {
   if (!address) return null;
   const latin: string[] = [];
   const han: string[] = [];
-  for (let word of fold(address).split(/[^\p{L}\p{N}]+/u)) {
-    if (!word) continue;
+  for (let word of addressWords(address.replace(/[(（][^()（）]*[)）]/gu, " "))) {
     if (HAN.test(word)) {
       word = word.replace(/\d+/g, " ");
       // A run up to its street suffix is the street ("天平路" → "天平").
@@ -222,7 +267,7 @@ export function streetCore(address: string | null | undefined): { latin: string[
       }
       const rest = word.replace(new RegExp(`${HAN.source}+`, "gu"), " ").trim();
       for (const w of rest.split(/\s+/)) if (w && !STREET_WORDS.has(w)) latin.push(w);
-    } else if (!/\d/.test(word) && !STREET_WORDS.has(word)) latin.push(word);
+    } else if ((ORDINAL.test(word) || !/\d/.test(word)) && !STREET_WORDS.has(word)) latin.push(word);
   }
   return latin.length + han.length > 0 ? { latin, han } : null;
 }
@@ -233,10 +278,10 @@ export function streetCore(address: string | null | undefined): { latin: string[
 function streetIn(core: { latin: string[]; han: string[] }, formatted: string | null): "yes" | "no" | "unknown" {
   if (!formatted) return "no";
   const f = fold(formatted);
-  const words = new Set(f.split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+  const words = new Set(addressWords(formatted));
   // A word, or (four letters or more) inside a run Google wrote as one
   // ("Tianping" in "Tianpinglu").
-  const latinOk = core.latin.every((w) => words.has(w) || (w.length >= 4 && f.replace(/\s+/g, "").includes(w)));
+  const latinOk = core.latin.every((w) => words.has(w) || (w.length >= 4 && !ORDINAL.test(w) && f.replace(/\s+/g, "").includes(w)));
   if (core.han.length > 0) {
     if (!HAN.test(formatted)) return core.latin.length > 0 && !latinOk ? "no" : "unknown";
     return core.han.every((h) => f.includes(h)) && latinOk ? "yes" : "no";
@@ -249,12 +294,12 @@ function streetIn(core: { latin: string[]; han: string[] }, formatted: string | 
 function hasStreetLevel(formatted: string | null): boolean {
   if (!formatted) return false;
   const first = formatted.split(",")[0] ?? "";
-  return /\d+\s*[A-Za-z\u00c0-\u024f]/.test(first) || /[路街道巷弄号號]/u.test(formatted);
+  return /\d+\s*[A-Za-zÀ-ɏ]/.test(first) || /[路街道巷弄号號]/u.test(formatted);
 }
 
 /** The language to ask Google in, from the script of a name. */
-function languageFor(names: string[]): string | undefined {
-  const all = names.join(" ");
+function languageFor(names: (string | null | undefined)[]): string | undefined {
+  const all = names.filter(Boolean).join(" ");
   if (/[぀-ヿ]/u.test(all)) return "ja";
   if (/[가-힯]/u.test(all)) return "ko";
   if (hasCjk(all)) return "zh-CN";
@@ -272,79 +317,156 @@ export function distanceM(a: { lat: number; lng: number }, b: { lat: number; lng
 
 const MAX_QUERY = 300;
 
-interface Candidate {
+/** Everything Google said about one place, in every language asked. The
+ *  first name and address are the ones in Google's default language. */
+interface Seen {
   googlePlaceId: string;
-  name: string | null;
-  formattedAddress: string | null;
+  names: string[];
+  addresses: string[];
   lat: number | null;
   lng: number | null;
 }
 
-/**
- * Does a found place's address agree with the read one? A read house
- * number must be in it. A read street with no number must be in it too:
- * Latin words compared without the street type ("Blvd") or side ("S"); a
- * Han street ("天平路") against Google's address in the street's own
- * script, asked for when the first answer is in English.
- */
-async function addressAgreement(
-  c: Candidate,
-  address: string | null | undefined,
-  query: string,
-  locationBias: MatchOptions["locationBias"],
-): Promise<null | "address_mismatch" | "street_mismatch" | "street_unverified"> {
-  // A landmark ("near X", "X与Y交叉口") is not an address: the match rests
-  // on the name and the locality, as with no address at all.
-  if (isLandmarkAddress(address)) return null;
-  const number = houseNumber(address);
-  const numberIn = (f: string | null) => Boolean(number) && new RegExp(`(^|[^0-9A-Za-z])${number}([^0-9A-Za-z]|$)`, "i").test(f ?? "");
-  if (number) {
-    if (numberIn(c.formattedAddress)) return null;
-    // Google's address has a street and not this number: another branch.
-    // With no street in it at all, the number cannot be checked; the
-    // street is compared below, in the street's own script if need be.
-    if (hasStreetLevel(c.formattedAddress)) return "address_mismatch";
-  }
-  const core = streetCore(address);
-  if (!core) return number ? "street_unverified" : null;
-  let verdict = streetIn(core, c.formattedAddress);
-  let local: string | null = null;
-  if (verdict === "unknown" || (number && verdict === "no" && !hasStreetLevel(c.formattedAddress))) {
-    const lang = languageFor([address ?? ""]);
-    const again = lang ? await findPlaceByText(query, { locationBias: locationBias ?? null, language: lang }).catch(() => null) : null;
-    if (again && again.googlePlaceId === c.googlePlaceId) {
-      local = again.formattedAddress;
-      if (number) {
-        if (numberIn(local)) return null;
-        if (hasStreetLevel(local)) return "address_mismatch";
-      }
-      verdict = streetIn(core, local);
-    }
-  }
-  if (verdict === "yes") return null;
-  return hasStreetLevel(c.formattedAddress) || hasStreetLevel(local) ? "street_mismatch" : "street_unverified";
-}
+// ── Locality ────────────────────────────────────────────────────────────
 
-/** The parts of a read locality ("豫园/城隍庙，上海" → 豫园, 城隍庙, 上海),
- *  without a trailing 市 / 区 / 县, folded. */
-function localityParts(locality: string | null | undefined): string[] {
-  return (locality ?? "")
+/** What to look for in Google's address for a read locality ("豫园/城隍庙，
+ *  上海" → 豫园, 城隍庙, 上海, shanghai; "Arts District, DTLA" → arts
+ *  district, los angeles; "Downtown Los Angeles" → also "los angeles"),
+ *  folded, a trailing 市 / 区 / 县 cut. */
+export function localityTerms(locality: string | null | undefined): string[] {
+  const out = new Set<string>();
+  const parts = (locality ?? "")
     .split(/[\/,，、;；|·()（）]+|\s{2,}/u)
     .flatMap((p) => (HAN.test(p) ? [p.replace(/\s+/g, "")] : [p]))
     .map((p) => fold(p.trim()).replace(/(市|区|區|县|縣)$/u, ""))
-    .filter((p) => p.length >= (HAN.test(p) ? 2 : 3));
+    .filter(Boolean);
+  for (const p of parts) {
+    if (HAN.test(p)) {
+      if (p.length >= 2) out.add(p);
+      // A branch area read with its 店 ("外滩店"); a place whose name ends
+      // in 店 (驻马店) is in an address that carries the rest of it too.
+      const bare = p.replace(/分?店$/u, "");
+      if (bare !== p && bare.length >= 2) out.add(bare);
+      for (const [han, city] of Object.entries(CITY_ALIASES)) {
+        if (HAN.test(han) && p.includes(han)) {
+          out.add(han);
+          out.add(city);
+        }
+      }
+      continue;
+    }
+    const alias = CITY_ALIASES[p];
+    if (alias) out.add(alias);
+    if (p.length >= 3) out.add(p);
+    // "Downtown Los Angeles", "Lower East Side, New York": a trailing run
+    // of two words or more may be the city.
+    const words = p.split(/\s+/).filter(Boolean);
+    for (let i = 1; i + 2 <= words.length; i++) out.add(words.slice(i).join(" "));
+  }
+  return [...out];
 }
 
-/** One of the read locality's parts is in one of Google's addresses. */
-function localityIn(locality: string | null | undefined, addresses: (string | null)[]): boolean {
-  const parts = localityParts(locality);
-  const hay = addresses.filter((a): a is string => Boolean(a)).map(fold);
-  return parts.some((p) => hay.some((h) => h.includes(p)));
+/** One of the read locality's terms is in one of Google's addresses. */
+export function localityIn(locality: string | null | undefined, addresses: (string | null)[]): boolean {
+  const terms = localityTerms(locality);
+  const hay = addresses.filter((a): a is string => Boolean(a)).map((a) => {
+    const f = fold(a);
+    return { words: ` ${f.split(/[^\p{L}\p{N}]+/u).filter(Boolean).join(" ")} `, raw: f, squashed: f.replace(/[^\p{L}\p{N}]+/gu, "") };
+  });
+  return terms.some((t) =>
+    hay.some((h) => {
+      if (HAN.test(t)) return h.raw.includes(t);
+      // A whole word or run of words; or, eight letters or more, inside a
+      // run Google wrote without spaces ("Shang Hai Shi" for "shanghai").
+      if (h.words.includes(` ${t} `)) return true;
+      const sq = t.replace(/\s+/g, "");
+      return sq.length >= 8 && h.squashed.includes(sq);
+    }),
+  );
 }
 
-/** Find Place for a query, then link what it found, or keep it as a
- *  suggestion when it is a guess. Never throws. */
-export async function matchPlaceByText(query: string, basis: string, nameLocal: string | null, opts: MatchOptions): Promise<PlaceMatch> {
+// ── The decision ────────────────────────────────────────────────────────
+
+interface Judged {
+  /** `agrees`: one name carries the other; `uncomparable`: different
+   *  scripts; `partial`: they share a word; `none`: they share nothing. */
+  name: "agrees" | "uncomparable" | "partial" | "none";
+  score: number | null;
+  /** Null when the location is confirmed. */
+  where: MatchReason | null;
+}
+
+function judgeName(names: string[], c: Seen): Pick<Judged, "name" | "score"> {
+  const pairs = names.flatMap((n) => c.names.map((f) => [n, f] as const));
+  const comparablePairs = pairs.filter(([n, f]) => comparable(n, f));
+  if (comparablePairs.length === 0) return { name: "uncomparable", score: null };
+  const score = Math.max(0, ...comparablePairs.map(([n, f]) => nameScore(n, f)));
+  if (comparablePairs.some(([n, f]) => nameMatches(n, f))) return { name: "agrees", score };
+  const shares = comparablePairs.some(([n, f]) => {
+    const fs = new Set(looseTokens(f));
+    return looseTokens(n).some((t) => fs.has(t));
+  });
+  return { name: shares || score > 0 ? "partial" : "none", score };
+}
+
+/** The read address against Google's addresses of the place: null when
+ *  it is confirmed, or when it says nothing checkable (a landmark), in
+ *  which case the locality decides. */
+function judgeAddress(address: string | null | undefined, c: Seen): MatchReason | "no_address" | null {
+  if (!address || isLandmarkAddress(address)) return "no_address";
+  const a = address.replace(/[(（][^()（）]*[)）]/gu, " ").trim();
+  const number = houseNumber(a);
+  const core = streetCore(a);
+  if (!number && !core) return "no_address";
+  const streetLevel = c.addresses.some(hasStreetLevel);
+  if (number) {
+    const re = new RegExp(`(^|[^0-9A-Za-z])${number}([^0-9A-Za-z]|$)`, "i");
+    if (c.addresses.some((f) => re.test(f))) return null;
+    if (streetLevel) return "address_mismatch";
+  }
+  if (!core) return "street_unverified";
+  const verdicts = c.addresses.map((f) => streetIn(core, f));
+  if (verdicts.includes("yes")) return null;
+  return streetLevel ? "street_mismatch" : "street_unverified";
+}
+
+/**
+ * Find a place for a query and decide what it is to the wish: a place to
+ * link (`linkGoogleId`), a suggestion, or nothing. Calls Google, writes
+ * nothing; `matchPlaceByText` links. `scripts/check-wish-match.ts` runs
+ * every case this rule has been tested on through it.
+ *
+ * The rule. A place is linked only when its name agrees with the asked-for
+ * one (`nameMatches`, in any language Google gave it in; a different script
+ * counts for a capture with an address or a city) and the read location is
+ * confirmed by Google's address in any language asked:
+ * - a capture with a street address: its house number, else its street
+ *   ("6th St", "天平路"), is in Google's address. Where Google's address
+ *   names no street at all, the read locality must be in it instead, the
+ *   name must agree at 0.9 or more, and no other place of that name in
+ *   Text Search's answer may be one the address cannot rule out
+ *   (`address_unverified`);
+ * - a capture with a city or neighbourhood and no address: a part of it
+ *   is in Google's address (`localityIn`);
+ * - a typed name: the place is inside the workspace's usual area.
+ * A reading that is itself a guess (`name_only`, `low_confidence`) is never
+ * linked. When Find Place's first answer does not qualify, Text Search (in
+ * the name's script and in English) is tried for one that does.
+ *
+ * Anything weaker is a suggestion with the reason; a found place whose
+ * name shares no word with the asked-for one is dropped (`rejected`). A
+ * typed name found outside the area whose name does not agree is offered
+ * only when Google's name shares the title's words and the rest of the
+ * title is in its address ("El Farolito Mission District" → Taquería El
+ * Farolito, Mission St); an in-area branch carrying the brand word comes
+ * first ("Sugarfish Little Tokyo" → a Los Angeles SUGARFISH), and a branch
+ * named for somewhere else with no in-area one is dropped.
+ */
+export async function decidePlaceMatch(
+  query: string,
+  basis: string,
+  opts: MatchOptions,
+): Promise<{ match: PlaceMatch; linkGoogleId: string | null }> {
   const q = query.trim().slice(0, MAX_QUERY);
   const match: PlaceMatch = {
     query: q,
@@ -360,155 +482,161 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     error: null,
   };
   const names = opts.names.map((n) => n.trim()).filter(Boolean);
-  const lang = languageFor(names);
+  const typed = opts.requireInArea !== undefined;
+  const area = opts.requireInArea ?? null;
+  const bias = typed ? area : opts.locationBias ?? null;
+  // The script to ask in besides English: the name's, else the address's.
+  const lang = languageFor(names) ?? languageFor([opts.address, opts.locality]);
+
+  const seen = new Map<string, Seen>();
+  const order: string[] = [];
+  const note = (id: string, name: string | null, address: string | null, lat: number | null, lng: number | null) => {
+    let s = seen.get(id);
+    if (!s) {
+      s = { googlePlaceId: id, names: [], addresses: [], lat, lng };
+      seen.set(id, s);
+      order.push(id);
+    }
+    if (name && !s.names.includes(name)) s.names.push(name);
+    if (address && !s.addresses.includes(address)) s.addresses.push(address);
+    if (s.lat === null && lat !== null) s.lat = lat;
+    if (s.lng === null && lng !== null) s.lng = lng;
+  };
+
+  const inArea = (c: Seen) => Boolean(area) && c.lat !== null && c.lng !== null && distanceM(area!, { lat: c.lat, lng: c.lng }) <= area!.radiusM;
+  const judge = (c: Seen): Judged => {
+    const n = judgeName(names, c);
+    let where: MatchReason | null;
+    if (typed) where = !area ? "name_only" : inArea(c) ? null : "outside_area";
+    else {
+      const a = judgeAddress(opts.address, c);
+      if (a !== "no_address") where = a;
+      else if (opts.locality) where = localityIn(opts.locality, c.addresses) ? null : "locality_mismatch";
+      else where = "name_only";
+    }
+    return { ...n, where };
+  };
+  const linkable = (j: Judged) =>
+    !opts.guessReason && j.where === null && (j.name === "agrees" || (j.name === "uncomparable" && opts.trustUncomparable === true));
+  const finish = (c: Seen, j: Judged, reason: MatchReason | null): { match: PlaceMatch; linkGoogleId: string | null } => {
+    match.google_place_id = c.googlePlaceId;
+    match.name = c.names[0] ?? null;
+    match.formatted_address = c.addresses[0] ?? null;
+    match.name_score = j.score === null ? null : Math.round(j.score * 100) / 100;
+    if (reason) {
+      match.tentative = true;
+      match.tentative_reason = reason;
+      return { match, linkGoogleId: null };
+    }
+    return { match, linkGoogleId: c.googlePlaceId };
+  };
+  const reject = (c: Seen, error: string) => {
+    match.rejected = { google_place_id: c.googlePlaceId, name: c.names[0] ?? null, formatted_address: c.addresses[0] ?? null };
+    match.error = error;
+    return { match, linkGoogleId: null };
+  };
+
   try {
-    const first: FoundPlace | null = await findPlaceByText(q, { locationBias: opts.locationBias ?? null });
+    // Find Place answers nothing for some phrasings Text Search reads
+    // ("R&G Lounge near Commercial St"): its first answer stands in.
+    const first =
+      (await findPlaceByText(q, { locationBias: bias })) ??
+      (await searchPlacesByText(q, { maxResults: 1, locationBias: bias }).then(
+        ([c]) => (c ? { googlePlaceId: c.google_place_id, name: c.name, formattedAddress: c.formatted_address, lat: c.lat, lng: c.lng } : null),
+        () => null,
+      ));
     if (!first) {
       match.error = "no place found";
-      return match;
+      return { match, linkGoogleId: null };
     }
-    let found: Candidate = first;
-    const best = (f: Candidate) => Math.max(0, ...names.map((n) => nameScore(n, f.name ?? "")));
-    /** The names agree, asking again in the name's own script when Google
-     *  answered a CJK name in English. */
-    const nameAgreement = async (c: Candidate): Promise<{ agrees: boolean; score: number | null }> => {
-      if (names.some((n) => nameMatches(n, c.name ?? ""))) return { agrees: true, score: best(c) };
-      if (lang) {
-        const again = await findPlaceByText(q, { locationBias: opts.locationBias ?? null, language: lang }).catch(() => null);
-        if (again && again.googlePlaceId === c.googlePlaceId && names.some((n) => nameMatches(n, again.name ?? ""))) {
-          return { agrees: true, score: best(again) };
-        }
-      }
-      return { agrees: false, score: null };
-    };
-    let names1 = await nameAgreement(found);
-    let addressIssue = await addressAgreement(found, opts.address, q, opts.locationBias);
+    note(first.googlePlaceId, first.name, first.formattedAddress, first.lat, first.lng);
+    if (lang) {
+      const local = await findPlaceByText(q, { locationBias: bias, language: lang }).catch(() => null);
+      if (local?.googlePlaceId === first.googlePlaceId) note(local.googlePlaceId, local.name, local.formattedAddress, local.lat, local.lng);
+    }
+    const firstSeen = seen.get(first.googlePlaceId)!;
+    const firstJudged = judge(firstSeen);
+    if (linkable(firstJudged)) return finish(firstSeen, firstJudged, null);
 
-    // Google's first answer is at another address, or is another place
-    // altogether (a name it can compare that does not agree: "Kang Ho
-    // Dong Baekjeong 6th St" answered with another restaurant on 6th St):
-    // the place meant may be further down the list. Text Search, in the
-    // name's script and in English, and take the first whose name and
-    // address both agree.
-    /** Google's addresses of the first answer, in every language seen. */
-    const firstAddresses: (string | null)[] = [found.formattedAddress];
-    /** Other places of the asked-for name whose address cannot rule them
-     *  out either (Google gives no street for them). */
-    let otherUnrefuted = 0;
+    // Text Search, in the name's script and in English, for a place that
+    // qualifies further down Google's list. Not for a bare name with
+    // nothing to check it against.
     let searched = false;
-    /** Every place Text Search answered, in its order. */
-    const listed: Candidate[] = [];
-    const otherName = !names1.agrees && names.some((n) => comparable(n, found.name ?? ""));
-    if (addressIssue || otherName) {
-      const seen = new Set([found.googlePlaceId]);
-      const firstId = found.googlePlaceId;
-      const langs = [...new Set([lang ?? languageFor([opts.address ?? ""]), undefined])];
-      search: for (const languageCode of langs) {
-        const list = await searchPlacesByText(q, { maxResults: 5, languageCode, locationBias: opts.locationBias ?? null }).catch(() => null);
+    if (opts.guessReason !== "name_only") {
+      for (const languageCode of [...new Set([lang, undefined])]) {
+        const list = await searchPlacesByText(q, { maxResults: 5, languageCode, locationBias: bias }).catch(() => null);
         if (!list) continue;
         searched = true;
-        for (const c of list) {
-          if (c.google_place_id === firstId) firstAddresses.push(c.formatted_address);
-          if (seen.has(c.google_place_id)) continue;
-          seen.add(c.google_place_id);
-          const cand: Candidate = { googlePlaceId: c.google_place_id, name: c.name, formattedAddress: c.formatted_address, lat: c.lat, lng: c.lng };
-          listed.push(cand);
-          if (!names.some((n) => nameMatches(n, cand.name ?? ""))) continue;
-          const issue = await addressAgreement(cand, opts.address, q, opts.locationBias);
-          if (issue === "street_unverified") otherUnrefuted++;
-          if (issue !== null) continue;
-          found = cand;
-          names1 = { agrees: true, score: best(cand) };
-          addressIssue = null;
-          break search;
-        }
+        for (const c of list) note(c.google_place_id, c.name, c.formatted_address, c.lat, c.lng);
       }
     }
+    const judged = order.map((id) => ({ c: seen.get(id)!, j: judge(seen.get(id)!) }));
+    const ok = judged.find(({ j }) => linkable(j));
+    if (ok) return finish(ok.c, ok.j, null);
 
-    // Google's address names no street (common for mainland China: "四牌楼
-    // Huangpu, China"), so the read one can be neither confirmed nor
-    // refuted. Linked when the name agrees closely, the read locality is in
-    // Google's address, and no other place of that name could be the one
-    // at the read address (every other branch Text Search knows is on
-    // another street or number).
-    if (addressIssue === "street_unverified" && names1.agrees && (names1.score ?? 0) >= 0.9 && searched && otherUnrefuted === 0) {
-      let inArea = localityIn(opts.locality, firstAddresses);
-      if (!inArea && lang) {
-        const again = await findPlaceByText(q, { locationBias: opts.locationBias ?? null, language: lang }).catch(() => null);
-        if (again && again.googlePlaceId === found.googlePlaceId) inArea = localityIn(opts.locality, [again.formattedAddress]);
-      }
-      if (inArea) {
-        addressIssue = null;
+    // Google's address names no street to check the read one against
+    // (mainland China: "四牌楼 Huangpu, China"): linked on the name and the
+    // locality when no other place of that name could be at the address.
+    if (!opts.guessReason && searched && opts.locality) {
+      const sameName = judged.filter(({ j }) => j.name === "agrees");
+      const unrefuted = sameName.filter(({ j }) => j.where === "street_unverified");
+      const only = unrefuted.length === 1 ? unrefuted[0]! : null;
+      if (only && (only.j.score ?? 0) >= 0.9 && localityIn(opts.locality, only.c.addresses)) {
         match.address_unverified = true;
+        return finish(only.c, only.j, null);
       }
     }
 
-    // A typed name with words for where ("Sugarfish Little Tokyo"): no
-    // branch carries the whole of it, and Find Place may answer with one in
-    // another city. A branch in the workspace's area that carries the
-    // name's first word (the brand) is the better suggestion; with none, a
-    // place elsewhere whose name does not agree is not suggested at all.
-    const area = opts.requireInArea;
-    const inArea = (c: Candidate) =>
-      Boolean(area) && c.lat !== null && c.lng !== null && distanceM(area!, { lat: c.lat, lng: c.lng }) <= area!.radiusM;
-    let brandOnly = false;
-    if (area && !inArea(found) && !names1.agrees) {
-      if (!searched) {
-        const list = await searchPlacesByText(q, { maxResults: 5, languageCode: lang, locationBias: area }).catch(() => null);
-        for (const c of list ?? []) {
-          if (c.google_place_id === found.googlePlaceId) continue;
-          listed.push({ googlePlaceId: c.google_place_id, name: c.name, formattedAddress: c.formatted_address, lat: c.lat, lng: c.lng });
-        }
-      }
+    const reasonFor = (j: Judged): MatchReason =>
+      opts.guessReason ?? j.where ?? (j.name === "uncomparable" ? "name_unverified" : "name_mismatch");
+
+    // A typed name found outside the area with a name that does not agree.
+    if (typed && area && firstJudged.where === "outside_area" && firstJudged.name !== "agrees") {
       const brands = names.map((n) => nameTokens(n)[0]).filter((t): t is string => Boolean(t) && (hasCjk(t!) || t!.length >= 3));
-      const local = listed.find((c) => inArea(c) && brands.some((b) => nameTokens(c.name ?? "").includes(b)));
-      if (local) {
-        found = local;
-        names1 = { agrees: false, score: best(local) };
-        addressIssue = null;
-        brandOnly = true;
-      } else if (names.some((n) => comparable(n, found.name ?? ""))) {
-        match.rejected = { google_place_id: found.googlePlaceId, name: found.name, formatted_address: found.formattedAddress };
-        match.error = "no place of that name found in the usual area";
-        return match;
-      }
+      const local = judged.find(({ c }) => inArea(c) && brands.some((b) => c.names.some((n) => nameTokens(n).includes(b))));
+      if (local) return finish(local.c, local.j, local.j.name === "agrees" ? "outside_area" : "name_mismatch");
+      if (firstJudged.name === "partial" && namedForItsAddress(names, firstSeen)) return finish(firstSeen, firstJudged, "outside_area");
+      return reject(firstSeen, "no place of that name found in the usual area");
     }
 
-    match.google_place_id = found.googlePlaceId;
-    match.name = found.name;
-    match.formatted_address = found.formattedAddress;
-    match.name_score = Math.round((names1.score ?? best(found)) * 100) / 100;
-    const agrees = names1.agrees;
-    const uncomparable = !agrees && names.every((n) => !comparable(n, found.name ?? ""));
-    if (uncomparable) match.name_score = null;
-    const trusted = agrees || (uncomparable && opts.trustUncomparable === true);
-    // A bare name: only a place in the workspace's own area is linked.
-    let areaIssue: string | null = null;
-    if (opts.requireInArea !== undefined) {
-      const area = opts.requireInArea;
-      if (!area) areaIssue = "name_only";
-      else if (found.lat === null || found.lng === null || distanceM(area, { lat: found.lat, lng: found.lng }) > area.radiusM) {
-        areaIssue = "outside_area";
-      }
-    }
-    // Google's answer shares no word with the name asked for: it is
-    // another place, and offering it would suggest the wrong one. Nothing
-    // is suggested; what Google answered is kept for the record.
-    if (!agrees && !uncomparable && match.name_score === 0 && !brandOnly) {
-      match.google_place_id = null;
-      match.name = null;
-      match.formatted_address = null;
-      match.rejected = { google_place_id: found.googlePlaceId, name: found.name, formatted_address: found.formattedAddress };
-      match.error = "no place of that name found";
-      return match;
-    }
-    if (!trusted || addressIssue || areaIssue || opts.guessReason) {
-      match.tentative = true;
-      match.tentative_reason =
-        opts.guessReason ?? addressIssue ?? areaIssue ?? (uncomparable ? "name_unverified" : "name_mismatch");
-      return match;
-    }
-    const link = await linkGooglePlace(found.googlePlaceId, nameLocal);
+    // The best guess: the first place whose name agrees (or cannot be
+    // compared), else the first answer if its name shares a word.
+    const pick =
+      judged.find(({ j }) => j.name === "agrees") ??
+      judged.find(({ j }) => j.name === "uncomparable") ??
+      (firstJudged.name === "partial" ? { c: firstSeen, j: firstJudged } : null);
+    if (!pick) return reject(firstSeen, "no place of that name found");
+    return finish(pick.c, pick.j, reasonFor(pick.j));
+  } catch (err) {
+    match.error = (err as Error).message.slice(0, 200);
+    return { match, linkGoogleId: null };
+  }
+}
+
+/** A typed "<name> <where>" whose found place carries the name and sits
+ *  at the where: every word of the title Google's name lacks is either in
+ *  Google's address or there are none ("El Farolito Mission District" →
+ *  Taquería El Farolito, 2779 Mission St: "mission" is in the address).
+ *  "Sugarfish Little Tokyo" → SUGARFISH Little Italy, San Diego is not:
+ *  "tokyo" is nowhere in it. */
+function namedForItsAddress(names: string[], c: Seen): boolean {
+  const found = new Set(c.names.flatMap((n) => looseTokens(n)));
+  const addr = new Set(c.addresses.flatMap((a) => addressWords(a)));
+  return names.some((n) => {
+    const words = looseTokens(n);
+    if (!words.some((w) => found.has(w))) return false;
+    const extra = words.filter((w) => !found.has(w));
+    return extra.length === 0 || extra.some((w) => addr.has(w));
+  });
+}
+
+/** Find Place for a query, then link what it found, or keep it as a
+ *  suggestion when it is a guess (`decidePlaceMatch`). Never throws. */
+export async function matchPlaceByText(query: string, basis: string, nameLocal: string | null, opts: MatchOptions): Promise<PlaceMatch> {
+  const { match, linkGoogleId } = await decidePlaceMatch(query, basis, opts);
+  if (!linkGoogleId) return match;
+  try {
+    const link = await linkGooglePlace(linkGoogleId, nameLocal);
     match.place_id = link.placeId;
     match.error = link.error;
   } catch (err) {
@@ -516,6 +644,7 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
   }
   return match;
 }
+
 
 // ── The workspace's usual area ─────────────────────────────────────────
 

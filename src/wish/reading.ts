@@ -6,6 +6,7 @@
  */
 import { z } from "zod";
 import { fencedBlocks, pgSafeText } from "../ingest/contract/artefact.js";
+import { isKnownCity } from "./cities.js";
 
 const short = (max: number) =>
   z
@@ -19,7 +20,7 @@ const optionalShort = (max: number) =>
 
 /** Bumped with any change to what the prompt asks for; recorded on every
  *  capture as `capture.prompt_version`. */
-export const WISH_READ_PROMPT_VERSION = "1.5";
+export const WISH_READ_PROMPT_VERSION = "1.6";
 
 /** A link the server keeps: http(s) only. A bare domain ("instagram.com/x")
  *  is read as https; anything else (javascript:, data:, a phone number) is
@@ -62,13 +63,15 @@ export function splitBranch(title: string): { name: string; branch: string | nul
   return { name: title, branch: null };
 }
 
-/** "外滩店" → "外滩": a branch written as a locality names its area, not a
- *  shop. Left alone when the 店 is part of a word for a kind of place
- *  ("和平饭店", "半岛酒店", "新华书店": a hotel or shop the place is in, not
- *  a branch), or when one character or nothing would remain ("本店"). */
+/** "黄河路店" → "黄河路": the area of a branch split off a title ("佳家汤包
+ *  (黄河路店)"). Left alone when the 店 is part of a word for a kind of
+ *  place ("和平饭店", "半岛酒店", "新华书店": a hotel or shop the place is
+ *  in, not a branch), or when one character or nothing would remain
+ *  ("本店"). Only for a branch: a locality is a place name as read, and
+ *  many end in 店 (驻马店, 长辛店, 五里店). */
 const NOT_A_BRANCH_BEFORE_DIAN = /[饭飯酒商书書旅药藥花客网網茶]$/u;
-export function branchArea(locality: string): string {
-  const t = locality.trim();
+export function branchArea(branch: string): string {
+  const t = branch.trim();
   const fen = /^(.+?)\s*分店$/u.exec(t);
   if (fen?.[1] && fen[1].trim().length >= 2) return fen[1].trim();
   const m = /^(.+?)\s*店$/u.exec(t);
@@ -77,16 +80,58 @@ export function branchArea(locality: string): string {
   return rest;
 }
 
-/** A list post names its city once: an entry whose locality lacks the
- *  main reading's city ("Nob Hill, San Francisco") gets it appended
- *  ("Hayes Valley" → "Hayes Valley, San Francisco"). Only a city the main
- *  locality gives after a comma; nothing is invented. */
+/** A locality read straight from a branch name: only an unmistakable one
+ *  loses its 店, a 分店 or a street's branch ("黄河路店" → "黄河路").
+ *  "外滩店" is kept as read (the prompt asks for the area without 店, and
+ *  the matcher also looks for "外滩"); "驻马店" is a city. */
+export function localityArea(locality: string): string {
+  const t = locality.trim();
+  if (/分店$/u.test(t) || /(路|街|道|巷|广场|廣場|中心)店$/u.test(t)) return branchArea(t);
+  return t;
+}
+
+/** A list post names its city once: an entry whose locality is only a
+ *  neighbourhood ("Hayes Valley") gets the main reading's city ("Nob
+ *  Hill, San Francisco" → "Hayes Valley, San Francisco"). Only a city the
+ *  main locality gives after a comma, and only for an entry that names no
+ *  city of its own: one with its own comma-separated part ("Boyle
+ *  Heights, Los Angeles") or that is a known city ("Chicago") is kept as
+ *  read. Nothing is invented. */
 export function withListCity(locality: string | null, mainLocality: string | null): string | null {
   if (!locality || !mainLocality) return locality;
   const parts = mainLocality.split(/[,，]/u).map((p) => p.trim()).filter(Boolean);
   if (parts.length < 2) return locality;
+  const own = locality.split(/[,，]/u).map((p) => p.trim()).filter(Boolean);
+  if (own.length >= 2 || own.some(isKnownCity)) return locality;
   const city = parts[parts.length - 1]!;
   return locality.toLowerCase().includes(city.toLowerCase()) ? locality : `${locality}, ${city}`;
+}
+
+const SHOP_APPS = /^(amazon|ebay|walmart|target|best buy|etsy|costco|ikea|apple|淘宝|天猫|京东|拼多多|aliexpress|temu|shein|rakuten|楽天)$/i;
+
+/** Highlights that are only the listing's own words: a product title's
+ *  feature list ("Sony WH-1000XM5 ..., Auto NC Optimizer, Crystal Clear
+ *  Hands-Free Calling") read back as highlights. A highlight contained in
+ *  the listing's printed title, the title or the category is dropped; for
+ *  a shop's listing with no person recommending it, every highlight is
+ *  (the prompt asks for [] there; the model has not always given it). */
+export function listingHighlights(r: {
+  kind: string;
+  title: string;
+  listing_title: string | null;
+  category: string | null;
+  source_app: string | null;
+  recommended_by: string | null;
+  highlights: string[];
+}): string[] {
+  if (r.kind !== "thing") return r.highlights;
+  if (r.source_app && SHOP_APPS.test(r.source_app.trim()) && !r.recommended_by) return [];
+  const squash = (s: string | null) => (s ?? "").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const hay = [r.listing_title, r.title, r.category].map(squash).filter(Boolean);
+  return r.highlights.filter((h) => {
+    const k = squash(h);
+    return !k || !hay.some((x) => x.includes(k));
+  });
 }
 
 /** The app names a reading may give, folded to one spelling each. */
@@ -163,6 +208,10 @@ export const WishReading = z
     source_app: optionalShort(60),
     /** A link printed in the image, copied exactly. Never constructed. */
     source_url: optionalShort(500),
+    /** For a thing on a shop's listing: the product's title exactly as the
+     *  listing prints it, in full. Kept so its words are not taken for
+     *  highlights (`listingHighlights`). */
+    listing_title: optionalShort(500),
     /** For a thing: the printed price in minor units and its currency. */
     price_minor: z.number().int().positive().max(1_000_000_000).nullish().transform((n) => n ?? null),
     currency: z
@@ -193,18 +242,28 @@ export const WishReading = z
         title: t.name,
         name_local: n ? n.name : o.name_local,
         // "黄河路店" → "黄河路": the branch's area.
-        locality: o.locality ? branchArea(o.locality) : branch ? branchArea(branch) : null,
+        // The branch split off the title is its area, 店 cut; a locality
+        // read on its own is a place name, cut only where unmistakable.
+        locality: o.locality
+          ? branch && o.locality.trim() === branch
+            ? branchArea(branch)
+            : localityArea(o.locality)
+          : branch
+            ? branchArea(branch)
+            : null,
       };
     };
     const place = r.kind === "place";
     const main = unbranch(r, place);
+    const sourceApp = normaliseSourceApp(r.source_app);
     return {
       ...main,
+      highlights: listingHighlights({ ...main, source_app: sourceApp }),
       name_local: sameAsTitle(main.name_local, main.title),
       locality: dropGloss(main.locality),
       category: dropGloss(r.category),
       source_url: safeHttpUrl(r.source_url),
-      source_app: normaliseSourceApp(r.source_app),
+      source_app: sourceApp,
       others: r.others
         .map((o) => unbranch(o, place))
         .filter((o) => o.title.trim().toLowerCase() !== main.title.trim().toLowerCase())
@@ -248,6 +307,7 @@ Then end your reply with exactly one fenced JSON block:
   "recommended_by": "the name of the person who recommended it, as shown, else null",
   "source_app": "the app or site this is a screenshot of, if recognisable, else null",
   "source_url": "a link printed in the image, copied exactly, else null",
+  "listing_title": null,
   "price_minor": null,
   "currency": null,
   "confidence": "high" | "medium" | "low",
@@ -260,7 +320,7 @@ Then end your reply with exactly one fenced JSON block:
 Rules:
 - Copy names exactly as printed. Do not translate a name that is printed in one script only; put it in "title" as it is.
 - "title" is the whole name. A sign or menu that prints the name in parts ("PHILIPPE / The Original", "JOE'S / Pizza") gives the whole name ("Philippe The Original", "Joe's Pizza"), not only its largest word.
-- "title" is the place's name without a branch suffix: "佳家汤包(黄河路店)" is "佳家汤包", "Din Tai Fung - Glendale" is "Din Tai Fung"; the branch ("黄河路", "Glendale") goes in "locality" when nothing else gives one.
+- "title" is the place's name without a branch suffix: "佳家汤包(黄河路店)" is "佳家汤包", "Din Tai Fung - Glendale" is "Din Tai Fung"; the branch ("黄河路", "Glendale") goes in "locality" when nothing else gives one, as its area without 店 or 分店 ("外滩店" is "外滩"). A place name that itself ends in 店 (驻马店, 长辛店) is kept whole.
 - "address" is the street as the image gives it, with or without a house number: "天平路", "Valley Blvd", "700 S Grand Ave". Copy only what is printed or said; do not add cross streets, a city or anything in brackets. "locality" is only a city, district, neighbourhood or branch area, never a street: "天平路那家老店" in Shanghai is address "天平路", locality "上海". A street given only as a landmark ("near Commercial St", "近 Commercial St", "between X and Y", "at the corner of X", "南京路与西藏路交叉口", "天平路附近") is not the address: give "address" null and keep the phrase in "note".
 - A locality nickname is written out as the neighbourhood's own name: "K-town" is "Koreatown", "DTLA" is "Downtown Los Angeles", "WeHo" is "West Hollywood". Add a city only when the image gives it.
 - A post that names its city once ("3 San Francisco classics", "上海5家必吃") puts that city in every locality, the main one too: "Nob Hill, San Francisco", "Hayes Valley, San Francisco", or "San Francisco" for an entry with no neighbourhood.
@@ -271,6 +331,7 @@ Rules:
 - "source_app": name the app or site only from what identifies it on screen (its logo, its name, its distinctive layout), spelled as one of: Google Maps, Apple Maps, Yelp, Instagram, 小红书, WeChat, 大众点评, 抖音, TikTok, Amazon, X, Facebook, or the site's own name for anything else. A chat names its app only when the app's name or logo is on screen: never guess it from bubble colours or avatars (null).
 - "others" is [] unless the post lists several places or things with equal weight.
 - Never invent a locality, an address or a link. Null is the right answer when the image does not show it.
+- "listing_title" is for a thing on a shop's own listing (Amazon, a store's site): the product's title exactly as the listing prints it, in full, features and all. Null otherwise. "title" stays the short name a person would say ("Sony WH-1000XM5").
 - "price_minor" and "currency" are for a thing with a printed price (USD 12.99 is 1299, "USD"; JPY 5000 is 5000, "JPY"). Null for a place.
 - "kind": "none" when the image shows nothing a person could go to or buy; give "title" a short description of what it does show.`;
 }

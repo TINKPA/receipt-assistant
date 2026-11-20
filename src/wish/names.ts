@@ -24,7 +24,23 @@ const GENERIC = new Set([
 
 const CJK = /[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]/u;
 
+/** Only the words that never name anything: articles and the like. */
+const ARTICLES = new Set([
+  "the", "and", "of", "a", "an", "at", "on", "in", "by", "de", "la", "le", "el", "les", "los", "las", "di", "da",
+]);
+
 export function nameTokens(s: string): string[] {
+  return tokens(s).filter((t) => !GENERIC.has(t));
+}
+
+/** Every word of a name but its articles: "The Kitchen Boulder" →
+ *  kitchen, boulder. For "do the two names share a word at all", where
+ *  "kitchen" or "house" counts. */
+export function looseTokens(s: string): string[] {
+  return tokens(s).filter((t) => !ARTICLES.has(t));
+}
+
+function tokens(s: string): string[] {
   const folded = s
     .normalize("NFKD")
     .replace(/\p{M}/gu, "")
@@ -47,7 +63,7 @@ export function nameTokens(s: string): string[] {
       if (latin) out.push(latin);
     } else out.push(word);
   }
-  return out.filter((t) => !GENERIC.has(t));
+  return out;
 }
 
 export function hasCjk(s: string): boolean {

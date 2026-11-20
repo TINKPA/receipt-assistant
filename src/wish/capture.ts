@@ -28,7 +28,7 @@ import { getUploadDir } from "../routes/documents.service.js";
 import { resolveInside } from "../http/files.js";
 import { HttpProblem } from "../http/problem.js";
 import { storableImage } from "./image.js";
-import { isLandmarkAddress, matchPlaceByText, workspaceArea, type PlaceMatch } from "./places.js";
+import { isLandmarkAddress, landmarkQueryText, matchPlaceByText, workspaceArea, type MatchOptions, type PlaceMatch } from "./places.js";
 import { settleWishesSafely } from "./loop.js";
 import {
   WISH_READ_PROMPT_VERSION,
@@ -225,7 +225,7 @@ export async function recoverInterruptedCaptures(): Promise<number> {
 
 // ── Reading one capture ──────────────────────────────────────────────
 
-interface Placeable {
+export interface Placeable {
   title: string;
   name_local: string | null;
   locality: string | null;
@@ -237,8 +237,9 @@ function placeQuery(r: Placeable): { query: string; basis: "address" | "locality
   // The address with its neighbourhood or city: "7 Carmine St" alone is a
   // street in many towns.
   // A landmark ("near X St") with no city says too little to rest on.
-  if (r.address && isLandmarkAddress(r.address) && !r.locality) return { query: `${name} ${r.address}`, basis: "name_only" };
-  if (r.address) return { query: [name, r.address, r.locality].filter(Boolean).join(" "), basis: "address" };
+  const address = r.address && isLandmarkAddress(r.address) ? landmarkQueryText(r.address) : r.address;
+  if (r.address && isLandmarkAddress(r.address) && !r.locality) return { query: `${name} ${address}`, basis: "name_only" };
+  if (r.address) return { query: [name, address, r.locality].filter(Boolean).join(" "), basis: "address" };
   if (r.locality) return { query: `${name} ${r.locality}`, basis: "locality" };
   return { query: name, basis: "name_only" };
 }
@@ -247,20 +248,34 @@ function placeQuery(r: Placeable): { query: string; basis: "address" | "locality
  *  model was not sure of, is only a suggestion (src/wish/places.ts): the
  *  image is about someone else's town as often as the person's own. */
 async function matchPlace(workspaceId: string, r: Placeable, confidence: WishReading["confidence"]): Promise<PlaceMatch> {
+  const m = captureMatchInput(r, confidence);
+  // With no city in the image, the person's own area is the best guess.
+  const locationBias = m.basis === "name_only" ? await workspaceArea(workspaceId) : null;
+  return matchPlaceByText(m.query, m.basis, r.name_local, { ...m.opts, locationBias });
+}
+
+/** The query and options a capture's reading is matched with (also what
+ *  scripts/check-wish-match.ts runs). The location bias is the caller's. */
+export function captureMatchInput(
+  r: Placeable,
+  confidence: WishReading["confidence"],
+): { query: string; basis: "address" | "locality" | "name_only"; opts: MatchOptions } {
   const { query, basis } = placeQuery(r);
   const guessReason = basis === "name_only" ? "name_only" : confidence === "low" ? "low_confidence" : null;
   const names = [r.title, r.name_local].filter((n): n is string => Boolean(n));
-  return matchPlaceByText(query, basis, r.name_local, {
-    names,
-    guessReason,
-    // An address or a city is what the match rests on; a Han name and
-    // Google's English one cannot be compared word by word.
-    trustUncomparable: basis !== "name_only",
-    address: r.address,
-    locality: r.locality,
-    // With no city in the image, the person's own area is the best guess.
-    locationBias: basis === "name_only" ? await workspaceArea(workspaceId) : null,
-  });
+  return {
+    query,
+    basis,
+    opts: {
+      names,
+      guessReason,
+      // An address or a city is what the match rests on; a Han name and
+      // Google's English one cannot be compared word by word.
+      trustUncomparable: basis !== "name_only",
+      address: r.address,
+      locality: r.locality,
+    },
+  };
 }
 
 interface UserSet {

@@ -75,7 +75,7 @@ function viaImageMagick(input: Buffer, coder: "heic" | "avif"): Promise<Buffer> 
 
 async function toJpeg(input: Buffer, kind: "heic" | "avif"): Promise<Buffer> {
   try {
-    return await sharp(input).rotate().jpeg({ quality: JPEG_QUALITY }).toBuffer();
+    return await sharp(input, { limitInputPixels: MAX_IMAGE_PIXELS }).rotate().jpeg({ quality: JPEG_QUALITY }).toBuffer();
   } catch (sharpErr) {
     try {
       return await viaImageMagick(input, kind);
@@ -88,9 +88,41 @@ async function toJpeg(input: Buffer, kind: "heic" | "avif"): Promise<Buffer> {
 
 /** More pixels than any photo or screenshot worth reading (a phone
  *  screenshot is about 3.5M, a 48 MP photo 48M). Checked from the header
- *  before any pixel is decoded: a small PNG can declare 15000×15000, and
- *  decoding it costs seconds and hundreds of MB. */
+ *  before any pixel is decoded, for every type (HEIC and AVIF by
+ *  `heifDimensions`, before the conversion): a small file can declare
+ *  15000×15000, and decoding it costs seconds and hundreds of MB. */
 export const MAX_IMAGE_PIXELS = 50_000_000;
+
+function tooLarge(width: number, height: number): ValidationProblem {
+  console.warn(`[wish] upload refused: ${width}x${height} is over ${MAX_IMAGE_PIXELS} pixels`);
+  return new ValidationProblem([
+    {
+      path: "file",
+      code: "image_too_large",
+      message: `The image is ${width}×${height}; send one under ${MAX_IMAGE_PIXELS / 1_000_000} million pixels`,
+    },
+  ]);
+}
+
+/**
+ * A HEIC or AVIF image's size from its header: the `ispe` (image spatial
+ * extents) properties of its items, the largest one (a HEIC photo is a
+ * grid of 512×512 tiles, each with its own `ispe`, plus the grid's). Read
+ * from the bytes, before anything decodes them: sharp and ImageMagick
+ * both decode the whole image to convert it, which for a 38 KB file that
+ * declares 8000×8000 costs about 800 MB. Null when there is none.
+ */
+export function heifDimensions(buf: Buffer): { width: number; height: number } | null {
+  let best: { width: number; height: number } | null = null;
+  for (let i = buf.indexOf("ispe", 4, "latin1"); i >= 4; i = buf.indexOf("ispe", i + 4, "latin1")) {
+    // A box: size (4 bytes, 20 for ispe), type, version and flags, width, height.
+    if (i + 16 > buf.length || buf.readUInt32BE(i - 4) !== 20) continue;
+    const width = buf.readUInt32BE(i + 8);
+    const height = buf.readUInt32BE(i + 12);
+    if (!best || width * height > best.width * best.height) best = { width, height };
+  }
+  return best;
+}
 
 /** The first bytes only say what a file claims to be: a truncated or
  *  corrupt file with a JPEG header would still be stored, queued and sent
@@ -107,19 +139,10 @@ async function assertDecodes(buf: Buffer): Promise<void> {
     ]);
   }
   // One frame: that is all `stats` decodes, and all the Read tool shows.
-  if (meta.width && meta.height && meta.width * meta.height > MAX_IMAGE_PIXELS) {
-    console.warn(`[wish] upload refused: ${meta.width}x${meta.height} is over ${MAX_IMAGE_PIXELS} pixels`);
-    throw new ValidationProblem([
-      {
-        path: "file",
-        code: "image_too_large",
-        message: `The image is ${meta.width}×${meta.height}; send one under ${MAX_IMAGE_PIXELS / 1_000_000} million pixels`,
-      },
-    ]);
-  }
+  if (meta.width && meta.height && meta.width * meta.height > MAX_IMAGE_PIXELS) throw tooLarge(meta.width, meta.height);
   try {
     if (!meta.width || !meta.height) throw new Error("no dimensions");
-    await sharp(buf, { failOn: "error" }).stats();
+    await sharp(buf, { failOn: "error", limitInputPixels: MAX_IMAGE_PIXELS }).stats();
   } catch (err) {
     console.warn(`[wish] upload does not decode: ${(err as Error).message.slice(0, 200)}`);
     throw new ValidationProblem([
@@ -141,6 +164,14 @@ export async function storableImage(upload: Buffer): Promise<StoredImage> {
       { path: "file", code: "unsupported_image", message: "The file is not a JPEG, PNG, WebP, GIF, HEIC or AVIF image" },
     ]);
   }
+  // Its size from the header first: converting decodes every pixel.
+  const dims = heifDimensions(upload) ?? (await sharp(upload).metadata().then((m) => (m.width && m.height ? { width: m.width, height: m.height } : null), () => null));
+  if (!dims) {
+    throw new ValidationProblem([
+      { path: "file", code: "unreadable_image", message: `The ${heif.toUpperCase()} image has no size in its header: save or share it as JPEG or PNG` },
+    ]);
+  }
+  if (dims.width * dims.height > MAX_IMAGE_PIXELS) throw tooLarge(dims.width, dims.height);
   let jpeg: Buffer;
   try {
     jpeg = await toJpeg(upload, heif);

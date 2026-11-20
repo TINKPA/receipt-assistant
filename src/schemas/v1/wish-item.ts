@@ -36,10 +36,12 @@ export const WishConvertedTransaction = z
   })
   .openapi("WishConvertedTransaction");
 
-/** A place found for the wish's name that is only a guess: Google's best
- *  answer for a name with no city, a reading the model was unsure of, or a
- *  name that differs from the one asked for. Not linked, so it converts
- *  nothing. Confirm it with PATCH `google_place_id`, reject it with PATCH
+/** A place found for the wish's name that is only a guess. A place is
+ *  linked only when its name agrees with the wish's and the location the
+ *  image gave (its street, else its city or neighbourhood) is in Google's
+ *  address, or, for a typed name, it is inside the workspace's usual area;
+ *  anything weaker is offered here. Not linked, so it converts nothing.
+ *  Confirm it with PATCH `google_place_id`, reject it with PATCH
  *  `place_id: null`. */
 export const WishPlaceSuggestion = z
   .object({
@@ -50,13 +52,15 @@ export const WishPlaceSuggestion = z
      *  reading was a guess), `name_mismatch` (Google's place has another
      *  name; for a typed name, also a branch of the same brand inside the
      *  workspace's area when the typed words for where match no branch),
-     *  `name_unverified` (a typed name in another script than
-     *  Google's, so the two cannot be compared), `address_mismatch` (the
-     *  house number in the image is not in the found place's address),
-     *  `street_mismatch` (the street the image names, with no number, is
-     *  not in it), `street_unverified` (Google's address names no street
-     *  to compare it with), `outside_area` (a typed name found outside the
-     *  workspace's usual area). */
+     *  `name_unverified` (a typed name in another script than Google's, so
+     *  the two cannot be compared), `address_mismatch` (the house number
+     *  in the image is not in the found place's address), `street_mismatch`
+     *  (the street the image names, "6th Ave" or "天平路", is not in it),
+     *  `street_unverified` (Google's address names no street to compare it
+     *  with), `locality_mismatch` (the city or neighbourhood the image
+     *  names is not in Google's address: a namesake in another town, or a
+     *  neighbourhood Google's address does not name), `outside_area` (a
+     *  typed name found outside the workspace's usual area). */
     reason: z.string().nullable(),
   })
   .openapi("WishPlaceSuggestion");
