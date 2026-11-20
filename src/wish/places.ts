@@ -21,11 +21,12 @@
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { liveTransactions } from "../db/live.js";
-import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchPlaceV1Dual } from "../google/places-fetch.js";
+import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchAddressComponents, fetchPlaceV1Dual } from "../google/places-fetch.js";
 import { findPlaceByText } from "../google/find-place.js";
 import { searchPlacesByText } from "../google/text-search.js";
 import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
-import { BOROUGH_TOWNS, CITY_ALIASES, hanCitiesIn, isKnownCity } from "./cities.js";
+import { BOROUGH_TOWNS, CITY_ALIASES, CITY_REGIONS, NEW_YORK_BOROUGHS, NEW_YORK_SPELLINGS, hanCitiesIn, isKnownCity } from "./cities.js";
+import { toAddressComponents, type GoogleAddressComponent } from "../google/text-search.js";
 import { comparable, hasCjk, looseTokens, nameMatches, nameScore, nameTokens } from "./names.js";
 
 export interface PlaceLink {
@@ -136,11 +137,12 @@ export interface PlaceMatch {
  *   Google's address on the read street;
  * - `street_mismatch`: the read street is not in it;
  * - `street_unverified`: Google's address names no street to compare;
- * - `locality_mismatch`: no part of the read city or neighbourhood is in
- *   the locality part of Google's address (never its street) in any
- *   language asked, or the read city is not, whatever street agrees (a
- *   namesake in another town, or a neighbourhood Google's address does
- *   not name);
+ * - `locality_mismatch`: no part of the read city or neighbourhood is a
+ *   whole city-level part of Google's structured address in any language
+ *   asked (`localityConfirmed`; a state or a country alone confirms
+ *   nothing), or a read city is not, whatever street agrees (a namesake in
+ *   another town, "South San Francisco" for San Francisco, or a
+ *   neighbourhood Google does not name);
  * - `outside_area`: a typed name found outside the workspace's area.
  */
 export type MatchReason =
@@ -228,11 +230,6 @@ const STREET_WORDS = new Set([
   "n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west",
   "lu", "jie", "dao", "nan", "bei", "dong", "xi", "zhong",
 ]);
-/** The street types alone (no sides, no pinyin): what ends a street. */
-const STREET_TYPE_WORDS = new Set([
-  "st", "street", "ave", "av", "avenue", "blvd", "boulevard", "bl", "rd", "road", "dr", "drive", "ln", "lane", "way",
-  "pl", "ct", "court", "ter", "terrace", "pkwy", "parkway", "hwy", "highway", "cir", "circle", "aly", "alley",
-]);
 /** "Sixth" and "6th" are one street. */
 const ORDINAL_WORDS: Record<string, string> = {
   first: "1st", second: "2nd", third: "3rd", fourth: "4th", fifth: "5th", sixth: "6th", seventh: "7th", eighth: "8th",
@@ -282,9 +279,9 @@ export function streetCore(address: string | null | undefined): { latin: string[
   return latin.length + han.length > 0 ? { latin, han } : null;
 }
 
-/** Does Google's address carry the street? `unknown` when it is written in
- *  a script the street cannot be compared with (a Han street, an English
- *  address). */
+/** Is the read street the route Google names (`formatted`: the route's
+ *  spellings, `routeText`)? `unknown` when it is written in a script the
+ *  street cannot be compared with (a Han street, an English route). */
 function streetIn(core: { latin: string[]; han: string[] }, formatted: string | null): "yes" | "no" | "unknown" {
   if (!formatted) return "no";
   const f = fold(formatted);
@@ -297,14 +294,6 @@ function streetIn(core: { latin: string[]; han: string[] }, formatted: string | 
     return core.han.every((h) => f.includes(h)) && latinOk ? "yes" : "no";
   }
   return latinOk ? "yes" : "no";
-}
-
-/** Google's address names a street at all (not just a district and a
- *  postcode): a house number before a name, or a Han street word. */
-function hasStreetLevel(formatted: string | null): boolean {
-  if (!formatted) return false;
-  const first = formatted.split(",")[0] ?? "";
-  return /\d+\s*[A-Za-zÀ-ɏ]/.test(first) || /[路街道巷弄号號]/u.test(formatted);
 }
 
 /** The language to ask Google in, from the script of a name. */
@@ -335,106 +324,156 @@ interface Seen {
   addresses: string[];
   lat: number | null;
   lng: number | null;
+  /** Google's structured address by language ("en", "zh-CN", …). What
+   *  confirms a locality, a street or a house number. */
+  components: Map<string, GoogleAddressComponent[]>;
 }
 
-// ── Locality ────────────────────────────────────────────────────────────
+const componentSets = (c: Seen) => [...c.components.values()].filter((set) => set.length > 0);
 
-/** What to look for in Google's address for a read locality ("豫园/城隍庙，
- *  上海" → 豫园, 城隍庙, 上海, shanghai; "Arts District, DTLA" → arts
- *  district, los angeles; "Downtown Los Angeles" → also "los angeles"),
- *  folded, a trailing 市 / 区 / 县 cut. */
-export function localityTerms(locality: string | null | undefined): string[] {
-  const out = new Set<string>();
+/** Structured addresses already fetched, per Google id and language. */
+const componentCache = new Map<string, GoogleAddressComponent[]>();
+const COMPONENT_CACHE_MAX = 2000;
+
+/** Google's structured address of a place in one language: from the
+ *  `places` row when the ledger has the place (its `raw_response` holds
+ *  the full Place Details in en and zh-CN), else Place Details. Empty when
+ *  neither answers (the match is then not confirmed). */
+async function addressComponentsOf(googlePlaceId: string, language: string): Promise<GoogleAddressComponent[]> {
+  const key = `${googlePlaceId}|${language}`;
+  const hit = componentCache.get(key);
+  if (hit) return hit;
+  let found: GoogleAddressComponent[] = [];
+  if (language === "en" || language === "zh-CN") {
+    try {
+      const res = await db.execute(
+        sql`SELECT raw_response->'v1'->${language}->'addressComponents' AS c FROM places WHERE google_place_id = ${googlePlaceId}`,
+      );
+      found = toAddressComponents((res.rows[0] as { c: unknown } | undefined)?.c);
+    } catch {
+      /* fall through to Google */
+    }
+  }
+  if (found.length === 0) {
+    try {
+      found = await fetchAddressComponents(googlePlaceId, language);
+    } catch (err) {
+      console.warn(`[wish] address of ${googlePlaceId} (${language}) not fetched: ${(err as Error).message.slice(0, 200)}`);
+      return [];
+    }
+  }
+  if (componentCache.size >= COMPONENT_CACHE_MAX) componentCache.delete(componentCache.keys().next().value!);
+  componentCache.set(key, found);
+  return found;
+}
+
+// ── Locality: Google's structured address ──────────────────────────────
+
+/** Component types that name a city or a part of one: what confirms a read
+ *  locality. Never a street (`route`, `street_number`, `subpremise`), and
+ *  never a state or a country alone (`administrative_area_level_1`,
+ *  `country`) except for the cities Google files that way (`CITY_REGIONS`). */
+const CITY_LEVEL_TYPES = new Set([
+  "locality", "postal_town", "neighborhood", "administrative_area_level_2", "administrative_area_level_3",
+]);
+function isCityLevel(c: GoogleAddressComponent): boolean {
+  return c.types.some((t) => CITY_LEVEL_TYPES.has(t) || t.startsWith("sublocality"));
+}
+function isRegionLevel(c: GoogleAddressComponent): boolean {
+  return c.types.includes("administrative_area_level_1") || c.types.includes("country");
+}
+/** A component with no type is a street line Google did not split
+ *  ("解放街129号", "南京东路720号第一食品3楼"): it is read as the route, and
+ *  its house number as the street number. */
+const isUnsplitLine = (c: GoogleAddressComponent) => c.types.length === 0;
+const isRoute = (c: GoogleAddressComponent) => c.types.includes("route") || isUnsplitLine(c);
+
+/** One way to write a place name, for comparing whole names: folded,
+ *  spaces and punctuation out ("Shang Hai" = "Shanghai"), a trailing
+ *  "City", "Shi", "Qu" or "District" word cut ("Taipei City", "Shang Hai
+ *  Shi", "Jing An Qu"), and a Han name's trailing 市 / 区 / 县 cut (上海市 =
+ *  上海). Never a part of a name: "South San Francisco" stays itself. */
+export function placeKey(name: string): string {
+  const f = fold(name).trim();
+  if (HAN.test(f)) {
+    const h = f.replace(/\s+/g, "");
+    const cut = h.replace(/(市|区|區|县|縣)$/u, "");
+    return cut.length >= 2 ? cut : h;
+  }
+  const words = f.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  if (words.length > 1 && ["city", "shi", "qu", "district"].includes(words[words.length - 1]!)) words.pop();
+  return words.join("");
+}
+
+const REGION_KEYS = new Set([...CITY_REGIONS].map(placeKey));
+/** "Downtown Los Angeles" is in Los Angeles; "South San Francisco" is not
+ *  in San Francisco, so only these words come off. */
+const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\s+/;
+
+/** The names a read locality may be filed under, as `placeKey`s, each
+ *  marked when it is a city Google files as a region ("豫园/城隍庙，上海" →
+ *  豫园, 城隍庙, 上海 and shanghai, both regions; "NYC" → new york and the
+ *  five boroughs; "Downtown Los Angeles" → itself and los angeles). */
+export function localityKeys(locality: string | null | undefined): { key: string; region: boolean }[] {
+  const out = new Map<string, boolean>();
+  const add = (name: string, region = false) => {
+    const k = placeKey(name);
+    if (k.length < 2) return;
+    out.set(k, Boolean(out.get(k)) || region || REGION_KEYS.has(k));
+  };
+  // `read` is what the post wrote: only New York's own spellings bring in
+  // the five boroughs ("Manhattan" is an alias of New York, and brings in
+  // none of them).
+  const withCity = (name: string, read: string, region = false) => {
+    add(name, region);
+    if (NEW_YORK_SPELLINGS.has(read)) for (const b of NEW_YORK_BOROUGHS) add(b);
+    for (const t of BOROUGH_TOWNS[name] ?? []) add(t);
+  };
   const parts = (locality ?? "")
     .split(/[\/,，、;；|·()（）]+|\s{2,}/u)
     .flatMap((p) => (HAN.test(p) ? [p.replace(/\s+/g, "")] : [p]))
-    .map((p) => fold(p.trim()).replace(/(市|区|區|县|縣)$/u, ""))
+    .map((p) => fold(p.trim()).replace(/\s+/g, " "))
     .filter(Boolean);
   for (const p of parts) {
     if (HAN.test(p)) {
-      if (p.length >= 2) out.add(p);
+      add(p);
       // A branch area read with its 店 ("外滩店"); a place whose name ends
-      // in 店 (驻马店) is in an address that carries the rest of it too.
+      // in 店 (驻马店) is kept whole too.
       const bare = p.replace(/分?店$/u, "");
-      if (bare !== p && bare.length >= 2) out.add(bare);
+      if (bare !== p) add(bare);
       for (const [han, city] of Object.entries(CITY_ALIASES)) {
-        if (HAN.test(han) && p.includes(han)) {
-          out.add(han);
-          out.add(city);
-          for (const t of BOROUGH_TOWNS[city] ?? []) out.add(t);
-        }
+        if (!HAN.test(han) || !p.includes(han)) continue;
+        const region = REGION_KEYS.has(placeKey(city));
+        add(han, region);
+        withCity(city, han, region);
       }
       continue;
     }
-    const alias = CITY_ALIASES[p];
-    if (alias) out.add(alias);
-    for (const t of BOROUGH_TOWNS[alias ?? p] ?? []) out.add(t);
-    if (p.length >= 3) out.add(p);
-    // "Downtown Los Angeles", "Lower East Side, New York": a trailing run
-    // of two words or more may be the city.
-    const words = p.split(/\s+/).filter(Boolean);
-    for (let i = 1; i + 2 <= words.length; i++) out.add(words.slice(i).join(" "));
+    const names = [p];
+    const unqualified = p.replace(QUALIFIER, "");
+    if (unqualified !== p && unqualified) names.push(unqualified);
+    for (const n of names) {
+      withCity(n, n);
+      const alias = CITY_ALIASES[n];
+      if (alias) withCity(alias, n);
+    }
   }
-  return [...out];
+  return [...out].map(([key, region]) => ({ key, region }));
 }
 
-/** Han words that start a street in a Han address ("黄河路123号"). 道 is
- *  left out: it ends 街道 (a subdistrict) and 北海道. */
-const HAN_STREET_WORD = /(大街|大道|路|街|巷|弄|胡同)/u;
-/** The last administrative word before a Han street: 市, 区, 县, 镇. */
-const HAN_ADMIN = /[省市区區县縣镇鎮州]/gu;
-
-/** A comma-separated part of an address that is a street: a house number
- *  before a name ("822 Washington St"), or a name ending in a street type
- *  ("Washington St", "N Alameda St"). */
-function isStreetSegment(seg: string): boolean {
-  const t = seg.trim();
-  if (/^\d+[A-Za-z]?([-–]\d+[A-Za-z]?)?\s+\p{L}/u.test(t)) return true;
-  const words = addressWords(t);
-  const last = words[words.length - 1];
-  return words.length >= 2 && last !== undefined && STREET_TYPE_WORDS.has(last);
-}
-
-/**
- * The part of Google's address that says where, not on which street: the
- * comma-separated parts that are not a street ("822 Washington St, San
- * Francisco, CA" → "San Francisco, CA"), and a Han address cut before its
- * street ("中国上海市黄浦区黄河路123号" → "中国上海市黄浦区"). A city named
- * like a street (Washington, Alameda, Broadway) is then confirmed only by
- * the city part.
- */
-export function localityPart(address: string): string {
-  const segs = address.split(/[,，]/u);
-  const kept = segs.length > 1 ? segs.filter((s) => !isStreetSegment(s)) : segs;
-  return kept
-    .map((seg) => {
-      if (!HAN.test(seg)) return seg;
-      const m = HAN_STREET_WORD.exec(seg);
-      if (!m) return seg;
-      const before = seg.slice(0, m.index);
-      let end = -1;
-      for (const a of before.matchAll(HAN_ADMIN)) end = a.index!;
-      return before.slice(0, end + 1);
-    })
-    .join(",");
-}
-
-/** One of the read locality's terms is in the locality part of one of
- *  Google's addresses (`localityPart`: never its street). */
-export function localityIn(locality: string | null | undefined, addresses: (string | null)[]): boolean {
-  const terms = localityTerms(locality);
-  const hay = addresses.filter((a): a is string => Boolean(a)).map((a) => {
-    const f = fold(localityPart(a));
-    return { words: ` ${f.split(/[^\p{L}\p{N}]+/u).filter(Boolean).join(" ")} `, raw: f, squashed: f.replace(/[^\p{L}\p{N}]+/gu, "") };
-  });
-  return terms.some((t) =>
-    hay.some((h) => {
-      if (HAN.test(t)) return h.raw.includes(t);
-      // A whole word or run of words; or, eight letters or more, inside a
-      // run Google wrote without spaces ("Shang Hai Shi" for "shanghai").
-      if (h.words.includes(` ${t} `)) return true;
-      const sq = t.replace(/\s+/g, "");
-      return sq.length >= 8 && h.squashed.includes(sq);
+/** The read locality is a whole city-level part of Google's structured
+ *  address in some language asked: a locality, sublocality, neighbourhood,
+ *  postal town or county-level area, never a street; a state or a country
+ *  only for the cities Google files that way (`CITY_REGIONS`). */
+export function localityConfirmed(locality: string | null | undefined, sets: GoogleAddressComponent[][]): boolean {
+  const keys = localityKeys(locality);
+  if (keys.length === 0) return false;
+  return sets.some((set) =>
+    set.some((c) => {
+      const names = [placeKey(c.long), placeKey(c.short)];
+      if (isCityLevel(c)) return keys.some((k) => names.includes(k.key));
+      if (isRegionLevel(c)) return keys.some((k) => k.region && names.includes(k.key));
+      return false;
     }),
   );
 }
@@ -450,11 +489,38 @@ export function readCities(locality: string | null | undefined): string[] {
   return out;
 }
 
-/** The read locality names a known city and Google's address is in none
- *  of the cities it names: a namesake elsewhere, whatever street agrees. */
-export function cityContradicted(locality: string | null | undefined, addresses: (string | null)[]): boolean {
+/** The read locality names a known city and Google files the place under
+ *  none of the cities it names: a namesake elsewhere, whatever street
+ *  agrees. Unknown (false) when Google gave no structured address. */
+export function cityContradicted(locality: string | null | undefined, sets: GoogleAddressComponent[][]): boolean {
   const cities = readCities(locality);
-  return cities.length > 0 && !cities.some((c) => localityIn(c, addresses));
+  if (cities.length === 0 || !sets.some((s) => s.length > 0)) return false;
+  return !cities.some((c) => localityConfirmed(c, [...sets]));
+}
+
+/** Is `number` (as `houseNumber` reads it) the `street_number` of a
+ *  structured address: the number itself ("1435"), an end of a range
+ *  ("1001-1003", "9-11"), a Han one with its 号 ("269号", "45號")? Never a
+ *  suite (`subpremise`) or a postcode, which are other components. */
+export function streetNumberIs(number: string, set: GoogleAddressComponent[]): boolean {
+  const want = number.toLowerCase();
+  if (set.some((c) => isUnsplitLine(c) && houseNumber(c.long)?.toLowerCase() === want)) return true;
+  return set.some(
+    (c) =>
+      c.types.includes("street_number") &&
+      [c.long, c.short].some((v) =>
+        fold(v)
+          .replace(/[号號番地]/gu, "")
+          .replace(/\s+/g, "")
+          .split(/[-–]/)
+          .some((n) => n === want),
+      ),
+  );
+}
+
+/** The route names of a structured address, every spelling Google gave. */
+function routeText(set: GoogleAddressComponent[]): string {
+  return set.filter(isRoute).flatMap((c) => [c.long, c.short]).join(" , ");
 }
 
 // ── The decision ────────────────────────────────────────────────────────
@@ -483,35 +549,27 @@ function judgeName(names: string[], c: Seen): Pick<Judged, "name" | "score"> {
   return { name: shares || score > 0 ? "partial" : "none", score };
 }
 
-/** Is `number` (as `houseNumber` reads it: digits and an optional letter)
- *  the house number of Google's address: the number that starts its first
- *  part that starts with one ("1435 Broadway, …", a range "1001-1003 N
- *  Alameda St"), or a Han 号 number ("吴江路269号", "Kearny St 631号")?
- *  Never a suite ("Ste 2610") or a postcode ("CA 90010"). */
-export function houseNumberIn(number: string, formatted: string): boolean {
-  if (!/^\d+[A-Za-z]?$/.test(number)) return false;
-  const first = formatted.split(/[,，]/u).find((seg) => /^\s*\d/.test(seg));
-  if (first && new RegExp(`^\\s*(?:\\d+[A-Za-z]?[-–])?${number}(?:[-–]\\d+[A-Za-z]?)?(?![0-9A-Za-z])`, "i").test(first)) return true;
-  return new RegExp(`(^|[^0-9])${number}\\s*[号號]`, "u").test(formatted);
-}
-
-/** The read address against Google's addresses of the place: `number` or
- *  `street` when it is confirmed (Google's house number on the read
- *  street, or the read street), `no_address` when it says nothing
- *  checkable (a landmark) and the locality decides, else why not. */
+/** The read address against Google's structured address of the place:
+ *  `number` or `street` when it is confirmed (Google's `street_number`
+ *  together with a `route` that is the read street, or the read street is
+ *  the route), `no_address` when it says nothing checkable (a landmark) and
+ *  the locality decides, else why not. A suite (`subpremise`), a postcode
+ *  or a city named like a street are other components and confirm
+ *  nothing. */
 function judgeAddress(address: string | null | undefined, c: Seen): MatchReason | "no_address" | "number" | "street" {
   if (!address || isLandmarkAddress(address)) return "no_address";
   const a = address.replace(/[(（][^()（）]*[)）]/gu, " ").trim();
   const number = houseNumber(a);
   const core = streetCore(a);
   if (!number && !core) return "no_address";
-  const streetLevel = c.addresses.some(hasStreetLevel);
-  const verdicts = core ? c.addresses.map((f) => streetIn(core, f)) : [];
+  const withRoute = componentSets(c).filter((set) => set.some(isRoute));
+  const streetLevel = withRoute.length > 0;
+  const verdicts = core ? withRoute.map((set) => streetIn(core, routeText(set))) : [];
   // The number confirms only on the read street, unless Google wrote the
   // street in a script it cannot be compared with in every language asked.
-  const streetOk = !core || verdicts.includes("yes") || verdicts.every((v) => v === "unknown");
+  const streetOk = !core || verdicts.includes("yes") || (verdicts.length > 0 && verdicts.every((v) => v === "unknown"));
   if (number) {
-    if (streetOk && c.addresses.some((f) => houseNumberIn(number, f))) return "number";
+    if (streetOk && withRoute.some((set) => streetNumberIs(number, set))) return "number";
     if (streetLevel) return "address_mismatch";
   }
   if (!core) return "street_unverified";
@@ -532,21 +590,28 @@ function judgeAddress(address: string | null | undefined, c: Seen): MatchReason 
  * answer) counts as agreeing only for a capture whose house number
  * Google's address confirms: a city or a street alone does not do, because
  * any Han name, real or misread, finds some place in a city. The location:
- * - a capture with a street address: its house number is the house number
- *   of Google's address (the number starting its street part, or a 号
- *   number; never a suite or a postcode) on the read street, else its
- *   street ("6th St", "天平路") is in Google's address. Where Google's address
- *   names no street at all, the read locality must be in it instead, the
- *   name must agree at 0.9 or more, and no other place of that name in
- *   Text Search's answer may be one the address cannot rule out
+ * Every location check reads Google's structured address
+ * (`addressComponents`, in English and in the name's script), never the
+ * words of its formatted address:
+ * - a capture with a street address: its house number is the
+ *   `street_number` of a structured address whose `route` is the read
+ *   street (never a suite, which is a `subpremise`, or a postcode), else
+ *   its street ("6th St", "天平路") is the `route`. Where Google gives no
+ *   route at all, the read locality must be confirmed instead, the name
+ *   must agree at 0.9 or more, and no other place of that name in Text
+ *   Search's answer may be one the address cannot rule out
  *   (`address_unverified`);
- * - a capture with a city or neighbourhood and no address: a part of it
- *   is in the locality part of Google's address, never its street
- *   (`localityIn`: "Washington" is not confirmed by "822 Washington St,
- *   San Francisco");
+ * - a capture with a city or neighbourhood and no address: one of its
+ *   parts is a whole city-level component (`localityConfirmed`: locality,
+ *   sublocality, neighbourhood, postal town, county level), never a route
+ *   ("Washington" is not "Washington St"), never a part of a longer name
+ *   ("San Francisco" is not "South San Francisco"), never a state or a
+ *   country ("USA", "Taiwan", "California"), except for a city Google
+ *   files as one (`CITY_REGIONS`: 上海, Taipei, Tokyo, Singapore); "New
+ *   York", "NYC" and 纽约 are confirmed by the five boroughs;
  * - either way, a read city this app knows (`src/wish/cities.ts`) must be
- *   in Google's address too (`cityContradicted`): Katz's on E Houston St
- *   read as "Chicago" is a suggestion;
+ *   confirmed too (`cityContradicted`): Katz's on E Houston St read as
+ *   "Chicago" is a suggestion;
  * - a typed name: the place is inside the workspace's usual area.
  * A reading that is itself a guess (`name_only`, `low_confidence`) is never
  * linked. When Find Place's first answer does not qualify, Text Search (in
@@ -589,10 +654,17 @@ export async function decidePlaceMatch(
 
   const seen = new Map<string, Seen>();
   const order: string[] = [];
-  const note = (id: string, name: string | null, address: string | null, lat: number | null, lng: number | null) => {
+  const note = (
+    id: string,
+    name: string | null,
+    address: string | null,
+    lat: number | null,
+    lng: number | null,
+    components?: { language: string; list: GoogleAddressComponent[] },
+  ) => {
     let s = seen.get(id);
     if (!s) {
-      s = { googlePlaceId: id, names: [], addresses: [], lat, lng };
+      s = { googlePlaceId: id, names: [], addresses: [], lat, lng, components: new Map() };
       seen.set(id, s);
       order.push(id);
     }
@@ -600,11 +672,26 @@ export async function decidePlaceMatch(
     if (address && !s.addresses.includes(address)) s.addresses.push(address);
     if (s.lat === null && lat !== null) s.lat = lat;
     if (s.lng === null && lng !== null) s.lng = lng;
+    if (components && components.list.length > 0 && !s.components.has(components.language)) {
+      s.components.set(components.language, components.list);
+    }
+  };
+  // The languages a place's structured address is read in: English, and
+  // the name's (or address's) script.
+  const languages = [...new Set(["en", ...(lang ? [lang] : [])])];
+  const fetchComponents = async (c: Seen) => {
+    for (const language of languages) {
+      if (!c.components.has(language)) c.components.set(language, await addressComponentsOf(c.googlePlaceId, language));
+    }
   };
 
   const inArea = (c: Seen) => Boolean(area) && c.lat !== null && c.lng !== null && distanceM(area!, { lat: c.lat, lng: c.lng }) <= area!.radiusM;
-  const judge = (c: Seen): Judged => {
+  const judge = async (c: Seen): Promise<Judged> => {
     const n = judgeName(names, c);
+    // A place whose name shares nothing is never linked nor offered: its
+    // address is not worth a request.
+    if (!typed && n.name !== "none") await fetchComponents(c);
+    const sets = componentSets(c);
     let where: MatchReason | null = null;
     let by: Judged["by"] = null;
     if (typed) {
@@ -616,12 +703,12 @@ export async function decidePlaceMatch(
       if (a === "number" || a === "street") by = a;
       else if (a !== "no_address") where = a;
       else if (opts.locality) {
-        if (localityIn(opts.locality, c.addresses)) by = "locality";
+        if (localityConfirmed(opts.locality, sets)) by = "locality";
         else where = "locality_mismatch";
       } else where = "name_only";
       // A street that agrees does not outweigh a read city the address is
       // not in (Katz's on E Houston St, "Chicago").
-      if (by && cityContradicted(opts.locality, c.addresses)) {
+      if (by && cityContradicted(opts.locality, sets)) {
         by = null;
         where = "locality_mismatch";
       }
@@ -673,7 +760,7 @@ export async function decidePlaceMatch(
       if (local?.googlePlaceId === first.googlePlaceId) note(local.googlePlaceId, local.name, local.formattedAddress, local.lat, local.lng);
     }
     const firstSeen = seen.get(first.googlePlaceId)!;
-    const firstJudged = judge(firstSeen);
+    const firstJudged = await judge(firstSeen);
     if (linkable(firstJudged)) return finish(firstSeen, firstJudged, null);
 
     // Text Search, in the name's script and in English, for a place that
@@ -682,13 +769,22 @@ export async function decidePlaceMatch(
     let searched = false;
     if (opts.guessReason !== "name_only") {
       for (const languageCode of [...new Set([lang, undefined])]) {
-        const list = await searchPlacesByText(q, { maxResults: 5, languageCode, locationBias: bias }).catch(() => null);
+        const list = await searchPlacesByText(q, { maxResults: 5, languageCode, locationBias: bias, withAddressComponents: !typed }).catch(
+          () => null,
+        );
         if (!list) continue;
         searched = true;
-        for (const c of list) note(c.google_place_id, c.name, c.formatted_address, c.lat, c.lng);
+        for (const c of list) {
+          const components = c.address_components ? { language: languageCode ?? "en", list: c.address_components } : undefined;
+          note(c.google_place_id, c.name, c.formatted_address, c.lat, c.lng, components);
+        }
       }
     }
-    const judged = order.map((id) => ({ c: seen.get(id)!, j: judge(seen.get(id)!) }));
+    const judged: { c: Seen; j: Judged }[] = [];
+    for (const id of order) {
+      const c = seen.get(id)!;
+      judged.push({ c, j: await judge(c) });
+    }
     const ok = judged.find(({ j }) => linkable(j));
     if (ok) return finish(ok.c, ok.j, null);
 
@@ -702,8 +798,8 @@ export async function decidePlaceMatch(
       if (
         only &&
         (only.j.score ?? 0) >= 0.9 &&
-        localityIn(opts.locality, only.c.addresses) &&
-        !cityContradicted(opts.locality, only.c.addresses)
+        localityConfirmed(opts.locality, componentSets(only.c)) &&
+        !cityContradicted(opts.locality, componentSets(only.c))
       ) {
         match.address_unverified = true;
         return finish(only.c, only.j, null);

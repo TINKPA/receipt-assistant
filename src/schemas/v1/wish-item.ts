@@ -38,8 +38,8 @@ export const WishConvertedTransaction = z
 
 /** A place found for the wish's name that is only a guess. A place is
  *  linked only when its name agrees with the wish's and the location the
- *  image gave (its street, else its city or neighbourhood) is in Google's
- *  address, or, for a typed name, it is inside the workspace's usual area;
+ *  image gave (its street, else its city or neighbourhood) is confirmed by
+ *  Google's structured address, or, for a typed name, it is inside the workspace's usual area;
  *  anything weaker is offered here. Not linked, so it converts nothing.
  *  Confirm it with PATCH `google_place_id`, reject it with PATCH
  *  `place_id: null`. */
@@ -59,9 +59,10 @@ export const WishPlaceSuggestion = z
      *  (the street the image names, "6th Ave" or "天平路", is not in it),
      *  `street_unverified` (Google's address names no street to compare it
      *  with), `locality_mismatch` (the city or neighbourhood the image
-     *  names is not in Google's address outside its street, or the city
-     *  is not although the street is: a namesake in another town, or a
-     *  neighbourhood Google's address does not name), `outside_area` (a
+     *  names is not a whole city-level part of Google's structured address,
+     *  or the city is not although the street is: a namesake in another
+     *  town, "South San Francisco" for San Francisco, a state or a country
+     *  only, or a neighbourhood Google does not name), `outside_area` (a
      *  typed name found outside the workspace's usual area). */
     reason: z.string().nullable(),
   })

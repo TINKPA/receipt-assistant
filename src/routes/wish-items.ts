@@ -856,8 +856,10 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), " +
       "except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one " +
       "in `capture.duplicate_of`. A place is linked only when its name agrees and the location the image names is confirmed by Google's " +
-      "address in English or the name's own script: the house number, else the street (numbered ones such as `6th Ave` included), else the " +
-      "city or neighbourhood. A place that fails it is offered as `place_suggestion` with the reason; one whose name shares nothing is not offered. " +
+      "structured address (its address components) in English or the name's own script: the house number is its street number on the read " +
+      "street, else the street (numbered ones such as `6th Ave` included) is its route, else the city or neighbourhood is a whole city-level part " +
+      "of it (`South San Francisco` is not `San Francisco`; a state or a country such as `USA` or `Taiwan` confirms nothing; `New York` and `NYC` " +
+      "are confirmed by the five boroughs). A place that fails it is offered as `place_suggestion` with the reason; one whose name shares nothing is not offered. " +
       "For a shop's listing (Amazon and the like) with no person recommending it, `capture.reading.highlights` is empty: the listing's own words are not highlights. " +
       "HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`, and one over 50 million pixels a 422 `image_too_large` (checked from its header, before any pixel is decoded); nothing is stored or read. " +
       "The same bytes uploaded again answer 200 with the wish they made " +
@@ -878,7 +880,8 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Fields the person set by hand (`capture.user_set`) are kept; if the new reading fails, a wish they had named or placed stays `done`. " +
       "A wish split from another capture (`capture.sibling_of`) is not read on its own while that capture exists: 409, read the original. " +
-      "Once the original is deleted it is read on its own, for its own entry of the image (no further split).",
+      "Once the original is deleted it is read on its own, for its own entry of the image (no further split). " +
+      "An image file that is no longer on disk fails the capture with `capture.error: image_missing` before anything is read, and the wish keeps its kind.",
     tags: ["wish-items"],
     request: { params: z.object({ id: Uuid }) },
     responses: {

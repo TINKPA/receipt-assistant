@@ -39,6 +39,23 @@ export const BOROUGH_TOWNS: Record<string, string[]> = {
   ],
 };
 
+/** The five boroughs: a post's "New York", "NYC" or 纽约 is the whole city,
+ *  and Google files a Brooklyn, Bronx, Staten Island or Queens address
+ *  under the borough (or a Queens neighbourhood), not under New York. Only
+ *  the spellings of New York itself get them, never "Manhattan". */
+export const NEW_YORK_SPELLINGS = new Set(["new york", "nyc", "new york city", "纽约", "紐約"]);
+export const NEW_YORK_BOROUGHS = ["manhattan", "brooklyn", "bronx", "the bronx", "staten island", ...BOROUGH_TOWNS.queens!];
+
+/** Cities Google files as a region, not a locality: a municipality or a
+ *  city-state whose addresses carry it only as `administrative_area_level_1`
+ *  (上海市, Taipei City, Tokyo, Seoul) or as the country (Singapore, Hong
+ *  Kong). Such a read city is confirmed by that component; no other read
+ *  locality ever is (a state or a country says nothing about which branch). */
+export const CITY_REGIONS = new Set([
+  "shanghai", "beijing", "tianjin", "chongqing", "taipei", "tokyo", "seoul", "busan", "singapore", "hong kong",
+  "macau", "macao",
+]);
+
 /** Cities (and New York's boroughs, which posts use as cities). */
 const CITIES = new Set([
   ...Object.values(CITY_ALIASES),

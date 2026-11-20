@@ -30,6 +30,29 @@ export interface TextSearchCandidate {
   /** Where it is; used to rank, not part of the API answer. */
   lat: number | null;
   lng: number | null;
+  /** Google's structured address, only when `withAddressComponents` asked
+   *  for it; not part of the API answer. */
+  address_components?: GoogleAddressComponent[];
+}
+
+/** One part of Google's structured address: "Brooklyn", with its types
+ *  (`sublocality_level_1`, `sublocality`, `political`). */
+export interface GoogleAddressComponent {
+  long: string;
+  short: string;
+  types: string[];
+}
+
+/** Places API (New) `addressComponents` to `GoogleAddressComponent`s. */
+export function toAddressComponents(raw: unknown): GoogleAddressComponent[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((c: { longText?: unknown; shortText?: unknown; types?: unknown }) => ({
+      long: typeof c?.longText === "string" ? c.longText : "",
+      short: typeof c?.shortText === "string" ? c.shortText : "",
+      types: Array.isArray(c?.types) ? c.types.filter((t): t is string => typeof t === "string") : [],
+    }))
+    .filter((c) => c.long || c.short);
 }
 
 export class TextSearchKeyMissing extends Error {
@@ -56,6 +79,8 @@ export async function searchPlacesByText(
     languageCode?: string;
     /** Prefer places within `radiusM` (at most 50 km) of this point. */
     locationBias?: { lat: number; lng: number; radiusM: number } | null;
+    /** Also return each place's structured address (`address_components`). */
+    withAddressComponents?: boolean;
   } = {},
 ): Promise<TextSearchCandidate[]> {
   const apiKey = opts.apiKey ?? process.env.GOOGLE_MAPS_API_KEY;
@@ -75,7 +100,7 @@ export async function searchPlacesByText(
       headers: {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": FIELD_MASK,
+        "X-Goog-FieldMask": opts.withAddressComponents ? `${FIELD_MASK},places.addressComponents` : FIELD_MASK,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
@@ -105,6 +130,7 @@ export async function searchPlacesByText(
       userRatingCount?: number;
       primaryType?: string;
       location?: { latitude?: number; longitude?: number };
+      addressComponents?: unknown;
     }[];
   };
   return (json.places ?? [])
@@ -119,5 +145,6 @@ export async function searchPlacesByText(
       primary_type: p.primaryType ?? null,
       lat: typeof p.location?.latitude === "number" ? p.location.latitude : null,
       lng: typeof p.location?.longitude === "number" ? p.location.longitude : null,
+      ...(opts.withAddressComponents ? { address_components: toAddressComponents(p.addressComponents) } : {}),
     }));
 }

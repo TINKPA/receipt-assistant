@@ -10,8 +10,8 @@
  * after any change to src/wish/places.ts, src/wish/names.ts or the capture's
  * query (`captureMatchInput` in src/wish/capture.ts); every case must pass.
  *
- * It calls Google Find Place and Text Search (about 150 requests) and writes
- * nothing: `decidePlaceMatch` decides, and nothing is linked. Typed names
+ * It calls Google Find Place, Text Search and Place Details (address
+ * components only), a few hundred requests, and writes nothing: `decidePlaceMatch` decides, and nothing is linked. Typed names
  * are judged against, and name-only captures biased to, a fixed area (50
  * km around downtown Los Angeles), not a workspace's.
  *
@@ -24,7 +24,17 @@
  *
  * Exit code: 0 all pass, 1 a case failed, 2 no key.
  */
-import { decidePlaceMatch, houseNumberIn, localityIn, localityPart, AREA_RADIUS_M, type MatchOptions, type MatchReason } from "../src/wish/places.js";
+import {
+  decidePlaceMatch,
+  cityContradicted,
+  localityConfirmed,
+  placeKey,
+  streetNumberIs,
+  AREA_RADIUS_M,
+  type MatchOptions,
+  type MatchReason,
+} from "../src/wish/places.js";
+import type { GoogleAddressComponent } from "../src/google/text-search.js";
 import { captureMatchInput } from "../src/wish/capture.js";
 import { parseWishReading } from "../src/wish/reading.js";
 
@@ -32,6 +42,8 @@ const LA = { lat: 34.0522, lng: -118.2437, radiusM: AREA_RADIUS_M };
 
 type Expect =
   | { linked: string; address?: string; unverified?: boolean }
+  /** Whatever the outcome, never linked to a place at this address. */
+  | { notLinkedAt: string }
   | { suggested: string; reason: MatchReason; address?: string }
   | { nothing: true }
   /** Not linked: a suggestion of whatever Google answers, or nothing; and,
@@ -73,6 +85,20 @@ const CASES: Case[] = [
   { why: "r8: number, street and city agree", capture: { title: "Swan Oyster Depot", address: "1517 Polk St", locality: "San Francisco" }, expect: { linked: "Swan Oyster Depot", address: "1517 Polk" } },
   { why: "r8: a Han name with a street but no number is not enough", capture: { title: "福满楼", address: "Grant Ave", locality: "旧金山" }, expect: { suggestedAny: true } },
   // ── Captures with a city and no street ──
+  { why: "r9: a compound city is not the city it ends with", capture: { title: "Swan Oyster Depot", locality: "South San Francisco, CA" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
+  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Tartine Bakery", locality: "South San Francisco" }, expect: { notLinkedAt: "Guerrero" } },
+  { why: "r9: South San Francisco is not San Francisco", capture: { title: "Zuni Cafe", locality: "South San Francisco" }, expect: { notLinkedAt: "Market St" } },
+  { why: "r9: East Palo Alto is not Palo Alto", capture: { title: "Philz Coffee", locality: "East Palo Alto" }, expect: { notLinkedAt: "Forest Ave" } },
+  { why: "r9: West New York (New Jersey) is not New York", capture: { title: "Joe's Pizza", locality: "West New York" }, expect: { notLinkedAt: "Carmine" } },
+  { why: "r9: Pasadena is not South Pasadena", capture: { title: "Mike & Anne's", locality: "Pasadena" }, expect: { notLinkedAt: "South Pasadena" } },
+  { why: "r9: a country confirms no branch", capture: { title: "Shake Shack", locality: "USA" }, expect: { suggestedAny: true } },
+  { why: "r9: a country confirms no branch (中国)", capture: { title: "海底捞", locality: "中国" }, expect: { suggestedAny: true } },
+  { why: "r9: a country confirms no branch (Taiwan)", capture: { title: "Din Tai Fung", locality: "Taiwan" }, expect: { suggestedAny: true } },
+  { why: "a state confirms no branch", capture: { title: "In-N-Out Burger", locality: "California" }, expect: { suggestedAny: true } },
+  { why: "a city Google files as a region (Taipei City is administrative_area_level_1)", capture: { title: "Din Tai Fung", address: "City Hall Rd", locality: "Taipei" }, expect: { linked: "Din Tai Fung", address: "Taipei" } },
+  { why: "r9: New York is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "New York" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
+  { why: "r9: NYC is confirmed by Brooklyn", capture: { title: "Di Fara Pizza", locality: "NYC" }, expect: { linked: "Di Fara", address: "Brooklyn" } },
+  { why: "r9: 纽约 is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "纽约" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
   { why: "r8: a city named like a street is not confirmed by the street (Washington St)", capture: { title: "Golden Dragon", locality: "Washington" }, expect: { suggestedAny: true, notAddress: "Washington St" } },
   { why: "r8: Alameda the city is not N Alameda St", capture: { title: "Philippe The Original", locality: "Alameda" }, expect: { suggested: "Philippe", reason: "locality_mismatch" } },
   { why: "r8: the city it is in", capture: { title: "Philippe The Original", locality: "Los Angeles" }, expect: { linked: "Philippe", address: "Los Angeles" } },
@@ -110,6 +136,9 @@ function verdict(c: Case, m: Awaited<ReturnType<typeof decidePlaceMatch>>): stri
   const { match, linkGoogleId } = m;
   const e = c.expect;
   const has = (hay: string | null, needle: string | undefined) => !needle || (hay ?? "").toLowerCase().includes(needle.toLowerCase());
+  if ("notLinkedAt" in e) {
+    return linkGoogleId && match.formatted_address?.toLowerCase().includes(e.notLinkedAt.toLowerCase()) ? `expected no link at ${e.notLinkedAt}` : null;
+  }
   if ("nothing" in e) return linkGoogleId || match.tentative ? "expected nothing" : null;
   if ("suggestedAny" in e) {
     if (linkGoogleId) return "expected no link";
@@ -128,22 +157,69 @@ function verdict(c: Case, m: Awaited<ReturnType<typeof decidePlaceMatch>>): stri
   return null;
 }
 
-/** The address rules on fixed strings, no Google: [what, got, expected]. */
+/** Structured addresses as Google gives them, for the rules on fixed data. */
+const C = (long: string, types: string, short = long): GoogleAddressComponent => ({ long, short, types: types.split(",").filter(Boolean) });
+const US = [C("United States", "country,political", "US")];
+const SF = [C("822", "street_number"), C("Washington Street", "route", "Washington St"), C("Chinatown", "neighborhood,political"), C("San Francisco", "locality,political"), C("San Francisco County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const SSF = [C("123", "street_number"), C("Grand Avenue", "route", "Grand Ave"), C("South San Francisco", "locality,political"), C("San Mateo County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const DC = [C("1", "street_number"), C("Main Street Northwest", "route", "Main St NW"), C("Washington", "locality,political"), C("District of Columbia", "administrative_area_level_1,political", "DC"), ...US];
+const SOUTH_PASADENA = [C("1040", "street_number"), C("Mission Street", "route", "Mission St"), C("South Pasadena", "locality,political"), C("Los Angeles County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const BROOKLYN = [C("178", "street_number"), C("Broadway", "route"), C("Southside", "neighborhood,political"), C("Brooklyn", "sublocality_level_1,sublocality,political"), C("Kings County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const FLUSHING = [C("37-01", "street_number"), C("Main Street", "route", "Main St"), C("Flushing", "neighborhood,political"), C("Queens", "sublocality_level_1,sublocality,political"), C("Queens County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const GREAT_NECK = [C("255", "street_number"), C("Northern Boulevard", "route", "Northern Blvd"), C("Great Neck", "locality,political"), C("Nassau County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const CARMINE = [C("7", "street_number"), C("Carmine Street", "route", "Carmine St"), C("Manhattan", "sublocality_level_1,sublocality,political"), C("New York", "locality,political"), C("New York County", "administrative_area_level_2,political"), C("New York", "administrative_area_level_1,political", "NY"), ...US];
+const CENTURY_CITY = [C("Ste 2610", "subpremise"), C("10250", "street_number"), C("Santa Monica Boulevard", "route", "Santa Monica Blvd"), C("Century City", "neighborhood,political"), C("Los Angeles", "locality,political"), C("California", "administrative_area_level_1,political", "CA"), C("90067", "postal_code"), ...US];
+const ALAMEDA_ST = [C("1001-1003", "street_number"), C("North Alameda Street", "route", "N Alameda St"), C("Los Angeles", "locality,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+const SHANGHAI_ZH = [C("269", "street_number"), C("吴江路", "route"), C("静安区", "sublocality_level_1,sublocality,political"), C("上海市", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
+const SHANGHAI_PINYIN = [C("269", "street_number"), C("Wu Jiang Lu", "route"), C("Jing An Qu", "sublocality_level_1,sublocality,political"), C("Shang Hai Shi", "administrative_area_level_1,political"), C("China", "country,political", "CN")];
+const TAIPEI = [C("B1", "subpremise"), C("45號", "street_number"), C("City Hall Road", "route", "City Hall Rd"), C("Xinyi District", "administrative_area_level_2,political"), C("Taipei City", "administrative_area_level_1,political"), C("Taiwan", "country,political", "TW")];
+
+/** The address rules on fixed data, no Google: [what, got, expected]. */
 function pureChecks(): [string, unknown, unknown][] {
   return [
-    ["street part dropped", localityPart("822 Washington St, San Francisco, CA 94108, USA"), " San Francisco, CA 94108, USA"],
-    ["streetless first part kept", localityPart("四牌楼 Huangpu, China, 200010"), "四牌楼 Huangpu, China, 200010"],
-    ["Han address cut before its street", localityPart("中国上海市黄浦区黄河路90号"), "中国上海市黄浦区"],
-    ["Washington St is not Washington", localityIn("Washington", ["822 Washington St, San Francisco, CA 94108, USA"]), false],
-    ["Washington DC is", localityIn("Washington", ["1 Main St NW, Washington, DC 20001, USA"]), true],
-    ["华盛顿 is not Washington St", localityIn("华盛顿", ["822 Washington St, San Francisco, CA 94108, USA"]), false],
-    ["Queens by its neighbourhood", localityIn("Queens", ["136-20 Roosevelt Ave, Flushing, NY 11354, USA"]), true],
-    ["Manhattan is New York", localityIn("Manhattan", ["1435 Broadway, New York, NY 10018, USA"]), true],
-    ["a suite is not the house number", houseNumberIn("2610", "10250 Santa Monica Blvd Ste 2610, Los Angeles, CA 90067"), false],
-    ["a postcode is not the house number", houseNumberIn("90067", "10250 Santa Monica Blvd, Los Angeles, CA 90067"), false],
-    ["the house number", houseNumberIn("1435", "1435 Broadway, New York, NY 10018"), true],
-    ["a number in a range", houseNumberIn("1003", "1001-1003 N Alameda St, Los Angeles"), true],
-    ["a Han 号 number", houseNumberIn("269", "中国上海市静安区吴江路269号"), true],
+    ["Washington St is not Washington", localityConfirmed("Washington", [SF]), false],
+    ["Washington DC is", localityConfirmed("Washington", [DC]), true],
+    ["华盛顿 is not Washington St", localityConfirmed("华盛顿", [SF]), false],
+    ["Chinatown, a neighbourhood", localityConfirmed("Chinatown", [SF]), true],
+    ["SF, an abbreviation", localityConfirmed("SF", [SF]), true],
+    ["South San Francisco is not San Francisco", localityConfirmed("South San Francisco, CA", [SF]), false],
+    ["San Francisco is not South San Francisco", localityConfirmed("San Francisco", [SSF]), false],
+    ["South San Francisco is itself", localityConfirmed("South San Francisco", [SSF]), true],
+    ["Pasadena is not South Pasadena", localityConfirmed("Pasadena", [SOUTH_PASADENA]), false],
+    ["Pasadena contradicted by South Pasadena", cityContradicted("Pasadena", [SOUTH_PASADENA]), true],
+    ["a country confirms nothing", localityConfirmed("USA", [SF]), false],
+    ["a country confirms nothing (United States)", localityConfirmed("United States", [SF]), false],
+    ["a state confirms nothing", localityConfirmed("California", [SF]), false],
+    ["a state abbreviation confirms nothing", localityConfirmed("CA", [SF]), false],
+    ["New York the state is not New York the city", localityConfirmed("New York", [GREAT_NECK]), false],
+    ["中国 confirms nothing", localityConfirmed("中国", [SHANGHAI_ZH]), false],
+    ["Taiwan confirms nothing", localityConfirmed("Taiwan", [TAIPEI]), false],
+    ["上海, a city filed as a region", localityConfirmed("上海", [SHANGHAI_ZH]), true],
+    ["上海 against pinyin", localityConfirmed("上海", [SHANGHAI_PINYIN]), true],
+    ["静安 (区 cut)", localityConfirmed("静安", [SHANGHAI_ZH]), true],
+    ["Taipei, a city filed as a region", localityConfirmed("Taipei", [TAIPEI]), true],
+    ["New York confirmed by Brooklyn", localityConfirmed("New York", [BROOKLYN]), true],
+    ["NYC confirmed by Queens", localityConfirmed("NYC", [FLUSHING]), true],
+    ["纽约 confirmed by Brooklyn", localityConfirmed("纽约", [BROOKLYN]), true],
+    ["New York not contradicted by Brooklyn", cityContradicted("New York", [BROOKLYN]), false],
+    ["NYC not contradicted by Flushing", cityContradicted("NYC", [FLUSHING]), false],
+    ["Manhattan is not Brooklyn", localityConfirmed("Manhattan", [BROOKLYN]), false],
+    ["Manhattan is New York", localityConfirmed("Manhattan", [CARMINE]), true],
+    ["Queens by its neighbourhood", localityConfirmed("Queens", [FLUSHING]), true],
+    ["Flushing", localityConfirmed("法拉盛", [FLUSHING]), true],
+    ["West New York is not New York", localityConfirmed("West New York", [CARMINE]), false],
+    ["Downtown Los Angeles is Los Angeles", localityConfirmed("Downtown Los Angeles", [CENTURY_CITY]), true],
+    ["Chicago contradicted by New York", cityContradicted("Chicago", [CARMINE]), true],
+    ["no structured address contradicts nothing", cityContradicted("Chicago", []), false],
+    ["a suite is not the house number", streetNumberIs("2610", CENTURY_CITY), false],
+    ["a postcode is not the house number", streetNumberIs("90067", CENTURY_CITY), false],
+    ["the house number", streetNumberIs("10250", CENTURY_CITY), true],
+    ["a number in a range", streetNumberIs("1003", ALAMEDA_ST), true],
+    ["a Han 号 number", streetNumberIs("269", SHANGHAI_ZH), true],
+    ["a 號 number", streetNumberIs("45", TAIPEI), true],
+    ["a street line Google did not split", streetNumberIs("129", [C("解放街129号", ""), C("嘉定区", "sublocality_level_1,sublocality,political")]), true],
+    ["Shang Hai Shi is Shanghai", placeKey("Shang Hai Shi"), "shanghai"],
+    ["上海市 is 上海", placeKey("上海市"), "上海"],
   ];
 }
 

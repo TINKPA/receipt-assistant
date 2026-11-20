@@ -25,7 +25,7 @@ import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { runClaude } from "../claude.js";
 import { getUploadDir } from "../routes/documents.service.js";
-import { resolveInside } from "../http/files.js";
+import { resolveInside, resolveStoredFile } from "../http/files.js";
 import { HttpProblem } from "../http/problem.js";
 import { storableImage } from "./image.js";
 import { isLandmarkAddress, landmarkQueryText, matchPlaceByText, workspaceArea, type MatchOptions, type PlaceMatch } from "./places.js";
@@ -343,8 +343,12 @@ async function readCaptureWith(
   model: string | null,
   base: Record<string, unknown>,
 ): Promise<void> {
-  const abs = row.image_path ? resolveInside(wishImageRoot(), row.image_path) : null;
-  // No file to read: a failure like any other, with the attempt's time.
+  // A regular file inside the root, checked before anything is spawned:
+  // the model asked about a file that is not there says "nothing here",
+  // which would be filed as `nothing_to_save` and turn a place into a
+  // thing. No file to read is a failure like any other, with the
+  // attempt's time, and the kind is left as it was.
+  const abs = await resolveStoredFile(wishImageRoot(), row.image_path);
   if (!abs) return failCapture(id, { ...base, session_id: null, error: "image_missing" });
   console.log(`[wish] read capture=${id} sessionId=${sessionId}`);
   let stdout: string;
