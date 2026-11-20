@@ -137,8 +137,9 @@ export interface PlaceMatch {
 
 /**
  * Why a found place is only a suggestion:
- * - `name_only`: a capture with no city or address, or a typed name in a
- *   workspace with no usual area yet;
+ * - `name_only`: a capture with no city or address, or with a street and
+ *   neither a house number nor a city ("Main Street" is in most towns), or
+ *   a typed name in a workspace with no usual area yet;
  * - `low_confidence`: the reading itself was a guess;
  * - `name_mismatch`: Google's name does not carry the asked-for one (for a
  *   typed name, also a branch of the brand inside the area);
@@ -147,7 +148,8 @@ export interface PlaceMatch {
  *   Google's address confirms;
  * - `address_mismatch`: the read house number is not the house number of
  *   Google's address on the read street;
- * - `street_mismatch`: the read street is not in it;
+ * - `street_mismatch`: the read street is not in it (a street of the same
+ *   name and another type, "Pike St" for "Pike Pl", is another street);
  * - `street_unverified`: Google's address names no street to compare;
  * - `locality_mismatch`: no part of the read city or neighbourhood is a
  *   whole city-level part of Google's structured address in any language
@@ -156,9 +158,10 @@ export interface PlaceMatch {
  *   "Downtown" without a city that is confirmed too), or a read city is
  *   not, whatever street agrees (a namesake in another town, "South San
  *   Francisco" for San Francisco, or a neighbourhood Google does not name);
- * - `several_branches`: a capture with a city or neighbourhood and no
- *   street, where two or more places of that name are confirmed by it (a
- *   chain in a big city): the first is offered;
+ * - `several_branches`: a capture with a street and no house number, or a
+ *   city or neighbourhood and no street, where two or more places of that
+ *   name are confirmed by it (a chain on Broadway, a chain in a big city):
+ *   the first is offered;
  * - `outside_area`: a typed name found outside the workspace's area.
  */
 export type MatchReason =
@@ -247,6 +250,31 @@ const STREET_WORDS = new Set([
   "n", "s", "e", "w", "ne", "nw", "se", "sw", "north", "south", "east", "west",
   "lu", "jie", "dao", "nan", "bei", "dong", "xi", "zhong",
 ]);
+/** The kind of street, one spelling per kind: "Pike St" and "Pike Street"
+ *  are one street, "Pike St" and "Pike Pl" two. */
+const STREET_TYPES: Record<string, string> = {
+  st: "st", street: "st", ave: "ave", av: "ave", avenue: "ave", blvd: "blvd", boulevard: "blvd", bl: "blvd",
+  rd: "rd", road: "rd", dr: "dr", drive: "dr", ln: "ln", lane: "ln", way: "way", pl: "pl", place: "pl",
+  ct: "ct", court: "ct", ter: "ter", terrace: "ter", pkwy: "pkwy", parkway: "pkwy", hwy: "hwy", highway: "hwy",
+  cir: "cir", circle: "cir", sq: "sq", square: "sq", plz: "plz", plaza: "plz", aly: "aly", alley: "aly",
+  row: "row", walk: "walk", mall: "mall",
+};
+/** The street type of one Latin street line ("1124 Pike St" → "st",
+ *  "Saint Marks Place" → "pl"): the last type word that follows a word of
+ *  the name, so a leading "St" (Saint) is not one. Null when there is none
+ *  ("Broadway") or the line is not Latin. Only the part before a comma. */
+export function streetType(line: string | null | undefined): string | null {
+  if (!line || HAN.test(line)) return null;
+  let named = false;
+  let type: string | null = null;
+  for (const w of addressWords(line.split(/[,，]/u)[0]!)) {
+    if (/^\d+[a-z]?$/.test(w) && !named) continue;
+    const t = STREET_TYPES[w];
+    if (t && named) type = t;
+    else if (!t && !STREET_WORDS.has(w)) named = true;
+  }
+  return type;
+}
 /** "Sixth" and "6th" are one street. */
 const ORDINAL_WORDS: Record<string, string> = {
   first: "1st", second: "2nd", third: "3rd", fourth: "4th", fifth: "5th", sixth: "6th", seventh: "7th", eighth: "8th",
@@ -274,7 +302,9 @@ function addressWords(s: string): string[] {
  *  without the street type or side ("6th" and "3rd" kept: a numbered
  *  street is named by its number), and Han names without their 路 / 街.
  *  Null when nothing is left (no street to check). */
-export function streetCore(address: string | null | undefined): { latin: string[]; han: string[] } | null {
+export function streetCore(
+  address: string | null | undefined,
+): { latin: string[]; han: string[]; type: string | null } | null {
   if (!address) return null;
   const latin: string[] = [];
   const han: string[] = [];
@@ -293,14 +323,23 @@ export function streetCore(address: string | null | undefined): { latin: string[
       for (const w of rest.split(/\s+/)) if (w && !STREET_WORDS.has(w)) latin.push(w);
     } else if ((ORDINAL.test(word) || !/\d/.test(word)) && !STREET_WORDS.has(word)) latin.push(word);
   }
-  return latin.length + han.length > 0 ? { latin, han } : null;
+  return latin.length + han.length > 0 ? { latin, han, type: streetType(address) } : null;
 }
 
-/** Is the read street the route Google names (`formatted`: the route's
- *  spellings, `routeText`)? `unknown` when it is written in a script the
- *  street cannot be compared with (a Han street, an English route). */
-function streetIn(core: { latin: string[]; han: string[] }, formatted: string | null): "yes" | "no" | "unknown" {
+/** Is the read street the route of a structured address? `unknown` when
+ *  it is written in a script the street cannot be compared with (a Han
+ *  street, an English route). When both name a street type and the types
+ *  differ, it is another street ("Pike St" is not "Pike Pl"). */
+function streetIn(
+  core: { latin: string[]; han: string[]; type: string | null },
+  set: GoogleAddressComponent[],
+): "yes" | "no" | "unknown" {
+  const formatted = routeText(set);
   if (!formatted) return "no";
+  if (core.type) {
+    const types = new Set(set.filter(isRoute).flatMap((c) => [streetType(c.long), streetType(c.short)]).filter(Boolean));
+    if (types.size > 0 && !types.has(core.type)) return "no";
+  }
   const f = fold(formatted);
   const words = new Set(addressWords(formatted));
   // A word, or (four letters or more) inside a run Google wrote as one
@@ -629,7 +668,7 @@ function judgeAddress(address: string | null | undefined, c: Seen): MatchReason 
   if (!number && !core) return "no_address";
   const withRoute = componentSets(c).filter((set) => set.some(isRoute));
   const streetLevel = withRoute.length > 0;
-  const verdicts = core ? withRoute.map((set) => streetIn(core, routeText(set))) : [];
+  const verdicts = core ? withRoute.map((set) => streetIn(core, set)) : [];
   // The number confirms only on the read street, unless Google wrote the
   // street in a script it cannot be compared with in every language asked.
   const streetOk = !core || verdicts.includes("yes") || (verdicts.length > 0 && verdicts.every((v) => v === "unknown"));
@@ -661,7 +700,12 @@ function judgeAddress(address: string | null | undefined, c: Seen): MatchReason 
  * - a capture with a street address: its house number is the
  *   `street_number` of a structured address whose `route` is the read
  *   street (never a suite, which is a `subpremise`, or a postcode), else
- *   its street ("6th St", "天平路") is the `route`. Where Google gives no
+ *   its street ("6th St", "天平路") is the `route` (a street type that
+ *   differs, "Pike St" against "Pike Pl", is another street); a street
+ *   with no house number confirms only beside a read city ("Main Street"
+ *   alone is `name_only`) and only when it is the one place of that name
+ *   on the street among Find Place's and Text Search's answers (two or
+ *   more, Starbucks on Broadway: `several_branches`). Where Google gives no
  *   route at all, the read locality must be confirmed instead, the name
  *   must agree at 0.9 or more, and no other place of that name in Text
  *   Search's answer may be one the address cannot rule out
@@ -772,8 +816,13 @@ export async function decidePlaceMatch(
       else where = "outside_area";
     } else {
       const a = judgeAddress(opts.address, c);
-      if (a === "number" || a === "street") by = a;
-      else if (a !== "no_address") where = a;
+      if (a === "number") by = a;
+      // A street with no house number and no city is in most towns
+      // ("Main Street", "Sunset Blvd"): it confirms no location.
+      else if (a === "street") {
+        if (opts.locality) by = a;
+        else where = "name_only";
+      } else if (a !== "no_address") where = a;
       else if (opts.locality) {
         if (localityConfirmed(opts.locality, sets)) by = "locality";
         else where = "locality_mismatch";
@@ -833,10 +882,11 @@ export async function decidePlaceMatch(
     }
     const firstSeen = seen.get(first.googlePlaceId)!;
     const firstJudged = await judge(firstSeen);
-    // A house number or a street names one branch. A city or neighbourhood
-    // alone does only when no other branch of the name is in it, which
-    // Text Search below counts.
-    if (linkable(firstJudged) && firstJudged.by !== "locality") return finish(firstSeen, firstJudged, null);
+    // A house number names one branch. A street without one, or a city or
+    // neighbourhood alone, does only when no other branch of the name is
+    // on it or in it, which Text Search below counts.
+    const unique = (j: Judged) => j.by === "number" || j.by === "area";
+    if (linkable(firstJudged) && unique(firstJudged)) return finish(firstSeen, firstJudged, null);
 
     // Text Search, in the name's script and in English, for a place that
     // qualifies further down Google's list, and for the other branches a
@@ -861,15 +911,19 @@ export async function decidePlaceMatch(
       const c = seen.get(id)!;
       judged.push({ c, j: await judge(c) });
     }
-    const ok = judged.find(({ j }) => linkable(j) && j.by !== "locality");
+    const ok = judged.find(({ j }) => linkable(j) && unique(j));
     if (ok) return finish(ok.c, ok.j, null);
-    // Confirmed by the locality alone: linked only when it is the one place
-    // of that name the locality confirms ("Din Tai Fung, King County" has
-    // Tukwila, Bellevue and Seattle; Joe's Pizza in Manhattan has several).
-    // When Text Search could not run, Find Place's answer is all there is.
-    const byLocality = judged.filter(({ j }) => linkable(j) && j.by === "locality");
-    if (byLocality.length === 1) return finish(byLocality[0]!.c, byLocality[0]!.j, null);
-    if (byLocality.length > 1) return finish(byLocality[0]!.c, byLocality[0]!.j, "several_branches");
+    // Confirmed by a street with no number, or by the locality alone:
+    // linked only when it is the one place of that name so confirmed
+    // (Starbucks on Broadway in Manhattan has five; "Din Tai Fung, King
+    // County" has Tukwila, Bellevue and Seattle; Joe's Pizza in Manhattan
+    // has several). The street is asked first. When Text Search could not
+    // run, Find Place's answer is all there is.
+    for (const by of ["street", "locality"] as const) {
+      const confirmed = judged.filter(({ j }) => linkable(j) && j.by === by);
+      if (confirmed.length === 1) return finish(confirmed[0]!.c, confirmed[0]!.j, null);
+      if (confirmed.length > 1) return finish(confirmed[0]!.c, confirmed[0]!.j, "several_branches");
+    }
 
     // Google's address names no street to check the read one against
     // (mainland China: "四牌楼 Huangpu, China"): linked on the name and the

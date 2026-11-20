@@ -48,7 +48,8 @@ export const WishPlaceSuggestion = z
     google_place_id: z.string(),
     name: z.string().nullable(),
     formatted_address: z.string().nullable(),
-    /** `name_only` (no city or address to go on), `low_confidence` (the
+    /** `name_only` (no city or address to go on, or only a street with no
+     *  house number and no city: "Main Street" is in most towns), `low_confidence` (the
      *  reading was a guess), `name_mismatch` (Google's place has another
      *  name; for a typed name, also a branch of the same brand inside the
      *  workspace's area when the typed words for where match no branch),
@@ -56,7 +57,9 @@ export const WishPlaceSuggestion = z
      *  two cannot be compared, and no house number confirms the place),
      *  `address_mismatch` (the house number in the image is not the found
      *  place's house number on the street the image names), `street_mismatch`
-     *  (the street the image names, "6th Ave" or "天平路", is not in it),
+     *  (the street the image names, "6th Ave" or "天平路", is not in it;
+     *  a street of the same name and another type, "Pike St" for "Pike Pl",
+     *  is another street),
      *  `street_unverified` (Google's address names no street to compare it
      *  with), `locality_mismatch` (the city or neighbourhood the image
      *  names is not a whole city-level part of Google's structured address,
@@ -64,9 +67,9 @@ export const WishPlaceSuggestion = z
      *  town, "South San Francisco" for San Francisco, a state, a country
      *  or a county only, a bare generic neighbourhood such as "Downtown"
      *  with no city, or a neighbourhood Google does not name),
-     *  `several_branches` (the image names a city or neighbourhood and no
-     *  street, and two or more places of that name are in it: the first is
-     *  offered), `outside_area` (a typed name found outside the workspace's
+     *  `several_branches` (the image names a street and no house number,
+     *  or a city or neighbourhood and no street, and two or more places of
+     *  that name are on it or in it: the first is offered), `outside_area` (a typed name found outside the workspace's
      *  usual area). */
     reason: z.string().nullable(),
   })
