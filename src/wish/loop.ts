@@ -15,13 +15,22 @@
  *     still a wish. "The day" is the local date in the wish place's time
  *     zone, else the transaction place's, else the workspace's most
  *     common one. On that same day it must also not be known to be
- *     earlier: its `occurred_at` when printed, else when it was booked (a
- *     receipt booked before the wish was made is a visit before it);
+ *     earlier: its `occurred_at` when printed, else when it was booked;
+ *   - it was booked after the wish was made (or set back to active): a
+ *     receipt is booked after the visit it records, so one booked before
+ *     the wish is a visit before it, whatever date it now carries (a
+ *     misread future date, a date edited later);
+ *   - it is not dated after today (local day, as above), nor printed with
+ *     a time still to come: a date ahead of the clock is a misreading, not
+ *     a visit, and would make `converted_at` a future time;
  *   - it is not one the user dismissed (leaving `converted` by hand puts
  *     the converting transaction in `dismissed_transaction_ids`);
  *   - for a place wish: `transactions.place_id` is the wish's place, or the
- *     transaction's merchant's place (`merchants.place_id`, a Google id)
- *     is the wish place's `google_place_id`;
+ *     transaction has no place of its own and its merchant's place
+ *     (`merchants.place_id`, a Google id) is the wish place's
+ *     `google_place_id`. A merchant is per brand and its place is one
+ *     branch, so a purchase placed at another branch never matches through
+ *     it;
  *     for a thing wish with a `product_id`: a live line item of the
  *     transaction has that product.
  *
@@ -130,14 +139,18 @@ async function workspaceTimeZone(workspaceId: string): Promise<string> {
   return tz;
 }
 
+/** Transaction `t` (merchant `m`) happened at place wish `w` (place `wp`).
+ *  The merchant's place counts only for a transaction with no place of its
+ *  own: a merchant is per brand, and its place is one of its branches. */
+const atWishPlace = sql`(w.kind = 'place' AND w.place_id IS NOT NULL
+           AND (t.place_id = w.place_id
+                OR (t.place_id IS NULL AND m.place_id IS NOT NULL AND m.place_id = wp.google_place_id)))`;
+
 /** The wish ids a run looks at: active ones and receipt conversions the
  *  scope can touch, plus every receipt conversion that lost its proof. */
 async function wishesInScope(scope: WishLoopScope): Promise<string[]> {
   const open = sql`(w.status = 'active' OR (w.status = 'converted' AND w.converted_by = 'receipt'))`;
-  const matches = sql`(
-         (w.kind = 'place' AND w.place_id IS NOT NULL
-           AND (t.place_id = w.place_id OR (m.place_id IS NOT NULL AND m.place_id = wp.google_place_id)))
-      OR (w.kind = 'thing' AND w.product_id IS NOT NULL
+  const matches = sql`(${atWishPlace} OR (w.kind = 'thing' AND w.product_id IS NOT NULL
            AND EXISTS (SELECT 1 FROM transaction_items ti WHERE ti.transaction_id = t.id AND ti.product_id = w.product_id)))`;
   let scoped: SQL | null = null;
   if ("transactionIds" in scope) {
@@ -188,6 +201,9 @@ interface WishState {
   converted_transaction_id: string | null;
 }
 
+/** A printed time this far ahead of the server's clock still counts. */
+const CLOCK_GRACE_MS = 10 * 60 * 1000;
+
 /** Qualifying transactions of these wishes, earliest first per wish. */
 async function qualifying(wishIds: string[]): Promise<Map<string, { row: CandidateRow; tz: string }[]>> {
   const out = new Map<string, { row: CandidateRow; tz: string }[]>();
@@ -208,23 +224,32 @@ async function qualifying(wishIds: string[]): Promise<Map<string, { row: Candida
        -- Any zone's local day of 'since' is at most a day before its UTC day;
        -- the exact day is checked below.
        AND t.occurred_on >= ((greatest(w.created_at, w.reactivated_at) AT TIME ZONE 'UTC')::date - 1)
+       -- Booked after the wish: a receipt booked before it records a visit
+       -- before it, whatever date it carries now.
+       AND t.created_at >= greatest(w.created_at, w.reactivated_at)
+       -- Any zone's local today is at most a day after the UTC one; the
+       -- exact day is checked below.
+       AND t.occurred_on <= (now() AT TIME ZONE 'UTC')::date + 1
        AND d.pl_class IN ('expense', 'mixed') AND d.total > 0
        AND coalesce(t.metadata->>'flow', 'purchase') NOT IN ('refund', 'income')
        AND nullif(btrim(t.metadata->>'refund_of'), '') IS NULL
        AND (
-             (w.kind = 'place' AND w.place_id IS NOT NULL
-               AND (t.place_id = w.place_id OR (m.place_id IS NOT NULL AND m.place_id = wp.google_place_id)))
+             ${atWishPlace}
           OR (w.kind = 'thing' AND w.product_id IS NOT NULL
                AND EXISTS (SELECT 1 FROM transaction_items ti
                             WHERE ti.transaction_id = t.id AND ti.product_id = w.product_id AND ti.retired_at IS NULL))
            )
      ORDER BY w.id, t.occurred_on, t.occurred_at NULLS LAST, t.created_at, t.id`);
+  const now = new Date();
   for (const row of res.rows as unknown as CandidateRow[]) {
     const tz = validTimeZone(row.wish_tz) ?? validTimeZone(row.txn_tz) ?? (await workspaceTimeZone(row.workspace_id));
     const since = new Date(row.since);
     const sinceDay = localDate(since, tz);
     if (row.occurred_on < sinceDay) continue; // bought or visited before it was wished for
     if (row.occurred_on === sinceDay && new Date(row.occurred_at ?? row.booked_at) < since) continue; // earlier that day
+    if (new Date(row.booked_at) < since) continue; // booked before the wish: a visit before it
+    if (row.occurred_on > localDate(now, tz)) continue; // dated after today: a misreading, not a visit
+    if (row.occurred_at && new Date(row.occurred_at).getTime() > now.getTime() + CLOCK_GRACE_MS) continue; // a time still to come
     const list = out.get(row.wish_id) ?? [];
     list.push({ row, tz });
     out.set(row.wish_id, list);

@@ -210,6 +210,9 @@ export const MergeProductResponse = z
     target_id: Uuid,
     moved_transaction_items: z.number().int(),
     moved_owned_items: z.number().int(),
+    /** Thing wishes for the source, now wishes for the target (and checked
+     *  against the target's purchases at once). */
+    moved_wish_items: z.number().int(),
     derivation_event_id: Uuid,
   })
   .openapi("MergeProductResponse");

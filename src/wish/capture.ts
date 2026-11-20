@@ -138,8 +138,15 @@ const keepCaptureKeys = sql.raw(
   ).join(" || "),
 );
 
+/** The wish a sibling was split from still exists. */
+const originalExists = sql`EXISTS (SELECT 1 FROM wish_items o
+                                    WHERE o.id::text = capture->>'sibling_of' AND o.workspace_id = wish_items.workspace_id)`;
+
 /** Read a failed (or interrupted) capture again. Fields the person set by
- *  hand stay theirs (`capture.user_set`). */
+ *  hand stay theirs (`capture.user_set`). A wish split from another
+ *  capture is read through that one, which reads all the places in the
+ *  image; once that wish is deleted, the split one is read on its own,
+ *  for its own entry of the list (`readCapture`). */
 export async function retryCapture(workspaceId: string, id: string): Promise<void> {
   const res = await db.execute(sql`
     UPDATE wish_items
@@ -148,10 +155,12 @@ export async function retryCapture(workspaceId: string, id: string): Promise<voi
            updated_at = now()
      WHERE id = ${id}::uuid AND workspace_id = ${workspaceId}::uuid
        AND image_path IS NOT NULL AND capture_status IN ('failed', 'done')
-       AND NOT coalesce(capture ? 'sibling_of', false)
+       AND NOT (coalesce(capture ? 'sibling_of', false) AND ${originalExists})
     RETURNING id`);
   if (res.rows.length === 0) {
-    const why = await db.execute(sql`SELECT capture->>'sibling_of' AS sibling_of FROM wish_items WHERE id = ${id}::uuid`);
+    const why = await db.execute(sql`
+      SELECT capture->>'sibling_of' AS sibling_of FROM wish_items
+       WHERE id = ${id}::uuid AND coalesce(capture ? 'sibling_of', false) AND ${originalExists}`);
     const siblingOf = (why.rows[0] as { sibling_of: string | null } | undefined)?.sibling_of;
     if (siblingOf) {
       throw new HttpProblem(
@@ -255,9 +264,19 @@ async function failCapture(id: string, capture: Record<string, unknown>, describ
 }
 
 async function readCapture(id: string): Promise<void> {
-  const rows = await db.execute(sql`SELECT workspace_id, image_path, notes FROM wish_items WHERE id = ${id}::uuid AND capture_status = 'reading'`);
-  const row = rows.rows[0] as { workspace_id: string; image_path: string | null; notes: string | null } | undefined;
+  const rows = await db.execute(sql`
+    SELECT workspace_id, image_path, notes, title, capture ? 'sibling_of' AS is_sibling,
+           capture->'retry_of'->'reading'->>'title' AS read_title
+      FROM wish_items WHERE id = ${id}::uuid AND capture_status = 'reading'`);
+  const row = rows.rows[0] as
+    | { workspace_id: string; image_path: string | null; notes: string | null; title: string; is_sibling: boolean; read_title: string | null }
+    | undefined;
   if (!row?.image_path) return; // deleted, or no longer waiting
+  // A wish split from a list (its original deleted, so retried on its
+  // own): the reading is about its entry, and the list is not split again.
+  const focus = row.is_sibling
+    ? ([WISH_TITLE_WHILE_READING, WISH_TITLE_UNREAD].includes(row.title) ? row.read_title : row.title) ?? row.read_title
+    : null;
   const abs = resolveInside(wishImageRoot(), row.image_path);
   if (!abs) return failCapture(id, { error: "image_missing" });
 
@@ -269,7 +288,7 @@ async function readCapture(id: string): Promise<void> {
   try {
     const args = ["--output-format", "text"];
     if (model) args.push("--model", model);
-    ({ stdout } = await runClaude(buildWishReadPrompt(abs, row.notes), { profile: "image_read", args, timeoutMs: READ_TIMEOUT_MS, sessionId }));
+    ({ stdout } = await runClaude(buildWishReadPrompt(abs, row.notes, focus), { profile: "image_read", args, timeoutMs: READ_TIMEOUT_MS, sessionId }));
   } catch (err) {
     console.error(`[wish] capture=${id} FAILED:`, (err as Error).message.slice(0, 300));
     return failCapture(id, { ...base, error: "agent_error", detail: (err as Error).message.slice(0, 300) });
@@ -309,12 +328,37 @@ async function readCapture(id: string): Promise<void> {
            capture = ${JSON.stringify({ ...base, reading: r, place_match: match })}::jsonb || ${keepCaptureKeys},
            updated_at = now()
      WHERE id = ${id}::uuid AND capture_status = 'reading'
-    RETURNING id, place_id, capture ? 'siblings' AS has_siblings`);
-  const done = upd.rows[0] as { id: string; place_id: string | null; has_siblings: boolean } | undefined;
+    RETURNING id, place_id, capture ? 'siblings' AS has_siblings, capture ? 'sibling_of' AS is_sibling`);
+  const done = upd.rows[0] as { id: string; place_id: string | null; has_siblings: boolean; is_sibling: boolean } | undefined;
   if (!done) return;
-  // Been there already since the wish was made? Usually not.
-  if (done.place_id) await settleWishesSafely({ wishIds: [id] });
-  if (r.others.length > 0 && !done.has_siblings) await splitSiblings(id, row.workspace_id, r, base);
+  if (done.place_id) {
+    await markDuplicate(id, row.workspace_id, done.place_id);
+    // Been there already since the wish was made? Usually not.
+    await settleWishesSafely({ wishIds: [id] });
+  }
+  if (r.others.length > 0 && !done.has_siblings && !done.is_sibling) await splitSiblings(id, row.workspace_id, r, base);
+}
+
+/**
+ * A place the workspace already wishes for, saved again from another
+ * image (a second screenshot of the same listing): the new wish names the
+ * earlier one in `capture.duplicate_of`, so a client can offer to merge
+ * them. The wish itself stays: its id is what the uploader is polling.
+ * Split wishes skip such a place instead (`others_skipped`).
+ */
+async function markDuplicate(id: string, workspaceId: string, placeId: string): Promise<void> {
+  const res = await db.execute(sql`
+    UPDATE wish_items w
+       SET capture = w.capture || jsonb_build_object('duplicate_of', d.id)
+      FROM (SELECT o.id FROM wish_items o
+             WHERE o.workspace_id = ${workspaceId}::uuid AND o.place_id = ${placeId}::uuid
+               AND o.id <> ${id}::uuid AND o.status <> 'declined'
+               AND o.created_at <= (SELECT created_at FROM wish_items WHERE id = ${id}::uuid)
+             ORDER BY o.created_at, o.id LIMIT 1) d
+     WHERE w.id = ${id}::uuid
+    RETURNING d.id`);
+  const dup = (res.rows[0] as { id: string } | undefined)?.id;
+  if (dup) console.log(`[wish] capture=${id} is a place already wished for: wish=${dup}`);
 }
 
 /**

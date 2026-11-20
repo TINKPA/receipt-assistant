@@ -15,7 +15,7 @@ import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishItems, products, places } from "../schema/index.js";
 import { startCapture, retryCapture, wishImageRoot } from "../wish/capture.js";
-import { linkGooglePlace, matchPlaceByText, workspaceArea, type PlaceLink, type PlaceMatch } from "../wish/places.js";
+import { distanceM, linkGooglePlace, matchPlaceByText, workspaceArea, type PlaceLink, type PlaceMatch } from "../wish/places.js";
 import { settleWishesSafely } from "../wish/loop.js";
 import { nameTokens } from "../wish/names.js";
 import { safeHttpUrl } from "../wish/reading.js";
@@ -230,15 +230,6 @@ async function assertTransactionInWorkspace(workspaceId: string, txnId: string):
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-/** Great-circle distance in metres. */
-function distanceM(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
-  const rad = Math.PI / 180;
-  const dLat = (b.lat - a.lat) * rad;
-  const dLng = (b.lng - a.lng) * rad;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
-  return 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(h)));
-}
 
 /** A conversion time the person sent: not before the wish was made (a
  *  day's grace, since the client may send the start of a local day) and
@@ -513,9 +504,13 @@ wishItemsRouter.post(
       // A name Google answers with another place is only a suggestion.
       let placeMatch: PlaceMatch | null = null;
       if (kind === "place" && !placeId) {
+        // A bare name says nothing about where: only a place in the
+        // workspace's own area is linked, anything else is a suggestion.
+        const area = await workspaceArea(req.ctx.workspaceId);
         placeMatch = await matchPlaceByText(body.title, "title", null, {
           names: [body.title],
-          locationBias: await workspaceArea(req.ctx.workspaceId),
+          locationBias: area,
+          requireInArea: area,
         });
         if (placeMatch.error) console.warn(`[wish] typed place "${body.title.slice(0, 80)}" not linked: ${placeMatch.error}`);
         else if (placeMatch.tentative) console.log(`[wish] typed place "${body.title.slice(0, 80)}" suggested, not linked: ${placeMatch.name ?? "?"}`);
@@ -571,6 +566,7 @@ wishItemsRouter.patch(
       if (body.notes !== undefined) updates["notes"] = body.notes;
       if (body.target_price_minor !== undefined)
         updates["targetPriceMinor"] = body.target_price_minor;
+      if (body.currency !== undefined) updates["currency"] = body.currency;
       if (body.planned_days !== undefined) updates["plannedDays"] = body.planned_days;
       if (body.urgency !== undefined) updates["urgency"] = body.urgency;
       if (body.snoozed_until !== undefined) updates["snoozedUntil"] = body.snoozed_until;
@@ -777,7 +773,9 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from " +
       "`GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title " +
       "with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in " +
-      "`capture.place_match.error`, and a found place whose name differs from the title is not linked but offered as `place_suggestion`. " +
+      "`capture.place_match.error`. Only a found place inside the workspace's usual area (50 km around its purchases) whose name carries " +
+      "the title is linked; anything else (another name, another region, or a workspace with too few purchases to have an area) is offered " +
+      "as `place_suggestion`. " +
       "A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
     request: {
       body: { content: { "application/json": { schema: CreateWishItemRequest } } },
@@ -821,7 +819,9 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place " +
       "the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. " +
       "An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), " +
-      "except for places already wished for. " +
+      "except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one " +
+      "in `capture.duplicate_of`. A street the image names is checked against the found place's address (its house number, or with no " +
+      "number the street itself); a place that fails it is offered as `place_suggestion`. " +
       "HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made " +
       "the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
     tags: ["wish-items"],
@@ -839,13 +839,14 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     summary: "Read a captured image again",
     description:
       "Fields the person set by hand (`capture.user_set`) are kept; if the new reading fails, a wish they had named or placed stays `done`. " +
-      "A wish split from another capture (`capture.sibling_of`) is not read on its own: 409, read the original.",
+      "A wish split from another capture (`capture.sibling_of`) is not read on its own while that capture exists: 409, read the original. " +
+      "Once the original is deleted it is read on its own, for its own entry of the image (no further split).",
     tags: ["wish-items"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
       202: { description: "Accepted; reading", content: { "application/json": { schema: WishItem } } },
       404: { description: "Not Found", content: problemContent },
-      409: { description: "No image, or it is being read now", content: problemContent },
+      409: { description: "No image, it is being read now, or it was split from a capture that still exists", content: problemContent },
     },
   });
 
@@ -868,7 +869,8 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
       "replacing it (`null` removes a key, `{}` changes nothing). " +
-      "`status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made). " +
+      "`status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made; " +
+      "`Z` or a UTC offset). `currency` changes the currency of `target_price_minor` (the amount is not converted). " +
       "Changing `converted_transaction_id` (a live transaction) or `converted_at` on a receipt conversion makes it `converted_by: user`. " +
       "Leaving `converted` (to active or declined) dismisses its transaction for good; `status: active` from converted or declined " +
       "starts the wish over: only a purchase from then on converts it, and that is checked at once. " +

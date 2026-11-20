@@ -34,9 +34,11 @@ import {
   productAssets,
   transactionItems,
   ownedItems,
+  wishItems,
   derivationEvents,
   merchants,
 } from "../schema/index.js";
+import { settleWishesSafely } from "../wish/loop.js";
 import { buildInfo } from "../generated/build-info.js";
 import { PROMPT_VERSION } from "../ingest/prompt-contract.js";
 import { recomputeProductStats } from "../catalog/product-stats.js";
@@ -905,6 +907,20 @@ productsRouter.post(
           )
           .returning({ id: ownedItems.id });
 
+        // Re-point wish_items: a thing wish for the source is a wish for
+        // the target, and only the target's line items convert it now
+        // (src/wish/loop.ts reads `product_id`).
+        const wiMoved = await tx
+          .update(wishItems)
+          .set({ productId: body.target_id, updatedAt: new Date() })
+          .where(
+            and(
+              eq(wishItems.productId, sourceId),
+              eq(wishItems.workspaceId, req.ctx.workspaceId),
+            ),
+          )
+          .returning({ id: wishItems.id });
+
         // Retire source. Also push the source's product_key into
         // target's metadata.aliases so a future agent canonicalization
         // pass can collapse the old key to the new id without human
@@ -975,11 +991,18 @@ productsRouter.post(
           target_id: body.target_id,
           moved_transaction_items: tiMoved.length,
           moved_owned_items: oiMoved.length,
+          moved_wish_items: wiMoved.length,
           derivation_event_id: evt!.id,
+          moved_wish_ids: wiMoved.map((w) => w.id),
         };
       });
 
-      res.json(result);
+      // The moved wishes are checked against the target's purchases: a
+      // conversion by a moved line item stands, and one by a target line
+      // item converts an active wish.
+      const { moved_wish_ids: movedWishIds, ...answer } = result;
+      if (movedWishIds.length > 0) await settleWishesSafely({ wishIds: movedWishIds });
+      res.json(answer);
     } catch (err) {
       next(err);
     }
@@ -1225,7 +1248,7 @@ export function registerProductsOpenApi(registry: OpenAPIRegistry): void {
   registry.registerPath({
     method: "post",
     path: "/v1/products/{id}/merge_into",
-    summary: "Merge this product into the target — re-points transaction_items + owned_items, retires source",
+    summary: "Merge this product into the target — re-points transaction_items, owned_items and wish_items, retires source",
     tags: ["products"],
     request: {
       params: z.object({ id: Uuid }),

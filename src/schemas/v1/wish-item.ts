@@ -50,7 +50,11 @@ export const WishPlaceSuggestion = z
      *  reading was a guess), `name_mismatch` (Google's place has another
      *  name), `name_unverified` (a typed name in another script than
      *  Google's, so the two cannot be compared), `address_mismatch` (the
-     *  address in the image is not the found place's). */
+     *  house number in the image is not in the found place's address),
+     *  `street_mismatch` (the street the image names, with no number, is
+     *  not in it), `street_unverified` (Google's address names no street
+     *  to compare it with), `outside_area` (a typed name found outside the
+     *  workspace's usual area). */
     reason: z.string().nullable(),
   })
   .openapi("WishPlaceSuggestion");
@@ -94,6 +98,9 @@ export const WishItem = z
     workspace_id: Uuid,
     /** NULL for free-text wishes (a course, a used chair). */
     product_id: Uuid.nullable(),
+    /** A capture is `place` until its reading says otherwise; a reading
+     *  of an image with nothing to save leaves it `place` with
+     *  `capture_status: failed` and `capture.error: nothing_to_save`. */
     kind: WishKind,
     /** The matched place of a place wish; null until matched, or after
      *  the user removed a wrong match. */
@@ -145,8 +152,10 @@ export const WishItem = z
      *  `user_set` lists what the person set by hand (`title`, `kind`,
      *  `place`), which a reading never overwrites. `sibling_of` names the
      *  wish whose image listed this place too; that wish lists them in
-     *  `siblings`. `converted_from` names a HEIC / AVIF upload stored as
-     *  JPEG. Written by the server only. */
+     *  `siblings`. `duplicate_of` names an earlier wish (not declined) at
+     *  the same place, when this capture's place was already wished for.
+     *  `converted_from` names a HEIC / AVIF upload stored as JPEG.
+     *  Written by the server only. */
     capture: z.record(z.string(), z.unknown()).nullable(),
     metadata: Metadata,
     created_at: IsoDateTime,
@@ -190,6 +199,8 @@ export const UpdateWishItemRequest = z
     product_id: Uuid.nullable().optional(),
     notes: Notes.nullable().optional(),
     target_price_minor: z.number().int().positive().nullable().optional(),
+    /** The currency of `target_price_minor`; the amount is not converted. */
+    currency: CurrencyCode.optional(),
     planned_days: z.number().int().positive().nullable().optional(),
     urgency: WishUrgency.optional(),
     snoozed_until: IsoDate.nullable().optional(),
@@ -207,8 +218,14 @@ export const UpdateWishItemRequest = z
     converted_transaction_id: Uuid.nullable().optional(),
     /** Only with a conversion (status converted, sent or current); not
      *  before the wish was made (a day's grace for time zones) nor more
-     *  than a day ahead. */
-    converted_at: IsoDateTime.optional(),
+     *  than a day ahead. ISO 8601 with `Z` or a UTC offset
+     *  (`2026-11-20T00:00:00+09:00`, the start of a local day); returned
+     *  in UTC. */
+    converted_at: z
+      .string()
+      .datetime({ offset: true })
+      .optional()
+      .openapi({ format: "date-time", example: "2026-11-20T00:00:00+09:00" }),
     metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
