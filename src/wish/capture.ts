@@ -140,7 +140,7 @@ const keepCaptureKeys = sql.raw(
 
 /** The wish a sibling was split from still exists. */
 const originalExists = sql`EXISTS (SELECT 1 FROM wish_items o
-                                    WHERE o.id::text = capture->>'sibling_of' AND o.workspace_id = wish_items.workspace_id)`;
+                                    WHERE o.id::text = wish_items.capture->>'sibling_of' AND o.workspace_id = wish_items.workspace_id)`;
 
 /** Read a failed (or interrupted) capture again. Fields the person set by
  *  hand stay theirs (`capture.user_set`). A wish split from another
