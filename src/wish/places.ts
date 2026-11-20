@@ -27,7 +27,7 @@ import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchPlaceV1Dual } from "
 import { findPlaceByText, type FoundPlace } from "../google/find-place.js";
 import { searchPlacesByText } from "../google/text-search.js";
 import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
-import { comparable, hasCjk, nameMatches, nameScore } from "./names.js";
+import { comparable, hasCjk, nameMatches, nameScore, nameTokens } from "./names.js";
 
 export interface PlaceLink {
   placeId: string | null;
@@ -119,8 +119,10 @@ export interface PlaceMatch {
   /** How much of the asked-for name the found one carries (0..1); null
    *  when the two are in different scripts. */
   name_score: number | null;
-  /** Google's answer when it shared no word with the asked-for name: not
-   *  linked and not suggested (`error` says so). Absent otherwise. */
+  /** Google's answer when it shared no word with the asked-for name, or
+   *  (a typed name) was outside the workspace's area with a name that does
+   *  not agree and no branch of the brand was found inside it: not linked
+   *  and not suggested (`error` says so). Absent otherwise. */
   rejected?: { google_place_id: string; name: string | null; formatted_address: string | null };
   /** True when the query was biased to the workspace's usual area. */
   location_biased: boolean;
@@ -394,6 +396,8 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
      *  out either (Google gives no street for them). */
     let otherUnrefuted = 0;
     let searched = false;
+    /** Every place Text Search answered, in its order. */
+    const listed: Candidate[] = [];
     const otherName = !names1.agrees && names.some((n) => comparable(n, found.name ?? ""));
     if (addressIssue || otherName) {
       const seen = new Set([found.googlePlaceId]);
@@ -408,6 +412,7 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
           if (seen.has(c.google_place_id)) continue;
           seen.add(c.google_place_id);
           const cand: Candidate = { googlePlaceId: c.google_place_id, name: c.name, formattedAddress: c.formatted_address, lat: c.lat, lng: c.lng };
+          listed.push(cand);
           if (!names.some((n) => nameMatches(n, cand.name ?? ""))) continue;
           const issue = await addressAgreement(cand, opts.address, q, opts.locationBias);
           if (issue === "street_unverified") otherUnrefuted++;
@@ -438,6 +443,37 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
       }
     }
 
+    // A typed name with words for where ("Sugarfish Little Tokyo"): no
+    // branch carries the whole of it, and Find Place may answer with one in
+    // another city. A branch in the workspace's area that carries the
+    // name's first word (the brand) is the better suggestion; with none, a
+    // place elsewhere whose name does not agree is not suggested at all.
+    const area = opts.requireInArea;
+    const inArea = (c: Candidate) =>
+      Boolean(area) && c.lat !== null && c.lng !== null && distanceM(area!, { lat: c.lat, lng: c.lng }) <= area!.radiusM;
+    let brandOnly = false;
+    if (area && !inArea(found) && !names1.agrees) {
+      if (!searched) {
+        const list = await searchPlacesByText(q, { maxResults: 5, languageCode: lang, locationBias: area }).catch(() => null);
+        for (const c of list ?? []) {
+          if (c.google_place_id === found.googlePlaceId) continue;
+          listed.push({ googlePlaceId: c.google_place_id, name: c.name, formattedAddress: c.formatted_address, lat: c.lat, lng: c.lng });
+        }
+      }
+      const brands = names.map((n) => nameTokens(n)[0]).filter((t): t is string => Boolean(t) && (hasCjk(t!) || t!.length >= 3));
+      const local = listed.find((c) => inArea(c) && brands.some((b) => nameTokens(c.name ?? "").includes(b)));
+      if (local) {
+        found = local;
+        names1 = { agrees: false, score: best(local) };
+        addressIssue = null;
+        brandOnly = true;
+      } else if (names.some((n) => comparable(n, found.name ?? ""))) {
+        match.rejected = { google_place_id: found.googlePlaceId, name: found.name, formatted_address: found.formattedAddress };
+        match.error = "no place of that name found in the usual area";
+        return match;
+      }
+    }
+
     match.google_place_id = found.googlePlaceId;
     match.name = found.name;
     match.formatted_address = found.formattedAddress;
@@ -458,7 +494,7 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     // Google's answer shares no word with the name asked for: it is
     // another place, and offering it would suggest the wrong one. Nothing
     // is suggested; what Google answered is kept for the record.
-    if (!agrees && !uncomparable && match.name_score === 0) {
+    if (!agrees && !uncomparable && match.name_score === 0 && !brandOnly) {
       match.google_place_id = null;
       match.name = null;
       match.formatted_address = null;

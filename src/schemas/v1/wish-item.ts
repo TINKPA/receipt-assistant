@@ -48,7 +48,9 @@ export const WishPlaceSuggestion = z
     formatted_address: z.string().nullable(),
     /** `name_only` (no city or address to go on), `low_confidence` (the
      *  reading was a guess), `name_mismatch` (Google's place has another
-     *  name), `name_unverified` (a typed name in another script than
+     *  name; for a typed name, also a branch of the same brand inside the
+     *  workspace's area when the typed words for where match no branch),
+     *  `name_unverified` (a typed name in another script than
      *  Google's, so the two cannot be compared), `address_mismatch` (the
      *  house number in the image is not in the found place's address),
      *  `street_mismatch` (the street the image names, with no number, is
@@ -126,8 +128,9 @@ export const WishItem = z
     /** Set when status=converted: the transaction that realized the wish. */
     converted_transaction_id: Uuid.nullable(),
     /** When it was bought or visited: the converting transaction's time
-     *  (or the start of its day), or when the user marked it. Null unless
-     *  converted. */
+     *  (or the start of its day), or when the user marked it. A receipt
+     *  conversion follows its transaction: editing the transaction's date
+     *  or time moves it. Null unless converted. */
     converted_at: IsoDateTime.nullable(),
     /** `receipt`: a purchase booked at the wish's place (or with its
      *  product) converted it. `user`: the user marked it. Null unless

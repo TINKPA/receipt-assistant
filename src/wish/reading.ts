@@ -63,11 +63,18 @@ export function splitBranch(title: string): { name: string; branch: string | nul
 }
 
 /** "外滩店" → "外滩": a branch written as a locality names its area, not a
- *  shop. Left alone when nothing would remain ("店"). */
+ *  shop. Left alone when the 店 is part of a word for a kind of place
+ *  ("和平饭店", "半岛酒店", "新华书店": a hotel or shop the place is in, not
+ *  a branch), or when one character or nothing would remain ("本店"). */
+const NOT_A_BRANCH_BEFORE_DIAN = /[饭飯酒商书書旅药藥花客网網茶]$/u;
 export function branchArea(locality: string): string {
   const t = locality.trim();
-  const m = /^(.+?)\s*(分店|店)$/u.exec(t);
-  return m?.[1] && m[1].trim().length >= 1 ? m[1].trim() : t;
+  const fen = /^(.+?)\s*分店$/u.exec(t);
+  if (fen?.[1] && fen[1].trim().length >= 2) return fen[1].trim();
+  const m = /^(.+?)\s*店$/u.exec(t);
+  const rest = m?.[1]?.trim();
+  if (!rest || rest.length < 2 || NOT_A_BRANCH_BEFORE_DIAN.test(rest)) return t;
+  return rest;
 }
 
 /** A list post names its city once: an entry whose locality lacks the

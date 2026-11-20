@@ -308,12 +308,29 @@ async function readCapture(id: string): Promise<void> {
   const focus = row.is_sibling
     ? ([WISH_TITLE_WHILE_READING, WISH_TITLE_UNREAD].includes(row.title) ? row.read_title : row.title) ?? row.read_title
     : null;
-  const abs = resolveInside(wishImageRoot(), row.image_path);
-  if (!abs) return failCapture(id, { error: "image_missing" });
-
   const sessionId = randomUUID();
   const model = process.env.CLAUDE_MODEL || null;
   const base = { session_id: sessionId, model_requested: model, read_at: new Date().toISOString(), prompt_version: WISH_READ_PROMPT_VERSION };
+  // Every way this ends can change what the wish converts on (its place,
+  // its kind): the loop looks at it again, whatever the outcome.
+  try {
+    await readCaptureWith(id, row, focus, sessionId, model, base);
+  } finally {
+    await settleWishesSafely({ wishIds: [id] });
+  }
+}
+
+async function readCaptureWith(
+  id: string,
+  row: { workspace_id: string; image_path: string | null; notes: string | null },
+  focus: string | null,
+  sessionId: string,
+  model: string | null,
+  base: Record<string, unknown>,
+): Promise<void> {
+  const abs = row.image_path ? resolveInside(wishImageRoot(), row.image_path) : null;
+  // No file to read: a failure like any other, with the attempt's time.
+  if (!abs) return failCapture(id, { ...base, session_id: null, error: "image_missing" });
   console.log(`[wish] read capture=${id} sessionId=${sessionId}`);
   let stdout: string;
   try {
@@ -362,11 +379,9 @@ async function readCapture(id: string): Promise<void> {
     RETURNING id, place_id, capture ? 'siblings' AS has_siblings, capture ? 'sibling_of' AS is_sibling`);
   const done = upd.rows[0] as { id: string; place_id: string | null; has_siblings: boolean; is_sibling: boolean } | undefined;
   if (!done) return;
-  if (done.place_id) {
-    await markDuplicate(id, row.workspace_id, done.place_id);
-    // Been there already since the wish was made? Usually not.
-    await settleWishesSafely({ wishIds: [id] });
-  }
+  // Been there already since the wish was made? Usually not. The loop
+  // (in readCapture) runs whatever the reading did to the place.
+  if (done.place_id) await markDuplicate(id, row.workspace_id, done.place_id);
   if (r.others.length > 0 && !done.has_siblings && !done.is_sibling) await splitSiblings(id, row.workspace_id, r, base);
 }
 

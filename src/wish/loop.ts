@@ -36,7 +36,8 @@
  *
  * `settleWishes` then, per wish in scope:
  *   - active: the earliest qualifying transaction converts it;
- *   - converted by a receipt: kept while its transaction still qualifies;
+ *   - converted by a receipt: kept while its transaction still qualifies
+ *     (`converted_at` following an edit of its date or time);
  *     otherwise moved to the earliest one that does (a dedup apply folds
  *     the converting row into a survivor at the same place), else set back
  *     to active with the conversion cleared. Every receipt conversion
@@ -298,9 +299,20 @@ export async function settleWishes(scope: WishLoopScope): Promise<WishSettlement
       continue;
     }
     // Converted by a receipt: does its proof still stand?
-    if (w.converted_transaction_id && list.some((q) => q.row.txn_id === w.converted_transaction_id)) continue;
     const guard = sql`id = ${w.id}::uuid AND status = 'converted' AND converted_by = 'receipt'
            AND converted_transaction_id IS NOT DISTINCT FROM ${w.converted_transaction_id}::uuid`;
+    const proof = w.converted_transaction_id ? list.find((q) => q.row.txn_id === w.converted_transaction_id) : undefined;
+    if (proof) {
+      // It still stands; its date or time may have been edited since, and
+      // the visit time follows the receipt.
+      const at = convertedAt(proof.row, proof.tz).toISOString();
+      const upd = await db.execute(sql`
+        UPDATE wish_items SET converted_at = ${at}::timestamptz, updated_at = now()
+         WHERE ${guard} AND converted_at IS DISTINCT FROM ${at}::timestamptz
+        RETURNING id`);
+      if (upd.rows.length > 0) console.log(`[wish] wish=${w.id} converted_at follows transaction=${proof.row.txn_id}: ${at}`);
+      continue;
+    }
     if (first) {
       const upd = await db.execute(sql`
         UPDATE wish_items

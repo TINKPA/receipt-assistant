@@ -855,7 +855,7 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "except for places already wished for; a capture whose own place is already wished for keeps its wish and names the earlier one " +
       "in `capture.duplicate_of`. A street the image names is checked against the found place's address (its house number, or with no " +
       "number the street itself); a place that fails it is offered as `place_suggestion`. " +
-      "HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`; nothing is stored or read. " +
+      "HEIC and AVIF are converted to JPEG first. A file that does not decode as an image is a 422 `unreadable_image`, and one over 50 million pixels a 422 `image_too_large` (checked from its header, before any pixel is decoded); nothing is stored or read. " +
       "The same bytes uploaded again answer 200 with the wish they made " +
       "the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
     tags: ["wish-items"],
@@ -863,7 +863,7 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     responses: {
       200: { description: "This image was captured before: the existing wish", content: { "application/json": { schema: WishItem } } },
       202: { description: "Accepted; reading", content: { "application/json": { schema: WishItem } } },
-      422: { description: "Not an image this endpoint reads (`unsupported_image`), or one that does not decode (`unreadable_image`)", content: problemContent },
+      422: { description: "Not an image this endpoint reads (`unsupported_image`), one that does not decode (`unreadable_image`), or one over 50 million pixels (`image_too_large`)", content: problemContent },
     },
   });
 

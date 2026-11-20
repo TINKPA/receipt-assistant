@@ -86,13 +86,38 @@ async function toJpeg(input: Buffer, kind: "heic" | "avif"): Promise<Buffer> {
   }
 }
 
+/** More pixels than any photo or screenshot worth reading (a phone
+ *  screenshot is about 3.5M, a 48 MP photo 48M). Checked from the header
+ *  before any pixel is decoded: a small PNG can declare 15000×15000, and
+ *  decoding it costs seconds and hundreds of MB. */
+export const MAX_IMAGE_PIXELS = 50_000_000;
+
 /** The first bytes only say what a file claims to be: a truncated or
  *  corrupt file with a JPEG header would still be stored, queued and sent
  *  to a model. Decoding every pixel (`stats` reads them all) is what
  *  tells, and costs far less than a reading. */
 async function assertDecodes(buf: Buffer): Promise<void> {
+  let meta: sharp.Metadata;
   try {
-    const meta = await sharp(buf, { failOn: "error" }).metadata();
+    meta = await sharp(buf, { failOn: "error" }).metadata();
+  } catch (err) {
+    console.warn(`[wish] upload does not decode: ${(err as Error).message.slice(0, 200)}`);
+    throw new ValidationProblem([
+      { path: "file", code: "unreadable_image", message: "The file could not be decoded as an image: it may be truncated or damaged" },
+    ]);
+  }
+  // One frame: that is all `stats` decodes, and all the Read tool shows.
+  if (meta.width && meta.height && meta.width * meta.height > MAX_IMAGE_PIXELS) {
+    console.warn(`[wish] upload refused: ${meta.width}x${meta.height} is over ${MAX_IMAGE_PIXELS} pixels`);
+    throw new ValidationProblem([
+      {
+        path: "file",
+        code: "image_too_large",
+        message: `The image is ${meta.width}×${meta.height}; send one under ${MAX_IMAGE_PIXELS / 1_000_000} million pixels`,
+      },
+    ]);
+  }
+  try {
     if (!meta.width || !meta.height) throw new Error("no dimensions");
     await sharp(buf, { failOn: "error" }).stats();
   } catch (err) {
@@ -124,5 +149,8 @@ export async function storableImage(upload: Buffer): Promise<StoredImage> {
       { path: "file", code: "unreadable_image", message: `The ${heif.toUpperCase()} image could not be converted: save or share it as JPEG or PNG` },
     ]);
   }
+  // The converted file is held to the same limit (its pixels are what a
+  // reading would see).
+  await assertDecodes(jpeg);
   return { bytes: jpeg, mime: "image/jpeg", ext: "jpg", convertedFrom: heif };
 }
