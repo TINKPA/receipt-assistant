@@ -28,6 +28,7 @@ import {
   decidePlaceMatch,
   cityContradicted,
   localityConfirmed,
+  localityKeys,
   placeKey,
   streetNumberIs,
   streetType,
@@ -37,6 +38,7 @@ import {
 } from "../src/wish/places.js";
 import type { GoogleAddressComponent } from "../src/google/text-search.js";
 import { hanCitiesIn } from "../src/wish/cities.js";
+import { searchLanguageFor } from "../src/wish/names.js";
 import { captureMatchInput } from "../src/wish/capture.js";
 import { parseWishReading } from "../src/wish/reading.js";
 
@@ -118,6 +120,16 @@ const CASES: Case[] = [
   { why: "r11: Downtown with its city is that city's", capture: { title: "Philz Coffee", locality: "Downtown, Culver City" }, expect: { linked: "Philz", address: "Culver City" } },
   { why: "r11: a chain with several branches in the city is a suggestion", capture: { title: "Din Tai Fung", locality: "Seattle" }, expect: { notReason: "locality_mismatch" } },
   { why: "a city Google files as a region (Taipei City is administrative_area_level_1)", capture: { title: "Din Tai Fung", address: "City Hall Rd", locality: "Taipei" }, expect: { linked: "Din Tai Fung", address: "Taipei" } },
+  // r12b: Taiwan's county-administered cities and Vietnam's provincial cities are administrative_area_level_2.
+  { why: "r12b: 花蓮市 is a city Google files at level 2", capture: { title: "公正包子", locality: "花蓮市" }, expect: { linked: "", address: "Hualien" } },
+  { why: "r12b: Hualien City at level 2, read in English", capture: { title: "Gong Zheng Bun Store", locality: "Hualien" }, expect: { linked: "Gong Zheng", address: "Hualien" } },
+  { why: "r12b: Hội An is a city Google files at level 2", capture: { title: "Morning Glory", locality: "Hoi An" }, expect: { notReason: "locality_mismatch" } },
+  { why: "r12b: 上城区 is Hangzhou's Shangcheng District, not the generic 上城", capture: { title: "新白鹿", locality: "上城区" }, expect: { notReason: "locality_mismatch" } },
+  { why: "r12b: Center City is Philadelphia's (Google: Center City East)", capture: { title: "Reading Terminal Market", locality: "Center City" }, expect: { linked: "Reading Terminal Market" } },
+  // Z & Y Peking Duck, its sister restaurant on the same block, also carries the name: several_branches either way.
+  { why: "r12b: a generic word and its city with no comma", capture: { title: "Z & Y Restaurant", locality: "Chinatown San Francisco" }, expect: { suggested: "Z & Y", reason: "several_branches" } },
+  { why: "r12b: the same with a comma", capture: { title: "Z & Y Restaurant", locality: "Chinatown, San Francisco" }, expect: { suggested: "Z & Y", reason: "several_branches" } },
+  { why: "r12b: Koreatown LA with no comma", capture: { title: "Park's BBQ", locality: "Koreatown LA" }, expect: { linked: "Park" } },
   { why: "r9: New York is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "New York" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
   { why: "r9: NYC is confirmed by Brooklyn", capture: { title: "Di Fara Pizza", locality: "NYC" }, expect: { linked: "Di Fara", address: "Brooklyn" } },
   { why: "r9: 纽约 is confirmed by Brooklyn", capture: { title: "Peter Luger Steak House", locality: "纽约" }, expect: { linked: "Peter Luger", address: "Brooklyn" } },
@@ -224,6 +236,15 @@ const BEIJING_ZH = [C("朝阳区", "sublocality_level_1,sublocality,political"),
 const GUANGZHOU_BEIJING_RD_ZH = [C("168号", "street_number"), C("北京路", "route"), C("越秀区", "sublocality_level_1,sublocality,political"), C("广州市", "locality,political"), C("广东省", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
 const SHANGHAI_NANJING_RD_ZH = [C("636号", "street_number"), C("南京东路", "route"), C("黄浦区", "sublocality_level_1,sublocality,political"), C("上海市", "administrative_area_level_1,political"), C("中国", "country,political", "CN")];
 
+const TW = C("Taiwan", "country,political", "TW");
+const HUALIEN = [C("Ren'ai Street", "route", "Ren'ai St"), C("Zhumu Village", "administrative_area_level_3,political"), C("Hualien City", "administrative_area_level_2,political"), C("Hualien County", "administrative_area_level_1,political"), TW];
+const HUALIEN_ZH = [C("仁愛街", "route"), C("主睦里", "administrative_area_level_3,political"), C("花蓮市", "administrative_area_level_2,political"), C("花蓮縣", "administrative_area_level_1,political"), C("台灣", "country,political", "TW")];
+const YILAN = [C("Nanjin Village", "administrative_area_level_3,political"), C("Yilan City", "administrative_area_level_2,political"), C("Yilan County", "administrative_area_level_1,political"), TW];
+const HOI_AN = [C("Nguyễn Thái Học", "route"), C("Hội An", "administrative_area_level_2,political"), C("Đà Nẵng", "administrative_area_level_1,political"), C("Vietnam", "country,political", "VN")];
+const HANGZHOU_ZH = [C("上城区", "sublocality_level_1,sublocality,political"), C("杭州市", "locality,political"), C("中国", "country,political", "CN")];
+const PHILLY = [C("Arch Street", "route", "Arch St"), C("Center City East", "neighborhood,political"), C("Philadelphia", "locality,political"), C("Philadelphia County", "administrative_area_level_2,political"), C("Pennsylvania", "administrative_area_level_1,political", "PA"), ...US];
+const KTOWN_LA = [C("Koreatown", "neighborhood,political"), C("Los Angeles", "locality,political"), C("Los Angeles County", "administrative_area_level_2,political"), C("California", "administrative_area_level_1,political", "CA"), ...US];
+
 /** A capture reading through the server's tidying: "address|locality". */
 function tidied(k: { title: string; locality?: string; address?: string }): string {
   const parsed = parseWishReading("```json\n" + JSON.stringify({ kind: "place", title: k.title, name_local: null, locality: k.locality ?? null, address: k.address ?? null, confidence: "high" }) + "\n```");
@@ -322,6 +343,34 @@ function pureChecks(): [string, unknown, unknown][] {
     ["Sixth Avenue", streetType("Sixth Avenue, New York"), "ave"],
     ["a Han street has no type here", streetType("黄河路"), null],
     ["上海市 is 上海", placeKey("上海市"), "上海"],
+    // r12b: a level-2 component that is itself a city confirms; a county still does not.
+    ["Hualien City at level 2", localityConfirmed("Hualien", [HUALIEN]), true],
+    ["花蓮市 at level 2", localityConfirmed("花蓮市", [HUALIEN_ZH]), true],
+    ["花蓮 at level 2", localityConfirmed("花蓮", [HUALIEN_ZH]), true],
+    ["Yilan at level 2", localityConfirmed("Yilan", [YILAN]), true],
+    ["Hội An at level 2 (Vietnam)", localityConfirmed("Hoi An", [HOI_AN]), true],
+    ["Hualien County is a region, not the city", localityConfirmed("Hualien County", [HUALIEN]), false],
+    ["Orange County still is not a city", localityConfirmed("Orange County", [COSTA_MESA]), false],
+    ["King County still is not a city", localityConfirmed("King County", [[C("Tukwila", "locality,political"), C("King County", "administrative_area_level_2,political"), C("Washington", "administrative_area_level_1,political", "WA"), ...US]]), false],
+    // r12b: generic words are whole words; a generic word before its city.
+    ["上城区 is a district", localityConfirmed("上城区", [HANGZHOU_ZH]), true],
+    ["上城 alone is generic", localityConfirmed("上城", [HANGZHOU_ZH]), false],
+    ["老城区 is not generic", localityKeys("老城区, 洛阳").find((k) => k.key === "老城")?.generic, false],
+    ["老城 alone is generic", localityKeys("老城").find((k) => k.key === "老城")?.generic, true],
+    ["Center City keeps its City", placeKey("Center City"), "centercity"],
+    ["Center City is Center City East", localityConfirmed("Center City", [PHILLY]), true],
+    ["Center alone is generic", localityConfirmed("Center", [PHILLY]), false],
+    ["Chinatown San Francisco", localityConfirmed("Chinatown San Francisco", [SF]), true],
+    ["Koreatown LA", localityConfirmed("Koreatown LA", [KTOWN_LA]), true],
+    ["Koreatown alone confirms nothing", localityConfirmed("Koreatown", [KTOWN_LA]), false],
+    ["Chinatown San Francisco is not South San Francisco", localityConfirmed("Chinatown San Francisco", [SSF]), false],
+    // r12b: place-search asks Google in the language typed.
+    ["公正包子 → zh-CN", searchLanguageFor("公正包子"), "zh-CN"],
+    ["鼎泰豐 → zh-TW", searchLanguageFor("鼎泰豐"), "zh-TW"],
+    ["海底捞 → zh-CN", searchLanguageFor("海底捞"), "zh-CN"],
+    ["一蘭ラーメン → ja", searchLanguageFor("一蘭ラーメン"), "ja"],
+    ["북촌손만두 → ko", searchLanguageFor("북촌손만두"), "ko"],
+    ["Bestia → Google's default", searchLanguageFor("Bestia"), undefined],
   ];
 }
 

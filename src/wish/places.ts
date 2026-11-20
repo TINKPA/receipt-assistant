@@ -435,19 +435,27 @@ const CITY_LEVEL_TYPES = new Set([
 function isCityLevel(c: GoogleAddressComponent): boolean {
   return c.types.some((t) => CITY_LEVEL_TYPES.has(t) || t.startsWith("sublocality"));
 }
+/** Countries whose `administrative_area_level_2` is a city, a town or a
+ *  district, never a county of many towns: Taiwan's county-administered
+ *  cities and townships (Hualien City, 花蓮市), Vietnam's provincial cities
+ *  and districts (Hội An). */
+const LEVEL2_IS_TOWN_COUNTRIES = new Set(["tw", "vn"]);
 /** A component that confirms a read locality: city-level, but not a
  *  county (`administrative_area_level_2` and nothing more specific), which
  *  holds many towns ("Orange County", "King County"), unless it is one
- *  city (`CITY_COUNTIES`) or a district of one (Taipei's "Xinyi
- *  District", a 区). */
-function confirmsLocality(c: GoogleAddressComponent): boolean {
+ *  city (`CITY_COUNTIES`), a district of one (Taipei's "Xinyi District", a
+ *  区), named as a city itself ("Hualien City", 花蓮市, "Thành phố Huế"), or
+ *  in a country whose level 2 is a town (`LEVEL2_IS_TOWN_COUNTRIES`: Hội
+ *  An) and not named a county there. */
+function confirmsLocality(c: GoogleAddressComponent, set: GoogleAddressComponent[]): boolean {
   if (!isCityLevel(c)) return false;
   const countyOnly = c.types.includes("administrative_area_level_2") && !c.types.some((t) => t !== "administrative_area_level_2" && t !== "political" && (CITY_LEVEL_TYPES.has(t) || t.startsWith("sublocality")));
   if (!countyOnly) return true;
-  return [c.long, c.short].some((v) => {
-    const f = fold(v).trim().replace(/\s+/g, " ");
-    return COUNTY_CITY_KEYS.has(placeKey(v)) || /\b(district|ward)$|-(gu|ku)$/.test(f) || /[区區구]$/u.test(f);
-  });
+  const names = [c.long, c.short].map((v) => fold(v).trim().replace(/\s+/g, " "));
+  const county = (f: string) => /\b(county|parish|borough|shire|census area)$|^huyen\b/.test(f) || /[县縣郡]$/u.test(f);
+  if (names.some(county)) return [c.long, c.short].some((v) => COUNTY_CITY_KEYS.has(placeKey(v)));
+  if (names.some((f) => COUNTY_CITY_KEYS.has(placeKey(f)) || /\b(district|ward|city)$|-(gu|ku)$|^(city of|thanh pho) /.test(f) || /[区區구市]$/u.test(f))) return true;
+  return set.some((x) => x.types.includes("country") && LEVEL2_IS_TOWN_COUNTRIES.has(x.short.toLowerCase()));
 }
 function isRegionLevel(c: GoogleAddressComponent): boolean {
   return c.types.includes("administrative_area_level_1") || c.types.includes("country");
@@ -458,6 +466,11 @@ function isRegionLevel(c: GoogleAddressComponent): boolean {
 const isUnsplitLine = (c: GoogleAddressComponent) => c.types.length === 0;
 const isRoute = (c: GoogleAddressComponent) => c.types.includes("route") || isUnsplitLine(c);
 
+/** The generic neighbourhood words as written, folded: compared with the
+ *  whole word read, before `placeKey` cuts a 区 or a "City" (上城区 is
+ *  Hangzhou's Shangcheng District, not 上城; "Center City" is
+ *  Philadelphia's, not "center"). */
+const GENERIC_WORDS = new Set(GENERIC_NEIGHBOURHOODS.map((g) => fold(g).trim().replace(/\s+/g, " ")));
 /** One way to write a place name, for comparing whole names: folded,
  *  spaces and punctuation out ("Shang Hai" = "Shanghai"), a trailing
  *  "City", "Shi", "Qu" or "District" word cut ("Taipei City", "Shang Hai
@@ -471,16 +484,27 @@ export function placeKey(name: string): string {
     return cut.length >= 2 ? cut : h;
   }
   const words = f.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-  if (words.length > 1 && ["city", "shi", "qu", "district"].includes(words[words.length - 1]!)) words.pop();
+  // "Center City" keeps its City: "center" alone is a generic word.
+  if (words.length > 1 && ["city", "shi", "qu", "district"].includes(words[words.length - 1]!) && !GENERIC_WORDS.has(words.slice(0, -1).join(" "))) {
+    words.pop();
+  }
   return words.join("");
 }
 
 const REGION_KEYS = new Set([...CITY_REGIONS].map(placeKey));
 const COUNTY_CITY_KEYS = new Set([...CITY_COUNTIES].map(placeKey));
-const GENERIC_KEYS = new Set(GENERIC_NEIGHBOURHOODS.map(placeKey));
-/** "Downtown Los Angeles" is in Los Angeles; "South San Francisco" is not
- *  in San Francisco, so only these words come off. */
-const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\s+/;
+/** "Downtown Los Angeles" is in Los Angeles, and "Chinatown San Francisco"
+ *  in San Francisco; "South San Francisco" is not in San Francisco, so only
+ *  these words come off the front (the longest first: "old town"). */
+const QUALIFIER = new RegExp(
+  `^(${[...new Set(["downtown", "uptown", "midtown", "central", "greater", "old town", "historic", ...[...GENERIC_WORDS].filter((g) => !HAN.test(g))])]
+    .sort((a, b) => b.length - a.length)
+    .map((g) => g.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")})\\s+`,
+);
+/** What is left after a qualifier when the two words were one name ("Center
+ *  City", "Old Town Road"): not a city. */
+const NOT_A_CITY_AFTER_QUALIFIER = /^(city|town|district|square|park|road|street|st|avenue|ave)\b/;
 
 /** The names a read locality may be filed under, as `placeKey`s, each
  *  marked when it is a city Google files as a region ("豫园/城隍庙，上海" →
@@ -494,13 +518,19 @@ const QUALIFIER = /^(downtown|uptown|midtown|central|greater|old town|historic)\
 export function localityKeys(
   locality: string | null | undefined,
 ): { key: string; region: boolean; nyc: boolean; generic: boolean }[] {
-  const out = new Map<string, { region: boolean; nyc: boolean }>();
+  const out = new Map<string, { region: boolean; nyc: boolean; generic: boolean }>();
   const add = (name: string, region = false, nyc = false) => {
     const k = placeKey(name);
     if (k.length < 2) return;
     const prev = out.get(k);
-    // Read as itself anywhere, it is not held to New York.
-    out.set(k, { region: Boolean(prev?.region) || region || REGION_KEYS.has(k), nyc: prev ? prev.nyc && nyc : nyc });
+    const generic = GENERIC_WORDS.has(fold(name).trim().replace(/\s+/g, " "));
+    // Read as itself anywhere, it is not held to New York; read once as a
+    // real name, it is not generic.
+    out.set(k, {
+      region: Boolean(prev?.region) || region || REGION_KEYS.has(k),
+      nyc: prev ? prev.nyc && nyc : nyc,
+      generic: prev ? prev.generic && generic : generic,
+    });
   };
   // `read` is what the post wrote: only New York's own spellings bring in
   // the five boroughs ("Manhattan" is an alias of New York, and brings in
@@ -532,14 +562,18 @@ export function localityKeys(
     }
     const names = [p];
     const unqualified = p.replace(QUALIFIER, "");
-    if (unqualified !== p && unqualified) names.push(unqualified);
+    if (unqualified !== p && unqualified && !NOT_A_CITY_AFTER_QUALIFIER.test(unqualified)) {
+      names.push(unqualified);
+      // The qualifier is read too, as the generic word it is.
+      add(p.slice(0, p.length - unqualified.length).trim());
+    }
     for (const n of names) {
       withCity(n, n);
       const alias = CITY_ALIASES[n];
       if (alias) withCity(alias, n);
     }
   }
-  return [...out].map(([key, v]) => ({ key, ...v, generic: GENERIC_KEYS.has(key) }));
+  return [...out].map(([key, v]) => ({ key, ...v }));
 }
 
 const NYC_PART_KEYS = new Set([...NEW_YORK_PARTS, ...NEW_YORK_COUNTIES].map(placeKey));
@@ -575,7 +609,13 @@ export function localityConfirmed(locality: string | null | undefined, sets: Goo
   return sets.some((set) =>
     set.some((c) => {
       const names = [placeKey(c.long), placeKey(c.short)];
-      if (confirmsLocality(c)) return usable.some((k) => names.includes(k.key));
+      if (confirmsLocality(c, set)) {
+        if (usable.some((k) => names.includes(k.key))) return true;
+        // Google splits a neighbourhood by compass point ("Center City
+        // East" for "Center City"); never a town ("West Hollywood").
+        const part = c.types.includes("neighborhood") || c.types.some((t) => t.startsWith("sublocality"));
+        return part && usable.some((k) => names.some((n) => n !== k.key && n.replace(/(east|west|north|south)$/, "") === k.key));
+      }
       if (isRegionLevel(c)) return usable.some((k) => k.region && names.includes(k.key));
       return false;
     }),

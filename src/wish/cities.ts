@@ -68,12 +68,15 @@ export const CITY_COUNTIES = new Set([
 
 /** A neighbourhood word many cities have: by itself it says no city
  *  ("Downtown" is Culver City's as well as Los Angeles's), so it confirms
- *  a place only together with a city that is confirmed too. */
+ *  a place only together with a city that is confirmed too. Compared with
+ *  the whole word read: 上城区 (Hangzhou), 老城区 (Luoyang) and "Center
+ *  City" (Philadelphia) are districts with these names, not the bare
+ *  words. */
 export const GENERIC_NEIGHBOURHOODS = [
   "downtown", "midtown", "uptown", "old town", "old city", "chinatown", "koreatown", "japantown", "little italy",
   "little saigon", "financial district", "arts district", "fashion district", "theater district", "theatre district",
   "historic district", "city center", "city centre", "town center", "town centre", "centre", "center", "waterfront",
-  "市中心", "市区", "市區", "唐人街", "中国城", "中國城", "华埠", "華埠", "老城", "老城区", "老城區", "韩国城", "韓國城",
+  "市中心", "市区", "市區", "唐人街", "中国城", "中國城", "华埠", "華埠", "老城", "韩国城", "韓國城",
   "韩国街", "韓國街", "日本城", "小意大利", "金融区", "金融區", "下城", "中城", "上城",
 ];
 

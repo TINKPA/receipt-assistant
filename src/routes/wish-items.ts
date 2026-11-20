@@ -17,7 +17,7 @@ import { wishItems, products, places } from "../schema/index.js";
 import { startCapture, retryCapture, wishImageRoot, removeWishImageIfUnused } from "../wish/capture.js";
 import { distanceM, linkGooglePlace, matchPlaceByText, workspaceArea, type PlaceLink, type PlaceMatch } from "../wish/places.js";
 import { settleWishesSafely } from "../wish/loop.js";
-import { nameTokens } from "../wish/names.js";
+import { hasCjk, nameTokens, searchLanguageFor } from "../wish/names.js";
 import { safeHttpUrl } from "../wish/reading.js";
 import { liveTransactions } from "../db/live.js";
 import {
@@ -254,13 +254,17 @@ function assertConvertedAt(at: Date, createdAt: Date): void {
 
 /** Does any candidate share a word with what was searched for? Google
  *  answers a query it cannot make sense of with whatever it has; that is
- *  no answer. */
+ *  no answer. A query in Chinese, Japanese or Korean is searched in that
+ *  language, so the names come back in it where Google has them; when no
+ *  candidate has a name or address in that script at all (Google knows the
+ *  place only by its English name), the two cannot be compared and
+ *  Google's answer stands. */
 function anyRelevant(query: string, candidates: { name: string | null; formatted_address: string | null; primary_type: string | null }[]): boolean {
-  const q = new Set(nameTokens(query).filter((t) => t.length >= 2 || /\p{Script=Han}/u.test(t)));
+  const q = new Set(nameTokens(query).filter((t) => t.length >= 2 || hasCjk(t)));
   if (q.size === 0) return true;
-  return candidates.some((c) =>
-    nameTokens(`${c.name ?? ""} ${c.formatted_address ?? ""} ${(c.primary_type ?? "").replace(/_/g, " ")}`).some((t) => q.has(t)),
-  );
+  const text = (c: (typeof candidates)[number]) => `${c.name ?? ""} ${c.formatted_address ?? ""} ${(c.primary_type ?? "").replace(/_/g, " ")}`;
+  if (candidates.some((c) => nameTokens(text(c)).some((t) => q.has(t)))) return true;
+  return hasCjk(query) && !candidates.some((c) => hasCjk(text(c)));
 }
 
 /** A Google place id the person picked, stored and linked, or the HTTP
@@ -306,7 +310,9 @@ wishItemsRouter.get(
       // Without a locality from the image, prefer the person's own area.
       const area = biasedToLocality ? null : await workspaceArea(req.ctx.workspaceId);
       try {
-        const found = await searchPlacesByText(text, { maxResults: 5, locationBias: area });
+        // Asked in the language of what was typed (公正包子 → zh-CN, 鼎泰豐 →
+        // zh-TW), so the names come back in it and can be compared.
+        const found = await searchPlacesByText(text, { maxResults: 5, locationBias: area, languageCode: searchLanguageFor(query.q) });
         // The bias is only a preference to Google; a text match far away
         // ("SUGARFISH Little Italy", San Diego, for "Sugarfish Little
         // Tokyo") can still come first. Places inside the area go first,

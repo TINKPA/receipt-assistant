@@ -70,6 +70,29 @@ export function hasCjk(s: string): boolean {
   return CJK.test(s);
 }
 
+/** Common characters written only in Traditional or only in Simplified
+ *  Chinese: enough to tell which one a short name is in (鼎泰豐 → 豐). */
+const TRADITIONAL_ONLY = new Set(
+  "豐臺灣館麵東車門們來說華國這個為會時從點過還開關長電學鳥龍風飯雞魚滷燒餐廳樓蘭縣區鄉號廣場隊鍋湯餅蝦魷鮮麼記樂興發義賣買萬與葉張陳劉黃楊趙師傅藝術醫藥體雲園圓壽厲勝夢實寶寫將專業書畫無熱燈營環現當樹橋機檔歡歲歷氣漢灣滿濟澤爾牆獨猶產畢盡盤確稱穩競筆節範築篮紅級紙細絲經綠網緣總織罐聯聲腸臉舊莊萊蓮處號蘇衛裝製見規親觀訂計記設許試話認語說請讀貓貝買資賓車軍農這進運過道遠選邊鄧醬鐵鍾鎮門開間閣陽隨難雙離電韓頁頂項順頭題顏願類風飛飲養餘館馬駐體髮鬆麥齊齋龍龜鯛鱔鴨鵝麵",
+);
+const SIMPLIFIED_ONLY = new Set(
+  "丰湾馆东车门们来说华国这个为会时从点过还开关长电学鸟龙风饭鸡鱼卤烧餐厅楼兰县区乡号广场队锅汤饼虾鱿鲜么记乐兴发义卖买万与叶张陈刘黄杨赵师傅艺术医药体园圆寿厉胜梦实宝写将专业书画无热灯营环现当树桥机档欢岁历气汉满济泽尔墙独犹产毕尽盘确称稳竞笔节筑篮红级纸细丝经绿网缘总织罐联声肠脸旧庄莱莲处苏卫装制见规亲观订计设许试话认语请读猫贝资宾军农进运远选边邓酱铁钟镇间阁阳随难双离韩页顶项顺头题颜愿类飞饮养马驻发麦齐斋龟鲷鳝鸭鹅捞",
+);
+
+/** The language to ask Google Text Search in for what a person typed, from
+ *  its script: Japanese kana, Korean hangul, Chinese Han (Traditional when
+ *  it carries a Traditional-only character and no Simplified-only one),
+ *  else none (Google's default, English). */
+export function searchLanguageFor(text: string): string | undefined {
+  if (/[぀-ヿ]/u.test(text)) return "ja";
+  if (/[가-힯]/u.test(text)) return "ko";
+  if (!hasCjk(text)) return undefined;
+  const chars = [...text];
+  const trad = chars.some((c) => TRADITIONAL_ONLY.has(c) && !SIMPLIFIED_ONLY.has(c));
+  const simp = chars.some((c) => SIMPLIFIED_ONLY.has(c) && !TRADITIONAL_ONLY.has(c));
+  return trad && !simp ? "zh-TW" : "zh-CN";
+}
+
 /** 0..1: how much of the shorter name the other one carries (a name
  *  contained in the other, spaces removed, is 1). Recorded with a match. */
 export function nameScore(query: string, found: string): number {
