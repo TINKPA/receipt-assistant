@@ -28,9 +28,15 @@ import { getUploadDir } from "../routes/documents.service.js";
 import { resolveInside } from "../http/files.js";
 import { HttpProblem } from "../http/problem.js";
 import { storableImage } from "./image.js";
-import { matchPlaceByText, type PlaceMatch } from "./places.js";
-import { convertWishesSafely } from "./loop.js";
-import { buildWishReadPrompt, parseWishReading, type WishReading } from "./reading.js";
+import { matchPlaceByText, workspaceArea, type PlaceMatch } from "./places.js";
+import { settleWishesSafely } from "./loop.js";
+import {
+  WISH_READ_PROMPT_VERSION,
+  buildWishReadPrompt,
+  parseWishReading,
+  type WishReading,
+  type WishReadingOther,
+} from "./reading.js";
 
 export const WISH_TITLE_WHILE_READING = "Reading…";
 const READ_TIMEOUT_MS = 180_000;
@@ -49,8 +55,23 @@ export interface CaptureInput {
 export interface CaptureStarted {
   id: string;
   /** The same bytes were captured before: `id` is that wish, and nothing
-   *  is read again. */
+   *  is read again. A note sent with them is added to its notes. */
   existing: boolean;
+}
+
+/** A note sent with an image already captured: kept, not dropped. It
+ *  becomes the notes when there are none, and is appended otherwise
+ *  (unless those notes already say it). */
+async function addNote(id: string, note: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE wish_items
+       SET notes = CASE
+                     WHEN notes IS NULL OR btrim(notes) = '' THEN ${note}
+                     WHEN position(${note} in notes) > 0 THEN notes
+                     ELSE left(notes || E'\n\n' || ${note}, 5000)
+                   END,
+           updated_at = now()
+     WHERE id = ${id}::uuid`);
 }
 
 async function wishWithImage(workspaceId: string, sourceSha: string): Promise<string | null> {
@@ -64,7 +85,10 @@ async function wishWithImage(workspaceId: string, sourceSha: string): Promise<st
 export async function startCapture(input: CaptureInput): Promise<CaptureStarted> {
   const sourceSha = createHash("sha256").update(input.bytes).digest("hex");
   const already = await wishWithImage(input.workspaceId, sourceSha);
-  if (already) return { id: already, existing: true };
+  if (already) {
+    if (input.note) await addNote(already, input.note);
+    return { id: already, existing: true };
+  }
 
   const image = await storableImage(input.bytes);
   const sha = image.convertedFrom ? createHash("sha256").update(image.bytes).digest("hex") : sourceSha;
@@ -92,25 +116,49 @@ export async function startCapture(input: CaptureInput): Promise<CaptureStarted>
     RETURNING id`);
   if (ins.rows.length === 0) {
     const other = await wishWithImage(input.workspaceId, sourceSha);
-    if (other) return { id: other, existing: true };
+    if (other) {
+      if (input.note) await addNote(other, input.note);
+      return { id: other, existing: true };
+    }
     throw new Error("wish capture insert conflicted with a row that is gone");
   }
   enqueue(id);
   return { id, existing: false };
 }
 
-/** Read a failed (or interrupted) capture again. */
+/** `capture` keys that outlive a reading: what the upload was converted
+ *  from, which fields the person set by hand (a new reading leaves those
+ *  alone), the wish it was split from and the ones split from it. */
+const KEPT_CAPTURE_KEYS = ["converted_from", "user_set", "sibling_of", "siblings"] as const;
+const keepCaptureKeys = sql.raw(
+  KEPT_CAPTURE_KEYS.map(
+    (k) => `CASE WHEN capture ? '${k}' THEN jsonb_build_object('${k}', capture->'${k}') ELSE '{}'::jsonb END`,
+  ).join(" || "),
+);
+
+/** Read a failed (or interrupted) capture again. Fields the person set by
+ *  hand stay theirs (`capture.user_set`). */
 export async function retryCapture(workspaceId: string, id: string): Promise<void> {
   const res = await db.execute(sql`
     UPDATE wish_items
        SET capture_status = 'reading',
-           capture = jsonb_build_object('queued_at', now(), 'retry_of', capture)
-                     || CASE WHEN capture ? 'converted_from' THEN jsonb_build_object('converted_from', capture->'converted_from') ELSE '{}'::jsonb END,
+           capture = jsonb_build_object('queued_at', now(), 'retry_of', capture) || ${keepCaptureKeys},
            updated_at = now()
      WHERE id = ${id}::uuid AND workspace_id = ${workspaceId}::uuid
        AND image_path IS NOT NULL AND capture_status IN ('failed', 'done')
+       AND NOT coalesce(capture ? 'sibling_of', false)
     RETURNING id`);
   if (res.rows.length === 0) {
+    const why = await db.execute(sql`SELECT capture->>'sibling_of' AS sibling_of FROM wish_items WHERE id = ${id}::uuid`);
+    const siblingOf = (why.rows[0] as { sibling_of: string | null } | undefined)?.sibling_of;
+    if (siblingOf) {
+      throw new HttpProblem(
+        409,
+        "capture-not-retryable",
+        "Read the original capture instead",
+        `This wish is one of several places in an image captured as wish ${siblingOf}; reading that image again reads all of them.`,
+      );
+    }
     throw new HttpProblem(409, "capture-not-retryable", "Nothing to read again", "The wish has no captured image, or its image is being read now.");
   }
   enqueue(id);
@@ -142,37 +190,71 @@ export async function recoverInterruptedCaptures(): Promise<number> {
 
 // ── Reading one capture ──────────────────────────────────────────────
 
-function placeQuery(r: WishReading): { query: string; basis: string } {
+interface Placeable {
+  title: string;
+  name_local: string | null;
+  locality: string | null;
+  address: string | null;
+}
+
+function placeQuery(r: Placeable): { query: string; basis: "address" | "locality" | "name_only" } {
   const name = r.name_local && r.name_local !== r.title ? `${r.title} ${r.name_local}` : r.title;
   if (r.address) return { query: `${name} ${r.address}`, basis: "address" };
   if (r.locality) return { query: `${name} ${r.locality}`, basis: "locality" };
   return { query: name, basis: "name_only" };
 }
 
-function matchPlace(r: WishReading): Promise<PlaceMatch> {
+/** A capture's place. A name with no city or address, or a reading the
+ *  model was not sure of, is only a suggestion (src/wish/places.ts): the
+ *  image is about someone else's town as often as the person's own. */
+async function matchPlace(workspaceId: string, r: Placeable, confidence: WishReading["confidence"]): Promise<PlaceMatch> {
   const { query, basis } = placeQuery(r);
-  return matchPlaceByText(query, basis, r.name_local);
+  const guessReason = basis === "name_only" ? "name_only" : confidence === "low" ? "low_confidence" : null;
+  const names = [r.title, r.name_local].filter((n): n is string => Boolean(n));
+  return matchPlaceByText(query, basis, r.name_local, {
+    names,
+    guessReason,
+    // With no city in the image, the person's own area is the best guess.
+    locationBias: basis === "name_only" ? await workspaceArea(workspaceId) : null,
+  });
 }
 
-async function failCapture(id: string, capture: Record<string, unknown>): Promise<void> {
+interface UserSet {
+  title?: boolean;
+  kind?: boolean;
+  place?: boolean;
+}
+
+function userSetOf(capture: unknown): UserSet {
+  const u = (capture as { user_set?: unknown } | null)?.user_set;
+  return u && typeof u === "object" ? (u as UserSet) : {};
+}
+
+async function failCapture(id: string, capture: Record<string, unknown>, describedAs: string | null = null): Promise<void> {
+  // A wish the person already named or placed by hand is theirs: the
+  // failure is kept as history and the wish stays resolved.
   await db.execute(sql`
     UPDATE wish_items
-       SET capture_status = 'failed',
-           title = CASE WHEN title = ${WISH_TITLE_WHILE_READING} THEN 'Unread capture' ELSE title END,
-           capture = ${JSON.stringify(capture)}::jsonb, updated_at = now()
+       SET capture_status = CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb THEN 'done' ELSE 'failed' END,
+           title = CASE WHEN title = ${WISH_TITLE_WHILE_READING} THEN coalesce(${describedAs}::text, 'Unread capture') ELSE title END,
+           capture = ${JSON.stringify({ ...capture, prompt_version: WISH_READ_PROMPT_VERSION })}::jsonb
+                     || ${keepCaptureKeys}
+                     || CASE WHEN coalesce(capture->'user_set', '{}'::jsonb) <> '{}'::jsonb
+                             THEN jsonb_build_object('resolved_by', 'user') ELSE '{}'::jsonb END,
+           updated_at = now()
      WHERE id = ${id}::uuid AND capture_status = 'reading'`);
 }
 
 async function readCapture(id: string): Promise<void> {
-  const rows = await db.execute(sql`SELECT image_path, notes FROM wish_items WHERE id = ${id}::uuid AND capture_status = 'reading'`);
-  const row = rows.rows[0] as { image_path: string | null; notes: string | null } | undefined;
+  const rows = await db.execute(sql`SELECT workspace_id, image_path, notes FROM wish_items WHERE id = ${id}::uuid AND capture_status = 'reading'`);
+  const row = rows.rows[0] as { workspace_id: string; image_path: string | null; notes: string | null } | undefined;
   if (!row?.image_path) return; // deleted, or no longer waiting
   const abs = resolveInside(wishImageRoot(), row.image_path);
   if (!abs) return failCapture(id, { error: "image_missing" });
 
   const sessionId = randomUUID();
   const model = process.env.CLAUDE_MODEL || null;
-  const base = { session_id: sessionId, model_requested: model, read_at: new Date().toISOString() };
+  const base = { session_id: sessionId, model_requested: model, read_at: new Date().toISOString(), prompt_version: WISH_READ_PROMPT_VERSION };
   console.log(`[wish] read capture=${id} sessionId=${sessionId}`);
   let stdout: string;
   try {
@@ -187,28 +269,92 @@ async function readCapture(id: string): Promise<void> {
   if (!parsed.ok) return failCapture(id, { ...base, error: parsed.reason, detail: parsed.detail });
   const r = parsed.reading;
   if (r.kind === "none") {
-    return failCapture(id, { ...base, error: "nothing_to_save", detail: r.title, reading: r });
+    // Read, and nothing to save: the title says what it showed.
+    return failCapture(id, { ...base, error: "nothing_to_save", detail: r.title, reading: r }, r.title);
   }
 
-  const match = r.kind === "place" ? await matchPlace(r) : null;
+  // What the person changed while the image was being read is theirs.
+  const now = await db.execute(sql`SELECT kind, capture FROM wish_items WHERE id = ${id}::uuid AND capture_status = 'reading'`);
+  const cur = now.rows[0] as { kind: string; capture: unknown } | undefined;
+  if (!cur) return;
+  const userSet = userSetOf(cur.capture);
+  const kind = userSet.kind ? cur.kind : r.kind;
+  const match = kind === "place" && !userSet.place ? await matchPlace(row.workspace_id, r, r.confidence) : null;
   if (match?.error) console.warn(`[wish] capture=${id} place not linked: ${match.error}`);
+  else if (match?.tentative) console.log(`[wish] capture=${id} place suggested, not linked (${match.tentative_reason}): ${match.name ?? "?"}`);
 
-  // Only a row still waiting is written: one deleted or edited into
-  // another state while the image was read is left as the person left it.
-  await db.execute(sql`
+  // Only a row still waiting is written, and inside it nothing the person
+  // set by hand (`capture.user_set`): a title, the kind, the place.
+  const upd = await db.execute(sql`
     UPDATE wish_items
-       SET kind = ${r.kind},
-           title = ${r.title},
+       SET kind = CASE WHEN capture->'user_set' ? 'kind' THEN kind ELSE ${r.kind} END,
+           title = CASE WHEN capture->'user_set' ? 'title' THEN title ELSE ${r.title} END,
            notes = coalesce(notes, ${r.note}),
            source_url = coalesce(source_url, ${r.source_url}),
-           target_price_minor = CASE WHEN ${r.kind} = 'thing' THEN coalesce(target_price_minor, ${r.price_minor}::int) ELSE target_price_minor END,
-           currency = CASE WHEN ${r.kind} = 'thing' AND ${r.currency}::text IS NOT NULL THEN ${r.currency} ELSE currency END,
-           place_id = ${match?.place_id ?? null}::uuid,
+           target_price_minor = CASE WHEN ${kind} = 'thing' THEN coalesce(target_price_minor, ${r.price_minor}::int) ELSE target_price_minor END,
+           currency = CASE WHEN ${kind} = 'thing' AND ${r.currency}::text IS NOT NULL THEN ${r.currency} ELSE currency END,
+           place_id = CASE WHEN capture->'user_set' ? 'place' THEN place_id
+                           WHEN ${kind} = 'place' THEN ${match?.place_id ?? null}::uuid
+                           ELSE NULL END,
            capture_status = 'done',
-           capture = ${JSON.stringify({ ...base, reading: r, place_match: match })}::jsonb
-                     || CASE WHEN capture ? 'converted_from' THEN jsonb_build_object('converted_from', capture->'converted_from') ELSE '{}'::jsonb END,
+           capture = ${JSON.stringify({ ...base, reading: r, place_match: match })}::jsonb || ${keepCaptureKeys},
            updated_at = now()
-     WHERE id = ${id}::uuid AND capture_status = 'reading'`);
+     WHERE id = ${id}::uuid AND capture_status = 'reading'
+    RETURNING id, place_id, capture ? 'siblings' AS has_siblings`);
+  const done = upd.rows[0] as { id: string; place_id: string | null; has_siblings: boolean } | undefined;
+  if (!done) return;
   // Been there already since the wish was made? Usually not.
-  if (match?.place_id) await convertWishesSafely({ wishIds: [id] });
+  if (done.place_id) await settleWishesSafely({ wishIds: [id] });
+  if (r.others.length > 0 && !done.has_siblings) await splitSiblings(id, row.workspace_id, r, base);
+}
+
+/**
+ * A post that lists several places with equal weight: one wish for each
+ * of the others, sharing the image and pointing back with
+ * `capture.sibling_of`; the first wish lists them in `capture.siblings`.
+ * A place the workspace already has a wish for is not wished for twice
+ * (`capture.others_skipped`). Done once per capture: reading it again does
+ * not split it again.
+ */
+async function splitSiblings(id: string, workspaceId: string, r: WishReading, base: Record<string, unknown>): Promise<void> {
+  const src = await db.execute(sql`
+    SELECT image_path, image_sha256, image_mime_type, capture->'converted_from' AS converted_from FROM wish_items WHERE id = ${id}::uuid`);
+  const img = src.rows[0] as { image_path: string; image_sha256: string; image_mime_type: string; converted_from: unknown } | undefined;
+  if (!img) return;
+  const siblings: string[] = [];
+  const skipped: { title: string; reason: string; wish_id?: string }[] = [];
+  for (const o of r.others as WishReadingOther[]) {
+    const match = r.kind === "place" ? await matchPlace(workspaceId, o, r.confidence) : null;
+    if (match?.place_id) {
+      const dup = await db.execute(sql`
+        SELECT id FROM wish_items WHERE workspace_id = ${workspaceId}::uuid AND place_id = ${match.place_id}::uuid AND status <> 'declined' LIMIT 1`);
+      const dupId = (dup.rows[0] as { id: string } | undefined)?.id;
+      if (dupId) {
+        skipped.push({ title: o.title, reason: "already_wished", wish_id: dupId });
+        continue;
+      }
+    }
+    const sid = randomUUID();
+    const capture = {
+      ...base,
+      sibling_of: id,
+      reading: { kind: r.kind, ...o, recommended_by: r.recommended_by, source_app: r.source_app, confidence: r.confidence },
+      place_match: match,
+      ...(img.converted_from ? { converted_from: img.converted_from } : {}),
+    };
+    await db.execute(sql`
+      INSERT INTO wish_items (id, workspace_id, kind, title, notes, place_id, source_url, image_path, image_sha256, image_mime_type, capture_status, capture)
+      VALUES (${sid}::uuid, ${workspaceId}::uuid, ${r.kind}, ${o.title}, ${o.note}, ${match?.place_id ?? null}::uuid, ${r.source_url},
+              ${img.image_path}, ${img.image_sha256}, ${img.image_mime_type}, 'done', ${JSON.stringify(capture)}::jsonb)`);
+    siblings.push(sid);
+    console.log(`[wish] capture=${id} split: wish=${sid} "${o.title.slice(0, 60)}"`);
+    if (match?.place_id) await settleWishesSafely({ wishIds: [sid] });
+  }
+  await db.execute(sql`
+    UPDATE wish_items
+       SET capture = coalesce(capture, '{}'::jsonb)
+                     || jsonb_build_object('siblings', ${JSON.stringify(siblings)}::jsonb)
+                     || CASE WHEN ${skipped.length} > 0 THEN jsonb_build_object('others_skipped', ${JSON.stringify(skipped)}::jsonb) ELSE '{}'::jsonb END,
+           updated_at = now()
+     WHERE id = ${id}::uuid`);
 }

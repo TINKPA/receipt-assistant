@@ -1,36 +1,49 @@
 /**
  * Visiting closes the loop: a purchase booked at the place of an active
  * place wish converts the wish (`status = 'converted'`,
- * `converted_by = 'receipt'`), with the transaction as its proof.
+ * `converted_by = 'receipt'`), with the transaction as its proof; and a
+ * proof that stops being one (deleted, merged away as a duplicate, its
+ * date moved before the wish, the wish's place changed) un-converts it.
  *
- * A transaction converts a wish when all of these hold:
- *   - the wish is `active` (a declined or converted wish is never touched);
+ * A transaction QUALIFIES for a wish when all of these hold:
  *   - the transaction is live (`ledger_live_transactions`);
  *   - it is money going out: its profit-and-loss legs are expenses with a
  *     positive total (`directionLateral`, the reconcile definition), and
  *     it is not marked a refund (`metadata.flow`, `metadata.refund_of`);
- *   - it happened on or after the day the wish was made, or set back to
- *     active (`reactivated_at`): wanting to go after having been is still
- *     a wish. "The day" is the local date in the wish place's time zone,
- *     else the transaction place's, else the workspace's most common one.
- *     On that same day it must also not be known to be earlier: its
- *     `occurred_at` when printed, else when it was booked (a receipt
- *     booked before the wish was made is a visit before it);
- *   - it is not one the user dismissed ("Want again" puts the converting
- *     transaction in `dismissed_transaction_ids`);
+ *   - it happened on or after the day the wish was made, or last set back
+ *     to active (`reactivated_at`): wanting to go after having been is
+ *     still a wish. "The day" is the local date in the wish place's time
+ *     zone, else the transaction place's, else the workspace's most
+ *     common one. On that same day it must also not be known to be
+ *     earlier: its `occurred_at` when printed, else when it was booked (a
+ *     receipt booked before the wish was made is a visit before it);
+ *   - it is not one the user dismissed (leaving `converted` by hand puts
+ *     the converting transaction in `dismissed_transaction_ids`);
  *   - for a place wish: `transactions.place_id` is the wish's place, or the
  *     transaction's merchant's place (`merchants.place_id`, a Google id)
  *     is the wish place's `google_place_id`;
  *     for a thing wish with a `product_id`: a live line item of the
  *     transaction has that product.
- * The earliest qualifying transaction wins.
  *
- * Run it after anything that books or links such a transaction (both
- * ingest writers, POST /v1/transactions and its items, a restore, a
- * merchant's place found by enrichment) with the transactions as scope,
- * and when a wish gets a place or a product with the wish as scope. It
- * reads, then updates each wish under `status = 'active'`, so running it
- * twice changes nothing. `convertWishesSafely` never throws.
+ * `settleWishes` then, per wish in scope:
+ *   - active: the earliest qualifying transaction converts it;
+ *   - converted by a receipt: kept while its transaction still qualifies;
+ *     otherwise moved to the earliest one that does (a dedup apply folds
+ *     the converting row into a survivor at the same place), else set back
+ *     to active with the conversion cleared. Every receipt conversion
+ *     whose transaction is not live (soft-deleted, or hard-deleted, which
+ *     the FK turns into a NULL `converted_transaction_id`) is in scope of
+ *     every run, whatever removed it;
+ *   - declined, or converted by the user: never touched.
+ * `converted_at` is the purchase's time, or the start of its local day,
+ * and never before the wish was made.
+ *
+ * Run it after anything that books, edits, deletes, restores or merges a
+ * transaction (both ingest writers, the transaction routes, the document
+ * cascade, re-extract, dedup apply and undo, merchant enrichment finding a
+ * place) and after a wish's place, product or kind changes or it is set
+ * back to active. Every write is guarded by the state it read, so running
+ * it twice changes nothing. `settleWishesSafely` never throws.
  */
 import { sql, type SQL } from "drizzle-orm";
 import { db } from "../db/client.js";
@@ -40,11 +53,17 @@ import { directionLateral } from "../reconcile/dedup.js";
 export type WishLoopScope =
   | { transactionIds: string[] }
   | { wishIds: string[] }
-  | { merchantId: string };
+  | { merchantId: string }
+  | { workspaceId: string };
 
-export interface WishConversion {
+export interface WishSettlement {
   wishId: string;
-  transactionId: string;
+  /** `converted`: an active wish converted. `moved`: a receipt conversion
+   *  now rests on another transaction. `unconverted`: its proof is gone
+   *  and nothing else qualifies, so it is active again. */
+  change: "converted" | "moved" | "unconverted";
+  transactionId: string | null;
+  previousTransactionId: string | null;
 }
 
 interface CandidateRow {
@@ -111,23 +130,68 @@ async function workspaceTimeZone(workspaceId: string): Promise<string> {
   return tz;
 }
 
-function scopeSql(scope: WishLoopScope): SQL | null {
+/** The wish ids a run looks at: active ones and receipt conversions the
+ *  scope can touch, plus every receipt conversion that lost its proof. */
+async function wishesInScope(scope: WishLoopScope): Promise<string[]> {
+  const open = sql`(w.status = 'active' OR (w.status = 'converted' AND w.converted_by = 'receipt'))`;
+  const matches = sql`(
+         (w.kind = 'place' AND w.place_id IS NOT NULL
+           AND (t.place_id = w.place_id OR (m.place_id IS NOT NULL AND m.place_id = wp.google_place_id)))
+      OR (w.kind = 'thing' AND w.product_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM transaction_items ti WHERE ti.transaction_id = t.id AND ti.product_id = w.product_id)))`;
+  let scoped: SQL | null = null;
   if ("transactionIds" in scope) {
     const ids = [...new Set(scope.transactionIds)];
-    if (ids.length === 0) return null;
-    return sql`t.id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})`;
-  }
-  if ("wishIds" in scope) {
+    if (ids.length > 0) {
+      const list = sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `);
+      // `transactions`, not the live view: a deleted row's wishes are the
+      // ones to look at again.
+      scoped = sql`
+        SELECT w.id FROM wish_items w
+          JOIN transactions t ON t.workspace_id = w.workspace_id AND t.id IN (${list})
+          LEFT JOIN places wp ON wp.id = w.place_id
+          LEFT JOIN merchants m ON m.id = t.merchant_id
+         WHERE ${open} AND (w.converted_transaction_id = t.id OR ${matches})
+        UNION
+        SELECT w.id FROM wish_items w WHERE ${open} AND w.converted_transaction_id IN (${list})`;
+    }
+  } else if ("wishIds" in scope) {
     const ids = [...new Set(scope.wishIds)];
-    if (ids.length === 0) return null;
-    return sql`w.id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})`;
+    if (ids.length > 0) {
+      scoped = sql`SELECT w.id FROM wish_items w WHERE ${open} AND w.id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})`;
+    }
+  } else if ("merchantId" in scope) {
+    scoped = sql`
+      SELECT w.id FROM wish_items w
+        JOIN transactions t ON t.workspace_id = w.workspace_id AND t.merchant_id = ${scope.merchantId}::uuid
+        LEFT JOIN places wp ON wp.id = w.place_id
+        LEFT JOIN merchants m ON m.id = t.merchant_id
+       WHERE ${open} AND ${matches}`;
+  } else {
+    scoped = sql`SELECT w.id FROM wish_items w WHERE ${open} AND w.workspace_id = ${scope.workspaceId}::uuid`;
   }
-  return sql`t.merchant_id = ${scope.merchantId}::uuid`;
+  // Proofs that are gone, whatever removed them: hard-deleted (the FK
+  // nulled the column) or no longer live. There are few converted wishes,
+  // so this is checked on every run.
+  const orphans = sql`
+    SELECT w.id FROM wish_items w
+     WHERE w.status = 'converted' AND w.converted_by = 'receipt'
+       AND (w.converted_transaction_id IS NULL
+            OR NOT EXISTS (SELECT 1 FROM ${liveTransactions} lt WHERE lt.id = w.converted_transaction_id))`;
+  const res = await db.execute(scoped ? sql`${scoped} UNION ${orphans}` : orphans);
+  return (res.rows as { id: string }[]).map((r) => r.id);
 }
 
-export async function convertWishes(scope: WishLoopScope): Promise<WishConversion[]> {
-  const where = scopeSql(scope);
-  if (!where) return [];
+interface WishState {
+  id: string;
+  status: string;
+  converted_transaction_id: string | null;
+}
+
+/** Qualifying transactions of these wishes, earliest first per wish. */
+async function qualifying(wishIds: string[]): Promise<Map<string, { row: CandidateRow; tz: string }[]>> {
+  const out = new Map<string, { row: CandidateRow; tz: string }[]>();
+  if (wishIds.length === 0) return out;
   const res = await db.execute(sql`
     SELECT w.id AS wish_id, w.workspace_id,
            greatest(w.created_at, w.reactivated_at) AS since,
@@ -139,8 +203,7 @@ export async function convertWishes(scope: WishLoopScope): Promise<WishConversio
       LEFT JOIN places tp ON tp.id = t.place_id
       LEFT JOIN merchants m ON m.id = t.merchant_id
       CROSS JOIN LATERAL (${directionLateral("t")}) d
-     WHERE ${where}
-       AND w.status = 'active'
+     WHERE w.id IN (${sql.join(wishIds.map((id) => sql`${id}::uuid`), sql`, `)})
        AND NOT (t.id = ANY (w.dismissed_transaction_ids))
        -- Any zone's local day of 'since' is at most a day before its UTC day;
        -- the exact day is checked below.
@@ -156,45 +219,95 @@ export async function convertWishes(scope: WishLoopScope): Promise<WishConversio
                             WHERE ti.transaction_id = t.id AND ti.product_id = w.product_id AND ti.retired_at IS NULL))
            )
      ORDER BY w.id, t.occurred_on, t.occurred_at NULLS LAST, t.created_at, t.id`);
-  const rows = res.rows as unknown as CandidateRow[];
-  if (rows.length === 0) return [];
-
-  const chosen = new Map<string, { row: CandidateRow; tz: string }>();
-  for (const row of rows) {
-    if (chosen.has(row.wish_id)) continue;
+  for (const row of res.rows as unknown as CandidateRow[]) {
     const tz = validTimeZone(row.wish_tz) ?? validTimeZone(row.txn_tz) ?? (await workspaceTimeZone(row.workspace_id));
     const since = new Date(row.since);
     const sinceDay = localDate(since, tz);
     if (row.occurred_on < sinceDay) continue; // bought or visited before it was wished for
     if (row.occurred_on === sinceDay && new Date(row.occurred_at ?? row.booked_at) < since) continue; // earlier that day
-    chosen.set(row.wish_id, { row, tz });
+    const list = out.get(row.wish_id) ?? [];
+    list.push({ row, tz });
+    out.set(row.wish_id, list);
   }
+  return out;
+}
 
-  const out: WishConversion[] = [];
-  for (const [wishId, { row, tz }] of chosen) {
-    const at = row.occurred_at ? new Date(row.occurred_at) : startOfLocalDay(row.occurred_on, tz);
-    const upd = await db.execute(sql`
-      UPDATE wish_items
-         SET status = 'converted',
-             converted_transaction_id = ${row.txn_id}::uuid,
-             converted_at = ${at.toISOString()}::timestamptz,
-             converted_by = 'receipt',
-             updated_at = now()
-       WHERE id = ${wishId}::uuid AND status = 'active'
-         AND NOT (${row.txn_id}::uuid = ANY (dismissed_transaction_ids))
-      RETURNING id`);
-    if (upd.rows.length > 0) {
-      console.log(`[wish] converted wish=${wishId} by transaction=${row.txn_id}`);
-      out.push({ wishId, transactionId: row.txn_id });
+/** When the purchase happened: its printed time, else the start of its
+ *  local day, and never before the wish was made (a same-day receipt with
+ *  no time was, by the rule above, after it). */
+function convertedAt(row: CandidateRow, tz: string): Date {
+  const at = row.occurred_at ? new Date(row.occurred_at) : startOfLocalDay(row.occurred_on, tz);
+  const since = new Date(row.since);
+  return at < since ? since : at;
+}
+
+export async function settleWishes(scope: WishLoopScope): Promise<WishSettlement[]> {
+  const ids = await wishesInScope(scope);
+  if (ids.length === 0) return [];
+  const stateRes = await db.execute(sql`
+    SELECT id, status, converted_transaction_id FROM wish_items
+     WHERE id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})`);
+  const states = stateRes.rows as unknown as WishState[];
+  const quals = await qualifying(ids);
+
+  const out: WishSettlement[] = [];
+  for (const w of states) {
+    const list = quals.get(w.id) ?? [];
+    const first = list[0] ?? null;
+    if (w.status === "active") {
+      if (!first) continue;
+      const upd = await db.execute(sql`
+        UPDATE wish_items
+           SET status = 'converted',
+               converted_transaction_id = ${first.row.txn_id}::uuid,
+               converted_at = ${convertedAt(first.row, first.tz).toISOString()}::timestamptz,
+               converted_by = 'receipt',
+               updated_at = now()
+         WHERE id = ${w.id}::uuid AND status = 'active'
+           AND NOT (${first.row.txn_id}::uuid = ANY (dismissed_transaction_ids))
+        RETURNING id`);
+      if (upd.rows.length > 0) {
+        console.log(`[wish] converted wish=${w.id} by transaction=${first.row.txn_id}`);
+        out.push({ wishId: w.id, change: "converted", transactionId: first.row.txn_id, previousTransactionId: null });
+      }
+      continue;
+    }
+    // Converted by a receipt: does its proof still stand?
+    if (w.converted_transaction_id && list.some((q) => q.row.txn_id === w.converted_transaction_id)) continue;
+    const guard = sql`id = ${w.id}::uuid AND status = 'converted' AND converted_by = 'receipt'
+           AND converted_transaction_id IS NOT DISTINCT FROM ${w.converted_transaction_id}::uuid`;
+    if (first) {
+      const upd = await db.execute(sql`
+        UPDATE wish_items
+           SET converted_transaction_id = ${first.row.txn_id}::uuid,
+               converted_at = ${convertedAt(first.row, first.tz).toISOString()}::timestamptz,
+               updated_at = now()
+         WHERE ${guard}
+        RETURNING id`);
+      if (upd.rows.length > 0) {
+        console.log(`[wish] converted wish=${w.id} by transaction=${first.row.txn_id} (was ${w.converted_transaction_id ?? "a deleted transaction"})`);
+        out.push({ wishId: w.id, change: "moved", transactionId: first.row.txn_id, previousTransactionId: w.converted_transaction_id });
+      }
+    } else {
+      const upd = await db.execute(sql`
+        UPDATE wish_items
+           SET status = 'active', converted_transaction_id = NULL, converted_at = NULL, converted_by = NULL,
+               updated_at = now()
+         WHERE ${guard}
+        RETURNING id`);
+      if (upd.rows.length > 0) {
+        console.log(`[wish] unconverted wish=${w.id}: transaction=${w.converted_transaction_id ?? "(deleted)"} no longer converts it`);
+        out.push({ wishId: w.id, change: "unconverted", transactionId: null, previousTransactionId: w.converted_transaction_id });
+      }
     }
   }
   return out;
 }
 
-/** `convertWishes`, logged instead of thrown: a wish never fails a booking. */
-export async function convertWishesSafely(scope: WishLoopScope): Promise<WishConversion[]> {
+/** `settleWishes`, logged instead of thrown: a wish never fails a booking. */
+export async function settleWishesSafely(scope: WishLoopScope): Promise<WishSettlement[]> {
   try {
-    return await convertWishes(scope);
+    return await settleWishes(scope);
   } catch (err) {
     console.error(`[wish] loop check failed for ${JSON.stringify(scope).slice(0, 200)}:`, err);
     return [];

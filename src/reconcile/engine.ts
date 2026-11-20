@@ -51,6 +51,7 @@ import { batches, reconcileProposals } from "../schema/index.js";
 import { newId } from "../http/uuid.js";
 import { NotFoundProblem } from "../http/problem.js";
 import { detectDedupPairs, directionLateral, flowsDisagree } from "./dedup.js";
+import { settleWishesSafely } from "../wish/loop.js";
 import {
   paymentLinkStub,
   inventoryStub,
@@ -1246,6 +1247,7 @@ async function reconcileLockedBatch(params: {
     // ── Auto-apply above threshold ───────────────────────────────────
     // Only dedup has a real action today; the stubs never produce
     // proposals so their auto-apply paths never fire.
+    let autoApplied = 0;
     for (const p of newProposals) {
       if (p.score < threshold) continue;
       if (p.kind !== "dedup") continue;
@@ -1257,6 +1259,7 @@ async function reconcileLockedBatch(params: {
           proposalId: p.id,
           via: "auto_applied",
         });
+        if (r.outcome === "applied") autoApplied++;
         if (r.outcome === "refused" || r.outcome === "stale") {
           // eslint-disable-next-line no-console
           console.warn(
@@ -1273,6 +1276,10 @@ async function reconcileLockedBatch(params: {
         // still `proposed` and a person can retry via apply.
       }
     }
+
+    // A wish converted by a row that was just folded away moves to the
+    // survivor, or goes back to active (src/wish/loop.ts).
+    if (autoApplied > 0) await settleWishesSafely({ workspaceId });
 
     // ── Flip batch to reconciled ─────────────────────────────────────
     await db
@@ -1365,6 +1372,7 @@ export async function applyProposals(params: {
     }
   }
 
+  if (applied.length > 0) await settleWishesSafely({ workspaceId });
   return { applied, skipped };
 }
 
@@ -1406,6 +1414,8 @@ export async function undoProposals(params: {
       skipped.push({ id: pid, reason: failureReason("undo_failed", pid, err) });
     }
   }
+  // A restored duplicate can be a visit to a wished-for place again.
+  if (reverted.length > 0) await settleWishesSafely({ workspaceId });
   return { reverted, skipped };
 }
 

@@ -45,12 +45,25 @@ export class TextSearchError extends Error {
 
 export async function searchPlacesByText(
   textQuery: string,
-  opts: { apiKey?: string; maxResults?: number; timeoutMs?: number; languageCode?: string } = {},
+  opts: {
+    apiKey?: string;
+    maxResults?: number;
+    timeoutMs?: number;
+    languageCode?: string;
+    /** Prefer places within `radiusM` (at most 50 km) of this point. */
+    locationBias?: { lat: number; lng: number; radiusM: number } | null;
+  } = {},
 ): Promise<TextSearchCandidate[]> {
   const apiKey = opts.apiKey ?? process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) throw new TextSearchKeyMissing();
   const body: Record<string, unknown> = { textQuery, pageSize: opts.maxResults ?? 5 };
   if (opts.languageCode) body.languageCode = opts.languageCode;
+  if (opts.locationBias) {
+    const b = opts.locationBias;
+    body.locationBias = {
+      circle: { center: { latitude: b.lat, longitude: b.lng }, radius: Math.min(50_000, Math.max(1, b.radiusM)) },
+    };
+  }
   let resp: globalThis.Response;
   try {
     resp = await fetch(TEXT_SEARCH_URL, {

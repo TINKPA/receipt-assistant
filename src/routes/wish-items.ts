@@ -15,8 +15,11 @@ import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishItems, products, places } from "../schema/index.js";
 import { startCapture, retryCapture, wishImageRoot } from "../wish/capture.js";
-import { linkGooglePlace, matchPlaceByText, type PlaceLink, type PlaceMatch } from "../wish/places.js";
-import { convertWishesSafely } from "../wish/loop.js";
+import { linkGooglePlace, matchPlaceByText, workspaceArea, type PlaceLink, type PlaceMatch } from "../wish/places.js";
+import { settleWishesSafely } from "../wish/loop.js";
+import { nameTokens } from "../wish/names.js";
+import { safeHttpUrl } from "../wish/reading.js";
+import { liveTransactions } from "../db/live.js";
 import {
   searchPlacesByText,
   TextSearchError,
@@ -92,10 +95,14 @@ const WISH_SELECT = sql`
          ct.occurred_on::text AS ct_occurred_on,
          ct.payee AS ct_payee,
          ct_total.total AS ct_total_minor,
-         ws.base_currency AS ct_currency
+         ws.base_currency AS ct_currency,
+         ARRAY(SELECT o.id FROM wish_items o
+                WHERE o.workspace_id = w.workspace_id AND o.place_id = w.place_id AND o.id <> w.id
+                ORDER BY o.created_at, o.id) AS same_place_ids
     FROM wish_items w
     JOIN workspaces ws ON ws.id = w.workspace_id
-    LEFT JOIN transactions ct ON ct.id = w.converted_transaction_id AND ct.workspace_id = w.workspace_id
+    -- Live only: a deleted proof is no proof (src/wish/loop.ts un-converts).
+    LEFT JOIN ${liveTransactions} ct ON ct.id = w.converted_transaction_id AND ct.workspace_id = w.workspace_id
     LEFT JOIN LATERAL (
       SELECT coalesce(sum(p.amount_base_minor) FILTER (WHERE a.type = 'expense'), 0) AS total
         FROM postings p JOIN accounts a ON a.id = p.account_id
@@ -116,6 +123,26 @@ async function loadWish(workspaceId: string, id: string) {
   );
   if (res.rows.length === 0) throw new NotFoundProblem("WishItem", id);
   return rowToDto(res.rows[0]);
+}
+
+/** A guessed place still waiting for the person: tentative, not linked,
+ *  and not answered (`capture.user_set.place`). */
+function placeSuggestion(placeId: string | null, capture: any) {
+  const m = capture?.place_match;
+  if (placeId || !m || m.tentative !== true || !m.google_place_id || capture?.user_set?.place) return null;
+  return {
+    google_place_id: String(m.google_place_id),
+    name: m.name ?? null,
+    formatted_address: m.formatted_address ?? null,
+    reason: m.tentative_reason ?? null,
+  };
+}
+
+function uuidList(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map(String);
+  // node-postgres leaves a uuid[] it has no parser for as "{a,b}".
+  if (typeof v === "string" && v.startsWith("{")) return v.slice(1, -1).split(",").filter(Boolean);
+  return [];
 }
 
 function rowToDto(row: any) {
@@ -141,7 +168,10 @@ function rowToDto(row: any) {
             rating: numOrNull(row.pl_rating),
           }
         : null,
-    source_url: row.sourceUrl ?? row.source_url ?? null,
+    place_suggestion: placeSuggestion(placeId, row.capture ?? null),
+    same_place_wish_ids: placeId ? uuidList(row.same_place_ids) : [],
+    // Only http(s) leaves the server, whatever an older row holds.
+    source_url: safeHttpUrl(row.sourceUrl ?? row.source_url ?? null),
     has_image: Boolean(row.imagePath ?? row.image_path),
     capture_status: row.captureStatus ?? row.capture_status ?? null,
     capture: row.capture ?? null,
@@ -191,12 +221,40 @@ async function assertPlaceExists(placeId: string): Promise<void> {
 }
 
 async function assertTransactionInWorkspace(workspaceId: string, txnId: string): Promise<void> {
-  const res = await db.execute(sql`SELECT 1 FROM transactions WHERE id = ${txnId}::uuid AND workspace_id = ${workspaceId}::uuid`);
+  const res = await db.execute(sql`SELECT 1 FROM ${liveTransactions} WHERE id = ${txnId}::uuid AND workspace_id = ${workspaceId}::uuid`);
   if (res.rows.length === 0) {
     throw new ValidationProblem([
-      { path: "converted_transaction_id", code: "not_found", message: `Transaction ${txnId} not in workspace` },
+      { path: "converted_transaction_id", code: "not_found", message: `Transaction ${txnId} is not a live transaction of this workspace` },
     ]);
   }
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** A conversion time the person sent: not before the wish was made (a
+ *  day's grace, since the client may send the start of a local day) and
+ *  not in the future (a day's grace for clocks). */
+function assertConvertedAt(at: Date, createdAt: Date): void {
+  if (at.getTime() < createdAt.getTime() - DAY_MS || at.getTime() > Date.now() + DAY_MS) {
+    throw new ValidationProblem([
+      {
+        path: "converted_at",
+        code: "out_of_range",
+        message: `converted_at must be between the day the wish was made (${createdAt.toISOString()}) and now`,
+      },
+    ]);
+  }
+}
+
+/** Does any candidate share a word with what was searched for? Google
+ *  answers a query it cannot make sense of with whatever it has; that is
+ *  no answer. */
+function anyRelevant(query: string, candidates: { name: string | null; formatted_address: string | null; primary_type: string | null }[]): boolean {
+  const q = new Set(nameTokens(query).filter((t) => t.length >= 2 || /\p{Script=Han}/u.test(t)));
+  if (q.size === 0) return true;
+  return candidates.some((c) =>
+    nameTokens(`${c.name ?? ""} ${c.formatted_address ?? ""} ${(c.primary_type ?? "").replace(/_/g, " ")}`).some((t) => q.has(t)),
+  );
 }
 
 /** A Google place id the person picked, stored and linked, or the HTTP
@@ -227,17 +285,24 @@ wishItemsRouter.get(
     try {
       const query = parseOrThrow(WishPlaceSearchQuery, req.query);
       let text = query.q;
+      let biasedToLocality = false;
       if (query.near) {
         const near = await db.execute(sql`
           SELECT capture->'reading'->>'locality' AS locality FROM wish_items
            WHERE id = ${query.near}::uuid AND workspace_id = ${req.ctx.workspaceId}::uuid`);
         if (near.rows.length === 0) throw new NotFoundProblem("WishItem", query.near);
         const locality = (near.rows[0] as { locality: string | null }).locality?.trim();
-        if (locality && !text.toLowerCase().includes(locality.toLowerCase())) text = `${text} ${locality}`;
+        if (locality && !text.toLowerCase().includes(locality.toLowerCase())) {
+          text = `${text} ${locality}`;
+          biasedToLocality = true;
+        }
       }
+      // Without a locality from the image, prefer the person's own area.
+      const area = biasedToLocality ? null : await workspaceArea(req.ctx.workspaceId);
       try {
-        const candidates = await searchPlacesByText(text, { maxResults: 5 });
-        res.json(WishPlaceSearchResponse.parse({ query: text, candidates }));
+        const found = await searchPlacesByText(text, { maxResults: 5, locationBias: area });
+        const candidates = anyRelevant(query.q, found) ? found : [];
+        res.json(WishPlaceSearchResponse.parse({ query: text, location_biased: area !== null, candidates }));
       } catch (err) {
         if (err instanceof TextSearchKeyMissing) {
           throw new HttpProblem(503, "google-places-unavailable", "Place search is not configured", "The server has no Google Maps key.");
@@ -429,10 +494,15 @@ wishItemsRouter.post(
       const placeId = body.place_id ?? (body.google_place_id ? await placeFromGoogleId(body.google_place_id) : null);
       // A place wish typed in with only a name: match it now, as a capture
       // would. A miss leaves it unmatched with the reason on the row.
+      // A name Google answers with another place is only a suggestion.
       let placeMatch: PlaceMatch | null = null;
       if (kind === "place" && !placeId) {
-        placeMatch = await matchPlaceByText(body.title, "title", null);
+        placeMatch = await matchPlaceByText(body.title, "title", null, {
+          names: [body.title],
+          locationBias: await workspaceArea(req.ctx.workspaceId),
+        });
         if (placeMatch.error) console.warn(`[wish] typed place "${body.title.slice(0, 80)}" not linked: ${placeMatch.error}`);
+        else if (placeMatch.tentative) console.log(`[wish] typed place "${body.title.slice(0, 80)}" suggested, not linked: ${placeMatch.name ?? "?"}`);
       }
       const inserted = await db
         .insert(wishItems)
@@ -454,7 +524,7 @@ wishItemsRouter.post(
         })
         .returning({ id: wishItems.id, placeId: wishItems.placeId, productId: wishItems.productId });
       const row = inserted[0]!;
-      if (row.placeId || row.productId) await convertWishesSafely({ wishIds: [row.id] });
+      if (row.placeId || row.productId) await settleWishesSafely({ wishIds: [row.id] });
       res.status(201).json(await loadWish(req.ctx.workspaceId, row.id));
     } catch (err) {
       next(err);
@@ -539,42 +609,61 @@ wishItemsRouter.patch(
             { path: body.converted_at !== undefined ? "converted_at" : "converted_transaction_id", code: "not_converted", message: "Only a converted wish has a converting transaction or time" },
           ]);
         }
+        const sentAt = body.converted_at !== undefined ? new Date(body.converted_at) : null;
+        if (sentAt) assertConvertedAt(sentAt, cur.createdAt);
         if (status === "converted") {
           if (cur.status !== "converted") {
             // The user says it is done: theirs, now unless they say when.
             updates["status"] = "converted";
             updates["convertedBy"] = "user";
-            updates["convertedAt"] = body.converted_at ? new Date(body.converted_at) : new Date();
+            updates["convertedAt"] = sentAt ?? new Date();
             updates["convertedTransactionId"] = body.converted_transaction_id ?? null;
           } else {
-            if (body.converted_transaction_id !== undefined) updates["convertedTransactionId"] = body.converted_transaction_id;
-            if (body.converted_at !== undefined) updates["convertedAt"] = new Date(body.converted_at);
+            // An edit of a conversion makes it the user's: the loop then
+            // leaves it alone.
+            let edited = false;
+            if (body.converted_transaction_id !== undefined && body.converted_transaction_id !== cur.convertedTransactionId) {
+              updates["convertedTransactionId"] = body.converted_transaction_id;
+              edited = true;
+            }
+            if (sentAt && sentAt.getTime() !== cur.convertedAt?.getTime()) {
+              updates["convertedAt"] = sentAt;
+              edited = true;
+            }
+            if (edited) updates["convertedBy"] = "user";
           }
         } else if (body.status !== undefined && body.status !== cur.status) {
           updates["status"] = status;
           updates["convertedBy"] = null;
           updates["convertedAt"] = null;
           updates["convertedTransactionId"] = null;
-          if (cur.status === "converted" && status === "active") {
-            // "Want again": that purchase fulfilled it once; it must not
-            // fulfil it again, and an older one must not either.
-            updates["reactivatedAt"] = new Date();
-            if (cur.convertedTransactionId && !cur.dismissedTransactionIds.includes(cur.convertedTransactionId)) {
-              updates["dismissedTransactionIds"] = [...cur.dismissedTransactionIds, cur.convertedTransactionId];
-            }
+          // Leaving converted, whichever way: that purchase did not settle
+          // it, and must never settle it again (declined → active included).
+          if (cur.status === "converted" && cur.convertedTransactionId && !cur.dismissedTransactionIds.includes(cur.convertedTransactionId)) {
+            updates["dismissedTransactionIds"] = [...cur.dismissedTransactionIds, cur.convertedTransactionId];
           }
+          // Wanted again (from converted) or again (from declined): the
+          // wish starts over, and only a purchase from now on fulfils it.
+          if (status === "active") updates["reactivatedAt"] = new Date();
         }
 
-        // A failed capture the user fixed by hand is resolved; its error
-        // stays under `capture` as history.
-        const fixes = body.title !== undefined || body.kind !== undefined || body.place_id !== undefined || body.google_place_id !== undefined;
-        if (fixes && cur.captureStatus === "failed") {
-          updates["captureStatus"] = "done";
-          updates["capture"] = {
-            ...((cur.capture as Record<string, unknown> | null) ?? {}),
-            resolved_by: "user",
-            resolved_at: new Date().toISOString(),
-          };
+        // What the person set by hand on a captured or matched wish is
+        // theirs: a reading (now or a later "read again") leaves it alone,
+        // and a failed capture it fixes is resolved, its error kept.
+        const setByHand = {
+          ...(body.title !== undefined ? { title: true } : {}),
+          ...(body.kind !== undefined ? { kind: true } : {}),
+          ...(body.place_id !== undefined || body.google_place_id !== undefined ? { place: true } : {}),
+        };
+        if (Object.keys(setByHand).length > 0 && (cur.capture !== null || cur.captureStatus !== null)) {
+          const capture = { ...((cur.capture as Record<string, unknown> | null) ?? {}) };
+          capture["user_set"] = { ...((capture["user_set"] as Record<string, unknown> | undefined) ?? {}), ...setByHand };
+          if (cur.captureStatus === "failed") {
+            updates["captureStatus"] = "done";
+            capture["resolved_by"] = "user";
+            capture["resolved_at"] = new Date().toISOString();
+          }
+          updates["capture"] = capture;
         }
         if (Object.keys(updates).length === 0) return cur;
         updates["updatedAt"] = new Date();
@@ -585,9 +674,16 @@ wishItemsRouter.patch(
           .returning();
         return updated[0]!;
       });
-      // A new place or product: maybe it was bought or visited already.
-      if (updates["placeId"] || updates["productId"]) {
-        await convertWishesSafely({ wishIds: [id] });
+      // A new place, product or kind: maybe it was bought or visited
+      // already, or a receipt conversion no longer holds. Set back to
+      // active: a purchase since then may already be on the books.
+      if (
+        updates["placeId"] !== undefined ||
+        updates["productId"] !== undefined ||
+        updates["kind"] !== undefined ||
+        updates["status"] === "active"
+      ) {
+        await settleWishesSafely({ wishIds: [id] });
       }
       res.json(await loadWish(req.ctx.workspaceId, id));
     } catch (err) {
@@ -664,7 +760,8 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from " +
       "`GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title " +
-      "with Google Find Place before the answer; a miss leaves it unmatched, with the reason in `capture.place_match.error`. " +
+      "with Google Find Place before the answer, biased to the workspace's usual area; a miss leaves it unmatched, with the reason in " +
+      "`capture.place_match.error`, and a found place whose name differs from the title is not linked but offered as `place_suggestion`. " +
       "A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
     request: {
       body: { content: { "application/json": { schema: CreateWishItemRequest } } },
@@ -682,8 +779,9 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/wish-items/place-search",
     summary: "Search Google for a wish's place (up to five candidates)",
     description:
-      "Google Places Text Search with the server's key. With `near`, the query is biased to the locality the wish's image " +
-      "reading found. Pick a candidate by sending its `google_place_id` in `PATCH /v1/wish-items/{id}`.",
+      "Google Places Text Search with the server's key. With `near`, the locality the wish's image reading found is added to the " +
+      "query; otherwise the search prefers the workspace's usual area (`location_biased`). Candidates that share no word with `q` " +
+      "are not returned. Pick a candidate by sending its `google_place_id` in `PATCH /v1/wish-items/{id}`.",
     tags: ["wish-items"],
     request: { query: WishPlaceSearchQuery },
     responses: {
@@ -703,10 +801,13 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. " +
       "The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and " +
-      "`capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. " +
-      "Nothing the reading fills overwrites a note sent with the upload. " +
+      "`capture_status` becomes `done`, or `failed` with `capture.error` (`nothing_to_save` titles it with what the image showed). " +
+      "Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload, or a title, kind or place " +
+      "the person set while it was being read. A place with no city or address in the image is offered as `place_suggestion`, not linked. " +
+      "An image that lists several places with equal weight makes one wish for each (`capture.sibling_of` / `capture.siblings`), " +
+      "except for places already wished for. " +
       "HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made " +
-      "the first time, whatever its state, and are not read again.",
+      "the first time, whatever its state, and are not read again; a note sent with them is added to its notes.",
     tags: ["wish-items"],
     request: { body: { content: { "multipart/form-data": { schema: CaptureWishForm } } } },
     responses: {
@@ -720,6 +821,9 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     method: "post",
     path: "/v1/wish-items/{id}/capture/retry",
     summary: "Read a captured image again",
+    description:
+      "Fields the person set by hand (`capture.user_set`) are kept; if the new reading fails, a wish they had named or placed stays `done`. " +
+      "A wish split from another capture (`capture.sibling_of`) is not read on its own: 409, read the original.",
     tags: ["wish-items"],
     request: { params: z.object({ id: Uuid }) },
     responses: {
@@ -748,11 +852,14 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     description:
       "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
       "replacing it (`null` removes a key, `{}` changes nothing). " +
-      "`status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent). " +
-      "`status: active` on a converted wish is \"Want again\": the transaction that converted it never converts it again, " +
-      "and only a purchase from that day on can. `google_place_id` stores the picked place and links it. " +
-      "Setting `title`, `kind` or the place on a wish whose capture failed marks the capture `done` " +
-      "(`capture.resolved_by: user`, the error kept). A new place or product is checked against the ledger at once.",
+      "`status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent; not before the wish was made). " +
+      "Changing `converted_transaction_id` (a live transaction) or `converted_at` on a receipt conversion makes it `converted_by: user`. " +
+      "Leaving `converted` (to active or declined) dismisses its transaction for good; `status: active` from converted or declined " +
+      "starts the wish over: only a purchase from then on converts it, and that is checked at once. " +
+      "`google_place_id` stores the picked place and links it (confirming a `place_suggestion`); `place_id: null` removes a place " +
+      "or rejects the suggestion. Setting `title`, `kind` or the place on a captured wish records it in `capture.user_set`, which " +
+      "no reading overwrites; on a wish whose capture failed it also marks the capture `done` (`capture.resolved_by: user`, the error kept). " +
+      "A new place, product or kind is checked against the ledger at once.",
     tags: ["wish-items"],
     request: {
       params: z.object({ id: Uuid }),

@@ -61,7 +61,7 @@ import {
 } from "../schema/index.js";
 import { normalizeFxSafely } from "../fx/normalize.js";
 import { valuePointsSafely } from "../points/valuation.js";
-import { convertWishesSafely } from "../wish/loop.js";
+import { settleWishesSafely } from "../wish/loop.js";
 import {
   defaultClaudeExtractor,
   runRecordExtraction,
@@ -764,7 +764,7 @@ async function extractAndClose(
   await normalizeFxSafely(terminal.produced.transaction_ids, workspaceId);
   // A purchase at a wished-for place (or of a wished-for product)
   // converts the wish (src/wish/loop.ts). Never throws.
-  await convertWishesSafely({ transactionIds: terminal.produced.transaction_ids });
+  await settleWishesSafely({ transactionIds: terminal.produced.transaction_ids });
 
   await finish({
     ...exited,
@@ -1080,7 +1080,7 @@ async function closeApplied(
   await runPostCommitPasses(applied, workspaceId);
   // Written or attached: a purchase at a wished-for place converts the
   // wish (src/wish/loop.ts). Never throws.
-  await convertWishesSafely({ transactionIds: applied.transactionIds });
+  await settleWishesSafely({ transactionIds: applied.transactionIds });
   busEmit("job.done", {
     batchId,
     ingestId,

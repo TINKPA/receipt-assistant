@@ -24,7 +24,13 @@ export class FindPlaceError extends Error {
 /** The best candidate for `query`, or null when Google has none. */
 export async function findPlaceByText(
   query: string,
-  opts: { apiKey?: string; timeoutMs?: number; language?: string } = {},
+  opts: {
+    apiKey?: string;
+    timeoutMs?: number;
+    language?: string;
+    /** Prefer places within `radiusM` of this point (a bias, not a filter). */
+    locationBias?: { lat: number; lng: number; radiusM: number } | null;
+  } = {},
 ): Promise<FoundPlace | null> {
   const apiKey = opts.apiKey ?? process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) throw new FindPlaceError("GOOGLE_MAPS_API_KEY is not set");
@@ -33,6 +39,10 @@ export async function findPlaceByText(
   url.searchParams.set("inputtype", "textquery");
   url.searchParams.set("fields", "place_id,name,formatted_address");
   if (opts.language) url.searchParams.set("language", opts.language);
+  if (opts.locationBias) {
+    const b = opts.locationBias;
+    url.searchParams.set("locationbias", `circle:${Math.round(b.radiusM)}@${b.lat.toFixed(6)},${b.lng.toFixed(6)}`);
+  }
   url.searchParams.set("key", apiKey);
   let resp: globalThis.Response;
   try {
