@@ -231,26 +231,42 @@ export const WishReading = z
     const sameAsTitle = (v: string | null, title: string) => (v && v.trim().toLowerCase() === title.trim().toLowerCase() ? null : v);
     // A branch in brackets after a place's name is where, not who: the
     // name goes in the title, the branch in the locality when there is
-    // none.
-    const unbranch = <T extends { title: string; name_local: string | null; locality: string | null }>(o: T, place: boolean): T => {
+    // none. A branch that is a Han street ("佳家汤包(黄河路店)", or a
+    // locality read as "黄河路店") goes in the address instead when none
+    // was read: a street confirms a place only as an address, never as a
+    // locality (src/wish/places.ts).
+    const unbranch = <T extends { title: string; name_local: string | null; locality: string | null; address: string | null }>(o: T, place: boolean): T => {
       if (!place) return o;
       const t = splitBranch(o.title);
       const n = o.name_local ? splitBranch(o.name_local) : null;
       const branch = t.branch ?? n?.branch ?? null;
+      // "黄河路店" → "黄河路": the branch's area. The branch split off the
+      // title is its area, 店 cut; a locality read on its own is a place
+      // name, cut only where unmistakable.
+      const locality = o.locality
+        ? branch && o.locality.trim() === branch
+          ? branchArea(branch)
+          : localityArea(o.locality)
+        : branch
+          ? branchArea(branch)
+          : null;
+      // A branch that is a street ("黄河路店" → 黄河路), from the title or
+      // read as the locality. A neighbourhood named for a street (唐人街,
+      // 步行街) is not one.
+      const isStreet = (v: string | null): v is string =>
+        v !== null && /^[^,，\s]+(大道|大街|路|街|巷|弄|胡同)$/u.test(v.trim()) && !/(唐人街|中华街|中華街|步行街|商业街|商業街)$/u.test(v.trim());
+      const titleBranch = branch ? branchArea(branch) : null;
+      const readBranch = !branch && /店$/u.test(o.locality?.trim() ?? "") ? locality : null;
+      const streetBranch = o.address ? null : isStreet(titleBranch) ? titleBranch : isStreet(readBranch) ? readBranch : null;
+      if (streetBranch) {
+        const own = o.locality && o.locality.trim() !== branch && readBranch === null ? locality : null;
+        return { ...o, title: t.name, name_local: n ? n.name : o.name_local, address: streetBranch, locality: own === streetBranch ? null : own };
+      }
       return {
         ...o,
         title: t.name,
         name_local: n ? n.name : o.name_local,
-        // "黄河路店" → "黄河路": the branch's area.
-        // The branch split off the title is its area, 店 cut; a locality
-        // read on its own is a place name, cut only where unmistakable.
-        locality: o.locality
-          ? branch && o.locality.trim() === branch
-            ? branchArea(branch)
-            : localityArea(o.locality)
-          : branch
-            ? branchArea(branch)
-            : null,
+        locality,
       };
     };
     const place = r.kind === "place";

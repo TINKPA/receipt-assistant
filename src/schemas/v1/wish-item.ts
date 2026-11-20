@@ -52,13 +52,15 @@ export const WishPlaceSuggestion = z
      *  reading was a guess), `name_mismatch` (Google's place has another
      *  name; for a typed name, also a branch of the same brand inside the
      *  workspace's area when the typed words for where match no branch),
-     *  `name_unverified` (a typed name in another script than Google's, so
-     *  the two cannot be compared), `address_mismatch` (the house number
-     *  in the image is not in the found place's address), `street_mismatch`
+     *  `name_unverified` (a name in another script than Google's, so the
+     *  two cannot be compared, and no house number confirms the place),
+     *  `address_mismatch` (the house number in the image is not the found
+     *  place's house number on the street the image names), `street_mismatch`
      *  (the street the image names, "6th Ave" or "天平路", is not in it),
      *  `street_unverified` (Google's address names no street to compare it
      *  with), `locality_mismatch` (the city or neighbourhood the image
-     *  names is not in Google's address: a namesake in another town, or a
+     *  names is not in Google's address outside its street, or the city
+     *  is not although the street is: a namesake in another town, or a
      *  neighbourhood Google's address does not name), `outside_area` (a
      *  typed name found outside the workspace's usual area). */
     reason: z.string().nullable(),

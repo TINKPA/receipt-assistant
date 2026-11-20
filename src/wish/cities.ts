@@ -20,6 +20,23 @@ export const CITY_ALIASES: Record<string, string> = {
   新加坡: "singapore", 香港: "hong kong", 台北: "taipei", 臺北: "taipei", 上海: "shanghai", 北京: "beijing",
   广州: "guangzhou", 廣州: "guangzhou", 深圳: "shenzhen", 成都: "chengdu", 杭州: "hangzhou", 南京: "nanjing",
   重庆: "chongqing", 重慶: "chongqing", 西安: "xian", 武汉: "wuhan", 武漢: "wuhan", 郑州: "zhengzhou", 鄭州: "zhengzhou",
+  // New York's boroughs as Google writes them: Manhattan is "New York, NY";
+  // Brooklyn, the Bronx and Staten Island are themselves; Queens is its
+  // neighbourhood ("Flushing, NY"), listed in BOROUGH_TOWNS.
+  manhattan: "new york", 曼哈顿: "new york", 曼哈頓: "new york", 布鲁克林: "brooklyn", 布魯克林: "brooklyn",
+  "the bronx": "bronx", 布朗克斯: "bronx", 皇后区: "queens", 皇后區: "queens", 法拉盛: "flushing",
+};
+
+/** A borough whose addresses name the neighbourhood instead: any of these
+ *  in Google's address confirms it. */
+export const BOROUGH_TOWNS: Record<string, string[]> = {
+  queens: [
+    "queens", "flushing", "astoria", "long island city", "jackson heights", "elmhurst", "east elmhurst", "forest hills",
+    "jamaica", "woodside", "sunnyside", "corona", "bayside", "ridgewood", "rego park", "fresh meadows", "kew gardens",
+    "ozone park", "south ozone park", "richmond hill", "whitestone", "college point", "maspeth", "middle village",
+    "little neck", "douglaston", "glendale", "howard beach", "far rockaway", "rockaway park", "hollis", "queens village",
+    "springfield gardens", "saint albans", "cambria heights", "woodhaven", "oakland gardens", "bellerose", "floral park",
+  ],
 };
 
 /** Cities (and New York's boroughs, which posts use as cities). */
@@ -35,4 +52,10 @@ const CITIES = new Set([
 /** The locality is a city by itself ("Chicago", "Brooklyn", "芝加哥"). */
 export function isKnownCity(locality: string): boolean {
   return CITIES.has(locality.trim().toLowerCase().replace(/\s+/g, " "));
+}
+
+/** The Han city names of CITY_ALIASES a Han locality carries ("旧金山唐人街"
+ *  → 旧金山). */
+export function hanCitiesIn(locality: string): string[] {
+  return Object.keys(CITY_ALIASES).filter((k) => /\p{Script=Han}/u.test(k) && locality.includes(k));
 }

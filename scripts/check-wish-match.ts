@@ -10,7 +10,7 @@
  * after any change to src/wish/places.ts, src/wish/names.ts or the capture's
  * query (`captureMatchInput` in src/wish/capture.ts); every case must pass.
  *
- * It calls Google Find Place and Text Search (about 80 requests) and writes
+ * It calls Google Find Place and Text Search (about 150 requests) and writes
  * nothing: `decidePlaceMatch` decides, and nothing is linked. Typed names
  * are judged against, and name-only captures biased to, a fixed area (50
  * km around downtown Los Angeles), not a workspace's.
@@ -24,7 +24,7 @@
  *
  * Exit code: 0 all pass, 1 a case failed, 2 no key.
  */
-import { decidePlaceMatch, AREA_RADIUS_M, type MatchOptions, type MatchReason } from "../src/wish/places.js";
+import { decidePlaceMatch, houseNumberIn, localityIn, localityPart, AREA_RADIUS_M, type MatchOptions, type MatchReason } from "../src/wish/places.js";
 import { captureMatchInput } from "../src/wish/capture.js";
 import { parseWishReading } from "../src/wish/reading.js";
 
@@ -33,7 +33,10 @@ const LA = { lat: 34.0522, lng: -118.2437, radiusM: AREA_RADIUS_M };
 type Expect =
   | { linked: string; address?: string; unverified?: boolean }
   | { suggested: string; reason: MatchReason; address?: string }
-  | { nothing: true };
+  | { nothing: true }
+  /** Not linked: a suggestion of whatever Google answers, or nothing; and,
+   *  with `notAddress`, never a place at that address. */
+  | { suggestedAny: true; notAddress?: string };
 
 interface Case {
   why: string;
@@ -54,14 +57,31 @@ const CASES: Case[] = [
   { why: "r3: another branch by its house number", capture: { title: "Joe's Pizza", address: "1435 Broadway", locality: "New York" }, expect: { linked: "Joe's Pizza", address: "1435 Broadway" } },
   { why: "r3: a Han street against Google's address in Chinese", capture: { title: "佳家汤包", address: "黄河路", locality: "上海" }, expect: { linked: "", address: "Huang He" } },
   { why: "r3: a branch in brackets becomes the locality", capture: { title: "佳家汤包(黄河路店)" }, expect: { linked: "", address: "Huang He" } },
+  { why: "r8: a street branch goes in the address, beside a read city", capture: { title: "佳家汤包(黄河路店)", locality: "上海" }, expect: { linked: "", address: "Huang He" } },
+  { why: "r8: a street branch read as the locality", capture: { title: "佳家汤包", locality: "黄河路店" }, expect: { linked: "", address: "Huang He" } },
   { why: "r4: Google's address names no street; the locality and the name decide", capture: { title: "南翔馒头店", address: "豫园路85号", locality: "豫园/城隍庙，上海" }, expect: { linked: "南翔馒头店", unverified: true } },
   { why: "r4: a house number on a Han street", capture: { title: "南翔馒头店", address: "吴江路269号", locality: "上海" }, expect: { linked: "", address: "269" } },
   { why: "r4: the read city is not where Google knows the name", capture: { title: "南翔馒头店", address: "豫园路85号", locality: "北京" }, expect: { nothing: true } },
   { why: "r2: a landmark street is not an address; the city decides", capture: { title: "R&G Lounge", address: "Between Washington St & Jackson St", locality: "San Francisco" }, expect: { linked: "R & G Lounge" } },
-  { why: "r4: a Han name, a landmark, and a Han city Google writes in English", capture: { title: "岭南小馆", address: "近 Commercial St", locality: "旧金山唐人街" }, expect: { linked: "R & G Lounge" } },
+  { why: "r8: a Han name Google has no Chinese name for, a landmark and a city: a suggestion, since any Han name finds some place in that city", capture: { title: "岭南小馆", address: "近 Commercial St", locality: "旧金山唐人街" }, expect: { suggested: "R & G Lounge", reason: "name_unverified" } },
   { why: "r4: a landmark with no city is name_only", capture: { title: "R&G Lounge", address: "near Commercial St" }, expect: { suggested: "R & G Lounge", reason: "name_only" } },
   { why: "r3: a name with no city is only a suggestion, in the person's area", capture: { title: "Joe's Pizza" }, expect: { suggested: "Joe's Pizza", reason: "name_only", address: "CA" } },
+  { why: "r8: a suite number is not the house number (Ste 2610 on Santa Monica Blvd)", capture: { title: "Haidilao Hot Pot", address: "2610 Wilshire Blvd", locality: "Los Angeles" }, expect: { suggested: "Haidilao", reason: "address_mismatch" } },
+  { why: "r8: the street agrees, the read city does not", capture: { title: "Katz's Delicatessen", address: "E Houston St", locality: "Chicago" }, expect: { suggested: "Katz", reason: "locality_mismatch" } },
+  { why: "r8: the street agrees, the read city does not", capture: { title: "Swan Oyster Depot", address: "Polk St", locality: "Los Angeles" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
+  { why: "r8: the house number agrees, the read city does not", capture: { title: "Swan Oyster Depot", address: "1517 Polk St", locality: "Los Angeles" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
+  { why: "r8: number, street and city agree", capture: { title: "Swan Oyster Depot", address: "1517 Polk St", locality: "San Francisco" }, expect: { linked: "Swan Oyster Depot", address: "1517 Polk" } },
+  { why: "r8: a Han name with a street but no number is not enough", capture: { title: "福满楼", address: "Grant Ave", locality: "旧金山" }, expect: { suggestedAny: true } },
   // ── Captures with a city and no street ──
+  { why: "r8: a city named like a street is not confirmed by the street (Washington St)", capture: { title: "Golden Dragon", locality: "Washington" }, expect: { suggestedAny: true, notAddress: "Washington St" } },
+  { why: "r8: Alameda the city is not N Alameda St", capture: { title: "Philippe The Original", locality: "Alameda" }, expect: { suggested: "Philippe", reason: "locality_mismatch" } },
+  { why: "r8: the city it is in", capture: { title: "Philippe The Original", locality: "Los Angeles" }, expect: { linked: "Philippe", address: "Los Angeles" } },
+  { why: "r8: a street as the locality confirms nothing", capture: { title: "Joe's Pizza", locality: "Broadway" }, expect: { suggestedAny: true } },
+  { why: "r8: a Han name and only a city: Google's English guess is not linked", capture: { title: "张记小馆", locality: "旧金山" }, expect: { suggestedAny: true } },
+  { why: "r8: a Han name and only a city", capture: { title: "王记牛肉面", locality: "旧金山" }, expect: { suggestedAny: true } },
+  { why: "r8: a description, not a name", capture: { title: "小红书推荐的火锅", locality: "洛杉矶" }, expect: { suggestedAny: true } },
+  { why: "r8: Google writes Manhattan as New York", capture: { title: "Joe's Pizza", locality: "Manhattan" }, expect: { linked: "Joe's Pizza", address: "New York" } },
+  { why: "r8: 曼哈顿 too", capture: { title: "Joe's Pizza", locality: "曼哈顿" }, expect: { linked: "Joe's Pizza", address: "New York" } },
   { why: "r2: a branch by its city", capture: { title: "Din Tai Fung", locality: "Glendale" }, expect: { linked: "Din Tai Fung", address: "Glendale" } },
   { why: "r7: a namesake in another city is not linked", capture: { title: "Swan Oyster Depot", locality: "Los Angeles" }, expect: { suggested: "Swan Oyster Depot", reason: "locality_mismatch" } },
   { why: "r7: Katz's is in New York, not Chicago", capture: { title: "Katz's Delicatessen", locality: "Chicago" }, expect: { suggested: "Katz", reason: "locality_mismatch" } },
@@ -91,6 +111,11 @@ function verdict(c: Case, m: Awaited<ReturnType<typeof decidePlaceMatch>>): stri
   const e = c.expect;
   const has = (hay: string | null, needle: string | undefined) => !needle || (hay ?? "").toLowerCase().includes(needle.toLowerCase());
   if ("nothing" in e) return linkGoogleId || match.tentative ? "expected nothing" : null;
+  if ("suggestedAny" in e) {
+    if (linkGoogleId) return "expected no link";
+    if (e.notAddress && match.formatted_address?.toLowerCase().includes(e.notAddress.toLowerCase())) return `expected no place at ${e.notAddress}`;
+    return null;
+  }
   if ("linked" in e) {
     if (!linkGoogleId) return "expected a link";
     if (!has(match.name, e.linked) || !has(match.formatted_address, e.address)) return `expected a link to ${e.linked} | ${e.address ?? ""}`;
@@ -103,7 +128,34 @@ function verdict(c: Case, m: Awaited<ReturnType<typeof decidePlaceMatch>>): stri
   return null;
 }
 
+/** The address rules on fixed strings, no Google: [what, got, expected]. */
+function pureChecks(): [string, unknown, unknown][] {
+  return [
+    ["street part dropped", localityPart("822 Washington St, San Francisco, CA 94108, USA"), " San Francisco, CA 94108, USA"],
+    ["streetless first part kept", localityPart("四牌楼 Huangpu, China, 200010"), "四牌楼 Huangpu, China, 200010"],
+    ["Han address cut before its street", localityPart("中国上海市黄浦区黄河路90号"), "中国上海市黄浦区"],
+    ["Washington St is not Washington", localityIn("Washington", ["822 Washington St, San Francisco, CA 94108, USA"]), false],
+    ["Washington DC is", localityIn("Washington", ["1 Main St NW, Washington, DC 20001, USA"]), true],
+    ["华盛顿 is not Washington St", localityIn("华盛顿", ["822 Washington St, San Francisco, CA 94108, USA"]), false],
+    ["Queens by its neighbourhood", localityIn("Queens", ["136-20 Roosevelt Ave, Flushing, NY 11354, USA"]), true],
+    ["Manhattan is New York", localityIn("Manhattan", ["1435 Broadway, New York, NY 10018, USA"]), true],
+    ["a suite is not the house number", houseNumberIn("2610", "10250 Santa Monica Blvd Ste 2610, Los Angeles, CA 90067"), false],
+    ["a postcode is not the house number", houseNumberIn("90067", "10250 Santa Monica Blvd, Los Angeles, CA 90067"), false],
+    ["the house number", houseNumberIn("1435", "1435 Broadway, New York, NY 10018"), true],
+    ["a number in a range", houseNumberIn("1003", "1001-1003 N Alameda St, Los Angeles"), true],
+    ["a Han 号 number", houseNumberIn("269", "中国上海市静安区吴江路269号"), true],
+  ];
+}
+
 async function main() {
+  let pureFailed = 0;
+  for (const [what, got, want] of pureChecks()) {
+    if (got !== want) {
+      pureFailed++;
+      console.log(`FAIL ${what}: got ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
+    }
+  }
+  if (pureFailed) console.log(`${pureFailed} address rule(s) failed\n`);
   if (!process.env.GOOGLE_MAPS_API_KEY) {
     console.error("GOOGLE_MAPS_API_KEY is not set: run this inside the sandbox container");
     process.exit(2);
@@ -140,7 +192,7 @@ async function main() {
     } else console.log(`ok   ${label} → ${describe(m)}`);
   }
   console.log(`\n${ran - failed}/${ran} cases pass`);
-  process.exit(failed > 0 ? 1 : 0);
+  process.exit(failed + pureFailed > 0 ? 1 : 0);
 }
 
 main().catch((err) => {
