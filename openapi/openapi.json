@@ -2455,6 +2455,44 @@
           "rating"
         ]
       },
+      "WishConvertedTransaction": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "occurred_on": {
+            "type": "string",
+            "format": "date",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "example": "2026-04-19"
+          },
+          "payee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_minor": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "occurred_on",
+          "payee",
+          "total_minor",
+          "currency"
+        ]
+      },
       "WishItem": {
         "type": "object",
         "properties": {
@@ -2551,6 +2589,26 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "converted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "converted_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "user",
+              "receipt"
+            ]
+          },
+          "converted_transaction": {
+            "$ref": "#/components/schemas/WishConvertedTransaction"
+          },
           "source_url": {
             "type": [
               "string",
@@ -2609,6 +2667,9 @@
           "snoozed_until",
           "status",
           "converted_transaction_id",
+          "converted_at",
+          "converted_by",
+          "converted_transaction",
           "source_url",
           "has_image",
           "capture_status",
@@ -2635,6 +2696,12 @@
             "type": "string",
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "google_place_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{10,300}$",
+            "description": "A Google place id (`ChIJ…`), as place search returns it.",
+            "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
           },
           "source_url": {
             "type": "string",
@@ -2706,6 +2773,12 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "google_place_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{10,300}$",
+            "description": "A Google place id (`ChIJ…`), as place search returns it.",
+            "example": "ChIJN1t_tDeuEmsRUsoyG83frY4"
+          },
           "source_url": {
             "type": [
               "string",
@@ -2775,6 +2848,10 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "converted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "metadata": {
             "type": "object",
             "additionalProperties": {}
@@ -2787,7 +2864,7 @@
         "properties": {
           "file": {
             "type": "string",
-            "description": "A JPEG, PNG, WebP or GIF image: a screenshot or a photo.",
+            "description": "A JPEG, PNG, WebP, GIF, HEIC or AVIF image: a screenshot or a photo. HEIC and AVIF are stored (and read) as JPEG.",
             "format": "binary"
           },
           "note": {
@@ -2798,6 +2875,70 @@
         },
         "required": [
           "file"
+        ]
+      },
+      "WishPlaceCandidate": {
+        "type": "object",
+        "properties": {
+          "google_place_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formatted_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rating": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "user_rating_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "primary_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "google_place_id",
+          "name",
+          "formatted_address",
+          "rating",
+          "user_rating_count",
+          "primary_type"
+        ]
+      },
+      "WishPlaceSearchResponse": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WishPlaceCandidate"
+            }
+          }
+        },
+        "required": [
+          "query",
+          "candidates"
         ]
       },
       "Insight": {
@@ -8521,6 +8662,7 @@
         "tags": [
           "wish-items"
         ],
+        "description": "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from `GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title with Google Find Place before the answer; a miss leaves it unmatched, with the reason in `capture.place_match.error`. A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -8545,7 +8687,27 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "Validation failed",
+            "description": "Validation failed (also: Google has no such `google_place_id`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google failed while fetching the picked place",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`google_place_id` sent, and the server has no Google Maps key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8603,7 +8765,7 @@
       },
       "patch": {
         "summary": "Patch a wish (fields, urgency, snooze, convert / decline)",
-        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing).",
+        "description": "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than replacing it (`null` removes a key, `{}` changes nothing). `status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent). `status: active` on a converted wish is \"Want again\": the transaction that converted it never converts it again, and only a purchase from that day on can. `google_place_id` stores the picked place and links it. Setting `title`, `kind` or the place on a wish whose capture failed marks the capture `done` (`capture.resolved_by: user`, the error kept). A new place or product is checked against the ledger at once.",
         "tags": [
           "wish-items"
         ],
@@ -8645,10 +8807,47 @@
             }
           },
           "400": {
-            "$ref": "#/components/responses/BadRequest"
+            "description": "No field to change",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           },
           "404": {
             "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation failed (also: Google has no such `google_place_id`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google failed while fetching the picked place",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`google_place_id` sent, and the server has no Google Maps key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8696,10 +8895,105 @@
         }
       }
     },
+    "/v1/wish-items/place-search": {
+      "get": {
+        "summary": "Search Google for a wish's place (up to five candidates)",
+        "description": "Google Places Text Search with the server's key. With `near`, the query is biased to the locality the wish's image reading found. Pick a candidate by sending its `google_place_id` in `PATCH /v1/wish-items/{id}`.",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300,
+              "description": "What to look for: a name, with a city if you know it."
+            },
+            "required": true,
+            "name": "q",
+            "in": "query"
+          },
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "description": "A wish whose reading names a locality: the query is biased to it (a place wish captured from a post about Los Angeles searches Los Angeles).",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": false,
+            "name": "near",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishPlaceSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`near` is not a UUID",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No wish `near`",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`q` missing or empty",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google answered with an error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server has no Google Maps key",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/wish-items/capture": {
       "post": {
         "summary": "Save a wish from an image (a screenshot of a post, a chat, a map; a photo)",
-        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload.",
+        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload. HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made the first time, whatever its state, and are not read again.",
         "tags": [
           "wish-items"
         ],
@@ -8713,6 +9007,16 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "This image was captured before: the existing wish",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
           "202": {
             "description": "Accepted; reading",
             "content": {

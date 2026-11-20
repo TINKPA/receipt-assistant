@@ -26,9 +26,10 @@ import { db } from "../db/client.js";
 import { runClaude } from "../claude.js";
 import { getUploadDir } from "../routes/documents.service.js";
 import { resolveInside } from "../http/files.js";
-import { HttpProblem, ValidationProblem } from "../http/problem.js";
-import { findPlaceByText, type FoundPlace } from "../google/find-place.js";
-import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
+import { HttpProblem } from "../http/problem.js";
+import { storableImage } from "./image.js";
+import { matchPlaceByText, type PlaceMatch } from "./places.js";
+import { convertWishesSafely } from "./loop.js";
 import { buildWishReadPrompt, parseWishReading, type WishReading } from "./reading.js";
 
 export const WISH_TITLE_WHILE_READING = "Reading…";
@@ -38,22 +39,6 @@ export function wishImageRoot(): string {
   return path.join(getUploadDir(), "wish");
 }
 
-/** The image types the Read tool shows a model, told apart by their bytes
- *  (a client's Content-Type is a claim, not a fact). */
-function sniffImage(buf: Buffer): { mime: string; ext: string } | null {
-  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { mime: "image/jpeg", ext: "jpg" };
-  if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
-    return { mime: "image/png", ext: "png" };
-  if (buf.length >= 12 && buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP")
-    return { mime: "image/webp", ext: "webp" };
-  if (buf.length >= 6 && /^GIF8[79]a$/.test(buf.toString("latin1", 0, 6))) return { mime: "image/gif", ext: "gif" };
-  return null;
-}
-
-function isHeif(buf: Buffer): boolean {
-  return buf.length >= 12 && buf.toString("latin1", 4, 8) === "ftyp" && /^(heic|heix|hevc|heim|heis|mif1|msf1|avif)$/.test(buf.toString("latin1", 8, 12));
-}
-
 export interface CaptureInput {
   workspaceId: string;
   bytes: Buffer;
@@ -61,40 +46,57 @@ export interface CaptureInput {
   note: string | null;
 }
 
-/** Store the image, insert the row, queue the reading. Returns the row id. */
-export async function startCapture(input: CaptureInput): Promise<string> {
-  const kind = sniffImage(input.bytes);
-  if (!kind) {
-    throw new ValidationProblem([
-      {
-        path: "file",
-        code: "unsupported_image",
-        message: isHeif(input.bytes)
-          ? "HEIC / AVIF images cannot be read yet: save or share it as JPEG or PNG"
-          : "The file is not a JPEG, PNG, WebP or GIF image",
-      },
-    ]);
-  }
-  const sha = createHash("sha256").update(input.bytes).digest("hex");
-  const stored = `${sha}.${kind.ext}`;
+export interface CaptureStarted {
+  id: string;
+  /** The same bytes were captured before: `id` is that wish, and nothing
+   *  is read again. */
+  existing: boolean;
+}
+
+async function wishWithImage(workspaceId: string, sourceSha: string): Promise<string | null> {
+  const res = await db.execute(sql`
+    SELECT id FROM wish_items WHERE workspace_id = ${workspaceId}::uuid AND image_source_sha256 = ${sourceSha}`);
+  return (res.rows[0] as { id: string } | undefined)?.id ?? null;
+}
+
+/** Store the image, insert the row, queue the reading. The same image
+ *  uploaded again (same bytes) answers with the wish it already made. */
+export async function startCapture(input: CaptureInput): Promise<CaptureStarted> {
+  const sourceSha = createHash("sha256").update(input.bytes).digest("hex");
+  const already = await wishWithImage(input.workspaceId, sourceSha);
+  if (already) return { id: already, existing: true };
+
+  const image = await storableImage(input.bytes);
+  const sha = image.convertedFrom ? createHash("sha256").update(image.bytes).digest("hex") : sourceSha;
+  const stored = `${sha}.${image.ext}`;
   const abs = resolveInside(wishImageRoot(), stored);
   if (!abs) throw new Error("wish image path left its root");
   await mkdir(wishImageRoot(), { recursive: true });
   try {
     await access(abs);
   } catch {
-    await writeFile(abs, input.bytes, { flag: "wx" }).catch((err: NodeJS.ErrnoException) => {
+    await writeFile(abs, image.bytes, { flag: "wx" }).catch((err: NodeJS.ErrnoException) => {
       if (err.code !== "EEXIST") throw err;
     });
   }
   const id = randomUUID();
-  // A place until the reading says otherwise: that is what most captures are.
-  await db.execute(sql`
-    INSERT INTO wish_items (id, workspace_id, kind, title, notes, image_path, image_sha256, image_mime_type, capture_status, capture)
+  const capture: Record<string, unknown> = { queued_at: new Date().toISOString() };
+  if (image.convertedFrom) capture.converted_from = image.convertedFrom;
+  // A place until the reading says otherwise: that is what most captures
+  // are. Two uploads of one image at once: the unique index lets one in.
+  const ins = await db.execute(sql`
+    INSERT INTO wish_items (id, workspace_id, kind, title, notes, image_path, image_sha256, image_source_sha256, image_mime_type, capture_status, capture)
     VALUES (${id}::uuid, ${input.workspaceId}::uuid, 'place', ${WISH_TITLE_WHILE_READING}, ${input.note},
-            ${stored}, ${sha}, ${kind.mime}, 'reading', ${JSON.stringify({ queued_at: new Date().toISOString() })}::jsonb)`);
+            ${stored}, ${sha}, ${sourceSha}, ${image.mime}, 'reading', ${JSON.stringify(capture)}::jsonb)
+    ON CONFLICT (workspace_id, image_source_sha256) WHERE image_source_sha256 IS NOT NULL DO NOTHING
+    RETURNING id`);
+  if (ins.rows.length === 0) {
+    const other = await wishWithImage(input.workspaceId, sourceSha);
+    if (other) return { id: other, existing: true };
+    throw new Error("wish capture insert conflicted with a row that is gone");
+  }
   enqueue(id);
-  return id;
+  return { id, existing: false };
 }
 
 /** Read a failed (or interrupted) capture again. */
@@ -102,7 +104,8 @@ export async function retryCapture(workspaceId: string, id: string): Promise<voi
   const res = await db.execute(sql`
     UPDATE wish_items
        SET capture_status = 'reading',
-           capture = jsonb_build_object('queued_at', now(), 'retry_of', capture),
+           capture = jsonb_build_object('queued_at', now(), 'retry_of', capture)
+                     || CASE WHEN capture ? 'converted_from' THEN jsonb_build_object('converted_from', capture->'converted_from') ELSE '{}'::jsonb END,
            updated_at = now()
      WHERE id = ${id}::uuid AND workspace_id = ${workspaceId}::uuid
        AND image_path IS NOT NULL AND capture_status IN ('failed', 'done')
@@ -139,17 +142,6 @@ export async function recoverInterruptedCaptures(): Promise<number> {
 
 // ── Reading one capture ──────────────────────────────────────────────
 
-interface PlaceMatch {
-  query: string;
-  /** `address` | `locality` | `name_only`: what besides the name the query carried. */
-  basis: string;
-  google_place_id: string | null;
-  name: string | null;
-  formatted_address: string | null;
-  place_id: string | null;
-  error: string | null;
-}
-
 function placeQuery(r: WishReading): { query: string; basis: string } {
   const name = r.name_local && r.name_local !== r.title ? `${r.title} ${r.name_local}` : r.title;
   if (r.address) return { query: `${name} ${r.address}`, basis: "address" };
@@ -157,36 +149,9 @@ function placeQuery(r: WishReading): { query: string; basis: string } {
   return { query: name, basis: "name_only" };
 }
 
-async function matchPlace(r: WishReading): Promise<PlaceMatch> {
+function matchPlace(r: WishReading): Promise<PlaceMatch> {
   const { query, basis } = placeQuery(r);
-  const match: PlaceMatch = { query, basis, google_place_id: null, name: null, formatted_address: null, place_id: null, error: null };
-  let found: FoundPlace | null;
-  try {
-    found = await findPlaceByText(query);
-  } catch (err) {
-    match.error = (err as Error).message;
-    return match;
-  }
-  if (!found) {
-    match.error = "no place found";
-    return match;
-  }
-  match.google_place_id = found.googlePlaceId;
-  match.name = found.name;
-  match.formatted_address = found.formattedAddress;
-  // A place the ledger already knows is linked as it is: `writePlace`
-  // would count a visit (hit_count, last_seen_at), and wanting to go is
-  // not having been.
-  const known = await db.execute(sql`SELECT id FROM places WHERE google_place_id = ${found.googlePlaceId}`);
-  if (known.rows.length > 0) {
-    match.place_id = (known.rows[0] as { id: string }).id;
-    return match;
-  }
-  const prefetch = await prefetchPlace(db, found.googlePlaceId);
-  const written = await db.transaction((tx) => writePlace(tx, prefetch, r.name_local));
-  match.place_id = written.placeId;
-  if (!written.placeId) match.error = written.warnings[0]?.message ?? "the place could not be stored";
-  return match;
+  return matchPlaceByText(query, basis, r.name_local);
 }
 
 async function failCapture(id: string, capture: Record<string, unknown>): Promise<void> {
@@ -225,9 +190,7 @@ async function readCapture(id: string): Promise<void> {
     return failCapture(id, { ...base, error: "nothing_to_save", detail: r.title, reading: r });
   }
 
-  const match = r.kind === "place" ? await matchPlace(r).catch((err): PlaceMatch => ({
-    ...placeQuery(r), google_place_id: null, name: null, formatted_address: null, place_id: null, error: (err as Error).message.slice(0, 200),
-  })) : null;
+  const match = r.kind === "place" ? await matchPlace(r) : null;
   if (match?.error) console.warn(`[wish] capture=${id} place not linked: ${match.error}`);
 
   // Only a row still waiting is written: one deleted or edited into
@@ -242,7 +205,10 @@ async function readCapture(id: string): Promise<void> {
            currency = CASE WHEN ${r.kind} = 'thing' AND ${r.currency}::text IS NOT NULL THEN ${r.currency} ELSE currency END,
            place_id = ${match?.place_id ?? null}::uuid,
            capture_status = 'done',
-           capture = ${JSON.stringify({ ...base, reading: r, place_match: match })}::jsonb,
+           capture = ${JSON.stringify({ ...base, reading: r, place_match: match })}::jsonb
+                     || CASE WHEN capture ? 'converted_from' THEN jsonb_build_object('converted_from', capture->'converted_from') ELSE '{}'::jsonb END,
            updated_at = now()
      WHERE id = ${id}::uuid AND capture_status = 'reading'`);
+  // Been there already since the wish was made? Usually not.
+  if (match?.place_id) await convertWishesSafely({ wishIds: [id] });
 }

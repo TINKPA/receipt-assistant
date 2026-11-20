@@ -250,8 +250,11 @@ export const ASK_SCHEMA_DIGEST: readonly DigestTable[] = [
       "snoozed_until",
       ["status", "[active|converted|declined]"],
       "converted_transaction_id",
+      "converted_at",
+      ["converted_by", "[user|receipt]"],
+      "created_at",
     ],
-    note: "what the user wants later: a thing to buy, or a place to go to (a recommended restaurant; place_id joins places). converted = bought or visited (converted_transaction_id)",
+    note: "what the user wants later: a thing to buy, or a place to go to (a recommended restaurant; place_id joins places). converted = bought or visited: converted_by receipt means a purchase booked at that place (converted_transaction_id) closed it, user means the user marked it; converted_at = when it happened; created_at = when it was wished for",
   },
   {
     table: "documents",

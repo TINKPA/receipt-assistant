@@ -16,6 +16,7 @@
  * caching/proxy layer. The merchant page already has a category-color
  * fallback hero (frontend #33). Photos land in a follow-up.
  */
+import { convertWishesSafely } from "../wish/loop.js";
 import { sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 
@@ -115,6 +116,9 @@ export async function enrichMerchant(
              updated_at = NOW()
        WHERE id = ${merchantId}::uuid
     `);
+    // The merchant's place is known now: a purchase there may be a visit
+    // to a wished-for place (src/wish/loop.ts).
+    if (cand.place_id) await convertWishesSafely({ merchantId });
     return "success";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

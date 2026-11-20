@@ -15,6 +15,13 @@ import { sql, eq, and } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { wishItems, products, places } from "../schema/index.js";
 import { startCapture, retryCapture, wishImageRoot } from "../wish/capture.js";
+import { linkGooglePlace, matchPlaceByText, type PlaceLink, type PlaceMatch } from "../wish/places.js";
+import { convertWishesSafely } from "../wish/loop.js";
+import {
+  searchPlacesByText,
+  TextSearchError,
+  TextSearchKeyMissing,
+} from "../google/text-search.js";
 import { resolveStoredFile, sendStoredFile, setStoredImageHeaders, storedImageEtag } from "../http/files.js";
 import { metadataPatchSet } from "../projection/metadata-patch.js";
 import { parseOrThrow } from "../http/validate.js";
@@ -24,6 +31,8 @@ import {
   UpdateWishItemRequest,
   ListWishItemsQuery,
   CaptureWishForm,
+  WishPlaceSearchQuery,
+  WishPlaceSearchResponse,
 } from "../schemas/v1/wish-item.js";
 import { ProblemDetails, paginated, Uuid } from "../schemas/v1/common.js";
 import { HttpProblem, NotFoundProblem, ValidationProblem } from "../http/problem.js";
@@ -49,7 +58,12 @@ interface WishItemsCursor {
 
 function toIsoString(v: unknown): string {
   if (v instanceof Date) return v.toISOString();
-  return String(v);
+  // A raw `db.execute` row carries Postgres' text form
+  // ("2026-11-20 10:04:36.006057+00"), which is not ISO 8601 and which
+  // some browsers' Date cannot parse.
+  const s = String(v);
+  const d = new Date(s.replace(" ", "T").replace(/([+-]\d{2})$/, "$1:00"));
+  return Number.isNaN(d.getTime()) ? s : d.toISOString();
 }
 
 function toIsoDateOrNull(v: unknown): string | null {
@@ -74,8 +88,19 @@ const WISH_SELECT = sql`
          pl.primary_type AS pl_primary_type,
          pl.rating AS pl_rating,
          comp.locality AS pl_locality,
-         comp.neighborhood AS pl_neighborhood
+         comp.neighborhood AS pl_neighborhood,
+         ct.occurred_on::text AS ct_occurred_on,
+         ct.payee AS ct_payee,
+         ct_total.total AS ct_total_minor,
+         ws.base_currency AS ct_currency
     FROM wish_items w
+    JOIN workspaces ws ON ws.id = w.workspace_id
+    LEFT JOIN transactions ct ON ct.id = w.converted_transaction_id AND ct.workspace_id = w.workspace_id
+    LEFT JOIN LATERAL (
+      SELECT coalesce(sum(p.amount_base_minor) FILTER (WHERE a.type = 'expense'), 0) AS total
+        FROM postings p JOIN accounts a ON a.id = p.account_id
+       WHERE p.transaction_id = ct.id
+    ) ct_total ON ct.id IS NOT NULL
     LEFT JOIN places pl ON pl.id = w.place_id
     LEFT JOIN LATERAL (
       SELECT max(c->>'longText') FILTER (WHERE c->'types' ? 'locality') AS locality,
@@ -140,6 +165,18 @@ function rowToDto(row: any) {
     status: row.status ?? "active",
     converted_transaction_id:
       row.convertedTransactionId ?? row.converted_transaction_id ?? null,
+    converted_at: row.converted_at ? toIsoString(row.converted_at) : null,
+    converted_by: row.converted_by ?? null,
+    converted_transaction:
+      row.converted_transaction_id && row.ct_occurred_on
+        ? {
+            id: row.converted_transaction_id,
+            occurred_on: String(row.ct_occurred_on).slice(0, 10),
+            payee: row.ct_payee ?? null,
+            total_minor: Number(row.ct_total_minor ?? 0),
+            currency: row.ct_currency,
+          }
+        : null,
     metadata: row.metadata ?? {},
     created_at: toIsoString(row.createdAt ?? row.created_at),
     updated_at: toIsoString(row.updatedAt ?? row.updated_at),
@@ -152,6 +189,69 @@ async function assertPlaceExists(placeId: string): Promise<void> {
     throw new ValidationProblem([{ path: "place_id", code: "not_found", message: `Place ${placeId} does not exist` }]);
   }
 }
+
+async function assertTransactionInWorkspace(workspaceId: string, txnId: string): Promise<void> {
+  const res = await db.execute(sql`SELECT 1 FROM transactions WHERE id = ${txnId}::uuid AND workspace_id = ${workspaceId}::uuid`);
+  if (res.rows.length === 0) {
+    throw new ValidationProblem([
+      { path: "converted_transaction_id", code: "not_found", message: `Transaction ${txnId} not in workspace` },
+    ]);
+  }
+}
+
+/** A Google place id the person picked, stored and linked, or the HTTP
+ *  answer for why not. */
+async function placeFromGoogleId(googlePlaceId: string): Promise<string> {
+  const link: PlaceLink = await linkGooglePlace(googlePlaceId, null);
+  if (link.placeId) return link.placeId;
+  switch (link.errorKind) {
+    case "key_missing":
+      throw new HttpProblem(503, "google-places-unavailable", "Place lookup is not configured", "The server has no Google Maps key.");
+    case "not_found":
+      throw new ValidationProblem([{ path: "google_place_id", code: "not_found", message: `Google has no place ${googlePlaceId}` }]);
+    case "not_projectable":
+      throw new ValidationProblem([{ path: "google_place_id", code: "not_projectable", message: "Google's record of this place has no address or location" }]);
+    default:
+      throw new HttpProblem(502, "google-places-upstream", "Google place fetch failed", "Fetching the place from Google failed; try again.");
+  }
+}
+
+// ── GET /v1/wish-items/place-search ────────────────────────────────────
+//
+// Candidates for a person to pick from when the automatic match was wrong
+// or missing. Registered before `/:id` so the path is not read as an id.
+
+wishItemsRouter.get(
+  "/place-search",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const query = parseOrThrow(WishPlaceSearchQuery, req.query);
+      let text = query.q;
+      if (query.near) {
+        const near = await db.execute(sql`
+          SELECT capture->'reading'->>'locality' AS locality FROM wish_items
+           WHERE id = ${query.near}::uuid AND workspace_id = ${req.ctx.workspaceId}::uuid`);
+        if (near.rows.length === 0) throw new NotFoundProblem("WishItem", query.near);
+        const locality = (near.rows[0] as { locality: string | null }).locality?.trim();
+        if (locality && !text.toLowerCase().includes(locality.toLowerCase())) text = `${text} ${locality}`;
+      }
+      try {
+        const candidates = await searchPlacesByText(text, { maxResults: 5 });
+        res.json(WishPlaceSearchResponse.parse({ query: text, candidates }));
+      } catch (err) {
+        if (err instanceof TextSearchKeyMissing) {
+          throw new HttpProblem(503, "google-places-unavailable", "Place search is not configured", "The server has no Google Maps key.");
+        }
+        if (err instanceof TextSearchError) {
+          throw new HttpProblem(502, "google-places-upstream", "Google place search failed", `Google answered: ${err.reason}.`);
+        }
+        throw err;
+      }
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // ── POST /v1/wish-items/capture ────────────────────────────────────────
 //
@@ -173,8 +273,9 @@ wishItemsRouter.post(
         throw new ValidationProblem([{ path: "file", code: "required", message: "Send one image in the multipart field `file`" }]);
       }
       const note = typeof req.body?.note === "string" && req.body.note.trim() !== "" ? req.body.note.trim().slice(0, 2000) : null;
-      const id = await startCapture({ workspaceId: req.ctx.workspaceId, bytes: req.file.buffer, note });
-      res.status(202).json(await loadWish(req.ctx.workspaceId, id));
+      const started = await startCapture({ workspaceId: req.ctx.workspaceId, bytes: req.file.buffer, note });
+      // The same image again is the wish it already made: 200, not read again.
+      res.status(started.existing ? 200 : 202).json(await loadWish(req.ctx.workspaceId, started.id));
     } catch (err) {
       next(err);
     }
@@ -262,7 +363,11 @@ wishItemsRouter.get(
       const items = page.map(rowToDto);
       const nextCursor = hasMore
         ? encodeCursor({
-            updated_at: toIsoString(page[page.length - 1]!.updated_at),
+            // The database's own text, microseconds kept: an ISO string
+            // cut to milliseconds would skip rows inside that millisecond.
+            updated_at: page[page.length - 1]!.updated_at instanceof Date
+              ? (page[page.length - 1]!.updated_at as Date).toISOString()
+              : String(page[page.length - 1]!.updated_at),
             id: page[page.length - 1]!.id,
           })
         : null;
@@ -315,14 +420,27 @@ wishItemsRouter.post(
           ]);
         }
       }
+      if (body.place_id && body.google_place_id) {
+        throw new ValidationProblem([{ path: "google_place_id", code: "conflict", message: "Send place_id or google_place_id, not both" }]);
+      }
       if (body.place_id) await assertPlaceExists(body.place_id);
+      const kind = body.kind ?? "thing";
+      // A picked place is stored before the row, so a failure leaves no row.
+      const placeId = body.place_id ?? (body.google_place_id ? await placeFromGoogleId(body.google_place_id) : null);
+      // A place wish typed in with only a name: match it now, as a capture
+      // would. A miss leaves it unmatched with the reason on the row.
+      let placeMatch: PlaceMatch | null = null;
+      if (kind === "place" && !placeId) {
+        placeMatch = await matchPlaceByText(body.title, "title", null);
+        if (placeMatch.error) console.warn(`[wish] typed place "${body.title.slice(0, 80)}" not linked: ${placeMatch.error}`);
+      }
       const inserted = await db
         .insert(wishItems)
         .values({
           workspaceId: req.ctx.workspaceId,
           productId: body.product_id ?? null,
-          kind: body.kind ?? "thing",
-          placeId: body.place_id ?? null,
+          kind,
+          placeId: placeId ?? placeMatch?.place_id ?? null,
           sourceUrl: body.source_url ?? null,
           title: body.title,
           notes: body.notes ?? null,
@@ -331,10 +449,13 @@ wishItemsRouter.post(
           plannedDays: body.planned_days ?? null,
           urgency: body.urgency ?? "someday",
           snoozedUntil: body.snoozed_until ?? null,
+          capture: placeMatch ? { place_match: placeMatch } : null,
           metadata: body.metadata ?? {},
         })
-        .returning({ id: wishItems.id });
-      res.status(201).json(await loadWish(req.ctx.workspaceId, inserted[0]!.id));
+        .returning({ id: wishItems.id, placeId: wishItems.placeId, productId: wishItems.productId });
+      const row = inserted[0]!;
+      if (row.placeId || row.productId) await convertWishesSafely({ wishIds: [row.id] });
+      res.status(201).json(await loadWish(req.ctx.workspaceId, row.id));
     } catch (err) {
       next(err);
     }
@@ -349,6 +470,9 @@ wishItemsRouter.patch(
     try {
       const id = String(req.params.id);
       const body = parseOrThrow(UpdateWishItemRequest, req.body);
+      if (body.place_id !== undefined && body.google_place_id !== undefined) {
+        throw new ValidationProblem([{ path: "google_place_id", code: "conflict", message: "Send place_id or google_place_id, not both" }]);
+      }
       const updates: Record<string, unknown> = {};
       if (body.title !== undefined) updates["title"] = body.title;
       if (body.kind !== undefined) updates["kind"] = body.kind;
@@ -364,10 +488,14 @@ wishItemsRouter.patch(
       if (body.planned_days !== undefined) updates["plannedDays"] = body.planned_days;
       if (body.urgency !== undefined) updates["urgency"] = body.urgency;
       if (body.snoozed_until !== undefined) updates["snoozedUntil"] = body.snoozed_until;
-      if (body.status !== undefined) updates["status"] = body.status;
-      if (body.converted_transaction_id !== undefined)
-        updates["convertedTransactionId"] = body.converted_transaction_id;
-      if (Object.keys(updates).length === 0 && body.metadata === undefined) {
+      if (
+        Object.keys(updates).length === 0 &&
+        body.metadata === undefined &&
+        body.google_place_id === undefined &&
+        body.status === undefined &&
+        body.converted_transaction_id === undefined &&
+        body.converted_at === undefined
+      ) {
         throw new HttpProblem(
           400,
           "no-fields",
@@ -375,25 +503,80 @@ wishItemsRouter.patch(
           "PATCH /v1/wish-items/:id needs at least one field to update.",
         );
       }
+      if (body.converted_transaction_id) {
+        await assertTransactionInWorkspace(req.ctx.workspaceId, body.converted_transaction_id);
+      }
       const where = and(
         eq(wishItems.id, id),
         eq(wishItems.workspaceId, req.ctx.workspaceId),
       );
+      // 404 before a Google call for a wish that is not there.
+      const exists = await db.select({ id: wishItems.id }).from(wishItems).where(where);
+      if (exists.length === 0) throw new NotFoundProblem("WishItem", id);
+      if (body.google_place_id !== undefined) {
+        updates["placeId"] = await placeFromGoogleId(body.google_place_id);
+      }
       await db.transaction(async (tx) => {
         const current = await tx.select().from(wishItems).where(where).for("update");
         if (current.length === 0) throw new NotFoundProblem("WishItem", id);
+        const cur = current[0]!;
         // `metadata` is a JSON Merge Patch over the stored object, never a
         // replacement for it (src/projection/metadata-patch.ts): `{}`
         // changes nothing, `null` removes a key.
         if (body.metadata !== undefined) {
           const set = metadataPatchSet(
             wishItems.metadata,
-            current[0]!.metadata,
+            cur.metadata,
             body.metadata,
           );
           if (set !== undefined) updates["metadata"] = set;
         }
-        if (Object.keys(updates).length === 0) return current[0]!;
+
+        // ── status and the conversion fields ──
+        const status = body.status ?? cur.status;
+        if (status !== "converted" && (body.converted_transaction_id || body.converted_at !== undefined)) {
+          throw new ValidationProblem([
+            { path: body.converted_at !== undefined ? "converted_at" : "converted_transaction_id", code: "not_converted", message: "Only a converted wish has a converting transaction or time" },
+          ]);
+        }
+        if (status === "converted") {
+          if (cur.status !== "converted") {
+            // The user says it is done: theirs, now unless they say when.
+            updates["status"] = "converted";
+            updates["convertedBy"] = "user";
+            updates["convertedAt"] = body.converted_at ? new Date(body.converted_at) : new Date();
+            updates["convertedTransactionId"] = body.converted_transaction_id ?? null;
+          } else {
+            if (body.converted_transaction_id !== undefined) updates["convertedTransactionId"] = body.converted_transaction_id;
+            if (body.converted_at !== undefined) updates["convertedAt"] = new Date(body.converted_at);
+          }
+        } else if (body.status !== undefined && body.status !== cur.status) {
+          updates["status"] = status;
+          updates["convertedBy"] = null;
+          updates["convertedAt"] = null;
+          updates["convertedTransactionId"] = null;
+          if (cur.status === "converted" && status === "active") {
+            // "Want again": that purchase fulfilled it once; it must not
+            // fulfil it again, and an older one must not either.
+            updates["reactivatedAt"] = new Date();
+            if (cur.convertedTransactionId && !cur.dismissedTransactionIds.includes(cur.convertedTransactionId)) {
+              updates["dismissedTransactionIds"] = [...cur.dismissedTransactionIds, cur.convertedTransactionId];
+            }
+          }
+        }
+
+        // A failed capture the user fixed by hand is resolved; its error
+        // stays under `capture` as history.
+        const fixes = body.title !== undefined || body.kind !== undefined || body.place_id !== undefined || body.google_place_id !== undefined;
+        if (fixes && cur.captureStatus === "failed") {
+          updates["captureStatus"] = "done";
+          updates["capture"] = {
+            ...((cur.capture as Record<string, unknown> | null) ?? {}),
+            resolved_by: "user",
+            resolved_at: new Date().toISOString(),
+          };
+        }
+        if (Object.keys(updates).length === 0) return cur;
         updates["updatedAt"] = new Date();
         const updated = await tx
           .update(wishItems)
@@ -402,6 +585,10 @@ wishItemsRouter.patch(
           .returning();
         return updated[0]!;
       });
+      // A new place or product: maybe it was bought or visited already.
+      if (updates["placeId"] || updates["productId"]) {
+        await convertWishesSafely({ wishIds: [id] });
+      }
       res.json(await loadWish(req.ctx.workspaceId, id));
     } catch (err) {
       next(err);
@@ -437,6 +624,7 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
   registry.register("CreateWishItemRequest", CreateWishItemRequest);
   registry.register("UpdateWishItemRequest", UpdateWishItemRequest);
   registry.register("CaptureWishForm", CaptureWishForm);
+  registry.register("WishPlaceSearchResponse", WishPlaceSearchResponse);
 
   const problemContent = {
     "application/problem+json": { schema: ProblemDetails },
@@ -473,12 +661,38 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     path: "/v1/wish-items",
     summary: "Add a wish",
     tags: ["wish-items"],
+    description:
+      "A place wish can name its place by `place_id` (a place the ledger has) or `google_place_id` (one picked from " +
+      "`GET /v1/wish-items/place-search`, stored by the server). A place wish sent with neither is matched by its title " +
+      "with Google Find Place before the answer; a miss leaves it unmatched, with the reason in `capture.place_match.error`. " +
+      "A wish that gets a place or a product is checked against the ledger at once: a live purchase there on or after the day the wish was made converts it.",
     request: {
       body: { content: { "application/json": { schema: CreateWishItemRequest } } },
     },
     responses: {
       201: { description: "Created", content: { "application/json": { schema: WishItem } } },
-      422: { description: "Validation failed", content: problemContent },
+      422: { description: "Validation failed (also: Google has no such `google_place_id`)", content: problemContent },
+      502: { description: "Google failed while fetching the picked place", content: problemContent },
+      503: { description: "`google_place_id` sent, and the server has no Google Maps key", content: problemContent },
+    },
+  });
+
+  registry.registerPath({
+    method: "get",
+    path: "/v1/wish-items/place-search",
+    summary: "Search Google for a wish's place (up to five candidates)",
+    description:
+      "Google Places Text Search with the server's key. With `near`, the query is biased to the locality the wish's image " +
+      "reading found. Pick a candidate by sending its `google_place_id` in `PATCH /v1/wish-items/{id}`.",
+    tags: ["wish-items"],
+    request: { query: WishPlaceSearchQuery },
+    responses: {
+      200: { description: "OK", content: { "application/json": { schema: WishPlaceSearchResponse } } },
+      400: { description: "`near` is not a UUID", content: problemContent },
+      404: { description: "No wish `near`", content: problemContent },
+      422: { description: "`q` missing or empty", content: problemContent },
+      502: { description: "Google answered with an error", content: problemContent },
+      503: { description: "The server has no Google Maps key", content: problemContent },
     },
   });
 
@@ -490,10 +704,13 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
       "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. " +
       "The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and " +
       "`capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. " +
-      "Nothing the reading fills overwrites a note sent with the upload.",
+      "Nothing the reading fills overwrites a note sent with the upload. " +
+      "HEIC and AVIF are converted to JPEG first. The same bytes uploaded again answer 200 with the wish they made " +
+      "the first time, whatever its state, and are not read again.",
     tags: ["wish-items"],
     request: { body: { content: { "multipart/form-data": { schema: CaptureWishForm } } } },
     responses: {
+      200: { description: "This image was captured before: the existing wish", content: { "application/json": { schema: WishItem } } },
       202: { description: "Accepted; reading", content: { "application/json": { schema: WishItem } } },
       422: { description: "Not an image this endpoint reads", content: problemContent },
     },
@@ -530,7 +747,12 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     summary: "Patch a wish (fields, urgency, snooze, convert / decline)",
     description:
       "JSON Merge Patch (RFC 7396). `metadata` merges into the stored object rather than " +
-      "replacing it (`null` removes a key, `{}` changes nothing).",
+      "replacing it (`null` removes a key, `{}` changes nothing). " +
+      "`status: converted` from the user sets `converted_by: user` and `converted_at` (now unless sent). " +
+      "`status: active` on a converted wish is \"Want again\": the transaction that converted it never converts it again, " +
+      "and only a purchase from that day on can. `google_place_id` stores the picked place and links it. " +
+      "Setting `title`, `kind` or the place on a wish whose capture failed marks the capture `done` " +
+      "(`capture.resolved_by: user`, the error kept). A new place or product is checked against the ledger at once.",
     tags: ["wish-items"],
     request: {
       params: z.object({ id: Uuid }),
@@ -543,7 +765,11 @@ export function registerWishItemsOpenApi(registry: OpenAPIRegistry): void {
     },
     responses: {
       200: { description: "OK", content: { "application/json": { schema: WishItem } } },
+      400: { description: "No field to change", content: problemContent },
       404: { description: "Not Found", content: problemContent },
+      422: { description: "Validation failed (also: Google has no such `google_place_id`)", content: problemContent },
+      502: { description: "Google failed while fetching the picked place", content: problemContent },
+      503: { description: "`google_place_id` sent, and the server has no Google Maps key", content: problemContent },
     },
   });
 

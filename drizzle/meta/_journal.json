@@ -323,6 +323,13 @@
       "when": 1795166459694,
       "tag": "0045_wish_places",
       "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1795168688936,
+      "tag": "0046_wish_loop",
+      "breakpoints": true
     }
   ]
 }

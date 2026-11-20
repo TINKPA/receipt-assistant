@@ -68,6 +68,7 @@ import {
 } from "./transactions.service.js";
 import { ProblemDetails, paginated, IdParam, Uuid } from "../schemas/v1/common.js";
 import { SERVER_OWNED_TX_METADATA_KEYS } from "../projection/metadata-patch.js";
+import { convertWishesSafely } from "../wish/loop.js";
 
 export const transactionsRouter: Router = Router();
 
@@ -133,6 +134,9 @@ transactionsRouter.post(
         req.ctx.userId,
         body,
       );
+      // This body carries no place, merchant or items, so today nothing it
+      // books can convert a wish; the check is here for when it does.
+      await convertWishesSafely({ transactionIds: [result.id] });
       res.setHeader("Location", `/v1/transactions/${result.id}`);
       setTransactionEtag(res, result);
       res.status(201).json(result);
@@ -347,6 +351,7 @@ transactionsRouter.post(
         currentVersion,
         { userId: req.ctx.userId },
       );
+      await convertWishesSafely({ transactionIds: [id] });
       setTransactionEtag(res, result);
       res.status(200).json(result);
     } catch (err) {
@@ -448,6 +453,8 @@ transactionsRouter.post(
         id,
         body.items,
       );
+      // A line with a wished-for product converts a thing wish.
+      if (body.items.some((i) => i.product_id)) await convertWishesSafely({ transactionIds: [id] });
       res.status(201).json(result);
     } catch (err) {
       next(err);
