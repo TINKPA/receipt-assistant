@@ -26,7 +26,7 @@ import { liveTransactions } from "../db/live.js";
 import { GooglePlacesApiKeyMissing, GooglePlacesError, fetchPlaceV1Dual } from "../google/places-fetch.js";
 import { findPlaceByText, type FoundPlace } from "../google/find-place.js";
 import { prefetchPlace, writePlace } from "../ingest/apply/places.js";
-import { hasCjk, nameMatches, nameScore } from "./names.js";
+import { comparable, hasCjk, nameMatches, nameScore } from "./names.js";
 
 export interface PlaceLink {
   placeId: string | null;
@@ -102,9 +102,11 @@ export interface PlaceMatch {
   /** True when the match is a guess: not linked, offered as
    *  `place_suggestion` until the person confirms or rejects it. */
   tentative: boolean;
-  /** Why it is a guess: `name_only`, `low_confidence`, `name_mismatch`. */
+  /** Why it is a guess: `name_only`, `low_confidence`, `name_mismatch`,
+   *  `name_unverified` (a typed name in another script than Google's). */
   tentative_reason: string | null;
-  /** How much of the asked-for name the found one carries (0..1). */
+  /** How much of the asked-for name the found one carries (0..1); null
+   *  when the two are in different scripts. */
   name_score: number | null;
   /** True when the query was biased to the workspace's usual area. */
   location_biased: boolean;
@@ -119,6 +121,11 @@ export interface MatchOptions {
   guessReason?: string | null;
   /** Bias Find Place to this area (the workspace's usual one). */
   locationBias?: { lat: number; lng: number; radiusM: number } | null;
+  /** Link a match whose name cannot be compared with the asked-for one
+   *  (a Han name, an English answer). True for a capture whose query had
+   *  an address or a city, which is what the match rests on; false for a
+   *  bare typed name. */
+  trustUncomparable?: boolean;
 }
 
 /** The language to ask Google in, from the script of a name. */
@@ -173,9 +180,12 @@ export async function matchPlaceByText(query: string, basis: string, nameLocal: 
     match.formatted_address = found.formattedAddress;
     if (match.name_score === null) match.name_score = Math.round(best(found) * 100) / 100;
     else match.name_score = Math.round(match.name_score * 100) / 100;
-    if (!agrees || opts.guessReason) {
+    const uncomparable = !agrees && names.every((n) => !comparable(n, found.name ?? ""));
+    if (uncomparable) match.name_score = null;
+    const trusted = agrees || (uncomparable && opts.trustUncomparable === true);
+    if (!trusted || opts.guessReason) {
       match.tentative = true;
-      match.tentative_reason = !agrees ? "name_mismatch" : opts.guessReason ?? null;
+      match.tentative_reason = opts.guessReason ?? (uncomparable ? "name_unverified" : "name_mismatch");
       return match;
     }
     const link = await linkGooglePlace(found.googlePlaceId, nameLocal);

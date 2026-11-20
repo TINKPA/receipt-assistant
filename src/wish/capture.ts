@@ -214,6 +214,9 @@ async function matchPlace(workspaceId: string, r: Placeable, confidence: WishRea
   return matchPlaceByText(query, basis, r.name_local, {
     names,
     guessReason,
+    // An address or a city is what the match rests on; a Han name and
+    // Google's English one cannot be compared word by word.
+    trustUncomparable: basis !== "name_only",
     // With no city in the image, the person's own area is the best guess.
     locationBias: basis === "name_only" ? await workspaceArea(workspaceId) : null,
   });

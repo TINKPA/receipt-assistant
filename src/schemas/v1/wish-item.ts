@@ -48,7 +48,8 @@ export const WishPlaceSuggestion = z
     formatted_address: z.string().nullable(),
     /** `name_only` (no city or address to go on), `low_confidence` (the
      *  reading was a guess), `name_mismatch` (Google's place has another
-     *  name). */
+     *  name), `name_unverified` (a typed name in another script than
+     *  Google's, so the two cannot be compared). */
     reason: z.string().nullable(),
   })
   .openapi("WishPlaceSuggestion");
@@ -259,7 +260,8 @@ export const WishPlaceSearchResponse = z
      *  places of its purchases); false with `near` and a locality, or a
      *  workspace with too few places to tell. */
     location_biased: z.boolean(),
-    /** Up to five, best first. Empty when Google has none, or when none
+    /** Up to five, best first (with `location_biased`, those within 50 km
+     *  of the workspace's area first). Empty when Google has none, or when none
      *  of them shares a word with `q` (Google answers nonsense with
      *  whatever it has). */
     candidates: z.array(WishPlaceCandidate),

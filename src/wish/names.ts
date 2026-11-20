@@ -11,10 +11,8 @@
  * (accents dropped, case ignored, `&` read as "and", apostrophes removed),
  * generic words ("restaurant", "cafe", "the") left out, and a run of
  * CJK characters taken one character at a time (so 岭南小馆 and 嶺南小館
- * still share half their characters). The score is the share of the
- * smaller set found in the other; a name contained in the other, spaces
- * removed, scores 1; two names each of whose first word is in the other
- * score at least 0.75.
+ * still share half their characters). `nameMatches` is the rule;
+ * `nameScore` is recorded beside a match for whoever reads it later.
  */
 
 const GENERIC = new Set([
@@ -56,30 +54,57 @@ export function hasCjk(s: string): boolean {
   return CJK.test(s);
 }
 
-/** 0..1: how much of the shorter name the other one carries. */
+/** 0..1: how much of the shorter name the other one carries (a name
+ *  contained in the other, spaces removed, is 1). Recorded with a match. */
 export function nameScore(query: string, found: string): number {
   const q = nameTokens(query);
   const f = nameTokens(found);
   if (q.length === 0 || f.length === 0) return 0;
   const qs = new Set(q);
   const fs = new Set(f);
-  const squash = (a: string[]) => a.join("");
-  const qj = squash(q);
-  const fj = squash(f);
-  if (Math.min(qj.length, fj.length) >= 4 && (qj.includes(fj) || fj.includes(qj))) return 1;
+  if (squashContains(q, f)) return 1;
   let shared = 0;
   for (const t of fs) if (qs.has(t)) shared++;
-  const overlap = shared / Math.min(qs.size, fs.size);
-  // "Sugarfish Little Tokyo" asked, "SUGARFISH by sushi nozawa" found:
-  // each name's first word is in the other. ("Joe's Pizza" and "Pizza
-  // Hut" share a word, but "joes" is not in "Pizza Hut".)
-  const leadsAgree = q[0]!.length >= 3 && f[0]!.length >= 3 && fs.has(q[0]!) && qs.has(f[0]!);
-  return Math.max(overlap, leadsAgree ? 0.75 : 0);
+  return shared / Math.min(qs.size, fs.size);
 }
 
-/** Strong enough to link without asking. CJK names get a lower bar
- *  because traditional and simplified forms of one name differ. */
+function squashContains(q: string[], f: string[]): boolean {
+  const qj = q.join("");
+  const fj = f.join("");
+  return Math.min(qj.length, fj.length) >= 4 && (qj.includes(fj) || fj.includes(qj));
+}
+
+const isCjkToken = (t: string) => CJK.test(t);
+
+/** Can the two names be compared at all? A name in Han characters and
+ *  Google's English name for the same place ("嶺南小館", "R & G Lounge")
+ *  share no script, so no word can agree or disagree. */
+export function comparable(query: string, found: string): boolean {
+  const q = nameTokens(query);
+  const f = nameTokens(found);
+  const qc = q.some(isCjkToken);
+  const ql = q.some((t) => !isCjkToken(t));
+  const fc = f.some(isCjkToken);
+  const fl = f.some((t) => !isCjkToken(t));
+  return (qc && fc) || (ql && fl);
+}
+
+/**
+ * Strong enough to link without asking: one name's significant words are
+ * all in the other ("Joe's Pizza" in "Joe's Pizza Mid-City", "République"
+ * in "Republique m"), or one is the other with the spaces removed. Two
+ * names that each carry a word the other lacks are different places as
+ * often as not ("Sugarfish Little Tokyo", "SUGARFISH Little Italy"). CJK
+ * names need half their characters shared instead, because traditional
+ * and simplified forms of one name differ.
+ */
 export function nameMatches(query: string, found: string): boolean {
-  const score = nameScore(query, found);
-  return score >= (hasCjk(query) || hasCjk(found) ? 0.5 : 0.6);
+  const q = nameTokens(query);
+  const f = nameTokens(found);
+  if (q.length === 0 || f.length === 0) return false;
+  if (squashContains(q, f)) return true;
+  const qs = new Set(q);
+  const fs = new Set(f);
+  if (q.some(isCjkToken) || f.some(isCjkToken)) return nameScore(query, found) >= 0.5;
+  return [...qs].every((t) => fs.has(t)) || [...fs].every((t) => qs.has(t));
 }

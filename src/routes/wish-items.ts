@@ -231,6 +231,15 @@ async function assertTransactionInWorkspace(workspaceId: string, txnId: string):
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** Great-circle distance in metres. */
+function distanceM(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
+  const rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLng = (b.lng - a.lng) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
 /** A conversion time the person sent: not before the wish was made (a
  *  day's grace, since the client may send the start of a local day) and
  *  not in the future (a day's grace for clocks). */
@@ -301,7 +310,14 @@ wishItemsRouter.get(
       const area = biasedToLocality ? null : await workspaceArea(req.ctx.workspaceId);
       try {
         const found = await searchPlacesByText(text, { maxResults: 5, locationBias: area });
-        const candidates = anyRelevant(query.q, found) ? found : [];
+        // The bias is only a preference to Google; a text match far away
+        // ("SUGARFISH Little Italy", San Diego, for "Sugarfish Little
+        // Tokyo") can still come first. Places inside the area go first,
+        // each group in Google's order.
+        const inside = (c: { lat: number | null; lng: number | null }) =>
+          area && c.lat !== null && c.lng !== null && distanceM(area, { lat: c.lat, lng: c.lng }) <= area.radiusM ? 0 : 1;
+        const ranked = area ? found.map((c, i) => ({ c, i, k: inside(c) })).sort((a, b) => a.k - b.k || a.i - b.i).map((x) => x.c) : found;
+        const candidates = anyRelevant(query.q, ranked) ? ranked : [];
         res.json(WishPlaceSearchResponse.parse({ query: text, location_biased: area !== null, candidates }));
       } catch (err) {
         if (err instanceof TextSearchKeyMissing) {

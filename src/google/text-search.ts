@@ -17,6 +17,7 @@ const FIELD_MASK = [
   "places.rating",
   "places.userRatingCount",
   "places.primaryType",
+  "places.location",
 ].join(",");
 
 export interface TextSearchCandidate {
@@ -26,6 +27,9 @@ export interface TextSearchCandidate {
   rating: number | null;
   user_rating_count: number | null;
   primary_type: string | null;
+  /** Where it is; used to rank, not part of the API answer. */
+  lat: number | null;
+  lng: number | null;
 }
 
 export class TextSearchKeyMissing extends Error {
@@ -100,6 +104,7 @@ export async function searchPlacesByText(
       rating?: number;
       userRatingCount?: number;
       primaryType?: string;
+      location?: { latitude?: number; longitude?: number };
     }[];
   };
   return (json.places ?? [])
@@ -112,5 +117,7 @@ export async function searchPlacesByText(
       rating: typeof p.rating === "number" ? p.rating : null,
       user_rating_count: typeof p.userRatingCount === "number" ? p.userRatingCount : null,
       primary_type: p.primaryType ?? null,
+      lat: typeof p.location?.latitude === "number" ? p.location.latitude : null,
+      lng: typeof p.location?.longitude === "number" ? p.location.longitude : null,
     }));
 }
