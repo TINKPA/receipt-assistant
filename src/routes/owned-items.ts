@@ -167,7 +167,7 @@ ownedItemsRouter.get(
           ? sql`SELECT o.*,
                   COALESCE(p.custom_name, p.canonical_name) AS product_name,
                   p.item_class AS item_class,
-                  COALESCE(ti.effective_total_minor, ti.line_total_minor) AS paid_minor,
+                  line.share_minor AS paid_minor,
                   ti.currency AS paid_currency,
                   -- #216: the base-currency equivalent, via the rate the
                   -- transaction's OWN posting was converted at. Both the FX
@@ -181,9 +181,9 @@ ownedItemsRouter.get(
                   -- dollars, which is the bug being fixed.
                   CASE
                     WHEN fx.rate IS NOT NULL
-                      THEN ROUND(COALESCE(ti.effective_total_minor, ti.line_total_minor) * fx.rate)
+                      THEN ROUND(line.share_minor * fx.rate)
                     WHEN ti.currency = w.base_currency
-                      THEN COALESCE(ti.effective_total_minor, ti.line_total_minor)
+                      THEN line.share_minor
                     ELSE NULL
                   END AS paid_base_minor,
                   t.payee AS payee,
@@ -192,6 +192,23 @@ ownedItemsRouter.get(
                 LEFT JOIN products p ON p.id = o.product_id
                 LEFT JOIN transaction_items ti ON ti.id = o.transaction_item_id
                 LEFT JOIN transactions t ON t.id = ti.transaction_id
+                -- One receipt line can stand for several instances ("3 x
+                -- iPhone"): each instance's share is the line divided by
+                -- the units it covers, never the whole line. Units is the
+                -- larger of the printed quantity (when whole) and the
+                -- instances actually linked to the line, so a weighed
+                -- line (2.5 lb) with one instance still gets all of it.
+                LEFT JOIN LATERAL (
+                  SELECT ROUND(
+                           COALESCE(ti.effective_total_minor, ti.line_total_minor)::numeric
+                           / GREATEST(
+                               (SELECT COUNT(*) FROM owned_items s
+                                 WHERE s.transaction_item_id = ti.id),
+                               CASE WHEN ti.quantity = TRUNC(ti.quantity)
+                                    THEN ti.quantity ELSE 1 END,
+                               1)
+                         )::bigint AS share_minor
+                ) line ON TRUE
                 LEFT JOIN merchants m ON m.id = t.merchant_id
                 LEFT JOIN workspaces w ON w.id = o.workspace_id
                 LEFT JOIN LATERAL (

@@ -55,7 +55,9 @@ export const OwnedItem = z
 export const OwnedItemExpanded = OwnedItem.extend({
   product_name: z.string().nullable().optional(),
   item_class: z.string().nullable().optional(),
-  /** What the line cost, **in the currency the line was recorded in** —
+  /** This instance's share of what the line cost (the line divided by the
+   *  units it covers, so each of "3 x" gets a third), **in the currency
+   *  the line was recorded in** —
    *  which is NOT necessarily the workspace base currency, and is not
    *  necessarily even cash. Read it with `paid_currency`; on its own it
    *  is an integer of unknown unit and unknown scale (points are stored
