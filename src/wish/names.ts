@@ -95,8 +95,8 @@ export function comparable(query: string, found: string): boolean {
  * in "Republique m"), or one is the other with the spaces removed. Two
  * names that each carry a word the other lacks are different places as
  * often as not ("Sugarfish Little Tokyo", "SUGARFISH Little Italy"). CJK
- * names need half their characters shared instead, because traditional
- * and simplified forms of one name differ.
+ * names need half their characters shared instead (and two of them at
+ * least), because traditional and simplified forms of one name differ.
  */
 export function nameMatches(query: string, found: string): boolean {
   const q = nameTokens(query);
@@ -105,6 +105,13 @@ export function nameMatches(query: string, found: string): boolean {
   if (squashContains(q, f)) return true;
   const qs = new Set(q);
   const fs = new Set(f);
-  if (q.some(isCjkToken) || f.some(isCjkToken)) return nameScore(query, found) >= 0.5;
+  if (q.some(isCjkToken) || f.some(isCjkToken)) {
+    // Half the characters, and at least two of them unless a name is one
+    // character long: two-character names sharing one (蜀味, 滋味成都) are
+    // other places as often as not.
+    let shared = 0;
+    for (const t of fs) if (qs.has(t)) shared++;
+    return nameScore(query, found) >= 0.5 && shared >= Math.min(2, qs.size, fs.size);
+  }
   return [...qs].every((t) => fs.has(t)) || [...fs].every((t) => qs.has(t));
 }

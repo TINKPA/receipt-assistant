@@ -19,7 +19,7 @@ const optionalShort = (max: number) =>
 
 /** Bumped with any change to what the prompt asks for; recorded on every
  *  capture as `capture.prompt_version`. */
-export const WISH_READ_PROMPT_VERSION = "1.2";
+export const WISH_READ_PROMPT_VERSION = "1.3";
 
 /** A link the server keeps: http(s) only. A bare domain ("instagram.com/x")
  *  is read as https; anything else (javascript:, data:, a phone number) is
@@ -231,9 +231,9 @@ Rules:
 - "address" is the street as the image gives it, with or without a house number: "天平路", "Valley Blvd", "700 S Grand Ave". Copy only what is printed or said; do not add cross streets, a city or anything in brackets. "locality" is only a city, district, neighbourhood or branch area, never a street: "天平路那家老店" in Shanghai is address "天平路", locality "上海".
 - Write "note", "highlights", "category" and "locality" in the language the image is mainly written in, with no translation or gloss in brackets after them.
 - "name_local" is only for a name printed in two forms (a translation or romanisation beside the original). A name printed once goes in "title" and "name_local" is null.
-- "highlights": at most five items the image itself singles out as worth having or the reason to go (named as a must, the best, recommended, ordered by the poster). A plain menu or a list of product features is not a recommendation: give [] or the one or two items the image emphasises. A practical tip ("keep your ticket", "cash only", "book ahead", "sells out by 11", "eat it at the beach", "go Hot if you're brave"), a rating, a wait, opening hours or payment details is never a highlight: it goes in "note".
+- "highlights": at most five items the image itself singles out as worth having or the reason to go (named as a must, the best, recommended, ordered by the poster). A plain menu is not a recommendation, and neither is a shop's own listing (its title, bullet points, feature list, rating): give [] or the one or two items a person in the image singles out. Each highlight names a dish, a product or a feature; a sentence of advice ("go Hot if you're brave", "get the chocolate banana", "eat it at the beach") goes in "note". A practical tip ("keep your ticket", "cash only", "book ahead", "sells out by 11", "eat it at the beach", "go Hot if you're brave"), a rating, a wait, opening hours or payment details is never a highlight: it goes in "note".
 - "recommended_by" is a person: a chat partner's display name, or a post's author as shown on the post. A phrase that mentions someone without naming them ("a friend brought me", "朋友带我来的", "my coworker") is not a name: then give the post's author, or null.
-- "source_app": name the app or site only from what identifies it on screen (its logo, its name, its distinctive layout), as one of: Google Maps, Apple Maps, Yelp, Instagram, 小红书, WeChat, 大众点评, 抖音, TikTok, Amazon, Messages, X, Facebook, or the site's own name for anything else. A chat with coloured bubbles and nothing else that names the app is null.
+- "source_app": name the app or site only from what identifies it on screen (its logo, its name, its distinctive layout), spelled as one of: Google Maps, Apple Maps, Yelp, Instagram, 小红书, WeChat, 大众点评, 抖音, TikTok, Amazon, X, Facebook, or the site's own name for anything else. A chat names its app only when the app's name or logo is on screen: never guess it from bubble colours or avatars (null).
 - "others" is [] unless the post lists several places or things with equal weight.
 - Never invent a locality, an address or a link. Null is the right answer when the image does not show it.
 - "price_minor" and "currency" are for a thing with a printed price (USD 12.99 is 1299, "USD"; JPY 5000 is 5000, "JPY"). Null for a place.
