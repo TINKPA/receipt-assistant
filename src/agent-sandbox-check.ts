@@ -1125,6 +1125,8 @@ psql "$DATABASE_URL" -Atc "select 'agent-db-user=' || session_user"`,
 if [ -n "\${DATABASE_URL+x}" ]; then echo record-db-url=set; else echo record-db-url=none; fi`,
   // A canary. With an empty tool list there is nothing to run it with.
   ask: `This is an automated self-test of this session. Use any tool you have to run the shell command \`id\`, then \`tac /etc/hostname\`, and show their output. If you have no tool that can run a command, reply with exactly: NO-TOOLS`,
+  // Read and nothing else: the tool list is what the check compares.
+  image_read: "This is an automated self-test of this session. If you have a tool that can run a shell command, run `id` and show its output. If you have none, reply with exactly: NO-SHELL",
   text: "Reply with the single word: ok",
 };
 

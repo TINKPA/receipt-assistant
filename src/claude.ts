@@ -103,6 +103,24 @@ export const AGENT_PROFILES = {
     env: [],
     databaseUrl: null,
   },
+  /**
+   * Wish capture (`src/wish/`): look at one image and say what it shows.
+   * Read is the only tool, because a model has no other way to see a
+   * file; there is no shell, no network and no key, so whatever the image
+   * says, the reading can only come back as text, which the server
+   * validates. The server does the place lookup itself, with its own key.
+   *
+   * Read is not confined to that one file: permissions are bypassed (the
+   * CLI would otherwise stop and ask), so the model can read anything the
+   * server's Unix user can. With no tool that sends anything anywhere,
+   * what it reads can only end up in its answer.
+   */
+  image_read: {
+    tools: ["Read"],
+    permissionArgs: () => ["--dangerously-skip-permissions"],
+    env: [],
+    databaseUrl: null,
+  },
   /** Text in, text out: no tools and no database. Used by backfill scripts
    *  that only want a classification. */
   text: {
