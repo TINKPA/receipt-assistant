@@ -2,7 +2,7 @@
 
 The extraction agent reads a document; server code writes the ledger. This document describes that design as it is built: the record the agent hands back, how the server checks and stores it, how it derives ledger rows from it, and how the change is rolled out. It is written for a maintainer who has only this repository.
 
-Status: built and deployed dark. Production runs `EXTRACTION_WRITER=agent_sql`, the legacy path on which the agent writes the ledger itself through `psql`. Nothing in production calls the server writer until the flip described under "Rollout".
+Status: live. Production has run `EXTRACTION_WRITER=server_apply` since the flip of 2026-11-19 and is in the watch window described under "Rollout". The legacy path, on which the agent writes the ledger itself through `psql`, is still in the image and is what the rollback returns to.
 
 `CLAUDE.md` keeps the operational side: the environment variables, what the boot and log lines mean, the commands that run each check, and the queries that read a run. Code comments cite sections of this file as `docs/server-writer.md, "<heading>"`. The headings are stable on purpose; rename one only together with the comments that cite it.
 
@@ -588,10 +588,10 @@ Usage, flags and the throwaway-database rules are in each script's header and in
 |---|---|---|
 | P0 | the A/B harness, the CLI probes, the model pin | done |
 | P1 | run records (`agent_runs`), the run fence, the process-group kill | in production |
-| P2 | the contract, the evidence store, the applier, code dedup, record stubs, the replay check | in production, dark |
-| P3 | the record prompt, the database-less profile, the hand-back parser, the repair round | in production, dark |
-| P4 | the A/B comparison on the sandbox | next |
-| P5 | the production flip and a watch window | after P4 |
+| P2 | the contract, the evidence store, the applier, code dedup, record stubs, the replay check | in production |
+| P3 | the record prompt, the database-less profile, the hand-back parser, the repair round | in production |
+| P4 | the A/B comparison on the sandbox | done in a slimmer form: one trial per arm on the two corpora, see below |
+| P5 | the production flip and a watch window | flipped 2026-11-19, watching |
 | P6 | a durable queue on `ingests`: leases, apply-only retries of a stored record, queue pauses on auth or quota outages | after P5 |
 | P7 | re-extract on records: a new record superseding the old, applied to the soft fields and items under the Layer 3 rules | after P6 |
 | P8 | the legacy writer retired: every profile without a database URL, `AGENT_GRANTS` empty, one prompt version | after a clean period on P5 |
@@ -636,7 +636,9 @@ The pre-A/B gate runs first, at no model cost: `check-projection-replay --from-l
 
 ### Flip and watch
 
-The flip is an environment change: set `EXTRACTION_WRITER=server_apply` in production's `.env` and recreate the app container (tag a rollback image first). The restart abandons at most the ingest in flight, as any deploy does.
+The flip is the default of `EXTRACTION_WRITER` in `docker-compose.yml`, which is `server_apply` since 2026-11-19; deploying that commit recreates the app container (tag a rollback image first). It is not set in `.env`, because the sandbox reads that file too and the campaign runner refuses it.
+
+It was made on less than the comparison above describes, by the owner's decision: one trial per arm over 37 documents rather than several, `race` not run in arm A, and the structural differences read only where they touch money. On those 37 the two arms were level on date and payee and arm B was one document better on total; G3, G6, G7, G8 and G9 passed. The restart abandons at most the ingest in flight, as any deploy does.
 
 Then watch, after each of the first ingests and daily for a week:
 
@@ -652,7 +654,7 @@ Any one of these flips the writer back: a `check-ledger` violation on a server-w
 |---|---|
 | P1 | the rollback image; migration 0042 is additive and the old image ignores it |
 | P2, P3 | nothing to do: the writer stays `agent_sql`, and the golden proves the legacy rendering unchanged |
-| P5 | set `EXTRACTION_WRITER=agent_sql` and recreate the container. No data step: server-written rows are ordinary ledger rows, records stay as evidence, and legacy re-extract works on them (G9) |
+| P5 | `EXTRACTION_WRITER=agent_sql docker compose up -d --no-deps receipt-assistant` from the main checkout (the shell value overrides the compose default), or revert the default. No data step: server-written rows are ordinary ledger rows, records stay as evidence, and legacy re-extract works on them (G9) |
 | a wrong applier rule after the flip | fix it, bump `APPLIER_VERSION`, and measure the effect by re-projecting stored records before deploying |
 
 ## Labels used in the code
