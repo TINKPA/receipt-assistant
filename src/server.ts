@@ -8,6 +8,7 @@
  *      orphaned ingests and abandons their runs).
  *   4. Start Express HTTP server built from `buildApp()`.
  */
+import { recoverInterruptedCaptures } from "./wish/capture.js";
 import "dotenv/config";
 import { buildApp } from "./app.js";
 import { runMigrations } from "./db/migrate.js";
@@ -164,6 +165,10 @@ async function main(): Promise<void> {
   // --exponent-mismatch` is run; there is no migration for it. Read-only
   // and non-fatal: it only says so in the boot log.
   await warnAboutMisScaledPostings();
+
+  // A wish capture that was being read when the last process stopped.
+  const interrupted = await recoverInterruptedCaptures();
+  if (interrupted > 0) console.log(`[wish] boot recovery: ${interrupted} capture(s) marked failed (interrupted); retry them from the wish`);
 
   if (!process.env.GOOGLE_MAPS_API_KEY) {
     console.warn(

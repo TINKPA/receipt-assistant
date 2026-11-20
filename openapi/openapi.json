@@ -2365,6 +2365,96 @@
         },
         "additionalProperties": false
       },
+      "WishPlace": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "google_place_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name_zh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formatted_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "locality": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "neighborhood": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lat": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lng": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "google_maps_uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rating": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "google_place_id",
+          "name",
+          "name_zh",
+          "formatted_address",
+          "locality",
+          "neighborhood",
+          "lat",
+          "lng",
+          "google_maps_uri",
+          "primary_type",
+          "rating"
+        ]
+      },
       "WishItem": {
         "type": "object",
         "properties": {
@@ -2385,6 +2475,24 @@
             ],
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "thing",
+              "place"
+            ]
+          },
+          "place_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "place": {
+            "$ref": "#/components/schemas/WishPlace"
           },
           "title": {
             "type": "string"
@@ -2443,6 +2551,33 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_image": {
+            "type": "boolean"
+          },
+          "capture_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "reading",
+              "done",
+              "failed"
+            ]
+          },
+          "capture": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {}
+          },
           "metadata": {
             "type": "object",
             "additionalProperties": {},
@@ -2462,6 +2597,9 @@
           "id",
           "workspace_id",
           "product_id",
+          "kind",
+          "place_id",
+          "place",
           "title",
           "notes",
           "target_price_minor",
@@ -2471,6 +2609,10 @@
           "snoozed_until",
           "status",
           "converted_transaction_id",
+          "source_url",
+          "has_image",
+          "capture_status",
+          "capture",
           "created_at",
           "updated_at"
         ]
@@ -2481,6 +2623,23 @@
           "title": {
             "type": "string",
             "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "thing",
+              "place"
+            ]
+          },
+          "place_id": {
+            "type": "string",
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "source_url": {
+            "type": "string",
+            "maxLength": 2000,
+            "format": "uri"
           },
           "product_id": {
             "type": "string",
@@ -2532,6 +2691,29 @@
             "type": "string",
             "minLength": 1
           },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "thing",
+              "place"
+            ]
+          },
+          "place_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 2000,
+            "format": "uri"
+          },
           "product_id": {
             "type": [
               "string",
@@ -2599,6 +2781,24 @@
           }
         },
         "additionalProperties": false
+      },
+      "CaptureWishForm": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "A JPEG, PNG, WebP or GIF image: a screenshot or a photo.",
+            "format": "binary"
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "What you want to remember about it. Stored as the wish's notes and shown to the reader."
+          }
+        },
+        "required": [
+          "file"
+        ]
       },
       "Insight": {
         "type": "object",
@@ -8253,6 +8453,18 @@
           },
           {
             "schema": {
+              "type": "string",
+              "enum": [
+                "thing",
+                "place"
+              ]
+            },
+            "required": false,
+            "name": "kind",
+            "in": "query"
+          },
+          {
+            "schema": {
               "type": "string"
             },
             "required": false,
@@ -8467,6 +8679,142 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wish-items/capture": {
+      "post": {
+        "summary": "Save a wish from an image (a screenshot of a post, a chat, a map; a photo)",
+        "description": "Stores the image and answers at once with a wish whose `capture_status` is `reading` and whose title is a placeholder. The image is then read in the background: the title, kind, notes, source link and, for a place, the matched `place` are filled in and `capture_status` becomes `done`, or `failed` with `capture.error`. Poll `GET /v1/wish-items/{id}`. Nothing the reading fills overwrites a note sent with the upload.",
+        "tags": [
+          "wish-items"
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureWishForm"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; reading",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "422": {
+            "description": "Not an image this endpoint reads",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wish-items/{id}/capture/retry": {
+      "post": {
+        "summary": "Read a captured image again",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted; reading",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WishItem"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No image, or it is being read now",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wish-items/{id}/image": {
+      "get": {
+        "summary": "The image a wish was captured from",
+        "tags": [
+          "wish-items"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
+            },
+            "required": true,
+            "name": "id",
+            "in": "path"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The image bytes"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"

@@ -316,6 +316,13 @@
       "when": 1795082880311,
       "tag": "0044_owned_item_cost_basis",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1795166459694,
+      "tag": "0045_wish_places",
+      "breakpoints": true
     }
   ]
 }

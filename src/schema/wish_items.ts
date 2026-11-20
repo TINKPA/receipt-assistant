@@ -12,6 +12,14 @@
  * records the transaction that realized the wish — the wish row stays
  * as provenance ("wanted for 12 weeks before buying"). `snoozed_until`
  * parks a wish without deciding.
+ *
+ * A wish is a `thing` (to buy) or a `place` (to go to: a restaurant
+ * someone recommended). A place wish has no price or lifespan; it links
+ * a `places` row once the name was matched, and "converted" means
+ * visited. Either kind can start as a captured image (a screenshot of a
+ * post, a chat, a map): `image_path` is that file under
+ * `<UPLOAD_DIR>/wish/`, `capture_status` says where its reading stands,
+ * and `capture` keeps what was read and how the place was matched.
  */
 import {
   pgTable,
@@ -22,11 +30,13 @@ import {
   timestamp,
   jsonb,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { workspaces } from "./workspaces.js";
 import { products } from "./products.js";
 import { transactions } from "./transactions.js";
+import { places } from "./places.js";
 
 export const wishItems = pgTable(
   "wish_items",
@@ -37,6 +47,13 @@ export const wishItems = pgTable(
       .references(() => workspaces.id, { onDelete: "cascade" }),
     /** Optional catalog link; free-text wishes leave this NULL. */
     productId: uuid("product_id").references(() => products.id, {
+      onDelete: "set null",
+    }),
+    /** thing | place. */
+    kind: text("kind").notNull().default("thing"),
+    /** The matched place, for a place wish. NULL until matched, or when
+     *  the user removed a wrong match. */
+    placeId: uuid("place_id").references(() => places.id, {
       onDelete: "set null",
     }),
     title: text("title").notNull(),
@@ -57,6 +74,17 @@ export const wishItems = pgTable(
       () => transactions.id,
       { onDelete: "set null" },
     ),
+    /** Where the wish came from, when it has a link (a post, a menu). */
+    sourceUrl: text("source_url"),
+    /** The captured image, relative to `<UPLOAD_DIR>/wish/`. */
+    imagePath: text("image_path"),
+    imageSha256: text("image_sha256"),
+    imageMimeType: text("image_mime_type"),
+    /** NULL (typed in by hand) | reading | done | failed. */
+    captureStatus: text("capture_status"),
+    /** The reading as validated, the place match, the run's session id
+     *  and model, or the error. Written by the server only. */
+    capture: jsonb("capture"),
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
@@ -65,5 +93,13 @@ export const wishItems = pgTable(
       .notNull()
       .default(sql`NOW()`),
   },
-  (t) => [index("wish_items_workspace_status_idx").on(t.workspaceId, t.status)],
+  (t) => [
+    index("wish_items_workspace_status_idx").on(t.workspaceId, t.status),
+    index("wish_items_place_idx").on(t.placeId),
+    check("wish_items_kind_check", sql`${t.kind} IN ('thing', 'place')`),
+    check(
+      "wish_items_capture_status_check",
+      sql`${t.captureStatus} IS NULL OR ${t.captureStatus} IN ('reading', 'done', 'failed')`,
+    ),
+  ],
 );
