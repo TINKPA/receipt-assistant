@@ -4170,6 +4170,17 @@
             "format": "uuid",
             "example": "01HXY9F0ABCDEFGHJKMNPQRSTV"
           },
+          "retryable_with_note": {
+            "type": "boolean",
+            "description": "Whether `POST /v1/ingests/{id}/retry` will accept this ingest when the request carries a non-empty `note` (#289): every `retryable` ingest, plus an `unsupported` one, since the note is the context the document lacked."
+          },
+          "uploader_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text from whoever uploaded the file (#289), as stored: what the money was, when the document alone does not say. The extractor reads it as context, never as evidence: amounts, dates, payee and items come from the document. Null when none was sent."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -4196,6 +4207,8 @@
           "category",
           "retryable",
           "dedup_of",
+          "retryable_with_note",
+          "uploader_note",
           "created_at",
           "completed_at"
         ]
@@ -4332,6 +4345,11 @@
           "auto_reconcile": {
             "type": "boolean",
             "description": "Whether to run reconcile for the batch once every file has been extracted. Sent as text: `true` / `1` / `false` / `0`, in any case. On when the field is absent or empty; any other value is a 422."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional uploader note (#289), stored on every ingest of the batch and shown to the extractor as context, never as evidence. For a multi-file upload a file can carry its own note in a field named `note[<filename>]` (the file's name as uploaded); it replaces the batch note for that file. A `note[…]` naming no file in the upload is a 422, as is `note` sent twice. At most 2000 characters each; blank is no note.",
+            "maxLength": 2000
           }
         }
       },
@@ -4383,6 +4401,20 @@
           "items",
           "poll"
         ]
+      },
+      "RetryIngestBody": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The uploader note for the new attempt (#289). Absent: the retried ingest's note is kept. A string replaces it; blank or null clears it. A non-empty note also makes an `unsupported` ingest retryable. Context for the extractor, never evidence. At most 2000 characters.",
+            "maxLength": 2000
+          }
+        },
+        "additionalProperties": false
       },
       "RetryIngestResponse": {
         "type": "object",
@@ -10564,7 +10596,7 @@
             "$ref": "#/components/responses/BadRequest"
           },
           "422": {
-            "description": "No files, or `auto_reconcile` is not one of true / 1 / false / 0",
+            "description": "No files; `auto_reconcile` is not one of true / 1 / false / 0; or a `note` is too long, sent twice, or (`note[<filename>]`) names no uploaded file",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10945,7 +10977,7 @@
     },
     "/v1/ingests/{id}/retry": {
       "post": {
-        "summary": "Retry a failed ingest (#158). Re-runs the original stored bytes through the batch pipeline (genuine-restore dedup branch — not suppressed). Returns 202 with the freshly-created ingest to poll. Accepts exactly the ingests whose `retryable` field is true, i.e. category `transient_actionable` or `infrastructure_fault` (#199); anything else 409s. `unsupported` was accepted before #199 despite always reporting `retryable: false`, and no longer is.",
+        "summary": "Retry a failed ingest (#158). Re-runs the original stored bytes through the batch pipeline (genuine-restore dedup branch — not suppressed). Returns 202 with the freshly-created ingest to poll. Accepts exactly the ingests whose `retryable` field is true, i.e. category `transient_actionable` or `infrastructure_fault` (#199); anything else 409s. `unsupported` was accepted before #199 despite always reporting `retryable: false`, and no longer is. Optional JSON body `{ \"note\": \"…\" }` (#289): the new attempt carries that uploader note instead of the retried ingest's (blank or null clears it; no body keeps it), and a non-empty note also makes an `unsupported` ingest retryable (`retryable_with_note`), since the note is the context the document lacked.",
         "tags": [
           "ingest"
         ],
@@ -10961,6 +10993,16 @@
             "in": "path"
           }
         ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetryIngestBody"
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
             "description": "Retry enqueued — poll the returned ingest / batch",
@@ -11003,7 +11045,7 @@
             }
           },
           "422": {
-            "description": "Stored source bytes missing",
+            "description": "Stored source bytes missing, or the body's `note` is not valid",
             "content": {
               "application/problem+json": {
                 "schema": {

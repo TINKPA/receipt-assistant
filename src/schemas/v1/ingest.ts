@@ -7,6 +7,7 @@
  */
 import { z } from "zod";
 import { IsoDateTime, QueryBoolean, Uuid } from "./common.js";
+import { UPLOADER_NOTE_MAX_CHARS } from "../../ingest/prompt-contract.js";
 
 // ── Enums (serialized as bare lowercase strings) ──────────────────────
 
@@ -128,6 +129,18 @@ export const Ingest = z
         "so this field and the endpoint can never disagree (#199).",
     }),
     dedup_of: Uuid.nullable(),
+    retryable_with_note: z.boolean().openapi({
+      description:
+        "Whether `POST /v1/ingests/{id}/retry` will accept this ingest when the request " +
+        "carries a non-empty `note` (#289): every `retryable` ingest, plus an `unsupported` " +
+        "one, since the note is the context the document lacked.",
+    }),
+    uploader_note: z.string().nullable().openapi({
+      description:
+        "Free text from whoever uploaded the file (#289), as stored: what the money was, " +
+        "when the document alone does not say. The extractor reads it as context, never as " +
+        "evidence: amounts, dates, payee and items come from the document. Null when none was sent.",
+    }),
     created_at: IsoDateTime,
     completed_at: IsoDateTime.nullable(),
   })
@@ -213,6 +226,32 @@ export const AutoReconcileField = z
       "absent or empty; any other value is a 422.",
   });
 
+/**
+ * An uploader note (#289): free text about the document from whoever
+ * uploads it, shown to the extractor as context. Trimmed; empty means "no
+ * note"; at most `UPLOADER_NOTE_MAX_CHARS` characters; a NUL byte (which
+ * Postgres text cannot hold) is refused.
+ */
+export const UploaderNote = z
+  .string()
+  .transform((v) => v.trim())
+  .pipe(
+    z
+      .string()
+      .max(UPLOADER_NOTE_MAX_CHARS, `at most ${UPLOADER_NOTE_MAX_CHARS} characters`)
+      .refine((v) => !v.includes("\u0000"), "must not contain a NUL character"),
+  )
+  .openapi({
+    type: "string",
+    maxLength: UPLOADER_NOTE_MAX_CHARS,
+    description:
+      "Context from the uploader (#289), e.g. \"employer relocation reimbursement paid to me\" or " +
+      "\"same payment as the Uber receipt uploaded alongside\". It may decide what the money was " +
+      "(income or transfer, which payment two documents share); amounts, dates, payee and items " +
+      "still come only from the document, and a note that contradicts the document is recorded " +
+      `as a warning. At most ${UPLOADER_NOTE_MAX_CHARS} characters; blank is no note.`,
+  });
+
 // Multipart form: one or more `files` fields + optional `auto_reconcile`.
 // zod-to-openapi can't fully model multipart; we register the shape so
 // the spec documents the expected fields. The route parses the text
@@ -222,6 +261,16 @@ export const CreateBatchForm = z
   .object({
     files: z.any().openapi({ type: "array", items: { type: "string", format: "binary" } }),
     auto_reconcile: AutoReconcileField,
+    note: UploaderNote.optional().openapi({
+      type: "string",
+      maxLength: UPLOADER_NOTE_MAX_CHARS,
+      description:
+        "Optional uploader note (#289), stored on every ingest of the batch and shown to the " +
+        "extractor as context, never as evidence. For a multi-file upload a file can carry its own " +
+        "note in a field named `note[<filename>]` (the file's name as uploaded); it replaces the " +
+        "batch note for that file. A `note[…]` naming no file in the upload is a 422, as is " +
+        `\`note\` sent twice. At most ${UPLOADER_NOTE_MAX_CHARS} characters each; blank is no note.`,
+    }),
   })
   .openapi("CreateBatchForm");
 
@@ -291,6 +340,29 @@ export const IngestProblemsQuery = z.object({
 // live transaction). Returns the freshly-created ingest so the caller can
 // poll it; `ingest.status` is `queued` normally, or `dedup` if in the
 // meantime the same purchase was ingested another way.
+/**
+ * `POST /v1/ingests/:id/retry` body (#289), optional. `note` absent: the new
+ * attempt keeps the retried ingest's note. A string replaces it for the new
+ * attempt (blank or `null` clears it). A non-empty note also lets an
+ * `unsupported` ingest be retried: the note is the context it lacked.
+ */
+export const RetryIngestBody = z
+  .object({
+    note: UploaderNote.nullable()
+      .optional()
+      .openapi({
+        type: ["string", "null"],
+        maxLength: UPLOADER_NOTE_MAX_CHARS,
+        description:
+          "The uploader note for the new attempt (#289). Absent: the retried ingest's note is kept. " +
+          "A string replaces it; blank or null clears it. A non-empty note also makes an " +
+          "`unsupported` ingest retryable. Context for the extractor, never evidence. " +
+          `At most ${UPLOADER_NOTE_MAX_CHARS} characters.`,
+      }),
+  })
+  .strict()
+  .openapi("RetryIngestBody");
+
 export const RetryIngestResponse = z
   .object({
     retried_ingest_id: Uuid,

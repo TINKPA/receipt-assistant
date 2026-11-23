@@ -88,6 +88,8 @@ export const RECORD_WARNING_RULES = [
   "mixed_tender",
   ...REVIEW_FLAGS.map((f) => `review_flag_${f}` as const),
   "repair_changed_unnamed",
+  "uploader_note_amount_mismatch",
+  "uploader_note_conflict",
 ] as const;
 
 /** Warnings only the applier can decide; they go on `apply_report`.
@@ -176,6 +178,11 @@ export interface ValidationContext {
   uploadedAt: Date;
   /** The ```receipt-text block that came with the record, if any. */
   receiptText?: string | null;
+  /** The uploader's note on the ingest (#289), if any. A note is context,
+   *  never evidence: when it states an amount the record does not book,
+   *  or the agent reports a conflict with it, the record carries a
+   *  warning and the booked figures stay the document's. */
+  uploaderNote?: string | null;
 }
 
 export type ValidationOutcome =
@@ -911,6 +918,55 @@ function recordWarnings(rec: ExtractionV1, ctx: ValidationContext): ValidationWa
 
   for (const f of rec.audit?.review_flags ?? []) {
     warn(`review_flag_${f}`, "audit.review_flags", `the agent flagged ${f}`);
+  }
+
+  const note = ctx.uploaderNote?.trim() ?? "";
+  if (note !== "") {
+    // The agent is told to start audit.note this way when the note and the
+    // document disagree (`UPLOADER_NOTE_RULES`).
+    if (/^\s*uploader note conflict\b/i.test(rec.audit?.note ?? "")) {
+      warn("uploader_note_conflict", "audit.note", "the agent found the uploader note contradicts the document; the document was followed");
+    }
+    // Checked here too, whatever the agent said: an amount in the note that
+    // is not the amount booked. The booked amount is the document's.
+    if (facts) {
+      const exponent = currencyExponent(facts.currency);
+      const stated = noteAmounts(note, exponent);
+      const booked = new Set<bigint>([BigInt(Math.abs(facts.total_minor))]);
+      if (rec.cash_component) booked.add(BigInt(Math.abs(rec.cash_component.amount_minor)));
+      if (stated.length > 0 && !stated.some((a) => booked.has(a))) {
+        warn(
+          "uploader_note_amount_mismatch",
+          "facts.total_minor",
+          `the uploader note states ${stated.join(", ")} minor units; the document's total, ${facts.total_minor} ${facts.currency}, was booked`,
+          true,
+        );
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The amounts an uploader note states, in minor units at `exponent`: a
+ * number next to a currency sign or code ("$1,250.00", "USD 980", "980
+ * dollars", "1.234,56 €"), or one written with two decimals ("1250.00").
+ * A bare whole number ("3 receipts", "May 12") is not an amount.
+ */
+export function noteAmounts(note: string, exponent: number): bigint[] {
+  const NUM = String.raw`\d(?:[\d,.'’]*\d)?`;
+  const SIGN = String.raw`[$€£¥₩₹]|\b(?:USD|EUR|GBP|JPY|CNY|RMB|CAD|AUD|HKD|TWD|KRW|SGD|CHF|MXN|INR)\b|US\$|元|円`;
+  const WORD = String.raw`\b(?:dollars?|bucks|euros?|pounds?|yen|yuan|won)\b`;
+  const re = new RegExp(
+    String.raw`(?:(?:${SIGN})\s?(${NUM}))|(?:(${NUM})\s?(?:${SIGN}|${WORD}))|(?:(?<![\d.,])(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})(?![\d.,]))`,
+    "giu",
+  );
+  const out: bigint[] = [];
+  for (const m of note.matchAll(re)) {
+    const raw = m[1] ?? m[2] ?? m[3];
+    if (!raw) continue;
+    const v = parsePrintedAmount(raw.trim(), exponent);
+    if (v !== null && v > 0n && !out.includes(v)) out.push(v);
   }
   return out;
 }

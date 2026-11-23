@@ -543,6 +543,14 @@ async function extractAndClose(
   // hash. Full scan is fine at corpus scale (~hundreds of rows).
   const phashNeighbors = await findPhashNeighbors(workspaceId, documentId);
 
+  // #289: the legacy rendering is frozen (`check-prompt-render.ts`), so it
+  // never shows an uploader note. Say so, rather than drop it silently.
+  if ((await ingestUploaderNote(ingestId)) !== null) {
+    console.warn(
+      `[ingest worker] ingest=${ingestId} has an uploader note; the legacy writer (agent_sql) does not show it to the agent`,
+    );
+  }
+
   // #261: decode an email / HTML upload before the agent starts, as
   // re-extract always has. Never throws; images and PDFs come back empty.
   const source = await decodeSourceForAgent(
@@ -817,12 +825,19 @@ const sha256 = (data: string | Buffer): string => createHash("sha256").update(da
 
 /** When the document was uploaded, as this ingest saw it: record dates
  *  are judged against it, never against the clock (`validate.ts`). */
-async function ingestUploadedAt(ingestId: string): Promise<Date> {
+async function ingestUploadedAt(ingestId: string): Promise<{ uploadedAt: Date; uploaderNote: string | null }> {
   const rows = await db
-    .select({ createdAt: ingests.createdAt })
+    .select({ createdAt: ingests.createdAt, uploaderNote: ingests.uploaderNote })
     .from(ingests)
     .where(eq(ingests.id, ingestId));
-  return rows[0]?.createdAt ?? new Date();
+  const note = rows[0]?.uploaderNote?.trim() ?? "";
+  return { uploadedAt: rows[0]?.createdAt ?? new Date(), uploaderNote: note === "" ? null : note };
+}
+
+/** The uploader note of an ingest (#289), read from its row at run time so
+ *  a requeued ingest keeps it. Null when there is none. */
+async function ingestUploaderNote(ingestId: string): Promise<string | null> {
+  return (await ingestUploadedAt(ingestId)).uploaderNote;
 }
 
 /** `document_extractions.input_meta`: what the run was shown besides the
@@ -832,6 +847,7 @@ async function recordInputMeta(
   neighbours: { documentId: string; transactionId: string; distance: number }[],
   attachments: DecodedAttachment[],
   promptBytes: number | null,
+  uploaderNote: string | null,
 ): Promise<Record<string, unknown>> {
   const files: { bytes: number; sha256: string | null }[] = [];
   for (const a of attachments) {
@@ -851,6 +867,11 @@ async function recordInputMeta(
     })),
     attachments: files,
     prompt_bytes: promptBytes,
+    // #289: which note the reading was shown, so a later re-extract knows
+    // the decision used it. The text itself is on the ingest row.
+    uploader_note: uploaderNote
+      ? { sha256: sha256(uploaderNote), chars: [...uploaderNote].length }
+      : null,
   };
 }
 
@@ -944,6 +965,7 @@ async function extractRecordAndApply(
        WHERE id = ${documentId}::uuid AND workspace_id = ${workspaceId}::uuid`);
   }
   const neighbours = await findPhashNeighbors(workspaceId, documentId);
+  const { uploadedAt, uploaderNote } = await ingestUploadedAt(ingestId);
 
   // 4. Spawn, parse, validate, repair. Writes nothing.
   const res = await runRecordExtraction({
@@ -955,7 +977,8 @@ async function extractRecordAndApply(
     sourceText: decoded.text,
     attachments: decoded.attachments,
     sessionId: run.sessionId,
-    uploadedAt: await ingestUploadedAt(ingestId),
+    uploadedAt,
+    uploaderNote,
     // The prompt tells the agent whether its key is set, so it never spends
     // a turn testing it or prints it.
     googleKeySet: childEnvHas("extraction_record", "GOOGLE_MAPS_API_KEY"),
@@ -1013,7 +1036,7 @@ async function extractRecordAndApply(
     outcome: res.outcome!,
     rawText: res.rawText,
     sourceTextSha256: decoded.text ? sha256(decoded.text) : null,
-    inputMeta: await recordInputMeta(neighbours, decoded.attachments, promptBytes),
+    inputMeta: await recordInputMeta(neighbours, decoded.attachments, promptBytes, uploaderNote),
     repairRounds: res.repairRounds,
     stats,
     final: true,

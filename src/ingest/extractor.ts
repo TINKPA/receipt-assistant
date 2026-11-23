@@ -253,6 +253,10 @@ export interface RecordExtractorInput {
   /** Whether the agent's environment has the Google key; the prompt says
    *  so (`ExtractorPromptContext.googleKeySet`). */
   googleKeySet: boolean;
+  /** The uploader's note on the ingest (#289), or null. Shown to the agent
+   *  as context, and handed to the validator, which warns when the note
+   *  states an amount the record does not book. */
+  uploaderNote?: string | null;
   /** Called with the rendered prompt's size just before the first spawn. */
   onPrompt?: (promptBytes: number) => void;
   /** Overrides, for the stub and the checks; production leaves them out. */
@@ -395,7 +399,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
   const sessionId = input.sessionId;
   const transcriptPath = getSessionJsonlPath(sessionId);
   const maxRounds = Math.min(MAX_REPAIR_ROUNDS, Math.max(0, input.repairRounds ?? extractionRepairRounds()));
-  const ctx = { uploadedAt: input.uploadedAt };
+  const ctx = { uploadedAt: input.uploadedAt, uploaderNote: input.uploaderNote ?? null };
   const spawn = input.spawn ?? runRecordClaude;
 
   const prompt = buildExtractorPrompt({
@@ -408,6 +412,7 @@ export async function runRecordExtraction(input: RecordExtractorInput): Promise<
     sourceText: input.sourceText,
     attachments: input.attachments,
     googleKeySet: input.googleKeySet,
+    uploaderNote: input.uploaderNote ?? null,
   });
   const promptBytes = Buffer.byteLength(prompt, "utf8");
   input.onPrompt?.(promptBytes);

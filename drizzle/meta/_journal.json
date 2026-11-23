@@ -330,6 +330,13 @@
       "when": 1795168688936,
       "tag": "0046_wish_loop",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1795421734729,
+      "tag": "0047_uploader_note",
+      "breakpoints": true
     }
   ]
 }

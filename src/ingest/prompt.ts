@@ -39,6 +39,7 @@ import {
   agentHygiene,
   forWriter,
   renderActiveLessons,
+  renderUploaderNote,
   type PromptWriter,
 } from "./prompt-contract.js";
 import {
@@ -106,6 +107,10 @@ export interface ExtractorPromptContext {
    *  spends a turn testing or printing it. Left out, the rendering says it
    *  is set. The legacy rendering ignores it. */
   googleKeySet?: boolean;
+  /** The uploader's note on this ingest (#289), shown by the record
+   *  rendering only, fenced, with `UPLOADER_NOTE_RULES`. The legacy
+   *  rendering ignores it: its text is frozen. */
+  uploaderNote?: string | null;
 }
 
 /** Render the pHash-neighbor context block for Phase 4a.0. */
@@ -419,7 +424,7 @@ ${renderDecodedSource(
   ctx.sourceText,
   ctx.attachments,
   record ? { writer: ctx.writer, delimiter: randomSourceDelimiter(ctx.sourceText) } : {},
-)}
+)}${record ? renderUploaderNote(ctx.uploaderNote) : ""}
 ── Phase 1 — Classify ─────────────────────────────────────────────────
 
 Follow the document-reading rules above FIRST — for a PDF that means

@@ -1,0 +1,1 @@
+ALTER TABLE "ingests" ADD COLUMN "uploader_note" text;
