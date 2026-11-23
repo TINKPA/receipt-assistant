@@ -238,7 +238,12 @@ export const UploaderNote = z
   .pipe(
     z
       .string()
-      .max(UPLOADER_NOTE_MAX_CHARS, `at most ${UPLOADER_NOTE_MAX_CHARS} characters`)
+      // Characters are code points (as input_meta.uploader_note.chars counts
+      // them), not UTF-16 units, so an emoji counts once.
+      .refine(
+        (v) => [...v].length <= UPLOADER_NOTE_MAX_CHARS,
+        `at most ${UPLOADER_NOTE_MAX_CHARS} characters`,
+      )
       .refine((v) => !v.includes("\u0000"), "must not contain a NUL character"),
   )
   .openapi({

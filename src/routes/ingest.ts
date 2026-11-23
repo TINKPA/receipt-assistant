@@ -51,7 +51,10 @@ import { on as busOn } from "../events/bus.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024, files: 50 },
+  // fieldSize: a note is at most 2000 characters (8 KB of UTF-8), so a
+  // larger value is refused before it is buffered; fieldNameSize: room for
+  // `note[<long filename>]` (multer's default is 100 bytes).
+  limits: { fileSize: 25 * 1024 * 1024, files: 50, fieldSize: 16 * 1024, fieldNameSize: 1024, fields: 100 },
 });
 
 function asyncHandler(
