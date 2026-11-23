@@ -41,6 +41,12 @@ import { agentRuns } from "./agent_runs.js";
  * it there. It is the run fence the server writer will check before it
  * writes (wave 1). The extraction agent's role cannot update either
  * column (`AGENT_GRANTS.ingests`).
+ *
+ * `uploader_note` (#289) is free text from whoever uploaded the file: what
+ * the money was, when the document alone does not say. Set at upload, or
+ * by a retry that sends a new note (each attempt is its own row, so a row's
+ * note is the one its run was shown). Context for the extractor, never
+ * evidence; the agent's role cannot write it either.
  */
 export const ingests = pgTable(
   "ingests",
@@ -68,6 +74,7 @@ export const ingests = pgTable(
       (): AnyPgColumn => agentRuns.id,
       { onDelete: "set null" },
     ),
+    uploaderNote: text("uploader_note"),
   },
   (t) => [
     index("ingests_batch_idx").on(t.batchId),

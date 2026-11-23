@@ -227,7 +227,8 @@ export class IngestNotRetryableProblem extends HttpProblem {
       "ingest-not-retryable",
       "Ingest is not retryable",
       `Ingest ${ingestId} has status='${status}' (category='${category}'). ` +
-        `Only 'transient_actionable' and 'infrastructure_fault' ingests can be retried.`,
+        `Only 'transient_actionable' and 'infrastructure_fault' ingests can be retried; ` +
+        `an 'unsupported' one can be retried with a non-empty \`note\` in the body.`,
       { ingest_id: ingestId, status, category },
     );
   }

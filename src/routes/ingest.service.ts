@@ -79,6 +79,9 @@ export interface IngestRow {
   category: IngestCategory;
   retryable: boolean;
   dedup_of: string | null;
+  /** #289: accepted by retry when the request carries a note. */
+  retryable_with_note: boolean;
+  uploader_note: string | null;
   created_at: string;
   completed_at: string | null;
 }
@@ -206,6 +209,20 @@ export function isIngestRetryable(
 }
 
 /**
+ * Retry with a note (#289): everything `isIngestRetryable` accepts, plus
+ * `unsupported`. The #199 reason for refusing `unsupported` (the same
+ * bytes through the same pipeline land in the same place) does not hold
+ * once the uploader adds the context the document lacked: the input has
+ * changed. Behind both the `retryable_with_note` field and the guard.
+ */
+export function isIngestRetryableWithNote(
+  status: IngestStatus,
+  error: string | null,
+): boolean {
+  return isIngestRetryable(status, error) || status === "unsupported";
+}
+
+/**
  * Parse the `status` query param — a single token or comma-separated set
  * (#158). Returns null when absent (caller applies its own default).
  * Throws `ValidationProblem` (422) on unknown tokens.
@@ -293,6 +310,8 @@ function mapIngestRow(r: typeof ingests.$inferSelect): IngestRow {
     category,
     retryable,
     dedup_of,
+    retryable_with_note: isIngestRetryableWithNote(status, r.error),
+    uploader_note: r.uploaderNote ?? null,
     created_at: toIso(r.createdAt)!,
     completed_at: toIso(r.completedAt),
   };
@@ -350,6 +369,9 @@ export interface IncomingFile {
   originalName: string;
   mimeType: string | null;
   bytes: Buffer;
+  /** The uploader note for this file (#289), already validated; null or
+   *  absent for none. Stored on its ingest, born-dedup ones included. */
+  note?: string | null;
 }
 
 /** Tail of the per-workspace upload chain (see `createBatchFromFiles`). */
@@ -458,6 +480,7 @@ async function seedBatchFromFiles(params: {
     // the loop below for why `bornDedup` is decided by "bytes already
     // known", NOT by "a live transaction was found".
     bornDedup: boolean;
+    uploaderNote: string | null;
     // When known, the pre-existing live transaction these bytes already
     // produced — used only for provenance (deep-link "view it"). May be
     // null on a race-born dedup (the sibling's transaction isn't committed
@@ -529,6 +552,7 @@ async function seedBatchFromFiles(params: {
       documentId: doc.id,
       bornDedup,
       dedupOf,
+      uploaderNote: f.note?.trim() ? f.note.trim() : null,
     });
   }
 
@@ -544,6 +568,7 @@ async function seedBatchFromFiles(params: {
               mimeType: s.mimeType,
               filePath: s.filePath,
               documentId: s.documentId,
+              uploaderNote: s.uploaderNote,
               status: "dedup" as const,
               // Point provenance at the pre-existing transaction so the
               // client can deep-link "already in your ledger → view it".
@@ -567,6 +592,7 @@ async function seedBatchFromFiles(params: {
               mimeType: s.mimeType,
               filePath: s.filePath,
               documentId: s.documentId,
+              uploaderNote: s.uploaderNote,
               status: "queued" as const,
             },
       ),
@@ -846,6 +872,18 @@ export async function listIngests(params: {
            AND later.status IN ('done', 'dedup', 'near_dup', 'unsupported')
       )
     )`);
+    // #289: the same for an `unsupported` row once a retry with a note (or
+    // the same bytes uploaded again) got its document into the ledger. A
+    // later `unsupported` or `error` does not settle it.
+    whereParts.push(sql`NOT (
+      status = 'unsupported' AND EXISTS (
+        SELECT 1 FROM ingests later
+         WHERE later.workspace_id = ingests.workspace_id
+           AND later.document_id = ingests.document_id
+           AND (later.created_at, later.id) > (ingests.created_at, ingests.id)
+           AND later.status IN ('done', 'dedup', 'near_dup')
+      )
+    )`);
   }
   if (cur) {
     whereParts.push(
@@ -873,6 +911,7 @@ export async function listIngests(params: {
       classification: r.classification,
       produced: r.produced,
       error: r.error,
+      uploaderNote: r.uploader_note ?? null,
       createdAt: r.created_at,
       completedAt: r.completed_at,
     } as typeof ingests.$inferSelect),
@@ -925,6 +964,11 @@ export async function listIngests(params: {
 export async function retryIngest(
   workspaceId: string,
   id: string,
+  opts: {
+    /** #289. Absent: the new attempt keeps the retried ingest's note. A
+     *  string replaces it (blank clears it); null clears it. */
+    note?: string | null;
+  } = {},
 ): Promise<{
   retried_ingest_id: string;
   batch_id: string;
@@ -932,7 +976,14 @@ export async function retryIngest(
   poll: string;
 }> {
   const original = await getIngest(workspaceId, id); // throws NotFound
-  if (!isIngestRetryable(original.status, original.error)) {
+  const given = opts.note === undefined ? undefined : (opts.note?.trim() ?? "");
+  const note = given === undefined ? original.uploader_note : given === "" ? null : given;
+  // A note sent with this request is new context: it also opens an
+  // `unsupported` ingest to retry (#289). A note carried over is not.
+  const allowed = given
+    ? isIngestRetryableWithNote(original.status, original.error)
+    : isIngestRetryable(original.status, original.error);
+  if (!allowed) {
     throw new IngestNotRetryableProblem(id, original.status, original.category);
   }
 
@@ -951,6 +1002,7 @@ export async function retryIngest(
         originalName: original.filename,
         mimeType: original.mime_type,
         bytes,
+        note,
       },
     ],
     autoReconcile: true,

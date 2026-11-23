@@ -32,7 +32,7 @@ Postgres, managed by Drizzle migrations in `drizzle/`. `src/schema/` is the sour
 | `merchants`, `brands`, `products`, `owned_items`, `wish_items` | Catalog. |
 | `transaction_events`, `derivation_events` | Append-only audit logs: user/agent edits, and re-derive / re-extract runs. |
 | `accounts`, `workspaces`, `users`, `workspace_members` | Multi-tenant scaffolding. |
-| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. `ingests.document_id` is the stored document; `ingests.current_run_id` is the run that owns a `processing` ingest. |
+| `ingests`, `batches`, `idempotency_keys`, `reconcile_proposals` | Upload workers, idempotency, reconcile flow. `ingests.document_id` is the stored document; `ingests.current_run_id` is the run that owns a `processing` ingest; `ingests.uploader_note` is the uploader's note (#289, see "Uploader note" below). |
 | `agent_runs` | One row per `claude -p` run for a document (ingest or re-extract), written only by the server: writer, session id, model requested and observed, CLI version, turns, tokens, exit, outcome and error class. See "Run records" under "Agent transcripts". |
 | `document_extractions` | One immutable row per reading of a document: the extraction record a run handed back under the server writer, as validated, with its errors, warnings and normalisations. `transaction_items`, `derivation_events` and `agent_runs` point back at it through `extraction_id`. Production has written it since the flip to `server_apply` on 2026-11-19; a run under `agent_sql` writes none. See "Extraction records" below. |
 
@@ -146,7 +146,7 @@ Wave 1 adds constants for the server writer, live in production since the flip o
 | Constant | Value | Versions | Bump when |
 |---|---|---|---|
 | `PROMPT_VERSION` (`prompt-contract.ts`) | `"3.4"`, frozen | the legacy rendering (`writer: 'agent_sql'`) and re-extract | as above; in practice never, because the golden check above refuses any change to that text |
-| `RECORD_PROMPT_VERSION` (`prompt-contract.ts`) | `"4.0"` | the record rendering of the ingest prompt (`writer: 'server_apply'`) | any semantic change to that rendering, under the same rules as above |
+| `RECORD_PROMPT_VERSION` (`prompt-contract.ts`) | `"4.1"` (4.1: the uploader note, #289) | the record rendering of the ingest prompt (`writer: 'server_apply'`) | any semantic change to that rendering, under the same rules as above |
 | `EXTRACTION_CONTRACT_VERSION` (`src/ingest/contract/v1.ts`, re-exported by `prompt-contract.ts`) | `1` | the shape of the extraction record | any change to the zod shape, always together with `RECORD_PROMPT_VERSION` |
 | `APPLIER_VERSION` (`src/ingest/apply/version.ts`) | `"1.0"` | the rules that turn a record into ledger rows | any change to a projection, dedup or catalog rule; no prompt bump |
 
@@ -206,7 +206,7 @@ A HARD document delete and an apply can meet in a 40P01 (the delete reaches the 
 
 ### The server writer in the worker (arm B, wave 1)
 
-`src/ingest/worker.ts::extractRecordAndApply` runs an ingest whose writer is `server_apply`: decode, the Message-ID check before any spawn, the pHash neighbours, `runRecordExtraction`, T1, T2, then the points and FX passes, the SSE event, the batch and the lesson append. The steps are under "The run flow" in [`docs/server-writer.md`](docs/server-writer.md). Its runs carry `prompt_version` `4.0`. None of the legacy guards (#125, #133, #134) is on this path: they check what an agent claims it wrote, and this agent writes nothing.
+`src/ingest/worker.ts::extractRecordAndApply` runs an ingest whose writer is `server_apply`: decode, the Message-ID check before any spawn, the pHash neighbours, `runRecordExtraction`, T1, T2, then the points and FX passes, the SSE event, the batch and the lesson append. The steps are under "The run flow" in [`docs/server-writer.md`](docs/server-writer.md). Its runs carry `prompt_version` `4.1` (`4.0` before the uploader note, #289). None of the legacy guards (#125, #133, #134) is on this path: they check what an agent claims it wrote, and this agent writes nothing.
 
 **What an ingest's end says.**
 
@@ -244,6 +244,15 @@ SELECT metadata->'extraction' FROM transactions WHERE id = $1;
 **Arm B's rows differ from arm A's on purpose.** The list (X1–X13, plus the tenders) is under "Expected differences from the legacy writer" in the design doc; the A/B adjudicates those as expected, not as regressions. One of them already reaches the `agent_sql` side: since d224b7b, which production runs, reconcile's `cardLast4` reads a typed `metadata.card_last4` first on every row, legacy rows included. That can only make reconcile more conservative (a card conflict suppresses a proposal without an identifier match and blocks auto-apply with one); a change in what reconcile proposes may come from it rather than from the writer. The rollout itself (sandbox check, A/B gates, flip, watch, rollback triggers) is under "Rollout".
 
 **Stubs.** A stub upload (sandbox only) takes the path it names, whatever `EXTRACTION_WRITER` says: a `terminal` stub the legacy one (run writer `stub`), a `record` stub the server writer's (run writer `server_apply`, record origin `stub`, no model or CLI on the run). The one exception is a `follow_writer` stub, which carries both parts and takes the path the variable names, for rehearsing both arms of the A/B with one manifest. A record stub's child prints its record as the agent's final message, so the real parser, validator, repair round, T1 and applier run on it; it can also supply the email envelope, a pHash, a pause between T1 and T2, and a failing child for the repair round only (`repair_child`). See RECORD MODE in `src/ingest/stub-extractor.ts`.
+
+### Uploader note (#289)
+
+An upload can carry free text about the document from whoever uploads it: `-F note=…` on `POST /v1/ingest/batch` (one note for every file; `note[<filename>]` gives one file its own, replacing the batch note), or `{"note": …}` on `POST /v1/ingests/:id/retry`. It is stored on each ingest as `uploader_note` (born-dedup ones included) and echoed on every ingest the API returns. The rules (`UPLOADER_NOTE_MAX_CHARS` = 2000, trimmed, blank is none) live in `UploaderNote` (`src/schemas/v1/ingest.ts`); the multipart parsing (multer nests `note[x]` into an object; a `note[…]` naming no uploaded file, or `note` sent twice, is a 422) in `readUploadNotes` (`src/routes/ingest.ts`).
+
+- **Retry.** No body keeps the retried ingest's note; a string replaces it for the new attempt; blank or `null` clears it. A non-empty note in the request also lets an `unsupported` ingest be retried (`isIngestRetryableWithNote`, reported as `retryable_with_note`): #199 refused those because the same bytes through the same pipeline end the same way, and a note changes the input. The problems inbox hides an `unsupported` row once a later ingest of its document ended `done`, `dedup` or `near_dup`, as it already did for `error` rows.
+- **Prompt.** Only the record rendering (`server_apply`) shows the note: `renderUploaderNote` in `prompt-contract.ts` fences it between two lines carrying a random per-run name and states `UPLOADER_NOTE_RULES`, the one copy of the contract: the note may decide classification and intent (income or transfer, which payment two documents share, personal or business); amounts, dates, payee and items come only from the document; a contradiction is followed by the document, flagged `needs_review`, and reported in `audit.note` starting "Uploader note conflict:". The legacy rendering is frozen, so under `agent_sql` the note is stored and not shown (the worker logs `… has an uploader note; the legacy writer (agent_sql) does not show it`). Re-extract does not read it.
+- **Checks in code.** `validate.ts` warns `uploader_note_amount_mismatch` (money) when the note states an amount (next to a currency sign, code or word, or written with two decimals: `noteAmounts`) and none is the booked total, and `uploader_note_conflict` when the agent reported one. The booked figures stay the document's either way.
+- **Provenance.** `document_extractions.input_meta.uploader_note` is `{sha256, chars}` of the note the run was shown (null without one); `metadata.extraction.extraction_id` leads there from the transaction. The note is never interpolated into SQL anywhere: the API writes it as a bound value, and the record agent has no database.
 
 ### Three ways to re-run a layer
 
@@ -693,7 +702,7 @@ Every ingest and re-extract run has a row in `agent_runs` (migration 0042, `src/
 - **At boot** every run still `running` becomes `abandoned` / `interrupted`, in the same transaction that errors the ingests of abandoned batches, and the boot log line `[ingest worker] boot recovery: …` gives the counts.
 - **Timeouts** kill the agent's whole process group (`src/claude.ts::runSupervised`: SIGTERM, then SIGKILL after 15 s), and the worker's slot is released only after the child has closed, so the next extraction never overlaps a dying one. The CLI (2.1.251) runs every Bash tool command in a session of its own, outside that group, so on a timeout the server first reads which groups the CLI's descendants are in and signals those too, and SIGKILLs any of them still alive when the pipes close. After a **normal** exit only the CLI's own group is killed: a tool command the agent left running in the background is no longer the CLI's child by then and is not reached. If something outside the group holds the CLI's pipes after it exits, they are abandoned 15 s later and the exit code stands (it is not turned into a timeout). In the container node is PID 1, so stopping it ends every group; a server killed outside a container leaves its current agent group running.
 
-`writer` names what wrote the ledger: `agent_sql` (the agent, through psql), `server_apply` (the server applier, from the agent's record or a record stub's) or `stub` (a legacy sandbox stub); `EXTRACTION_WRITER` is read per run. The server writer's runs carry `prompt_version` `4.0`, also end `recorded_only`, `invalid_record` or `reapplied`, with the classes `fenced_out`, `artefact_missing` and `artefact_invalid`, and store `repair_rounds`, `extraction_id` and `apply_report` (see "The server writer in the worker"). `scripts/check-ledger.ts` checks that no ended run leaves its ingest open (`run-without-terminal-ingest`).
+`writer` names what wrote the ledger: `agent_sql` (the agent, through psql), `server_apply` (the server applier, from the agent's record or a record stub's) or `stub` (a legacy sandbox stub); `EXTRACTION_WRITER` is read per run. The server writer's runs carry `prompt_version` `4.1` (`4.0` before #289), also end `recorded_only`, `invalid_record` or `reapplied`, with the classes `fenced_out`, `artefact_missing` and `artefact_invalid`, and store `repair_rounds`, `extraction_id` and `apply_report` (see "The server writer in the worker"). `scripts/check-ledger.ts` checks that no ended run leaves its ingest open (`run-without-terminal-ingest`).
 
 ### Finding a run
 
@@ -896,6 +905,34 @@ curl -sS "$BASE/v1/batches/$BATCH" | jq '.items[] | {id,status,error,produced}'
 #    postings/items are all here)
 TX=$(curl -sS "$BASE/v1/batches/$BATCH" | jq -r '.items[0].produced.transaction_ids[0]')
 curl -sS "$BASE/v1/transactions/$TX" | jq .
+```
+
+With an uploader note (#289), context the extractor may use for what the
+money was, never for amounts or dates. Use `--form-string` for note text
+(`-F` reads a leading `@` or `<` as a file):
+
+```bash
+# One note for every file in the batch
+curl -sS -X POST "$BASE/v1/ingest/batch" \
+  -F "file=@/path/to/payment-notification.eml" \
+  --form-string "note=employer relocation reimbursement paid to me" | jq .
+
+# Per-file notes in a multi-file upload (replaces the batch note for that file)
+curl -sS -X POST "$BASE/v1/ingest/batch" \
+  -F "file=@/path/to/paypal.eml" -F "file=@/path/to/uber.eml" \
+  --form-string "note[paypal.eml]=same payment as the Uber receipt uploaded alongside" | jq .
+
+# The note each ingest carries
+curl -sS "$BASE/v1/batches/$BATCH" | jq '.items[] | {id,status,uploader_note}'
+
+# Retry a rejected (unsupported) or failed ingest with the missing context;
+# poll the batch it returns. No body keeps the old note; "note": null clears it.
+curl -sS -X POST "$BASE/v1/ingests/$INGEST/retry" \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"employer relocation reimbursement paid to me"}' | jq '{batch_id, ingest: .ingest | {id,status,uploader_note}}'
+
+# What the run was shown, and any note warnings
+#   SELECT input_meta->'uploader_note', validation->'warnings' FROM document_extractions WHERE ingest_id = '<new ingest>';
 ```
 
 For what the agent did, read its session JSONL (see "Agent

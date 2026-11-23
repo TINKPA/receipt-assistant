@@ -30,7 +30,9 @@ import {
   IngestProblemsQuery,
   ListBatchesQuery,
   ListIngestsQuery,
+  RetryIngestBody,
   RetryIngestResponse,
+  UploaderNote,
 } from "../schemas/v1/ingest.js";
 import {
   createBatchFromFiles,
@@ -49,7 +51,10 @@ import { on as busOn } from "../events/bus.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024, files: 50 },
+  // fieldSize: a note is at most 2000 characters (8 KB of UTF-8), so a
+  // larger value is refused before it is buffered; fieldNameSize: room for
+  // `note[<long filename>]` (multer's default is 100 bytes).
+  limits: { fileSize: 25 * 1024 * 1024, files: 50, fieldSize: 16 * 1024, fieldNameSize: 1024, fields: 100 },
 });
 
 function asyncHandler(
@@ -58,6 +63,75 @@ function asyncHandler(
   return (req: Request, res: Response, next: NextFunction): void => {
     fn(req, res, next).catch(next);
   };
+}
+
+/**
+ * The uploader notes of a multipart upload (#289), out of `req.body`.
+ *
+ * multer's field parser reads `note[<name>]` as a nested key, so `note`
+ * arrives as a string (one batch note), an object (per-file notes, with
+ * the batch note under the key ""), or an array (`note` sent twice, a
+ * 422). A file name the parser cannot nest (one with brackets in it)
+ * stays a literal `note[…]` key, read here too. Every note goes through
+ * `UploaderNote`; a per-file note that names no uploaded file is a 422,
+ * so a typo never drops a note silently.
+ */
+function readUploadNotes(
+  body: Record<string, unknown>,
+  filenames: readonly string[],
+): { rest: Record<string, unknown>; batchNote: string | null; perFile: Map<string, string | null> } {
+  const rest: Record<string, unknown> = {};
+  const raw: Array<[string | null, unknown]> = [];
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "note") {
+      if (Array.isArray(value)) {
+        throw new ValidationProblem(
+          [{ path: "note", code: "invalid_type", message: "send `note` once; per-file notes go in `note[<filename>]`" }],
+          "Field `note` sent more than once",
+        );
+      }
+      if (value !== null && typeof value === "object") {
+        for (const [name, v] of Object.entries(value as Record<string, unknown>)) raw.push([name === "" ? null : name, v]);
+      } else {
+        raw.push([null, value]);
+      }
+    } else if (key.startsWith("note[") && key.endsWith("]")) {
+      raw.push([key.slice(5, -1), value]);
+    } else {
+      rest[key] = value;
+    }
+  }
+  let batchNote: string | null = null;
+  const perFile = new Map<string, string | null>();
+  for (const [name, value] of raw) {
+    const path = name === null ? "note" : `note[${name}]`;
+    if (typeof value !== "string") {
+      throw new ValidationProblem(
+        [{ path, code: "invalid_type", message: "a note is one text field" }],
+        `Field \`${path}\` is not text`,
+      );
+    }
+    const parsed = UploaderNote.safeParse(value);
+    if (!parsed.success) {
+      throw new ValidationProblem(
+        parsed.error.issues.map((i) => ({ path, code: i.code, message: i.message })),
+        `Field \`${path}\` is not a valid note`,
+      );
+    }
+    const note = parsed.data === "" ? null : parsed.data;
+    if (name === null) {
+      batchNote = note;
+    } else {
+      if (!filenames.includes(name)) {
+        throw new ValidationProblem(
+          [{ path, code: "unknown_file", message: `no file named '${name}' in this upload` }],
+          `Per-file note names no uploaded file`,
+        );
+      }
+      perFile.set(name, note);
+    }
+  }
+  return { rest, batchNote, perFile };
 }
 
 // ── /v1/ingest ────────────────────────────────────────────────────────
@@ -88,7 +162,11 @@ ingestRouter.post(
     // The text fields, checked before anything is written. A flag this
     // route cannot read is a 422, never a guess; on is only the default
     // for a flag that was not sent.
-    const fields = parseOrThrow(CreateBatchForm, req.body ?? {});
+    const notes = readUploadNotes(
+      (req.body ?? {}) as Record<string, unknown>,
+      files.map((f) => f.originalname),
+    );
+    const fields = parseOrThrow(CreateBatchForm, notes.rest);
     const autoReconcile = fields.auto_reconcile ?? true;
 
     const { batch, items } = await createBatchFromFiles({
@@ -97,6 +175,7 @@ ingestRouter.post(
         originalName: f.originalname,
         mimeType: f.mimetype ?? null,
         bytes: f.buffer,
+        note: notes.perFile.has(f.originalname) ? notes.perFile.get(f.originalname)! : notes.batchNote,
       })),
       autoReconcile,
     });
@@ -309,7 +388,9 @@ ingestsRouter.post(
   "/:id/retry",
   asyncHandler(async (req, res) => {
     const { id } = parseOrThrow(IdParam, req.params);
-    const out = await retryIngest(req.ctx.workspaceId, id);
+    // #289: an optional JSON body `{ note }`; no body is the old retry.
+    const body = parseOrThrow(RetryIngestBody, req.body ?? {});
+    const out = await retryIngest(req.ctx.workspaceId, id, { note: body.note });
     res.setHeader("Location", out.poll);
     res.status(202).json(out);
   }),
@@ -323,6 +404,7 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
   registry.register("Ingest", Ingest);
   registry.register("CreateBatchForm", CreateBatchForm);
   registry.register("CreateBatchResponse", CreateBatchResponse);
+  registry.register("RetryIngestBody", RetryIngestBody);
   registry.register("RetryIngestResponse", RetryIngestResponse);
 
   const problemContent = {
@@ -352,7 +434,9 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
         },
       },
       422: {
-        description: "No files, or `auto_reconcile` is not one of true / 1 / false / 0",
+        description:
+          "No files; `auto_reconcile` is not one of true / 1 / false / 0; or a `note` is too long, " +
+          "sent twice, or (`note[<filename>]`) names no uploaded file",
         content: problemContent,
       },
     },
@@ -490,9 +574,19 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
       "Accepts exactly the ingests whose `retryable` field is true, i.e. " +
       "category `transient_actionable` or `infrastructure_fault` (#199); " +
       "anything else 409s. `unsupported` was accepted before #199 despite " +
-      "always reporting `retryable: false`, and no longer is.",
+      "always reporting `retryable: false`, and no longer is. " +
+      "Optional JSON body `{ \"note\": \"…\" }` (#289): the new attempt carries that " +
+      "uploader note instead of the retried ingest's (blank or null clears it; no body keeps " +
+      "it), and a non-empty note also makes an `unsupported` ingest retryable " +
+      "(`retryable_with_note`), since the note is the context the document lacked.",
     tags: ["ingest"],
-    request: { params: z.object({ id: Uuid }) },
+    request: {
+      params: z.object({ id: Uuid }),
+      body: {
+        required: false,
+        content: { "application/json": { schema: RetryIngestBody } },
+      },
+    },
     responses: {
       202: {
         description: "Retry enqueued — poll the returned ingest / batch",
@@ -505,7 +599,7 @@ export function registerIngestOpenApi(registry: OpenAPIRegistry): void {
         content: problemContent,
       },
       422: {
-        description: "Stored source bytes missing",
+        description: "Stored source bytes missing, or the body's `note` is not valid",
         content: problemContent,
       },
     },
